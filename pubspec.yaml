@@ -14,8 +14,8 @@ dependencies:
   # BLE - Central mode (scanning, connecting to peripherals)
   flutter_blue_plus: ^1.31.0
   
-  # BLE - Peripheral mode (advertising, accepting connections)
-  ble_peripheral: ^2.4.0
+  # BLE - Peripheral mode (advertising, accepting connections) - bondless fork
+  ble_peripheral_bondless: ^2.5.0
   
   # Cryptography (Ed25519 signing, SHA-256 hashing)
   cryptography: ^2.9.0

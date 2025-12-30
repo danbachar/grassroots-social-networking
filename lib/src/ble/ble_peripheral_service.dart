@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'package:ble_peripheral/ble_peripheral.dart';
+import 'package:ble_peripheral_bondless/ble_peripheral_bondless.dart';
 import 'package:logger/logger.dart';
 
 /// Callback when data is received from a connected central

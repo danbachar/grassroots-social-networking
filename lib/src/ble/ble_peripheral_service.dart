@@ -110,7 +110,7 @@ class BlePeripheralService {
       // Start advertising
       await BlePeripheral.startAdvertising(
         services: [serviceUuid],
-        localName: localName ?? 'Bitchat',
+        // localName: '0',//localName ?? 'Bitchat',
       );
       
       _isAdvertising = true;

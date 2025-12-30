@@ -19,12 +19,13 @@ class BitchatIdentity {
   final Uint8List privateKey;
   
   /// Optional human-readable nickname for ANNOUNCE
-  final String? nickname;
+  final String nickname;
   
+  // TODO: nickname was changed to required, remove in production when this is just a transport layer
   BitchatIdentity({
     required this.publicKey,
     required this.privateKey,
-    this.nickname,
+    required this.nickname,
   }) {
     if (publicKey.length != 32) {
       throw ArgumentError('Public key must be 32 bytes (Ed25519)');
@@ -62,4 +63,20 @@ class BitchatIdentity {
   
   @override
   String toString() => 'BitchatIdentity(${nickname ?? shortFingerprint})';
+
+  static BitchatIdentity fromMap(Map<String, dynamic> map) {
+    return BitchatIdentity(
+      publicKey: Uint8List.fromList(List<int>.from(map['publicKey'])),
+      privateKey: Uint8List.fromList(List<int>.from(map['privateKey'])),
+      nickname: map['nickname'],
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+      return {
+        'publicKey': publicKey,
+        'privateKey': privateKey,
+        'nickname': nickname,
+      };
+  }
 }

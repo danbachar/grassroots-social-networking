@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:ble_peripheral/ble_peripheral.dart';
 import 'package:logger/logger.dart';
@@ -14,6 +15,9 @@ typedef PeripheralConnectionCallback = void Function(String deviceId, bool conne
 /// Peripheral (advertiser) simultaneously. This allows maximum connectivity.
 /// 
 /// Uses the ble_peripheral package for peripheral mode.
+/// 
+/// The service UUID is derived from the user's public key (last 128 bits).
+/// Identity details are exchanged via ANNOUNCE packets after connection.
 class BlePeripheralService {
   final Logger _log = Logger();
   
@@ -21,7 +25,6 @@ class BlePeripheralService {
   final String serviceUuid;
   
   /// Characteristic UUID for data transfer
-  /// Using a fixed UUID since we identify via service UUID
   static const String characteristicUuid = '0000ff01-0000-1000-8000-00805f9b34fb';
   
   /// Maximum characteristic value size
@@ -107,10 +110,12 @@ class BlePeripheralService {
         ),
       );
       
-      // Start advertising
+      // Start advertising - NO local name to keep packet small
+      // The 128-bit UUID derived from pubkey is used for discovery
+      // Identity exchange happens via ANNOUNCE after connection
       await BlePeripheral.startAdvertising(
         services: [serviceUuid],
-        // localName: '0',//localName ?? 'Bitchat',
+        // localName omitted to fit in legacy advertising packet
       );
       
       _isAdvertising = true;

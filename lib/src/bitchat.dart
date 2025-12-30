@@ -6,6 +6,7 @@ import 'ble/permission_handler.dart';
 import 'mesh/mesh_router.dart';
 import 'models/identity.dart';
 import 'models/peer.dart';
+import 'models/packet.dart';
 
 /// Transport status
 enum TransportStatus {
@@ -45,12 +46,16 @@ class BitchatConfig {
   /// Local name for BLE advertising
   final String? localName;
   
+  /// Interval for sending periodic ANNOUNCE packets
+  final Duration announceInterval;
+  
   const BitchatConfig({
     this.autoConnect = true,
     this.autoStart = true,
     this.scanDuration,
     this.enableRelay = true,
     this.localName,
+    this.announceInterval = const Duration(seconds: 10),
   });
 }
 
@@ -100,6 +105,9 @@ class Bitchat {
   /// Mesh router
   late final MeshRouter _router;
   
+  /// Timer for periodic ANNOUNCE broadcasts
+  Timer? _announceTimer;
+  
   /// Current transport status
   TransportStatus _status = TransportStatus.uninitialized;
   
@@ -114,6 +122,9 @@ class Bitchat {
   
   /// Called when a new peer connects and exchanges ANNOUNCE
   void Function(Peer peer)? onPeerConnected;
+  
+  /// Called when an existing peer sends an ANNOUNCE update
+  void Function(Peer peer)? onPeerUpdated;
   
   /// Called when a peer disconnects
   void Function(Peer peer)? onPeerDisconnected;
@@ -212,6 +223,7 @@ class Bitchat {
     
     _log.i('Starting Bitchat transport');
     await _ble.start();
+    _startAnnounceTimer();
     _setStatus(TransportStatus.active);
   }
   
@@ -220,6 +232,8 @@ class Bitchat {
     if (_status != TransportStatus.active) return;
     
     _log.i('Stopping Bitchat transport');
+    _announceTimer?.cancel();
+    _announceTimer = null;
     await _ble.stop();
     _setStatus(TransportStatus.ready);
   }
@@ -251,15 +265,32 @@ class Bitchat {
   void _setupBleCallbacks() {
     // Data received from BLE
     _ble.onDataReceived = (deviceId, data) {
-      // Get pubkey for this device if known
-      final pubkey = _ble.getPubkeyForDevice(deviceId);
-      _router.onPacketReceived(data, fromPeer: pubkey);
+      _log.d('Data received from device $deviceId: ${data.length} bytes');
+      
+      // Parse the packet to check if it's an ANNOUNCE
+      try {
+        final packet = BitchatPacket.deserialize(data);
+        
+        if (packet.type == PacketType.announce) {
+          // ANNOUNCE packet - associate device with pubkey
+          _log.i('Received ANNOUNCE from device $deviceId');
+          _ble.associateDeviceWithPubkey(deviceId, packet.senderPubkey);
+        }
+        
+        // Get pubkey for this device (may have just been set)
+        final pubkey = _ble.getPubkeyForDevice(deviceId);
+        _router.onPacketReceived(data, fromPeer: pubkey);
+      } catch (e) {
+        _log.e('Failed to process packet from $deviceId: $e');
+      }
     };
     
-    // Device connected
-    _ble.onDeviceConnected = (deviceId, isCentral) {
-      _log.d('BLE device connected: $deviceId (central: $isCentral)');
-      // We don't know the pubkey yet - wait for ANNOUNCE
+    // Device connected - need to send ANNOUNCE to identify ourselves
+    _ble.onDeviceConnected = (deviceId, isCentral) async {
+      _log.i('BLE device connected: $deviceId (central: $isCentral)');
+      // Send ANNOUNCE to this device so they know who we are
+      // We broadcast to the device - the ANNOUNCE contains our pubkey
+      await _sendAnnounceToDevice(deviceId);
     };
     
     // Device disconnected
@@ -301,16 +332,18 @@ class Bitchat {
       onMessageReceived?.call(senderPubkey, payload);
     };
     
-    // Peer connected (after ANNOUNCE)
+    // Peer connected (after ANNOUNCE received and processed)
     _router.onPeerConnected = (peer) {
-      // Associate BLE device with pubkey
-      // Note: We need to track which device sent the ANNOUNCE
-      // For now, this association happens in the packet handling
-      
+      _log.i('Peer connected: ${peer.displayName}');
+      // Note: We already sent our ANNOUNCE when BLE connected,
+      // so no need to send again here
       onPeerConnected?.call(peer);
-      
-      // Send our ANNOUNCE back
-      _router.sendAnnounce(peer.publicKey);
+    };
+    
+    // Peer updated (ANNOUNCE received from existing peer)
+    _router.onPeerUpdated = (peer) {
+      _log.d('Peer updated: ${peer.displayName}');
+      onPeerUpdated?.call(peer);
     };
     
     // Peer disconnected
@@ -326,11 +359,85 @@ class Bitchat {
     onStatusChanged?.call(newStatus);
   }
   
+  /// Send ANNOUNCE to a newly connected BLE device
+  Future<void> _sendAnnounceToDevice(String deviceId) async {
+    _log.i('Sending ANNOUNCE to device: $deviceId');
+    
+    // Create ANNOUNCE packet
+    final payload = _router.createAnnouncePayload();
+    
+    final packet = BitchatPacket(
+      type: PacketType.announce,
+      ttl: 0, // ANNOUNCE is not relayed
+      senderPubkey: identity.publicKey,
+      payload: payload,
+    );
+    
+    // TODO: Sign packet
+    
+    final data = packet.serialize();
+    final sent = await _ble.sendToDevice(deviceId, data);
+    
+    if (sent) {
+      _log.i('ANNOUNCE sent to device: $deviceId');
+    } else {
+      _log.w('Failed to send ANNOUNCE to device: $deviceId');
+    }
+  }
+  
   /// Clean up resources
   Future<void> dispose() async {
+    _announceTimer?.cancel();
     await stop();
     await _ble.dispose();
     _router.dispose();
     await _statusController.close();
+  }
+  
+  /// Start the periodic ANNOUNCE timer
+  void _startAnnounceTimer() {
+    _announceTimer?.cancel();
+    _announceTimer = Timer.periodic(config.announceInterval, (_) {
+      _log.d('Timer is up! time to ANNOUNCE again 📢');
+      _broadcastAnnounce();
+      _removeStaleePeers();
+    });
+  }
+  
+  /// Broadcast ANNOUNCE to all connected peers
+  Future<void> _broadcastAnnounce() async {
+    final peers = _router.connectedPeers;
+    if (peers.isEmpty) return;
+    
+    _log.d('Broadcasting ANNOUNCE to ${peers.length} peers');
+    
+    // Create ANNOUNCE packet
+    final payload = _router.createAnnouncePayload();
+    final packet = BitchatPacket(
+      type: PacketType.announce,
+      ttl: 0,
+      senderPubkey: identity.publicKey,
+      payload: payload,
+    );
+    final data = packet.serialize();
+    
+    // Send to all connected peers
+    await _ble.broadcast(data);
+  }
+  
+  /// Remove peers that haven't sent an ANNOUNCE within the interval
+  void _removeStaleePeers() {
+    final now = DateTime.now();
+    final staleThreshold = config.announceInterval * 2; // Give 2x grace period
+    
+    for (final peer in _router.connectedPeers) {
+      if (peer.lastSeen != null) {
+        final timeSinceLastSeen = now.difference(peer.lastSeen!);
+        if (timeSinceLastSeen > staleThreshold) {
+          _log.i('Removing stale peer: ${peer.displayName} (last seen ${timeSinceLastSeen.inSeconds}s ago)');
+          _router.onPeerBleDisconnected(peer.publicKey);
+        }
+      }
+    }
   }
 }

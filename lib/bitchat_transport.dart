@@ -65,6 +65,8 @@ export 'src/bitchat.dart';
 export 'src/models/identity.dart';
 export 'src/models/peer.dart';
 export 'src/models/packet.dart';
+export 'src/models/message.dart';
+export 'src/models/message_store.dart';
 
 // BLE (for advanced usage)
 export 'src/ble/permission_handler.dart' show PermissionHandler, PermissionResult;

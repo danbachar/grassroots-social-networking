@@ -197,6 +197,16 @@ class BleCentralService {
       // Discover services
       final services = await device.discoverServices();
       
+      // Log all discovered services for debugging
+      _log.d('Discovered ${services.length} services on $deviceId:');
+      for (final service in services) {
+        _log.d('  Service: ${service.uuid}');
+        for (final char in service.characteristics) {
+          _log.d('    Char: ${char.uuid}');
+        }
+      }
+      _log.d('Looking for service: ${discovered.serviceUuid}');
+      
       // Find our service
       BluetoothService? targetService;
       for (final service in services) {
@@ -213,11 +223,22 @@ class BleCentralService {
         return false;
       }
       
+      _log.d('Found target service, looking for characteristic: $characteristicUuid');
+      _log.d('Service has ${targetService.characteristics.length} characteristics:');
+      for (final char in targetService.characteristics) {
+        _log.d('  Char: ${char.uuid}');
+      }
+      
       // Find our characteristic
+      // Note: flutter_blue_plus may return short-form UUIDs (e.g., "ff01")
+      // while we define full 128-bit UUIDs, so we need to compare the short form
+      final shortCharUuid = characteristicUuid.substring(4, 8).toLowerCase(); // Extract "ff01" from "0000ff01-..."
       BluetoothCharacteristic? targetChar;
       for (final char in targetService.characteristics) {
-        if (char.uuid.toString().toLowerCase() == 
-            characteristicUuid.toLowerCase()) {
+        final charUuidStr = char.uuid.toString().toLowerCase();
+        // Match either the full UUID or the short form
+        if (charUuidStr == characteristicUuid.toLowerCase() ||
+            charUuidStr == shortCharUuid) {
           targetChar = char;
           break;
         }

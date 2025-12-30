@@ -59,6 +59,9 @@ class MeshRouter {
   /// Callback when a new peer is discovered
   PeerEventCallback? onPeerConnected;
   
+  /// Callback when a peer sends an ANNOUNCE update
+  PeerEventCallback? onPeerUpdated;
+  
   /// Callback when a peer disconnects
   PeerEventCallback? onPeerDisconnected;
   
@@ -209,7 +212,7 @@ class MeshRouter {
   Future<void> sendAnnounce(Uint8List peerPubkey) async {
     final payload = _encodeAnnounce(
       pubkey: identity.publicKey,
-      nickname: identity.nickname ?? '',
+      nickname: identity.nickname,
       protocolVersion: protocolVersion,
     );
     
@@ -301,6 +304,8 @@ class MeshRouter {
       
       // Deliver any cached messages
       _deliverCachedMessages(pubkey);
+    } else {
+      onPeerUpdated?.call(peer);
     }
   }
   
@@ -403,6 +408,15 @@ class MeshRouter {
   }
   
   // ===== ANNOUNCE encoding/decoding =====
+  
+  /// Create ANNOUNCE payload for sending to a new peer
+  Uint8List createAnnouncePayload() {
+    return _encodeAnnounce(
+      pubkey: identity.publicKey,
+      nickname: identity.nickname,
+      protocolVersion: protocolVersion,
+    );
+  }
   
   Uint8List _encodeAnnounce({
     required Uint8List pubkey,

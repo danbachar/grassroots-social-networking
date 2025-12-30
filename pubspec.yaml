@@ -35,6 +35,8 @@ dependencies:
   # Logging
   logger: ^2.0.0
   flutter_secure_storage: ^10.0.0
+  flutter_local_notifications: ^19.5.0
+  shared_preferences: ^2.5.4
 
 dev_dependencies:
   flutter_test:
@@ -45,4 +47,5 @@ dev_dependencies:
   mockito: ^5.4.0
 
 flutter:
+  uses-material-design: true
   # No assets needed for transport layer

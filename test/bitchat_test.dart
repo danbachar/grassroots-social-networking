@@ -246,17 +246,16 @@ void main() {
     test('creates peer with correct state', () {
       final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
       
-      final peer = Peer(publicKey: pubkey);
+      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect);
       
       expect(peer.connectionState, equals(PeerConnectionState.discovered));
       expect(peer.isReachable, isFalse);
-      expect(peer.hopCount, equals(0));
     });
     
     test('updates from ANNOUNCE correctly', () {
       final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
       
-      final peer = Peer(publicKey: pubkey);
+      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect);
       peer.updateFromAnnounce(
         nickname: 'Alice',
         protocolVersion: 1,
@@ -272,7 +271,7 @@ void main() {
     test('generates correct display name', () {
       final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
       
-      final peer = Peer(publicKey: pubkey);
+      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect);
       
       // Without nickname, should use fingerprint
       expect(peer.displayName, equals(peer.shortFingerprint));

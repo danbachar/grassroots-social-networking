@@ -286,8 +286,9 @@ class MeshRouter {
     var peer = _peers[key];
     final isNew = peer == null;
     
+    // TODO: Determine transport type from router; need to have a router per transport protocol
     if (isNew) {
-      peer = Peer(publicKey: pubkey);
+      peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect);
       _peers[key] = peer;
     }
     

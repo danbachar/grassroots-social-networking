@@ -62,7 +62,7 @@ class BitchatIdentity {
   }
   
   @override
-  String toString() => 'BitchatIdentity(${nickname ?? shortFingerprint})';
+  String toString() => 'BitchatIdentity($nickname)';
 
   static BitchatIdentity fromMap(Map<String, dynamic> map) {
     return BitchatIdentity(

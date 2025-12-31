@@ -1,4 +1,6 @@
 import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import '../transport/transport_service.dart';
 
 /// Connection state of a peer
 enum PeerConnectionState {
@@ -20,18 +22,48 @@ enum PeerTransport {
   /// Direct BLE connection (Central or Peripheral role)
   bleDirect,
   
-  /// Reachable via BLE mesh relay
-  bleMesh,
-  
-  /// TODO: Future transport layers (WebRTC, etc.)
-  // webrtc,
+  /// WebRTC P2P connection
+  webrtc,
 }
 
-/// Represents a peer in the Bitchat mesh network.
+/// Extension to get display info for peer transport
+extension PeerTransportDisplay on PeerTransport {
+  /// Get the icon for this transport type
+  Icon get icon {
+    switch (this) {
+      case PeerTransport.bleDirect:
+        return const Icon(Icons.bluetooth_connected, size: 16, color: Colors.blue);
+      case PeerTransport.webrtc:
+        return const Icon(Icons.public, size: 16, color: Colors.blue);
+    }
+  }
+  
+  /// Get the display name for this transport
+  String get displayName {
+    switch (this) {
+      case PeerTransport.bleDirect:
+        return 'Bluetooth';
+      case PeerTransport.webrtc:
+        return 'Internet';
+    }
+  }
+  
+  /// Convert from TransportType
+  static PeerTransport fromTransportType(TransportType type, {bool isMesh = false}) {
+    switch (type) {
+      case TransportType.ble:
+        return PeerTransport.bleDirect;
+      case TransportType.webrtc:
+        return PeerTransport.webrtc;
+    }
+  }
+}
+
+/// Represents a peer in the Bitchat network.
 /// 
 /// A peer can be:
 /// - Directly connected via BLE
-/// - Reachable via mesh relay (other peers forwarding)
+/// - Connected over WebRTC
 /// - Known but currently unreachable
 class Peer {
   /// Ed25519 public key (32 bytes) - primary identifier
@@ -60,9 +92,6 @@ class Peer {
   /// Signal strength (RSSI) if available, for BLE connections
   int? rssi;
   
-  /// Number of hops to reach this peer (0 = direct, 1+ = mesh relay)
-  int hopCount;
-  
   /// Protocol version from ANNOUNCE
   int protocolVersion;
   
@@ -70,12 +99,11 @@ class Peer {
     required this.publicKey,
     this.nickname = '',
     this.connectionState = PeerConnectionState.discovered,
-    this.transport = PeerTransport.bleDirect,
+    required this.transport,
     this.bleDeviceId,
     this.lastSeen,
     this.lastSentTo,
     this.rssi,
-    this.hopCount = 0,
     this.protocolVersion = 1,
   }) {
     if (publicKey.length != 32) {
@@ -101,9 +129,6 @@ class Peer {
   bool get isReachable => 
       connectionState == PeerConnectionState.connected ||
       connectionState == PeerConnectionState.connecting;
-  
-  /// Whether this is a direct BLE connection (not mesh relay)
-  bool get isDirect => hopCount == 0 && transport == PeerTransport.bleDirect;
   
   /// Update peer state from a received ANNOUNCE
   void updateFromAnnounce({
@@ -135,5 +160,5 @@ class Peer {
   int get hashCode => id.hashCode;
   
   @override
-  String toString() => 'Peer($displayName, $connectionState, hops=$hopCount)';
+  String toString() => 'Peer($displayName, $connectionState, $transport)';
 }

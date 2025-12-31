@@ -49,24 +49,31 @@
 /// - `Peer` - Represents a connected peer
 /// - `MeshRouter` - Handles routing, relay, and fragmentation
 /// - `BleManager` - Manages BLE Central and Peripheral roles
+/// - `TransportService` - Abstract interface for transport implementations
 /// 
 /// ## Protocol Compatibility
 /// 
 /// This implementation follows the Bitchat protocol specification for
 /// BLE mesh networking, ensuring compatibility with other Bitchat clients.
-/// The Nostr bridge has been removed, with a TODO for implementing
-/// alternative transport layers (WebRTC, STUN/TURN, etc.).
+/// 
+/// ## Transport Abstraction
+/// 
+/// The transport layer is abstracted via the `TransportService` interface,
+/// allowing multiple transport implementations:
+/// - `BleTransportService` - Bluetooth Low Energy mesh (default)
+/// - Future: WebRTC transport (STUN/TURN/TURNS)
 library bitchat_transport;
 
 // Main API
 export 'src/bitchat.dart';
 
+// Transport abstraction
+export 'src/transport/transport.dart';
+
 // Models
 export 'src/models/identity.dart';
 export 'src/models/peer.dart';
 export 'src/models/packet.dart';
-export 'src/models/message.dart';
-export 'src/models/message_store.dart';
 
 // BLE (for advanced usage)
 export 'src/ble/permission_handler.dart' show PermissionHandler, PermissionResult;

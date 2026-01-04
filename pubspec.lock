@@ -37,10 +37,10 @@ packages:
     dependency: "direct main"
     description:
       name: ble_peripheral_bondless
-      sha256: "73da1bedb786a80fde1b90135d76b75c37dcb7227c67c02eb4e4ea82dca1d2d8"
+      sha256: cf1509414e5b39e3d0d482b4737045677804427732ed25f64dd51261ca4baf1c
       url: "https://pub.dev"
     source: hosted
-    version: "2.5.0"
+    version: "2.5.1"
   bluez:
     dependency: transitive
     description:

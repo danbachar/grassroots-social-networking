@@ -62,8 +62,17 @@ void main() async {
   // Initialize notifications
   const AndroidInitializationSettings initializationSettingsAndroid =
       AndroidInitializationSettings('@mipmap/ic_launcher');
+  const DarwinInitializationSettings initializationSettingsDarwin =
+      DarwinInitializationSettings(
+    requestAlertPermission: true,
+    requestBadgePermission: true,
+    requestSoundPermission: true,
+  );
   const InitializationSettings initializationSettings =
-      InitializationSettings(android: initializationSettingsAndroid);
+      InitializationSettings(
+    android: initializationSettingsAndroid,
+    iOS: initializationSettingsDarwin,
+  );
   
   await flutterLocalNotificationsPlugin.initialize(
     initializationSettings,
@@ -237,8 +246,14 @@ class _BitchatHomeState extends State<BitchatHome> {
       importance: Importance.high,
       priority: Priority.high,
     );
+    const DarwinNotificationDetails iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
     const NotificationDetails notificationDetails = NotificationDetails(
       android: androidDetails,
+      iOS: iosDetails,
     );
     
     await flutterLocalNotificationsPlugin.show(

@@ -36,6 +36,9 @@ class BlePeripheralService {
   /// Connected centrals, keyed by device ID
   final Set<String> _connectedCentrals = {};
   
+  /// Completer for waiting for BLE to be powered on
+  final Completer<void> _bleReadyCompleter = Completer<void>();
+  
   /// Callback when data is received
   PeripheralDataCallback? onDataReceived;
   
@@ -57,6 +60,14 @@ class BlePeripheralService {
     try {
       // Initialize the peripheral
       await BlePeripheral.initialize();
+      
+      // Set up BLE state change callback to know when powered on
+      BlePeripheral.setBleStateChangeCallback((bool state) {
+        _log.i('BLE peripheral state changed: $state');
+        if (state && !_bleReadyCompleter.isCompleted) {
+          _bleReadyCompleter.complete();
+        }
+      });
       
       // Set up connection state callback (Android only, but safe to call on all platforms)
       BlePeripheral.setConnectionStateChangeCallback(_onConnectionStateChanged);
@@ -87,6 +98,16 @@ class BlePeripheralService {
     }
     
     try {
+      // Wait for BLE to be powered on (important for iOS)
+      _log.i('Waiting for BLE to be powered on...');
+      await _bleReadyCompleter.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          throw Exception('Timeout waiting for BLE to power on');
+        },
+      );
+      _log.i('BLE is powered on, adding service...');
+      
       // Add the GATT service with our characteristic
       await BlePeripheral.addService(
         BleService(

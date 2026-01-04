@@ -110,43 +110,16 @@ class PermissionHandler {
   
   Future<bool> _checkIOSPermissions() async {
     // iOS handles Bluetooth permissions automatically via Info.plist
-    // We mainly need to check if Bluetooth is available
-    final bluetooth = await Permission.bluetooth.isGranted;
-    
-    // Location needed for background BLE
-    final location = await Permission.locationWhenInUse.isGranted;
-    
-    return bluetooth && location;
+    // since iOS 13+. No need to check bluetooth permission explicitly.
+    // Just return true as Bluetooth will be granted automatically when used
+    _log.i('iOS: Bluetooth permissions handled by Info.plist');
+    return true;
   }
   
   Future<PermissionResult> _requestIOSPermissions() async {
-    // Request Bluetooth permission
-    final bluetoothStatus = await Permission.bluetooth.request();
-    
-    if (bluetoothStatus.isPermanentlyDenied) {
-      _log.w('Bluetooth permission permanently denied');
-      return PermissionResult.permanentlyDenied;
-    }
-    
-    if (bluetoothStatus.isDenied) {
-      _log.w('Bluetooth permission denied');
-      return PermissionResult.denied;
-    }
-    
-    // Request location permission
-    final locationStatus = await Permission.locationWhenInUse.request();
-    
-    if (locationStatus.isPermanentlyDenied) {
-      _log.w('Location permission permanently denied');
-      return PermissionResult.permanentlyDenied;
-    }
-    
-    if (locationStatus.isDenied) {
-      _log.w('Location permission denied');
-      return PermissionResult.denied;
-    }
-    
-    _log.i('All permissions granted');
+    // iOS 13+ handles Bluetooth automatically via Info.plist
+    // No explicit permission request needed for Bluetooth
+    _log.i('iOS: Bluetooth permissions granted automatically via Info.plist');
     return PermissionResult.granted;
   }
   

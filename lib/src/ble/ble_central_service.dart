@@ -26,12 +26,14 @@ class ConnectedPeer {
   final String deviceId;
   final BluetoothDevice device;
   final BluetoothCharacteristic characteristic;
+  final int rssi;
   DateTime lastActivity;
   
   ConnectedPeer({
     required this.deviceId,
     required this.device,
     required this.characteristic,
+    required this.rssi,
   }) : lastActivity = DateTime.now();
 }
 
@@ -92,11 +94,20 @@ class BleCentralService {
   /// Number of connected peripherals
   int get connectedCount => _connected.length;
   
-  /// Get discovered devices
-  List<DiscoveredDevice> get discoveredDevices => _discovered.values.toList();
+  /// Get discovered devices sorted by RSSI (strongest signal first)
+  List<DiscoveredDevice> get discoveredDevices {
+    final devices = _discovered.values.toList();
+    // Sort by RSSI descending (higher RSSI = stronger signal, e.g., -40 > -80)
+    devices.sort((a, b) => b.rssi.compareTo(a.rssi));
+    return devices;
+  }
   
-  /// Get connected peers
-  List<ConnectedPeer> get connectedPeers => _connected.values.toList();
+  /// Get connected peers sorted by RSSI (strongest signal first)
+  List<ConnectedPeer> get connectedPeers {
+    final peers = _connected.values.toList();
+    peers.sort((a, b) => b.rssi.compareTo(a.rssi));
+    return peers;
+  }
   
   /// Initialize the central service
   Future<void> initialize() async {
@@ -197,16 +208,6 @@ class BleCentralService {
       // Discover services
       final services = await device.discoverServices();
       
-      // Log all discovered services for debugging
-      _log.d('Discovered ${services.length} services on $deviceId:');
-      for (final service in services) {
-        _log.d('  Service: ${service.uuid}');
-        for (final char in service.characteristics) {
-          _log.d('    Char: ${char.uuid}');
-        }
-      }
-      _log.d('Looking for service: ${discovered.serviceUuid}');
-      
       // Find our service
       BluetoothService? targetService;
       for (final service in services) {
@@ -218,15 +219,8 @@ class BleCentralService {
       }
       
       if (targetService == null) {
-        _log.w('Service not found on device: $deviceId');
         await device.disconnect();
         return false;
-      }
-      
-      _log.d('Found target service, looking for characteristic: $characteristicUuid');
-      _log.d('Service has ${targetService.characteristics.length} characteristics:');
-      for (final char in targetService.characteristics) {
-        _log.d('  Char: ${char.uuid}');
       }
       
       // Find our characteristic
@@ -245,11 +239,10 @@ class BleCentralService {
       }
       
       if (targetChar == null) {
-        _log.w('Characteristic not found on device: $deviceId');
         await device.disconnect();
         return false;
       }
-      
+
       // Enable notifications to receive data
       await targetChar.setNotifyValue(true);
       
@@ -260,11 +253,12 @@ class BleCentralService {
         }),
       );
       
-      // Store connection
+      // Store connection with RSSI from discovery
       _connected[deviceId] = ConnectedPeer(
         deviceId: deviceId,
         device: device,
         characteristic: targetChar,
+        rssi: discovered.rssi,
       );
       
       _log.i('Connected to: $deviceId');
@@ -309,11 +303,15 @@ class BleCentralService {
     }
   }
   
-  /// Send data to all connected peripherals
+  /// Send data to all connected peripherals (sorted by signal strength)
   Future<void> broadcastData(Uint8List data, {String? excludeDevice}) async {
-    for (final entry in _connected.entries) {
-      if (entry.key == excludeDevice) continue;
-      await sendData(entry.key, data);
+    // Sort by RSSI descending (strongest signal first)
+    final peers = _connected.values.toList();
+    peers.sort((a, b) => b.rssi.compareTo(a.rssi));
+    
+    for (final peer in peers) {
+      if (peer.deviceId == excludeDevice) continue;
+      await sendData(peer.deviceId, data);
     }
   }
   
@@ -321,15 +319,11 @@ class BleCentralService {
   
   void _onScanResults(List<ScanResult> results) {
     for (final result in results) {
-      // Check if this device advertises a Bitchat-like service
-      // We look for services that match our UUID pattern
-      for (final serviceUuid in result.advertisementData.serviceUuids) {
-        final uuidStr = serviceUuid.toString().toLowerCase();
-        
-        // For now, accept any device advertising any service
-        // In production, we'd filter by a known prefix or pattern
-        // The service UUID is derived from the peer's pubkey
-        
+      // Check if this device advertises any service UUID
+      // Each Bitchat device advertises a unique UUID derived from its public key
+      // We discover all devices and filter after ANNOUNCE exchange
+      if (result.advertisementData.serviceUuids.isNotEmpty) {
+        final uuidStr = result.advertisementData.serviceUuids.first.toString().toLowerCase();
         final deviceId = result.device.remoteId.str;
         
         if (!_discovered.containsKey(deviceId)) {

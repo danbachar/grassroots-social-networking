@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:logger/logger.dart';
+import 'package:cryptography/cryptography.dart';
 import 'ble/ble_manager.dart';
 import 'ble/permission_handler.dart';
 import 'mesh/mesh_router.dart';
@@ -104,7 +105,7 @@ class Bitchat {
   
   /// Mesh router
   late final MeshRouter _router;
-  
+
   /// Timer for periodic ANNOUNCE broadcasts
   Timer? _announceTimer;
   
@@ -249,6 +250,8 @@ class Bitchat {
   /// 
   /// Returns true if the message was sent (or cached for later delivery).
   Future<bool> send(Uint8List recipientPubkey, Uint8List payload) async {
+    // let encrypted = await _encryptionLayer.encryptForPeer(recipientPubkey, payload);
+
     return await _router.sendMessage(
       payload: payload,
       recipientPubkey: recipientPubkey,
@@ -264,12 +267,19 @@ class Bitchat {
   
   void _setupBleCallbacks() {
     // Data received from BLE
-    _ble.onDataReceived = (deviceId, data) {
+    _ble.onDataReceived = (deviceId, data) async {
       _log.d('Data received from device $deviceId: ${data.length} bytes');
       
       // Parse the packet to check if it's an ANNOUNCE
       try {
         final packet = BitchatPacket.deserialize(data);
+        
+        // Verify signature
+        final isValid = await _verifyPacket(packet);
+        if (!isValid) {
+          _log.w('Dropping packet with invalid signature from device $deviceId');
+          return;
+        }
         
         if (packet.type == PacketType.announce) {
           // ANNOUNCE packet - associate device with pubkey
@@ -285,12 +295,13 @@ class Bitchat {
       }
     };
     
-    // Device connected - need to send ANNOUNCE to identify ourselves
+    // Device connected - broadcast our ANNOUNCE so they know who we are
     _ble.onDeviceConnected = (deviceId, isCentral) async {
       _log.i('BLE device connected: $deviceId (central: $isCentral)');
-      // Send ANNOUNCE to this device so they know who we are
-      // We broadcast to the device - the ANNOUNCE contains our pubkey
-      await _sendAnnounceToDevice(deviceId);
+      // Broadcast ANNOUNCE immediately so the new peer learns our identity
+      // The peer will do the same, and we'll associate their deviceId with their pubkey
+      // when we receive their ANNOUNCE
+      await _broadcastAnnounce();
     };
     
     // Device disconnected
@@ -359,32 +370,6 @@ class Bitchat {
     onStatusChanged?.call(newStatus);
   }
   
-  /// Send ANNOUNCE to a newly connected BLE device
-  Future<void> _sendAnnounceToDevice(String deviceId) async {
-    _log.i('Sending ANNOUNCE to device: $deviceId');
-    
-    // Create ANNOUNCE packet
-    final payload = _router.createAnnouncePayload();
-    
-    final packet = BitchatPacket(
-      type: PacketType.announce,
-      ttl: 0, // ANNOUNCE is not relayed
-      senderPubkey: identity.publicKey,
-      payload: payload,
-    );
-    
-    // TODO: Sign packet
-    
-    final data = packet.serialize();
-    final sent = await _ble.sendToDevice(deviceId, data);
-    
-    if (sent) {
-      _log.i('ANNOUNCE sent to device: $deviceId');
-    } else {
-      _log.w('Failed to send ANNOUNCE to device: $deviceId');
-    }
-  }
-  
   /// Clean up resources
   Future<void> dispose() async {
     _announceTimer?.cancel();
@@ -404,13 +389,10 @@ class Bitchat {
     });
   }
   
-  /// Broadcast ANNOUNCE to all connected peers
+  /// Broadcast ANNOUNCE to all connected BLE devices
   Future<void> _broadcastAnnounce() async {
-    final peers = _router.connectedPeers;
-    if (peers.isEmpty) return;
-    
-    _log.d('Broadcasting ANNOUNCE to ${peers.length} peers');
-    
+    _log.d('Broadcasting ANNOUNCE to all BLE devices');
+
     // Create ANNOUNCE packet
     final payload = _router.createAnnouncePayload();
     final packet = BitchatPacket(
@@ -418,10 +400,15 @@ class Bitchat {
       ttl: 0,
       senderPubkey: identity.publicKey,
       payload: payload,
+      signature: Uint8List(64), // Placeholder, will be signed below
     );
+    
+    // Sign packet
+    await _signPacket(packet);
+    
     final data = packet.serialize();
     
-    // Send to all connected peers
+    // Send to all connected BLE devices
     await _ble.broadcast(data);
   }
   
@@ -440,4 +427,49 @@ class Bitchat {
       }
     }
   }
+  
+  // ===== Signature =====
+  
+  /// Sign a packet with the identity's private key
+  Future<void> _signPacket(BitchatPacket packet) async {
+    final algorithm = Ed25519();
+    //final keyPair = //await algorithm.newKeyPairFromSeed(identity.privateKey.sublist(0, 32));
+    
+    // Get signable bytes (packet with signature zeroed out)
+    final signableBytes = packet.getSignableBytes();
+    
+    final keyPair = identity.keyPair;
+    // Sign
+    final signature = await algorithm.sign(signableBytes, keyPair: keyPair);
+    
+    // Update packet signature
+    packet.signature = Uint8List.fromList(signature.bytes);
+  }
+  
+  /// Verify a packet's signature
+  Future<bool> _verifyPacket(BitchatPacket packet) async {
+    try {
+      final algorithm = Ed25519();
+      final publicKey = SimplePublicKey(packet.senderPubkey, type: KeyPairType.ed25519);
+      
+      // Get signable bytes (packet with signature zeroed out)
+      final signableBytes = packet.getSignableBytes();
+      
+      // Create signature object
+      final signature = Signature(packet.signature, publicKey: publicKey);
+      
+      // Verify
+      final isValid = await algorithm.verify(signableBytes, signature: signature);
+      
+      if (!isValid) {
+        _log.w('Invalid signature from ${packet.senderPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}');
+      }
+      
+      return isValid;
+    } catch (e) {
+      _log.e('Signature verification error: $e');
+      return false;
+    }
+  }
 }
+

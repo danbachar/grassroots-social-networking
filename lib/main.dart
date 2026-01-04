@@ -36,9 +36,8 @@ Future<BitchatIdentity> _initIdentity() async {
 
     String nickname = 'User_${publicKeyBytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
 
-    var id = BitchatIdentity(
-      publicKey: Uint8List.fromList(publicKeyBytes), 
-      privateKey: privateKey64,
+    var id = await BitchatIdentity.create(
+      keyPair: keyPair,
       nickname: nickname,
     );
 

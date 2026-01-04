@@ -14,4 +14,5 @@ export 'transport_service.dart';
 export 'ble_transport_service.dart';
 
 // Re-export BLE types needed for advanced usage
+// TOOD: we should define DiscoveredPeer and ConnectedPeer here
 export '../ble/ble_central_service.dart' show DiscoveredDevice, ConnectedPeer;

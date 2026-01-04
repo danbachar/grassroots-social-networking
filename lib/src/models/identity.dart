@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:cryptography/cryptography.dart';
+
 /// Identity provided by GSG layer to Bitchat transport.
 /// 
 /// GSG is responsible for:
@@ -12,21 +14,53 @@ import 'dart:typed_data';
 /// - Peer identification via ANNOUNCE
 class BitchatIdentity {
   /// Ed25519 public key (32 bytes)
-  final Uint8List publicKey;
+  late final Uint8List publicKey;
   
   /// Ed25519 private key (64 bytes - seed + public key)
   /// This is kept private and used only for signing
-  final Uint8List privateKey;
+  late final Uint8List privateKey;
+
+  final SimpleKeyPair keyPair;
   
   /// Optional human-readable nickname for ANNOUNCE
   final String nickname;
   
-  // TODO: nickname was changed to required, remove in production when this is just a transport layer
-  BitchatIdentity({
+  // Private constructor - use create() factory method instead
+  BitchatIdentity._internal({
+    required this.keyPair,
+    required this.nickname,
     required this.publicKey,
     required this.privateKey,
-    required this.nickname,
-  }) {
+  });
+  
+  /// Create identity from a keypair (use this instead of constructor)
+  static Future<BitchatIdentity> create({
+    required SimpleKeyPair keyPair,
+    required String nickname,
+  }) async {
+    final pk = await keyPair.extractPublicKey();
+    final publicKey = Uint8List.fromList(pk.bytes);
+    if (publicKey.length != 32) {
+      throw ArgumentError('Public key must be 32 bytes (Ed25519)');
+    }
+    
+    final seed = await keyPair.extractPrivateKeyBytes();
+    final privateKey = Uint8List.fromList([...seed, ...pk.bytes]);
+    if (privateKey.length != 64) {
+      throw ArgumentError('Private key must be 64 bytes (Ed25519 seed + pubkey)');
+    }
+    
+    return BitchatIdentity._internal(
+      keyPair: keyPair,
+      publicKey: publicKey,
+      privateKey: privateKey,
+      nickname: nickname,
+    );
+  }
+
+  /// Validates the keypair lengths (for compatibility)
+  Future<void> validate() async {
+    // Keys are already validated in create(), this is kept for backward compatibility
     if (publicKey.length != 32) {
       throw ArgumentError('Public key must be 32 bytes (Ed25519)');
     }
@@ -65,18 +99,27 @@ class BitchatIdentity {
   String toString() => 'BitchatIdentity($nickname)';
 
   static BitchatIdentity fromMap(Map<String, dynamic> map) {
-    return BitchatIdentity(
-      publicKey: Uint8List.fromList(List<int>.from(map['publicKey'])),
-      privateKey: Uint8List.fromList(List<int>.from(map['privateKey'])),
+    final pk = Uint8List.fromList(List<int>.from(map['publicKey']));
+    final privatek = Uint8List.fromList(List<int>.from(map['privateKey']));
+    final keyPair = SimpleKeyPairData(
+      privatek.sublist(0, 32),
+      publicKey: SimplePublicKey(pk, type: KeyPairType.ed25519),
+      type: KeyPairType.ed25519,
+    );
+    // Use internal constructor since we already have validated keys from storage
+    return BitchatIdentity._internal(
+      keyPair: keyPair,
+      publicKey: pk,
+      privateKey: privatek,
       nickname: map['nickname'],
     );
   }
 
   Map<String, dynamic> toJson() {
-      return {
-        'publicKey': publicKey,
-        'privateKey': privateKey,
-        'nickname': nickname,
-      };
+    return {
+      'publicKey': publicKey,
+      'privateKey': privateKey,
+      'nickname': nickname,
+    };
   }
 }

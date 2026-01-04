@@ -37,6 +37,8 @@ dependencies:
   flutter_secure_storage: ^10.0.0
   flutter_local_notifications: ^19.5.0
   shared_preferences: ^2.5.4
+  encrypt: ^5.0.3
+  pointycastle: ^3.9.1
 
 dev_dependencies:
   flutter_test:

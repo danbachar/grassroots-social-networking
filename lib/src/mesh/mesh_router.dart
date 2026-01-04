@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:logger/logger.dart';
+import 'package:cryptography/cryptography.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
 import '../models/identity.dart';
@@ -104,7 +105,7 @@ class MeshRouter {
         ttl: ttl,
       );
     }
-    
+
     // Create single packet
     final packet = BitchatPacket(
       type: PacketType.message,
@@ -112,11 +113,11 @@ class MeshRouter {
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: payload,
+      signature: Uint8List(64), // Placeholder
     );
     
     // Sign the packet
-    // TODO: Implement signing with identity.privateKey
-    // packet.signature = sign(packet.getSignableBytes(), identity.privateKey);
+    await _signPacket(packet);
     
     return _sendPacket(packet, recipientPubkey);
   }
@@ -130,15 +131,17 @@ class MeshRouter {
       await _broadcastFragmented(payload: payload, ttl: ttl);
       return;
     }
-    
+
     final packet = BitchatPacket(
       type: PacketType.message,
       ttl: ttl,
       senderPubkey: identity.publicKey,
       payload: payload,
+      signature: Uint8List(64), // Placeholder
     );
     
-    // TODO: Sign packet
+    // Sign packet
+    await _signPacket(packet);
     
     // Mark as seen (don't re-process our own broadcast)
     _seenPackets.add(packet.packetId);
@@ -159,7 +162,10 @@ class MeshRouter {
       ttl: ttl,
     );
     
-    // TODO: Sign each fragment
+    // Sign each fragment
+    for (final fragment in fragmented.fragments) {
+      await _signPacket(fragment);
+    }
     
     var success = true;
     for (final fragment in fragmented.fragments) {
@@ -222,9 +228,11 @@ class MeshRouter {
       senderPubkey: identity.publicKey,
       recipientPubkey: peerPubkey,
       payload: payload,
+      signature: Uint8List(64), // Placeholder
     );
     
-    // TODO: Sign packet
+    // Sign packet
+    await _signPacket(packet);
     
     final data = packet.serialize();
     await onSendPacket?.call(peerPubkey, data);
@@ -311,7 +319,6 @@ class MeshRouter {
   }
   
   void _handleMessage(BitchatPacket packet, {Uint8List? fromPeer}) {
-    // Check if message is for us
     if (_isForUs(packet)) {
       _log.d('Message received for us: ${packet.packetId}');
       onMessageReceived?.call(packet.senderPubkey, packet.payload);
@@ -453,6 +460,21 @@ class MeshRouter {
   
   String _pubkeyToHex(Uint8List pubkey) {
     return pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
+  
+  /// Sign a packet with the identity's private key
+  Future<void> _signPacket(BitchatPacket packet) async {
+    final algorithm = Ed25519();
+    // final keyPair = await algorithm.newKeyPairFromSeed(identity.privateKey.sublist(0, 32));
+    
+    // Get signable bytes (packet with signature zeroed out)
+    final signableBytes = packet.getSignableBytes();
+    
+    // Sign
+    final signature = await algorithm.sign(signableBytes, keyPair: identity.keyPair);
+    
+    // Update packet signature
+    packet.signature = Uint8List.fromList(signature.bytes);
   }
   
   /// Clean up resources

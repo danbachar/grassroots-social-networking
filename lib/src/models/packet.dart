@@ -81,7 +81,7 @@ class BitchatPacket {
   final Uint8List payload;
   
   /// Ed25519 signature over packet contents
-  Uint8List? signature;
+  Uint8List signature;
   
   BitchatPacket({
     String? packetId,
@@ -91,7 +91,7 @@ class BitchatPacket {
     required this.senderPubkey,
     this.recipientPubkey,
     required this.payload,
-    this.signature,
+    required this.signature,
   })  : packetId = packetId ?? _uuid.v4(),
         timestamp = timestamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 {
     if (senderPubkey.length != 32) {
@@ -100,8 +100,8 @@ class BitchatPacket {
     if (recipientPubkey != null && recipientPubkey!.length != 32) {
       throw ArgumentError('Recipient public key must be 32 bytes');
     }
-    if (ttl < 0 || ttl > 255) {
-      throw ArgumentError('TTL must be 0-255');
+    if (signature.length != 64) {
+      throw ArgumentError('Signature must be 64 bytes');
     }
   }
   
@@ -164,11 +164,7 @@ class BitchatPacket {
     offset += 16;
     
     // Signature (64 bytes)
-    if (signature != null) {
-      bytes.setRange(offset, offset + 64, signature!);
-    } else {
-      bytes.fillRange(offset, offset + 64, 0);
-    }
+    bytes.setRange(offset, offset + 64, signature);
     offset += 64;
     
     // Payload
@@ -218,9 +214,7 @@ class BitchatPacket {
     
     // Signature
     final sigBytes = data.sublist(offset, offset + 64);
-    final signature = sigBytes.every((b) => b == 0) 
-        ? null 
-        : Uint8List.fromList(sigBytes);
+    final signature = Uint8List.fromList(sigBytes);
     offset += 64;
     
     // Payload

@@ -147,6 +147,7 @@ class FragmentHandler {
         senderPubkey: senderPubkey,
         recipientPubkey: recipientPubkey,
         payload: fragmentPayload,
+        signature: Uint8List(64), // Placeholder - will be signed by caller
       ));
     }
     

@@ -9,10 +9,6 @@ enum TransportType {
 
   /// WebRTC-based P2P transport (STUN/TURN/TURNS)
   webrtc,
-
-  /// Future: Other transport protocols
-  // libp2p,
-  // lorawan,
 }
 
 /// Display metadata for a transport service.

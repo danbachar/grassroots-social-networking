@@ -163,6 +163,9 @@ class Bitchat {
   /// Get peer by public key
   Peer? getPeer(Uint8List pubkey) => _router.getPeer(pubkey);
   
+  /// Get latest RSSI for a peer
+  int? getRssiForPeer(Uint8List pubkey) => _ble.getRssiForPubkey(pubkey);
+  
   // ===== Lifecycle =====
   
   /// Initialize the transport layer.
@@ -280,8 +283,8 @@ class Bitchat {
   
   void _setupBleCallbacks() {
     // Data received from BLE
-    _ble.onDataReceived = (deviceId, data) async {
-      _log.d('Data received from device $deviceId: ${data.length} bytes');
+    _ble.onDataReceived = (deviceId, data, rssi) async {
+      _log.d('Data received from device $deviceId: ${data.length} bytes at RSSI $rssi');
       
       // Parse the packet to check if it's an ANNOUNCE
       try {
@@ -295,14 +298,14 @@ class Bitchat {
         }
         
         if (packet.type == PacketType.announce) {
-          // ANNOUNCE packet - associate device with pubkey
-          _log.i('Received ANNOUNCE from device $deviceId');
+          // ANNOUNCE packet - associate device with pubkey and update RSSI
+          _log.i('Received ANNOUNCE from device $deviceId at RSSI $rssi');
           _ble.associateDeviceWithPubkey(deviceId, packet.senderPubkey);
         }
         
         // Get pubkey for this device (may have just been set)
         final pubkey = _ble.getPubkeyForDevice(deviceId);
-        _router.onPacketReceived(data, fromPeer: pubkey);
+        _router.onPacketReceived(data, fromPeer: pubkey, rssi: rssi);
       } catch (e) {
         _log.e('Failed to process packet from $deviceId: $e');
       }

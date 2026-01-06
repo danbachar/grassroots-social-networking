@@ -38,7 +38,7 @@ class ConnectedPeer {
 }
 
 /// Callback when data is received from a peripheral
-typedef CentralDataCallback = void Function(String deviceId, Uint8List data);
+typedef CentralDataCallback = void Function(String deviceId, Uint8List data, int rssi);
 
 /// Callback when a peripheral is discovered
 typedef DeviceDiscoveredCallback = void Function(DiscoveredDevice device);
@@ -349,9 +349,11 @@ class BleCentralService {
     final peer = _connected[deviceId];
     if (peer != null) {
       peer.lastActivity = DateTime.now();
+      // Pass RSSI along with the data
+      onDataReceived?.call(deviceId, data, peer.rssi);
+    } else {
+      _log.w('Data received from unknown device: $deviceId');
     }
-    
-    onDataReceived?.call(deviceId, data);
   }
   
   void _onDeviceDisconnected(String deviceId) {

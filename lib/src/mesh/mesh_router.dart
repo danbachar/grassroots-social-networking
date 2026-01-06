@@ -241,16 +241,16 @@ class MeshRouter {
   // ===== Inbound =====
   
   /// Process an incoming packet from BLE
-  void onPacketReceived(Uint8List data, {Uint8List? fromPeer}) {
+  void onPacketReceived(Uint8List data, {Uint8List? fromPeer, required int rssi}) {
     try {
       final packet = BitchatPacket.deserialize(data);
-      _processPacket(packet, fromPeer: fromPeer);
+      _processPacket(packet, fromPeer: fromPeer, rssi: rssi); 
     } catch (e) {
       _log.e('Failed to deserialize packet: $e');
     }
   }
   
-  void _processPacket(BitchatPacket packet, {Uint8List? fromPeer}) {
+  void _processPacket(BitchatPacket packet, {Uint8List? fromPeer, required int rssi}) {
     // Check for duplicates (except ANNOUNCE which shouldn't be deduplicated)
     if (packet.type != PacketType.announce) {
       if (_seenPackets.checkAndAdd(packet.packetId)) {
@@ -259,12 +259,10 @@ class MeshRouter {
       }
     }
     
-    // TODO: Verify signature
-    
     // Handle by type
     switch (packet.type) {
       case PacketType.announce:
-        _handleAnnounce(packet);
+        _handleAnnounce(packet, rssi: rssi);
         break;
         
       case PacketType.message:
@@ -287,7 +285,7 @@ class MeshRouter {
     }
   }
   
-  void _handleAnnounce(BitchatPacket packet) {
+  void _handleAnnounce(BitchatPacket packet, {required int rssi}) {
     final (pubkey, nickname, version) = _decodeAnnounce(packet.payload);
     final key = _pubkeyToHex(pubkey);
     
@@ -296,7 +294,7 @@ class MeshRouter {
     
     // TODO: Determine transport type from router; need to have a router per transport protocol
     if (isNew) {
-      peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect);
+      peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: rssi);
       _peers[key] = peer;
     }
     
@@ -306,7 +304,12 @@ class MeshRouter {
       receivedAt: DateTime.now(),
     );
     
-    _log.i('Peer ${isNew ? "connected" : "updated"}: ${peer.displayName}');
+    // // Update RSSI if available
+    // if (rssi != null) {
+    //   peer.rssi = rssi;
+    // }
+    
+    _log.i('Peer ${isNew ? "connected" : "updated"}: ${peer.displayName} at RSSI $rssi');
     
     if (isNew) {
       onPeerConnected?.call(peer);

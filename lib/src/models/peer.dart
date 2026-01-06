@@ -90,7 +90,7 @@ class Peer {
   DateTime? lastSentTo;
   
   /// Signal strength (RSSI) if available, for BLE connections
-  int? rssi;
+  int rssi;
   
   /// Protocol version from ANNOUNCE
   int protocolVersion;
@@ -103,7 +103,7 @@ class Peer {
     this.bleDeviceId,
     this.lastSeen,
     this.lastSentTo,
-    this.rssi,
+    required this.rssi,
     this.protocolVersion = 1,
   }) {
     if (publicKey.length != 32) {
@@ -146,7 +146,7 @@ class Peer {
   void markDisconnected() {
     connectionState = PeerConnectionState.disconnected;
     bleDeviceId = null;
-    rssi = null;
+    rssi = -100;
   }
   
   @override

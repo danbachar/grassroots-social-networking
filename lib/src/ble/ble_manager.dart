@@ -32,8 +32,11 @@ class BleManager {
   /// Map from pubkey to BLE device ID
   final Map<String, String> _pubkeyToDevice = {};
   
+  /// Map from device ID to latest RSSI value (from last data reception)
+  final Map<String, int> _deviceRssi = {};
+  
   /// Callback when data is received (regardless of role)
-  void Function(String deviceId, Uint8List data)? onDataReceived;
+  void Function(String deviceId, Uint8List data, int rssi)? onDataReceived;
   
   /// Callback when a device connects (regardless of role)
   void Function(String deviceId, bool isCentral)? onDeviceConnected;
@@ -71,8 +74,9 @@ class BleManager {
     _log.i('Initializing BLE manager');
     
     // Set up central callbacks
-    _central.onDataReceived = (deviceId, data) {
-      onDataReceived?.call(deviceId, data);
+    _central.onDataReceived = (deviceId, data, rssi) {
+      _updateRssiFromData(deviceId, rssi);
+      onDataReceived?.call(deviceId, data, rssi);
     };
     _central.onConnectionChanged = (deviceId, connected) {
       if (connected) {
@@ -86,8 +90,9 @@ class BleManager {
     };
     
     // Set up peripheral callbacks
-    _peripheral.onDataReceived = (deviceId, data) {
-      onDataReceived?.call(deviceId, data);
+    _peripheral.onDataReceived = (deviceId, data, rssi) {
+      _updateRssiFromData(deviceId, rssi);
+      onDataReceived?.call(deviceId, data, rssi);
     };
     _peripheral.onConnectionChanged = (deviceId, connected) {
       if (connected) {
@@ -148,6 +153,20 @@ class BleManager {
     return _pubkeyToDevice[_pubkeyToHex(pubkey)];
   }
   
+  /// Get latest RSSI for a device
+  int? getRssiForDevice(String deviceId) => _deviceRssi[deviceId];
+  
+  /// Get latest RSSI for a pubkey
+  int? getRssiForPubkey(Uint8List pubkey) {
+    final deviceId = getDeviceForPubkey(pubkey);
+    return deviceId != null ? _deviceRssi[deviceId] : null;
+  }
+  
+  /// Update RSSI when data is received
+  void _updateRssiFromData(String deviceId, int rssi) {
+    _deviceRssi[deviceId] = rssi;
+  }
+  
   /// Send data to a device by device ID
   Future<bool> sendToDevice(String deviceId, Uint8List data) async {
     // Try central first (we initiated connection)
@@ -187,6 +206,7 @@ class BleManager {
     if (pubkey != null) {
       _pubkeyToDevice.remove(_pubkeyToHex(pubkey));
     }
+    _deviceRssi.remove(deviceId);
     
     onDeviceDisconnected?.call(deviceId);
   }
@@ -201,5 +221,6 @@ class BleManager {
     await _peripheral.dispose();
     _deviceToPubkey.clear();
     _pubkeyToDevice.clear();
+    _deviceRssi.clear();
   }
 }

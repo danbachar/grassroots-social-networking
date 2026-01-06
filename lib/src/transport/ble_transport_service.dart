@@ -253,7 +253,7 @@ class BleTransportService extends TransportService with TransportServiceMixin {
 
   // ===== Internal Callbacks =====
 
-  void _onCentralDataReceived(String deviceId, Uint8List data) {
+  void _onCentralDataReceived(String deviceId, Uint8List data, int rssi) {
     _updatePeerLastSeen(deviceId);
     _dataController.add(TransportDataEvent(
       peerId: deviceId,
@@ -262,7 +262,7 @@ class BleTransportService extends TransportService with TransportServiceMixin {
     ));
   }
 
-  void _onPeripheralDataReceived(String deviceId, Uint8List data) {
+  void _onPeripheralDataReceived(String deviceId, Uint8List data, int rssi) {
     _updatePeerLastSeen(deviceId);
     _dataController.add(TransportDataEvent(
       peerId: deviceId,

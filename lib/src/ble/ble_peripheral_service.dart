@@ -4,7 +4,7 @@ import 'package:ble_peripheral_bondless/ble_peripheral_bondless.dart';
 import 'package:logger/logger.dart';
 
 /// Callback when data is received from a connected central
-typedef PeripheralDataCallback = void Function(String deviceId, Uint8List data);
+typedef PeripheralDataCallback = void Function(String deviceId, Uint8List data, int rssi);
 
 /// Callback when a central connects/disconnects
 typedef PeripheralConnectionCallback = void Function(String deviceId, bool connected);
@@ -244,7 +244,8 @@ class BlePeripheralService {
     
     // Deliver data to callback
     if (value != null && value.isNotEmpty) {
-      onDataReceived?.call(deviceId, Uint8List.fromList(value));
+      // Peripheral doesn't have RSSI data, use placeholder value
+      onDataReceived?.call(deviceId, Uint8List.fromList(value), -100);
     }
     
     // Acknowledge the write (return null or WriteRequestResult for success)

@@ -244,6 +244,19 @@ class Bitchat {
     await _ble.startScan(timeout: timeout ?? config.scanDuration);
   }
   
+  // ===== Identity =====
+  
+  /// Update the user's nickname and broadcast to all peers
+  Future<void> updateNickname(String newNickname) async {
+    if (newNickname.isEmpty) return;
+    
+    _log.i('Updating nickname to: $newNickname');
+    identity.nickname = newNickname;
+    
+    // Broadcast ANNOUNCE with new nickname to all connected peers
+    await _broadcastAnnounce();
+  }
+  
   // ===== Messaging =====
   
   /// Send a message to a specific peer.

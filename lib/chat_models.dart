@@ -84,6 +84,12 @@ class MessageStore extends ChangeNotifier {
   /// Get all peer hex IDs we have conversations with
   List<String> get conversationPeers => _conversations.keys.toList();
 
+  /// Get all conversations for a user (alias for conversationPeers)
+  List<String> getConversations(String myHex) {
+    // Return all peer hex IDs we have conversations with
+    return _conversations.keys.toList();
+  }
+
   /// Check if we have any messages with a peer
   bool hasConversation(String peerHex) => _conversations.containsKey(peerHex);
 }

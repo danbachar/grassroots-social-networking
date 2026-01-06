@@ -22,8 +22,8 @@ class BitchatIdentity {
 
   final SimpleKeyPair keyPair;
   
-  /// Optional human-readable nickname for ANNOUNCE
-  final String nickname;
+  /// Optional human-readable nickname for ANNOUNCE (mutable)
+  String nickname;
   
   // Private constructor - use create() factory method instead
   BitchatIdentity._internal({

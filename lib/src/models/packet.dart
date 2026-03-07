@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'package:logger/logger.dart' show Logger;
 import 'package:uuid/uuid.dart';
 
 /// Packet types matching Bitchat protocol
@@ -18,11 +19,14 @@ enum PacketType {
   /// Final fragment
   fragmentEnd(0x05),
   
-  /// Delivery acknowledgment
+  /// Delivery acknowledgment (for libp2p transport)
   ack(0x06),
-  
+
   /// Negative acknowledgment / request for data
-  nack(0x07);
+  nack(0x07),
+
+  /// Read receipt (recipient has read the message)
+  readReceipt(0x08);
   
   final int value;
   const PacketType(this.value);
@@ -223,6 +227,7 @@ class BitchatPacket {
     }
     final payload = Uint8List.fromList(data.sublist(offset, offset + payloadLength));
     
+    // _log.i("Serialized packet of type $type with payload length $payloadLength");
     return BitchatPacket(
       packetId: packetId,
       type: type,

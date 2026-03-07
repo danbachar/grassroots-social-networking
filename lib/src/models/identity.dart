@@ -9,7 +9,7 @@ import 'package:cryptography/cryptography.dart';
 /// - Passing it to Bitchat at initialization
 /// 
 /// Bitchat uses this for:
-/// - Deriving BLE Service UUID (last 128 bits of pubkey)
+/// - Deriving BLE Service UUID (Grassroots prefix + last 64 bits of pubkey)
 /// - Signing packets
 /// - Peer identification via ANNOUNCE
 class BitchatIdentity {
@@ -57,32 +57,30 @@ class BitchatIdentity {
       nickname: nickname,
     );
   }
-
-  /// Validates the keypair lengths (for compatibility)
-  Future<void> validate() async {
-    // Keys are already validated in create(), this is kept for backward compatibility
-    if (publicKey.length != 32) {
-      throw ArgumentError('Public key must be 32 bytes (Ed25519)');
-    }
-    if (privateKey.length != 64) {
-      throw ArgumentError('Private key must be 64 bytes (Ed25519 seed + pubkey)');
-    }
-  }
   
-  /// Derive BLE Service UUID from public key.
-  /// Uses the last 128 bits (16 bytes) of the public key.
-  String get bleServiceUuid {
-    // Take last 16 bytes of the 32-byte public key
-    final uuidBytes = publicKey.sublist(16, 32);
-    
-    // Format as UUID string: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    final hex = uuidBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  /// Static 8-byte prefix identifying Grassroots devices on BLE.
+  /// First 8 bytes of SHA-256("grassroots").
+  static const String grassrootsUuidPrefix = '84c403160871e5ad';
+
+  /// Derive BLE Service UUID from a public key.
+  /// Format: Grassroots prefix (8 bytes) + last 8 bytes of public key.
+  static String deriveServiceUuid(Uint8List pubkey) {
+    if (pubkey.length < 32) {
+      throw ArgumentError('Public key must be at least 32 bytes');
+    }
+    final suffixBytes = pubkey.sublist(24, 32);
+    final suffix =
+        suffixBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    final hex = '$grassrootsUuidPrefix$suffix';
     return '${hex.substring(0, 8)}-'
-           '${hex.substring(8, 12)}-'
-           '${hex.substring(12, 16)}-'
-           '${hex.substring(16, 20)}-'
-           '${hex.substring(20, 32)}';
+        '${hex.substring(8, 12)}-'
+        '${hex.substring(12, 16)}-'
+        '${hex.substring(16, 20)}-'
+        '${hex.substring(20, 32)}';
   }
+
+  /// BLE Service UUID for this identity.
+  String get bleServiceUuid => deriveServiceUuid(publicKey);
   
   /// Get fingerprint (first 8 bytes of SHA-256 hash of public key) for display
   /// Full verification uses the complete public key

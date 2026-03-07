@@ -1,0 +1,272 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'app_state.dart';
+import 'friendships_state.dart';
+import 'settings_state.dart';
+import 'messages_state.dart';
+
+/// Service for persisting Redux state to SharedPreferences
+class PersistenceService {
+  // Storage keys - using v2 to avoid conflicts with old stores during migration
+  static const String _friendshipsKey = 'bitchat_friendships_v2';
+  static const String _settingsKey = 'bitchat_settings_v2';
+  static const String _conversationsKey = 'bitchat_conversations_v2';
+  static const String _unreadCountsKey = 'bitchat_unread_counts_v2';
+
+  // Old storage keys (for migration)
+  static const String _oldFriendshipsKey = 'bitchat_friendships';
+  static const String _oldSettingsKey = 'bitchat_transport_settings';
+
+  /// Debounce timer for batching writes
+  Timer? _debounceTimer;
+  static const Duration _debounceDelay = Duration(milliseconds: 500);
+
+  /// Last state that was persisted (to avoid unnecessary writes)
+  AppState? _lastPersistedState;
+
+  /// Pending persistence flags
+  bool _pendingFriendships = false;
+  bool _pendingSettings = false;
+  bool _pendingConversations = false;
+
+  SharedPreferences? _prefs;
+
+  Future<SharedPreferences> get _preferences async {
+    _prefs ??= await SharedPreferences.getInstance();
+    return _prefs!;
+  }
+
+  // ===== Load Methods =====
+
+  /// Load friendships from storage
+  Future<FriendshipsState> loadFriendships() async {
+    final prefs = await _preferences;
+
+    // Try new key first
+    var data = prefs.getString(_friendshipsKey);
+
+    // Fall back to old key and migrate
+    if (data == null) {
+      data = prefs.getString(_oldFriendshipsKey);
+      if (data != null) {
+        debugPrint('Migrating friendships from old storage format');
+        // Old format was a list of friendships, new format has a wrapper
+        try {
+          final oldList = jsonDecode(data) as List<dynamic>;
+          final friendships = <String, FriendshipState>{};
+          for (final json in oldList) {
+            final f = _migrateOldFriendship(json as Map<String, dynamic>);
+            friendships[f.peerPubkeyHex] = f;
+          }
+          final state = FriendshipsState(friendships: friendships);
+          // Save in new format
+          await prefs.setString(_friendshipsKey, jsonEncode(state.toJson()));
+          // Clear old key
+          await prefs.remove(_oldFriendshipsKey);
+          return state;
+        } catch (e) {
+          debugPrint('Failed to migrate old friendships: $e');
+        }
+      }
+    }
+
+    if (data == null) return const FriendshipsState();
+
+    try {
+      return FriendshipsState.fromJson(jsonDecode(data) as Map<String, dynamic>);
+    } catch (e) {
+      debugPrint('Failed to load friendships: $e');
+      return const FriendshipsState();
+    }
+  }
+
+  /// Migrate old Friendship format (had isOnline, lastOnline fields)
+  FriendshipState _migrateOldFriendship(Map<String, dynamic> json) {
+    return FriendshipState(
+      peerPubkeyHex: json['peerPubkeyHex'] as String,
+      libp2pAddress: json['libp2pAddress'] as String?,
+      libp2pHostId: json['libp2pHostId'] as String?,
+      libp2pHostAddrs: json['libp2pHostAddrs'] != null
+          ? List<String>.from(json['libp2pHostAddrs'] as List)
+          : null,
+      nickname: json['nickname'] as String?,
+      status: FriendshipStatus.values[json['status'] as int],
+      createdAt: DateTime.parse(json['createdAt'] as String),
+      updatedAt: DateTime.parse(json['updatedAt'] as String),
+      message: json['message'] as String?,
+      // isOnline and lastOnline are no longer persisted
+    );
+  }
+
+  /// Load settings from storage
+  Future<SettingsState> loadSettings() async {
+    final prefs = await _preferences;
+
+    // Try new key first
+    var data = prefs.getString(_settingsKey);
+
+    // Fall back to old key and migrate
+    if (data == null) {
+      data = prefs.getString(_oldSettingsKey);
+      if (data != null) {
+        debugPrint('Migrating settings from old storage format');
+        try {
+          final settings = SettingsState.fromJson(
+              jsonDecode(data) as Map<String, dynamic>);
+          // Save in new format
+          await prefs.setString(_settingsKey, jsonEncode(settings.toJson()));
+          // Clear old key
+          await prefs.remove(_oldSettingsKey);
+          return settings;
+        } catch (e) {
+          debugPrint('Failed to migrate old settings: $e');
+        }
+      }
+    }
+
+    if (data == null) return const SettingsState();
+
+    try {
+      return SettingsState.fromJson(jsonDecode(data) as Map<String, dynamic>);
+    } catch (e) {
+      debugPrint('Failed to load settings: $e');
+      return const SettingsState();
+    }
+  }
+
+  /// Load conversations from storage
+  Future<(Map<String, List<ChatMessageState>>, Map<String, int>)>
+      loadConversations() async {
+    final prefs = await _preferences;
+
+    Map<String, List<ChatMessageState>> conversations = {};
+    Map<String, int> unreadCounts = {};
+
+    // Load conversations
+    final convData = prefs.getString(_conversationsKey);
+    if (convData != null) {
+      try {
+        final json = jsonDecode(convData) as Map<String, dynamic>;
+        conversations = json.map((key, value) => MapEntry(
+              key,
+              (value as List<dynamic>)
+                  .map((m) =>
+                      ChatMessageState.fromJson(m as Map<String, dynamic>))
+                  .toList(),
+            ));
+      } catch (e) {
+        debugPrint('Failed to load conversations: $e');
+      }
+    }
+
+    // Load unread counts
+    final unreadData = prefs.getString(_unreadCountsKey);
+    if (unreadData != null) {
+      try {
+        final json = jsonDecode(unreadData) as Map<String, dynamic>;
+        unreadCounts = json.map((key, value) => MapEntry(key, value as int));
+      } catch (e) {
+        debugPrint('Failed to load unread counts: $e');
+      }
+    }
+
+    return (conversations, unreadCounts);
+  }
+
+  // ===== Save Methods =====
+
+  /// Called when state changes - schedules debounced persistence
+  void onStateChanged(AppState state) {
+    // Check what changed
+    if (_lastPersistedState == null ||
+        state.friendships != _lastPersistedState!.friendships) {
+      _pendingFriendships = true;
+    }
+    if (_lastPersistedState == null ||
+        state.settings != _lastPersistedState!.settings) {
+      _pendingSettings = true;
+    }
+    if (_lastPersistedState == null ||
+        state.messages.conversations != _lastPersistedState!.messages.conversations ||
+        state.messages.unreadCounts != _lastPersistedState!.messages.unreadCounts) {
+      _pendingConversations = true;
+    }
+
+    // Schedule debounced write
+    if (_pendingFriendships || _pendingSettings || _pendingConversations) {
+      _debounceTimer?.cancel();
+      _debounceTimer = Timer(_debounceDelay, () => _persistState(state));
+    }
+  }
+
+  /// Actually persist the state to storage
+  Future<void> _persistState(AppState state) async {
+    final prefs = await _preferences;
+
+    if (_pendingFriendships) {
+      try {
+        await prefs.setString(
+          _friendshipsKey,
+          jsonEncode(state.friendships.toJson()),
+        );
+        _pendingFriendships = false;
+        debugPrint('Persisted ${state.friendships.friendships.length} friendships');
+      } catch (e) {
+        debugPrint('Failed to persist friendships: $e');
+      }
+    }
+
+    if (_pendingSettings) {
+      try {
+        await prefs.setString(
+          _settingsKey,
+          jsonEncode(state.settings.toJson()),
+        );
+        _pendingSettings = false;
+        debugPrint('Persisted settings');
+      } catch (e) {
+        debugPrint('Failed to persist settings: $e');
+      }
+    }
+
+    if (_pendingConversations) {
+      try {
+        // Persist conversations
+        final convJson = state.messages.conversations.map(
+          (key, value) => MapEntry(key, value.map((m) => m.toJson()).toList()),
+        );
+        await prefs.setString(_conversationsKey, jsonEncode(convJson));
+
+        // Persist unread counts
+        await prefs.setString(
+          _unreadCountsKey,
+          jsonEncode(state.messages.unreadCounts),
+        );
+
+        _pendingConversations = false;
+        debugPrint('Persisted ${state.messages.conversations.length} conversations');
+      } catch (e) {
+        debugPrint('Failed to persist conversations: $e');
+      }
+    }
+
+    _lastPersistedState = state;
+  }
+
+  /// Force immediate persistence (call on app exit)
+  Future<void> flush(AppState state) async {
+    _debounceTimer?.cancel();
+    _pendingFriendships = true;
+    _pendingSettings = true;
+    _pendingConversations = true;
+    await _persistState(state);
+  }
+
+  /// Clean up resources
+  void dispose() {
+    _debounceTimer?.cancel();
+  }
+}

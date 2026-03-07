@@ -74,6 +74,10 @@ export 'src/transport/transport.dart';
 export 'src/models/identity.dart';
 export 'src/models/peer.dart';
 export 'src/models/packet.dart';
+export 'src/models/block.dart';
+
+// Redux Store (includes friendships_state, settings_state, persistence_service)
+export 'src/store/store.dart';
 
 // BLE (for advanced usage)
 export 'src/ble/permission_handler.dart' show PermissionHandler, PermissionResult;

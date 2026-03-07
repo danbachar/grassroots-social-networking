@@ -61,11 +61,14 @@ class _ReassemblyState {
 class FragmentHandler {
   static const _uuid = Uuid();
   
-  /// Maximum payload size per fragment (matches Bitchat)
-  static const int maxFragmentPayload = 450; // Leave room for fragment metadata
-  
-  /// Threshold for fragmenting (matches Bitchat)
-  static const int fragmentThreshold = 500;
+  /// Maximum chunk size per fragment.
+  /// BLE MTU = 512, packet header = 152, fragment start metadata = 42.
+  /// 512 - 152 - 42 = 318, rounded down to 300 for safety.
+  static const int maxFragmentPayload = 300;
+
+  /// Threshold for fragmenting: max payload that fits in a single BLE packet.
+  /// BLE MTU (512) - packet header (152) = 360.
+  static const int fragmentThreshold = 360;
   
   /// Inter-fragment delay
   static const Duration fragmentDelay = Duration(milliseconds: 20);

@@ -2,15 +2,13 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:bitchat_transport/src/store/app_state.dart';
+import 'package:bitchat_transport/src/store/actions.dart';
 import 'package:bitchat_transport/src/store/reducers.dart';
 import 'package:bitchat_transport/src/store/peers_actions.dart';
 import 'package:bitchat_transport/src/store/messages_actions.dart';
 import 'package:bitchat_transport/src/store/friendships_actions.dart';
 import 'package:bitchat_transport/src/store/settings_actions.dart';
-import 'package:bitchat_transport/src/store/transports_actions.dart';
-import 'package:bitchat_transport/src/store/transports_state.dart';
 import 'package:bitchat_transport/src/store/peers_state.dart';
-import 'package:bitchat_transport/src/transport/transport_service.dart';
 
 void main() {
   group('appReducer', () {
@@ -40,7 +38,7 @@ void main() {
         expect(result.messages, equals(initial.messages));
         expect(result.friendships, equals(initial.friendships));
         expect(result.settings, equals(initial.settings));
-        expect(result.transports, equals(initial.transports));
+        expect(result.connectionStatus, equals(initial.connectionStatus));
       });
 
       test('MessageAction routes to messagesReducer', () {
@@ -65,7 +63,7 @@ void main() {
         expect(result.peers, equals(initial.peers));
         expect(result.friendships, equals(initial.friendships));
         expect(result.settings, equals(initial.settings));
-        expect(result.transports, equals(initial.transports));
+        expect(result.connectionStatus, equals(initial.connectionStatus));
       });
 
       test('FriendshipAction routes to friendshipsReducer', () {
@@ -88,7 +86,7 @@ void main() {
         expect(result.peers, equals(initial.peers));
         expect(result.messages, equals(initial.messages));
         expect(result.settings, equals(initial.settings));
-        expect(result.transports, equals(initial.transports));
+        expect(result.connectionStatus, equals(initial.connectionStatus));
       });
 
       test('SettingsAction routes to settingsReducer', () {
@@ -106,132 +104,135 @@ void main() {
         expect(result.peers, equals(initial.peers));
         expect(result.messages, equals(initial.messages));
         expect(result.friendships, equals(initial.friendships));
-        expect(result.transports, equals(initial.transports));
+        expect(result.connectionStatus, equals(initial.connectionStatus));
       });
+    });
 
-      test('TransportAction routes to transportsReducer', () {
+    // =========================================================
+    // 2. Connection status actions
+    // =========================================================
+    group('connection status actions', () {
+      test('SetInitializingAction sets status to initializing', () {
         const initial = AppState.initial;
-        final action =
-            BleTransportStateChangedAction(TransportState.initializing);
-
-        final result = appReducer(initial, action);
-
-        expect(result.transports, isNot(equals(initial.transports)));
         expect(
-            result.transports.bleState, TransportState.initializing);
-
-        // Other state sections remain unchanged
-        expect(result.peers, equals(initial.peers));
-        expect(result.messages, equals(initial.messages));
-        expect(result.friendships, equals(initial.friendships));
-        expect(result.settings, equals(initial.settings));
-      });
-    });
-
-    // =========================================================
-    // 2. Transport state actions
-    // =========================================================
-    group('transport state actions', () {
-      test('BleTransportStateChangedAction updates BLE state', () {
-        const initial = AppState.initial;
-        expect(initial.transports.bleState, TransportState.uninitialized);
-
-        final result = appReducer(
-          initial,
-          BleTransportStateChangedAction(TransportState.ready),
+          initial.connectionStatus,
+          TransportConnectionStatus.uninitialized,
         );
 
-        expect(result.transports.bleState, TransportState.ready);
-        expect(result.transports.libp2pState, TransportState.uninitialized);
-      });
+        final result = appReducer(initial, SetInitializingAction());
 
-      test('LibP2PTransportStateChangedAction updates libp2p state', () {
-        const initial = AppState.initial;
-
-        final result = appReducer(
-          initial,
-          LibP2PTransportStateChangedAction(TransportState.active),
+        expect(
+          result.connectionStatus,
+          TransportConnectionStatus.initializing,
         );
-
-        expect(result.transports.libp2pState, TransportState.active);
-        expect(result.transports.bleState, TransportState.uninitialized);
       });
 
-      test('BleTransportStateChangedAction with error stores error message',
-          () {
-        const initial = AppState.initial;
-
-        final result = appReducer(
-          initial,
-          BleTransportStateChangedAction(TransportState.error,
-              error: 'BLE unavailable'),
-        );
-
-        expect(result.transports.bleState, TransportState.error);
-        expect(result.transports.bleError, 'BLE unavailable');
-      });
-
-      test('BleScanningChangedAction updates scanning flag', () {
+      test('SetOnlineAction sets status to online', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          connectionStatus: TransportConnectionStatus.initializing,
         );
 
-        final result =
-            appReducer(state, BleScanningChangedAction(true));
+        final result = appReducer(state, SetOnlineAction());
 
-        expect(result.transports.bleScanning, isTrue);
-        expect(result.transports.bleState, TransportState.active);
+        expect(result.connectionStatus, TransportConnectionStatus.online);
+      });
 
-        final result2 =
-            appReducer(result, BleScanningChangedAction(false));
-        expect(result2.transports.bleScanning, isFalse);
+      test('SetErrorAction sets status to error with message', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.online,
+        );
+
+        final result = appReducer(state, SetErrorAction('BLE unavailable'));
+
+        expect(result.connectionStatus, TransportConnectionStatus.error);
+        expect(result.errorMessage, 'BLE unavailable');
       });
     });
 
     // =========================================================
-    // 3. Derived state (isHealthy, statusDisplayString)
+    // 3. Scan actions
     // =========================================================
-    group('derived transport state', () {
-      test('isHealthy is true when any transport is active', () {
-        final bleActive = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+    group('scan actions', () {
+      test('ScanStartedAction changes online to scanning', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.online,
         );
-        expect(bleActive.isHealthy, isTrue);
 
-        final libp2pActive = AppState.initial.copyWith(
-          transports: const TransportsState(
-              libp2pState: TransportState.active),
-        );
-        expect(libp2pActive.isHealthy, isTrue);
+        final result = appReducer(state, ScanStartedAction());
 
-        const noneActive = AppState.initial;
-        expect(noneActive.isHealthy, isFalse);
+        expect(result.connectionStatus, TransportConnectionStatus.scanning);
       });
 
-      test('statusDisplayString reflects transport state', () {
-        expect(AppState.initial.statusDisplayString, 'Initializing...');
-
-        final ready = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.ready),
+      test('ScanStartedAction does NOT change non-online states', () {
+        // initializing should stay initializing
+        final initializingState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.initializing,
         );
-        expect(ready.statusDisplayString, 'Ready');
-
-        final active = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+        final result1 = appReducer(initializingState, ScanStartedAction());
+        expect(
+          result1.connectionStatus,
+          TransportConnectionStatus.initializing,
         );
-        expect(active.statusDisplayString, 'Online');
 
-        final scanning = AppState.initial.copyWith(
-          transports: const TransportsState(
-            bleState: TransportState.active,
-            bleScanning: true,
-          ),
+        // error should stay error
+        final errorState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.error,
+          errorMessage: 'some error',
         );
-        expect(scanning.statusDisplayString, 'Scanning for peers...');
+        final result2 = appReducer(errorState, ScanStartedAction());
+        expect(result2.connectionStatus, TransportConnectionStatus.error);
+
+        // uninitialized should stay uninitialized
+        const uninitializedState = AppState.initial;
+        final result3 = appReducer(uninitializedState, ScanStartedAction());
+        expect(
+          result3.connectionStatus,
+          TransportConnectionStatus.uninitialized,
+        );
+
+        // scanning should stay scanning (already scanning)
+        final scanningState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.scanning,
+        );
+        final result4 = appReducer(scanningState, ScanStartedAction());
+        expect(result4.connectionStatus, TransportConnectionStatus.scanning);
+      });
+
+      test('ScanCompletedAction changes scanning to online', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.scanning,
+        );
+
+        final result = appReducer(state, ScanCompletedAction());
+
+        expect(result.connectionStatus, TransportConnectionStatus.online);
+      });
+
+      test('ScanCompletedAction does NOT change non-scanning states', () {
+        // online should stay online
+        final onlineState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.online,
+        );
+        final result1 = appReducer(onlineState, ScanCompletedAction());
+        expect(result1.connectionStatus, TransportConnectionStatus.online);
+
+        // initializing should stay initializing
+        final initializingState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.initializing,
+        );
+        final result2 = appReducer(initializingState, ScanCompletedAction());
+        expect(
+          result2.connectionStatus,
+          TransportConnectionStatus.initializing,
+        );
+
+        // error should stay error
+        final errorState = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.error,
+          errorMessage: 'oops',
+        );
+        final result3 = appReducer(errorState, ScanCompletedAction());
+        expect(result3.connectionStatus, TransportConnectionStatus.error);
       });
     });
 
@@ -241,8 +242,7 @@ void main() {
     group('unknown actions', () {
       test('unknown action returns the same state unchanged', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          connectionStatus: TransportConnectionStatus.online,
         );
 
         final result = appReducer(state, 'some_unknown_action');
@@ -265,11 +265,12 @@ void main() {
     // 5. Actions preserve unrelated state sections
     // =========================================================
     group('actions preserve unrelated state sections', () {
-      test(
-          'BleTransportStateChangedAction preserves peers, messages, friendships, settings',
+      test('SetOnlineAction preserves peers, messages, friendships, settings',
           () {
+        // Build a state with non-default sub-states
         final now = DateTime.now();
         final stateWithData = AppState(
+          connectionStatus: TransportConnectionStatus.initializing,
           peers: PeersState(
             discoveredBlePeers: {
               'dev1': DiscoveredPeerState(
@@ -282,13 +283,10 @@ void main() {
           ),
         );
 
-        final result = appReducer(
-          stateWithData,
-          BleTransportStateChangedAction(TransportState.active),
-        );
+        final result = appReducer(stateWithData, SetOnlineAction());
 
-        // Transports changed
-        expect(result.transports.bleState, TransportState.active);
+        // Connection status changed
+        expect(result.connectionStatus, TransportConnectionStatus.online);
 
         // Peers preserved exactly
         expect(result.peers, equals(stateWithData.peers));
@@ -303,10 +301,67 @@ void main() {
         expect(result.settings, equals(stateWithData.settings));
       });
 
-      test('PeerAction preserves transports and other sub-states', () {
+      test('SetErrorAction preserves all sub-states', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          connectionStatus: TransportConnectionStatus.online,
+        );
+
+        final result = appReducer(state, SetErrorAction('failure'));
+
+        expect(result.connectionStatus, TransportConnectionStatus.error);
+        expect(result.errorMessage, 'failure');
+        expect(result.peers, equals(state.peers));
+        expect(result.messages, equals(state.messages));
+        expect(result.friendships, equals(state.friendships));
+        expect(result.settings, equals(state.settings));
+      });
+
+      test('SetInitializingAction preserves all sub-states', () {
+        const state = AppState.initial;
+
+        final result = appReducer(state, SetInitializingAction());
+
+        expect(
+          result.connectionStatus,
+          TransportConnectionStatus.initializing,
+        );
+        expect(result.peers, equals(state.peers));
+        expect(result.messages, equals(state.messages));
+        expect(result.friendships, equals(state.friendships));
+        expect(result.settings, equals(state.settings));
+      });
+
+      test('ScanStartedAction preserves all sub-states', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.online,
+        );
+
+        final result = appReducer(state, ScanStartedAction());
+
+        expect(result.connectionStatus, TransportConnectionStatus.scanning);
+        expect(result.peers, equals(state.peers));
+        expect(result.messages, equals(state.messages));
+        expect(result.friendships, equals(state.friendships));
+        expect(result.settings, equals(state.settings));
+      });
+
+      test('ScanCompletedAction preserves all sub-states', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.scanning,
+        );
+
+        final result = appReducer(state, ScanCompletedAction());
+
+        expect(result.connectionStatus, TransportConnectionStatus.online);
+        expect(result.peers, equals(state.peers));
+        expect(result.messages, equals(state.messages));
+        expect(result.friendships, equals(state.friendships));
+        expect(result.settings, equals(state.settings));
+      });
+
+      test('PeerAction preserves connectionStatus and other sub-states', () {
+        final state = AppState.initial.copyWith(
+          connectionStatus: TransportConnectionStatus.online,
         );
 
         final action = BleDeviceDiscoveredAction(
@@ -319,7 +374,7 @@ void main() {
         expect(result.peers.discoveredBlePeers.containsKey('dev2'), isTrue);
 
         // Everything else preserved
-        expect(result.transports, equals(state.transports));
+        expect(result.connectionStatus, TransportConnectionStatus.online);
         expect(result.messages, equals(state.messages));
         expect(result.friendships, equals(state.friendships));
         expect(result.settings, equals(state.settings));

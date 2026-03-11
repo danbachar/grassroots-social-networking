@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:ble_peripheral_bondless/ble_peripheral_bondless.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart' show FlutterBluePlus, BluetoothAdapterState;
 import 'package:logger/logger.dart';
 
 /// Callback when data is received from a connected central
@@ -57,7 +58,10 @@ class BlePeripheralService {
   /// Number of connected centrals
   int get connectedCount => _connectedCentrals.length;
 
-  /// Whether a specific device is connected as a central
+  /// All connected central device IDs
+  Set<String> get connectedDeviceIds => Set.from(_connectedCentrals);
+
+  /// Whether a specific central device is connected
   bool isDeviceConnected(String deviceId) => _connectedCentrals.contains(deviceId);
 
   /// Initialize the peripheral service
@@ -75,13 +79,6 @@ class BlePeripheralService {
           _bleReadyCompleter.complete();
         }
       });
-
-      // If BLE hardware is available, it's likely already powered on
-      // (e.g. re-enabling after disable). Complete immediately to avoid
-      // waiting for a state change callback that won't fire.
-      if (await BlePeripheral.isSupported() && !_bleReadyCompleter.isCompleted) {
-        _bleReadyCompleter.complete();
-      }
 
       // Set up connection state callback (Android only, but safe to call on all platforms)
       BlePeripheral.setConnectionStateChangeCallback(_onConnectionStateChanged);
@@ -112,7 +109,13 @@ class BlePeripheralService {
     }
 
     try {
-      // Wait for BLE to be powered on (important for iOS)
+      // Check if BLE is already powered on (handles re-enable after toggle off/on)
+      final currentState = await FlutterBluePlus.adapterState.first;
+      if (currentState == BluetoothAdapterState.on && !_bleReadyCompleter.isCompleted) {
+        _bleReadyCompleter.complete();
+      }
+
+      // Wait for BLE to be powered on (important for iOS cold start)
       _log.i('Waiting for BLE to be powered on...');
       await _bleReadyCompleter.future.timeout(
         const Duration(seconds: 10),
@@ -204,10 +207,19 @@ class BlePeripheralService {
     _connectedCentrals.clear();
   }
 
-  /// Send data to a connected central via notification
+  /// Send data to a connected central via notification.
+  ///
+  /// Pre-checks data length to prevent Android's fatal
+  /// IllegalArgumentException from notifyCharacteristicChanged.
   Future<bool> sendData(String deviceId, Uint8List data) async {
     if (!_connectedCentrals.contains(deviceId)) {
       _log.w('Cannot send to disconnected central: $deviceId');
+      return false;
+    }
+
+    if (data.length > maxCharacteristicSize) {
+      _log.e('Data too large for BLE notification: '
+          '${data.length} > $maxCharacteristicSize bytes');
       return false;
     }
 
@@ -225,19 +237,9 @@ class BlePeripheralService {
     }
   }
 
-  /// Send data to all connected centrals
-  Future<void> broadcastData(Uint8List data, {String? excludeDevice}) async {
-    for (final deviceId in _connectedCentrals) {
-      if (deviceId == excludeDevice) continue;
-      await sendData(deviceId, data);
-    }
-  }
-
   // ===== Event handlers =====
 
   void _onConnectionStateChanged(String deviceId, bool connected) {
-    if (!_active) return;
-
     if (connected) {
       _connectedCentrals.add(deviceId);
       _log.i('Central connected: $deviceId');
@@ -255,8 +257,6 @@ class BlePeripheralService {
     bool isSubscribed,
     String? name,
   ) {
-    if (!_active) return;
-
     // On iOS/Mac/Windows, subscription change indicates device availability
     if (isSubscribed) {
       _connectedCentrals.add(deviceId);
@@ -294,7 +294,7 @@ class BlePeripheralService {
       return WriteRequestResult();  // Acknowledge but ignore
     }
 
-    // _log.d('Write request from $deviceId: ${value?.length ?? 0} bytes');
+    _log.d('Write request from $deviceId: ${value?.length ?? 0} bytes');
 
     // Deliver data to callback
     if (value != null && value.isNotEmpty) {

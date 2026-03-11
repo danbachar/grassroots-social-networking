@@ -5,7 +5,6 @@ import '../mesh/bloom_filter.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
-import '../protocol/fragment_handler.dart';
 import '../protocol/protocol_handler.dart';
 import '../store/app_state.dart';
 import '../store/peers_actions.dart';
@@ -18,7 +17,6 @@ import '../store/peers_state.dart';
 /// - Packet deduplication (via BloomFilter)
 /// - ANNOUNCE decoding and Redux dispatch
 /// - MESSAGE targeting (is-for-us check)
-/// - Fragment reassembly delegation
 /// - Callback dispatch to application layer
 ///
 /// All transports feed into [processPacket] — one entry point, one format.
@@ -28,7 +26,6 @@ class MessageRouter {
   final BitchatIdentity identity;
   final Store<AppState> store;
   final ProtocolHandler protocolHandler;
-  final FragmentHandler fragmentHandler;
   final BloomFilter _seenPackets = BloomFilter();
 
   /// Called when a message is received
@@ -42,8 +39,8 @@ class MessageRouter {
   void Function(String messageId)? onReadReceiptReceived;
 
   /// Called when a peer ANNOUNCE is processed (new or updated peer)
-  void Function(AnnounceData data, PeerTransport transport, {bool isNew})?
-      onPeerAnnounced;
+  void Function(AnnounceData data, PeerTransport transport,
+      {bool isNew, String? previousLibp2pAddress})? onPeerAnnounced;
 
   /// Called when a message needs an ACK sent back to the sender
   void Function(PeerTransport transport, String peerId, String messageId)?
@@ -56,7 +53,6 @@ class MessageRouter {
     required this.identity,
     required this.store,
     required this.protocolHandler,
-    required this.fragmentHandler,
   });
 
   // ===== Unified Packet Processing =====
@@ -103,16 +99,10 @@ class MessageRouter {
       case PacketType.announce:
         return; // Already handled above
       case PacketType.message:
-      // TODO: why do messages have different types than packets?
         _handleMessage(packet, transport: transport, libp2pPeerId: libp2pPeerId);
-      case PacketType.fragmentStart:
-      case PacketType.fragmentContinue:
-      case PacketType.fragmentEnd:
-        _handleFragment(packet);
       case PacketType.ack:
         _handleAck(packet);
       case PacketType.nack:
-        // TODO: handle this
         break;
       case PacketType.readReceipt:
         _handleReadReceipt(packet);
@@ -163,12 +153,14 @@ class MessageRouter {
       effectiveRssi = discoveredPeer.rssi;
     }
 
-    final isNew = _peersState.getPeerByPubkey(pubkey) == null;
+    final existingPeer = _peersState.getPeerByPubkey(pubkey);
+    final isNew = existingPeer == null;
+    final previousLibp2pAddress = existingPeer?.libp2pAddress;
 
     // LibP2P-specific: use peerId as fallback address
-    String? libp2pAddress = data.libp2pAddress;
-    if (transport == PeerTransport.libp2p && libp2pAddress == null) {
-      libp2pAddress = libp2pPeerId;
+    var libp2pAddresses = data.libp2pAddresses;
+    if (transport == PeerTransport.libp2p && libp2pAddresses.isEmpty && libp2pPeerId != null) {
+      libp2pAddresses = [libp2pPeerId];
     }
 
     // Set the correct BLE device ID field based on role
@@ -190,21 +182,19 @@ class MessageRouter {
       transport: transport,
       bleCentralDeviceId: centralId,
       blePeripheralDeviceId: peripheralId,
-      libp2pAddress: libp2pAddress,
+      libp2pAddresses: libp2pAddresses,
     ));
 
-    if (resolvedBleDeviceId != null && resolvedBleRole != null) {
-      store.dispatch(AssociateBleDeviceAction(
-        publicKey: pubkey,
-        deviceId: resolvedBleDeviceId,
-        role: resolvedBleRole,
-      ));
+    _log.i(
+        'Peer ${isNew ? "connected" : "updated"}: ${data.nickname} via ${transport.name}'
+        '${libp2pAddresses.isNotEmpty ? ", ${libp2pAddresses.length} libp2p addrs" : ""}'
+        '${previousLibp2pAddress != null ? ", prevAddr=${previousLibp2pAddress.substring(0, previousLibp2pAddress.length.clamp(0, 30))}..." : ""}');
+    if (libp2pAddresses.isNotEmpty) {
+      _log.d('  ANNOUNCE addresses: ${libp2pAddresses.join(", ")}');
     }
 
-    _log.i(
-        'Peer ${isNew ? "connected" : "updated"}: ${data.nickname} via ${transport.name}');
-
-    onPeerAnnounced?.call(data, transport, isNew: isNew);
+    onPeerAnnounced?.call(data, transport,
+        isNew: isNew, previousLibp2pAddress: previousLibp2pAddress);
   }
 
   void _handleMessage(
@@ -218,14 +208,6 @@ class MessageRouter {
     // Send ACK back for libp2p (delivery confirmation)
     if (transport == PeerTransport.libp2p && libp2pPeerId != null) {
       onAckRequested?.call(transport, libp2pPeerId, packet.packetId);
-    }
-  }
-
-  void _handleFragment(BitchatPacket packet) {
-    final reassembled = fragmentHandler.processFragment(packet);
-    if (reassembled != null) {
-      onMessageReceived?.call(
-          packet.packetId, packet.senderPubkey, reassembled);
     }
   }
 

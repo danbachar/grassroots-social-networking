@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:logger/logger.dart';
 import 'package:redux/redux.dart';
 
 import '../transport/transport_service.dart';
+import '../transport/fragmenter.dart';
 import '../ble/ble_central_service.dart';
 import '../ble/ble_peripheral_service.dart';
 import '../models/identity.dart';
@@ -59,11 +61,19 @@ class BleTransportService extends TransportService {
   /// Peripheral service (advertiser)
   late final BlePeripheralService _peripheral;
 
+  /// Transport-level fragmenter.
+  /// Default 512 bytes; overridden per-peer based on negotiated MTU.
+  final Fragmenter _fragmenter = Fragmenter(maxPayloadSize: 512);
+
+  /// Current transport state
+  TransportState _state = TransportState.uninitialized;
+
   /// Flag to block packet processing after stop() is called
   /// This prevents race conditions where packets were already in the event queue
   bool _stopped = false;
 
   /// Stream controllers
+  final _stateController = StreamController<TransportState>.broadcast();
   final _dataController = StreamController<TransportDataEvent>.broadcast();
   final _connectionController = StreamController<TransportConnectionEvent>.broadcast();
 
@@ -101,7 +111,10 @@ class BleTransportService extends TransportService {
   TransportDisplayInfo get displayInfo => _defaultBleDisplayInfo;
 
   @override
-  TransportState get state => store.state.transports.bleState;
+  TransportState get state => _state;
+
+  @override
+  Stream<TransportState> get stateStream => _stateController.stream;
 
   @override
   Stream<TransportDataEvent> get dataStream => _dataController.stream;
@@ -114,34 +127,19 @@ class BleTransportService extends TransportService {
 
   @override
   bool get isActive =>
-      store.state.transports.bleState == TransportState.active &&
+      _state == TransportState.active &&
       (_central.isScanning || _peripheral.isAdvertising);
 
   /// Whether currently scanning for devices
   bool get isScanning => _central.isScanning;
 
-  /// Get all known peers from Redux store
-  List<PeerState> get knownPeers => _peersState.peersList;
-
-  /// Get connected peers from Redux store
-  List<PeerState> get connectedKnownPeers => _peersState.connectedPeers;
-
-  /// Check if a peer is reachable
-  bool isPeerReachable(Uint8List pubkey) => _peersState.isPeerReachable(pubkey);
-
-  /// Get peer by public key
-  PeerState? getPeer(Uint8List pubkey) => _peersState.getPeerByPubkey(pubkey);
-
-  /// Get all discovered BLE peers (before ANNOUNCE)
-  List<DiscoveredPeerState> get discoveredPeers => _peersState.discoveredBlePeersList;
-
   // ===== Lifecycle =====
 
   @override
   Future<bool> initialize() async {
-    if (state != TransportState.uninitialized) {
+    if (_state != TransportState.uninitialized) {
       _log.w('BLE transport already initialized');
-      return state == TransportState.ready || state == TransportState.active;
+      return _state == TransportState.ready || _state == TransportState.active;
     }
 
     _setState(TransportState.initializing);
@@ -173,8 +171,8 @@ class BleTransportService extends TransportService {
 
   @override
   Future<void> start() async {
-    if (state != TransportState.ready && state != TransportState.active) {
-      _log.w('Cannot start BLE transport in state: $state');
+    if (_state != TransportState.ready && _state != TransportState.active) {
+      _log.w('Cannot start BLE transport in state: $_state');
       return;
     }
 
@@ -183,11 +181,8 @@ class BleTransportService extends TransportService {
     // Clear stopped flag to allow packet processing
     _stopped = false;
 
-    // Start advertising first (so others can find us)
+    // Start advertising (so others can find us)
     await _peripheral.startAdvertising(localName: localName);
-
-    // Then start scanning (to find others)
-    await _central.startScan();
 
     _setState(TransportState.active);
     _log.i('BLE transport started');
@@ -209,7 +204,7 @@ class BleTransportService extends TransportService {
     // Stop advertising and disconnect all centrals
     await _peripheral.stopAdvertising();
 
-    if (state == TransportState.active) {
+    if (_state == TransportState.active) {
       _setState(TransportState.ready);
     }
 
@@ -222,19 +217,50 @@ class BleTransportService extends TransportService {
   }
 
   @override
-  Future<bool> sendToPeer(String peerId, Uint8List data) async {
-    // Try central first (we initiated connection)
-    if (await _central.sendData(peerId, data)) {
-      return true;
-    }
-    // Try peripheral (they initiated connection)
-    return await _peripheral.sendData(peerId, data);
+  Future<bool> connectToPeer(String peerId) async {
+    return await _central.connectToDevice(peerId);
   }
 
   @override
-  Future<void> broadcast(Uint8List data, {String? excludePeerId}) async {
-    await _central.broadcastData(data, excludeDevice: excludePeerId);
-    await _peripheral.broadcastData(data, excludeDevice: excludePeerId);
+  Future<void> disconnectFromPeer(String peerId) async {
+    await _central.disconnectFromDevice(peerId);
+  }
+
+  @override
+  Future<bool> sendToPeer(String peerId, Uint8List data) async {
+    // Fragment based on peer's negotiated MTU (minus 3 bytes ATT overhead).
+    // Capped at 512: GATT attribute values cannot exceed 512 bytes regardless
+    // of negotiated MTU. Falls back to the default 512 if MTU is unknown.
+    final mtu = _central.getMtuForDevice(peerId);
+    final maxWriteSize = mtu != null ? min(mtu - 3, 512) : null;
+
+    final chunks = _fragmenter.split(data, maxSize: maxWriteSize);
+    for (final chunk in chunks) {
+      bool sent = await _central.sendData(peerId, chunk);
+      if (!sent) sent = await _peripheral.sendData(peerId, chunk);
+      if (!sent) return false;
+      if (chunks.length > 1) {
+        await Future.delayed(Fragmenter.fragmentDelay);
+      }
+    }
+    return true;
+  }
+
+  @override
+  Future<void> broadcast(
+    Uint8List data, {
+    Uint8List? friendData,
+    Set<String>? friendDeviceIds,
+  }) async {
+    final allDeviceIds = {
+      ..._central.connectedDeviceIds,
+      ..._peripheral.connectedDeviceIds,
+    };
+    for (final deviceId in allDeviceIds) {
+      final isFriend = friendDeviceIds?.contains(deviceId) ?? false;
+      final payload = isFriend ? (friendData ?? data) : data;
+      await sendToPeer(deviceId, payload);
+    }
   }
 
   @override
@@ -268,13 +294,15 @@ class BleTransportService extends TransportService {
     _log.i('Disposing BLE transport');
 
     await stop();
+    _fragmenter.dispose();
     await _central.dispose();
     await _peripheral.dispose();
 
-    _setState(TransportState.disposed);
-
+    await _stateController.close();
     await _dataController.close();
     await _connectionController.close();
+
+    _setState(TransportState.disposed);
   }
 
   /// Process an incoming raw BLE packet.
@@ -298,10 +326,6 @@ class BleTransportService extends TransportService {
 
   // ===== Peer Management =====
 
-  void onPeerBleConnected(String bleDeviceId, {int? rssi}) {
-    _log.d('BLE peer connected: $bleDeviceId');
-  }
-
   void onPeerBleDisconnected(Uint8List pubkey, {BleRole? role}) {
     final peer = _peersState.getPeerByPubkey(pubkey);
     if (peer != null) {
@@ -314,8 +338,12 @@ class BleTransportService extends TransportService {
   // ===== BLE Callbacks =====
 
   void _onCentralDataReceived(String deviceId, Uint8List data, int rssi) {
+    if (data.isNotEmpty && data[0] == Fragmenter.fragmentMarker) {
+      final assembled = _fragmenter.receive(deviceId, data);
+      if (assembled == null) return;
+      data = assembled;
+    }
     onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi, bleRole: BleRole.central);
-
     _dataController.add(TransportDataEvent(
       peerId: deviceId,
       transport: TransportType.ble,
@@ -324,8 +352,12 @@ class BleTransportService extends TransportService {
   }
 
   void _onPeripheralDataReceived(String deviceId, Uint8List data, int rssi) {
+    if (data.isNotEmpty && data[0] == Fragmenter.fragmentMarker) {
+      final assembled = _fragmenter.receive(deviceId, data);
+      if (assembled == null) return;
+      data = assembled;
+    }
     onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi, bleRole: BleRole.peripheral);
-
     _dataController.add(TransportDataEvent(
       peerId: deviceId,
       transport: TransportType.ble,
@@ -341,19 +373,20 @@ class BleTransportService extends TransportService {
     _handleConnectionChange(deviceId, connected, isCentral: false);
   }
 
+  /// Maximum time a device can stay in isConnecting before we reset the flag.
+  static const Duration _connectingTimeout = Duration(seconds: 20);
+
   void _onDeviceDiscovered(DiscoveredDevice device) {
-    // Check if this is a new discovery
     final existing = _peersState.getDiscoveredBlePeer(device.deviceId);
     final isNew = existing == null;
 
-    if (isNew) {
-      store.dispatch(BleDeviceDiscoveredAction(
-        deviceId: device.deviceId,
-        displayName: device.name,
-        rssi: device.rssi,
-        serviceUuid: device.serviceUuid,
-      ));
-    }
+    // Dispatch action to update Redux store
+    store.dispatch(BleDeviceDiscoveredAction(
+      deviceId: device.deviceId,
+      displayName: device.name,
+      rssi: device.rssi,
+      serviceUuid: device.serviceUuid,
+    ));
 
     // Also update RSSI for connected Peers (those who have sent ANNOUNCE)
     final pubkey = getPubkeyForPeerId(device.deviceId);
@@ -361,26 +394,35 @@ class BleTransportService extends TransportService {
       store.dispatch(PeerRssiUpdatedAction(publicKey: pubkey, rssi: device.rssi));
     }
 
-    if (!isNew && (existing.isConnected || existing.isConnecting)) return;
-
     // Check if we're in backoff period
     if (existing != null && existing.isInBackoff) {
       return; // Skip connection attempt — still in backoff
     }
 
-    _autoConnectToPeer(device.deviceId);
+    // Try to connect if not already connected.
+    // - New devices: always attempt connection
+    // - Known devices: retry if not connected and not currently connecting
+    //   (handles failed first attempts, silently dropped connections, etc.)
+    if (isNew) {
+      _autoConnectToPeer(device.deviceId);
+    } else if (!_isConnected(device.deviceId) && !existing.isConnecting) {
+      _autoConnectToPeer(device.deviceId);
+    } else if (existing.isConnecting) {
+      // Detect stuck isConnecting state — if it's been connecting for too long,
+      // reset and retry
+      final connectingDuration = DateTime.now().difference(existing.lastSeen);
+      if (connectingDuration > _connectingTimeout) {
+        _log.w('Connection to ${device.deviceId} stuck for ${connectingDuration.inSeconds}s, resetting');
+        store.dispatch(BleDeviceConnectionFailedAction(device.deviceId, error: 'Connecting timeout'));
+        _autoConnectToPeer(device.deviceId);
+      }
+    }
   }
 
   /// Automatically connect to a discovered peer and send ANNOUNCE
   Future<bool> _autoConnectToPeer(String deviceId) async {
-    // Skip if already connected
+    // Skip if already connected at the transport level
     if (_isConnected(deviceId)) {
-      return false;
-    }
-
-    // Skip if already connecting
-    final discovered = _peersState.getDiscoveredBlePeer(deviceId);
-    if (discovered?.isConnecting == true) {
       return false;
     }
 
@@ -428,8 +470,9 @@ class BleTransportService extends TransportService {
   // ===== Helpers =====
 
   void _setState(TransportState newState) {
-    if (store.state.transports.bleState != newState) {
-      store.dispatch(BleTransportStateChangedAction(newState));
+    if (_state != newState) {
+      _state = newState;
+      _stateController.add(newState);
     }
   }
 

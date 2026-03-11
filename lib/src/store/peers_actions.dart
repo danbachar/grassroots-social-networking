@@ -118,7 +118,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
   /// BLE device ID from our peripheral role (they connected to us)
   final String? blePeripheralDeviceId;
 
-  final String? libp2pAddress;
+  final List<String> libp2pAddresses;
 
   PeerAnnounceReceivedAction({
     required this.publicKey,
@@ -128,7 +128,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
     this.transport = PeerTransport.bleDirect,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
-    this.libp2pAddress,
+    this.libp2pAddresses = const [],
   });
 }
 

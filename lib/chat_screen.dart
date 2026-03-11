@@ -6,7 +6,6 @@ import 'package:bitchat_transport/bitchat_transport.dart';
 import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
-import 'package:uuid/uuid.dart';
 
 /// Chat screen for a conversation with a specific peer
 class ChatScreen extends StatefulWidget {
@@ -94,18 +93,19 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  static const _uuid = Uuid();
-
-  void _sendMessage() {
+  void _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
 
     _messageController.clear();
 
-    // Generate message ID upfront so we can show the message immediately
-    final messageId = _uuid.v4().substring(0, 8);
+    // Send via Bitchat using SayBlock - get messageId for tracking
+    final block = SayBlock(content: text);
+    _log.i("Sending '$text' to peer ${widget.peer.displayName}");
+    final messageId =
+        await widget.bitchat.send(widget.peer.publicKey, block.serialize());
 
-    // Save to conversation immediately so the message appears in the UI
+    // Save outgoing message to Redux store with messageId for status tracking
     widget.store.dispatch(SaveChatMessageAction(
       senderPubkeyHex: _myHex,
       recipientPubkeyHex: _peerHex,
@@ -115,12 +115,6 @@ class _ChatScreenState extends State<ChatScreen> {
     ));
 
     _scrollToBottom();
-
-    // Send in the background — status updates (sending → sent/delivered/failed)
-    // will be dispatched by Bitchat.send() and reflected via the status icon
-    final block = SayBlock(content: text);
-    _log.i("Sending '$text' to peer ${widget.peer.displayName}");
-    widget.bitchat.send(widget.peer.publicKey, block.serialize(), messageId: messageId);
   }
 
   void _scrollToBottom() {

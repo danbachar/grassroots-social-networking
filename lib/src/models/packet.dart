@@ -6,27 +6,18 @@ import 'package:uuid/uuid.dart';
 enum PacketType {
   /// Peer identity announcement (sent on connection)
   announce(0x01),
-  
+
   /// Application message (GSG blocks go here)
   message(0x02),
-  
-  /// Start of fragmented message
-  fragmentStart(0x03),
-  
-  /// Continuation fragment
-  fragmentContinue(0x04),
-  
-  /// Final fragment
-  fragmentEnd(0x05),
-  
+
   /// Delivery acknowledgment (for libp2p transport)
-  ack(0x06),
+  ack(0x03),
 
   /// Negative acknowledgment / request for data
-  nack(0x07),
+  nack(0x04),
 
   /// Read receipt (recipient has read the message)
-  readReceipt(0x08);
+  readReceipt(0x05);
   
   final int value;
   const PacketType(this.value);
@@ -57,6 +48,7 @@ enum PacketType {
 /// Total header size: 152 bytes
 /// Max payload for single packet: ~350 bytes (with 500 byte MTU target)
 class BitchatPacket {
+  static final Logger _log = Logger();
   static const int headerSize = 152;
   static const int maxPayloadSize = 348; // 500 - 152
   static const int defaultTtl = 7;
@@ -227,7 +219,7 @@ class BitchatPacket {
     }
     final payload = Uint8List.fromList(data.sublist(offset, offset + payloadLength));
     
-    // _log.i("Serialized packet of type $type with payload length $payloadLength");
+    _log.i("Serialized packet of type $type with payload length $payloadLength");
     return BitchatPacket(
       packetId: packetId,
       type: type,

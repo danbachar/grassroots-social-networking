@@ -14,7 +14,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
   // ===== BLE Discovery Actions =====
 
   if (action is BleDeviceDiscoveredAction) {
-    // TODO: why is nickname here? it comes in the announce
     final existing = state.discoveredBlePeers[action.deviceId];
     final now = DateTime.now();
 
@@ -33,7 +32,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
           ..[action.deviceId] = newPeer,
       );
     } else {
-      // TODO: this should be a different action, use update rssi
       // Update existing
       final updated = existing.copyWith(
         rssi: action.rssi,
@@ -70,6 +68,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
     if (existing != null) {
       final updated = existing.copyWith(
         isConnecting: true,
+        connectionAttempts: existing.connectionAttempts + 1,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -211,6 +210,23 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final existing = state.peers[pubkeyHex];
     final now = DateTime.now();
 
+    // ANNOUNCE addresses are the source of truth — always overwrite.
+    // If a peer removed an address, it's stale and should be cleared.
+    final parsed = _parseLibp2pAddresses(action.libp2pAddresses);
+
+    // libp2pAddress = the verified working connection address.
+    // - If existing address is still in the new ANNOUNCE list: keep it
+    // - If existing address is NOT in the new list: stale, clear it
+    // - If no existing and ANNOUNCE came via libp2p: use first address
+    // - If no existing and ANNOUNCE came via BLE: null (side-effect connects)
+    final existingLibp2pAddr = existing?.libp2pAddress;
+    String? libp2pAddress;
+    if (existingLibp2pAddr != null && action.libp2pAddresses.contains(existingLibp2pAddr)) {
+      libp2pAddress = existingLibp2pAddr;
+    } else if (action.transport == PeerTransport.libp2p && action.libp2pAddresses.isNotEmpty) {
+      libp2pAddress = action.libp2pAddresses.first;
+    }
+
     final isBle = action.transport == PeerTransport.bleDirect;
 
     if (existing == null) {
@@ -226,7 +242,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         bleCentralDeviceId: action.bleCentralDeviceId,
         blePeripheralDeviceId: action.blePeripheralDeviceId,
         lastBleSeen: isBle ? now : null,
-        libp2pAddress: action.libp2pAddress,
+        libp2pAddress: libp2pAddress,
+        libp2pHostId: parsed.hostId,
+        libp2pHostAddrs: parsed.baseAddresses,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = newPeer,
@@ -246,10 +264,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
         bleCentralDeviceId: action.bleCentralDeviceId ?? existing.bleCentralDeviceId,
         blePeripheralDeviceId: action.blePeripheralDeviceId ?? existing.blePeripheralDeviceId,
         lastBleSeen: isBle ? now : existing.lastBleSeen,
-        libp2pAddress: action.libp2pAddress ?? existing.libp2pAddress,
+        libp2pAddress: libp2pAddress,
+        libp2pHostId: parsed.hostId,
+        libp2pHostAddrs: parsed.baseAddresses,
         isFriend: existing.isFriend,
-        libp2pHostId: existing.libp2pHostId,
-        libp2pHostAddrs: existing.libp2pHostAddrs,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -456,22 +474,22 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
     if (existing != null) {
-      // Parse address to extract hostId and baseAddr
+      // Extract hostId from the address
       String? libp2pHostId;
-      List<String>? libp2pHostAddrs;
-
       if (action.address.isNotEmpty) {
         final parts = action.address.split('/p2p/');
-        if (parts.length == 2) {
-          libp2pHostId = parts[1];
-          libp2pHostAddrs = [parts[0]];
+        if (parts.length >= 2) {
+          libp2pHostId = parts.last;
         }
       }
 
+      // Update libp2pAddress, libp2pHostId, and mark as connected.
+      // Do NOT overwrite libp2pHostAddrs — the full backup list
+      // comes from ANNOUNCE and should be preserved.
       final updated = existing.copyWith(
         libp2pAddress: action.address.isEmpty ? null : action.address,
         libp2pHostId: libp2pHostId,
-        libp2pHostAddrs: libp2pHostAddrs,
+        connectionState: PeerConnectionState.connected,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -551,4 +569,28 @@ PeersState peersReducer(PeersState state, dynamic action) {
 
 String _pubkeyToHex(List<int> pubkey) {
   return pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
+
+/// Parse a list of libp2p multiaddrs to extract the hostId and base addresses.
+/// Each address may be in the form `/ip6/.../udp/.../udx/p2p/QmABC`.
+/// Returns the first hostId found and all base addresses (with /p2p/ suffix stripped).
+({String? hostId, List<String> baseAddresses}) _parseLibp2pAddresses(List<String> addresses) {
+  String? hostId;
+  final baseAddresses = <String>[];
+
+  for (final addr in addresses) {
+    final parts = addr.split('/p2p/');
+    if (parts.length >= 2) {
+      // Last /p2p/ segment is the hostId (handles circuit relay addresses too)
+      final id = parts.last;
+      hostId ??= id;
+      // Base address is everything before the last /p2p/ segment
+      baseAddresses.add(parts.sublist(0, parts.length - 1).join('/p2p/'));
+    } else {
+      // No /p2p/ component — use as-is
+      baseAddresses.add(addr);
+    }
+  }
+
+  return (hostId: hostId, baseAddresses: baseAddresses);
 }

@@ -4,7 +4,6 @@ import 'package:redux/redux.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:bitchat_transport/src/routing/message_router.dart';
 import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
 import 'package:bitchat_transport/src/models/identity.dart';
 import 'package:bitchat_transport/src/models/packet.dart';
 import 'package:bitchat_transport/src/models/peer.dart';
@@ -16,10 +15,10 @@ Uint8List buildAnnouncePayload({
   required Uint8List pubkey,
   String nickname = 'OtherPeer',
   String? address,
+  List<String> addresses = const [],
 }) {
   final nicknameBytes = Uint8List.fromList(nickname.codeUnits);
-  final addressBytes =
-      address != null ? Uint8List.fromList(address.codeUnits) : Uint8List(0);
+  final allAddresses = address != null ? [address] : addresses;
   final buffer = BytesBuilder();
 
   buffer.add(pubkey);
@@ -31,11 +30,13 @@ Uint8List buildAnnouncePayload({
   buffer.addByte(nicknameBytes.length);
   buffer.add(nicknameBytes);
 
-  final addrLenBytes = ByteData(2);
-  addrLenBytes.setUint16(0, addressBytes.length, Endian.big);
-  buffer.add(addrLenBytes.buffer.asUint8List());
-  if (addressBytes.isNotEmpty) {
-    buffer.add(addressBytes);
+  buffer.addByte(allAddresses.length);
+  for (final addr in allAddresses) {
+    final addrBytes = Uint8List.fromList(addr.codeUnits);
+    final addrLenBytes = ByteData(2);
+    addrLenBytes.setUint16(0, addrBytes.length, Endian.big);
+    buffer.add(addrLenBytes.buffer.asUint8List());
+    buffer.add(addrBytes);
   }
 
   return buffer.toBytes();
@@ -49,7 +50,6 @@ void main() {
     late BitchatIdentity otherIdentity;
     late ProtocolHandler protocolHandler;
     late ProtocolHandler otherProtocolHandler;
-    late FragmentHandler fragmentHandler;
     late Uint8List otherPubkey;
 
     setUp(() async {
@@ -73,13 +73,10 @@ void main() {
 
       protocolHandler = ProtocolHandler(identity: identity);
       otherProtocolHandler = ProtocolHandler(identity: otherIdentity);
-      fragmentHandler = FragmentHandler();
-
       router = MessageRouter(
         identity: identity,
         store: store,
         protocolHandler: protocolHandler,
-        fragmentHandler: fragmentHandler,
       );
 
       otherPubkey = otherIdentity.publicKey;
@@ -121,8 +118,9 @@ void main() {
         router.onMessageReceived = (_, __, ___) => anyCalled = true;
         router.onAckReceived = (_) => anyCalled = true;
         router.onReadReceiptReceived = (_) => anyCalled = true;
-        router.onPeerAnnounced = (_, __, {bool isNew = false}) =>
-            anyCalled = true;
+        router.onPeerAnnounced =
+            (_, __, {bool isNew = false, String? previousLibp2pAddress}) =>
+                anyCalled = true;
 
         // Create packet without signing (zero signature)
         final p = BitchatPacket(
@@ -212,7 +210,7 @@ void main() {
         expect(peer!.bleDeviceId, equals('ble-device-1'));
       });
 
-      test('includes libp2pAddress from ANNOUNCE payload', () async {
+      test('stores libp2p addresses as backups from BLE ANNOUNCE', () async {
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
           address: '/ip4/10.0.0.1/tcp/4001/p2p/QmTest',
@@ -230,16 +228,19 @@ void main() {
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
-        expect(
-          peer!.libp2pAddress,
-          equals('/ip4/10.0.0.1/tcp/4001/p2p/QmTest'),
-        );
+        // BLE ANNOUNCE does NOT set libp2pAddress (no verified connection)
+        expect(peer!.libp2pAddress, isNull);
+        // Addresses stored as backups for connection attempts
+        expect(peer.libp2pHostId, equals('QmTest'));
+        expect(peer.libp2pHostAddrs, contains('/ip4/10.0.0.1/tcp/4001'));
       });
 
       test('fires onPeerAnnounced callback', () async {
         AnnounceData? receivedData;
         PeerTransport? receivedTransport;
-        router.onPeerAnnounced = (data, transport, {bool isNew = false}) {
+        router.onPeerAnnounced =
+            (data, transport,
+                {bool isNew = false, String? previousLibp2pAddress}) {
           receivedData = data;
           receivedTransport = transport;
         };
@@ -274,7 +275,8 @@ void main() {
 
         int announceCount = 0;
         router.onPeerAnnounced =
-            (_, __, {bool isNew = false}) => announceCount++;
+            (_, __, {bool isNew = false, String? previousLibp2pAddress}) =>
+                announceCount++;
 
         await router.processPacket(
           p,
@@ -437,42 +439,6 @@ void main() {
     });
 
     // =========================================================================
-    // BLE Packet Processing - Fragments
-    // =========================================================================
-
-    group('processPacket - fragments', () {
-      test('reassembles fragmented message and delivers', () async {
-        Uint8List? reassembledPayload;
-        router.onMessageReceived = (_, __, payload) {
-          reassembledPayload = payload;
-        };
-
-        final payload = Uint8List(1000);
-        for (var i = 0; i < payload.length; i++) {
-          payload[i] = i % 256;
-        }
-
-        final fragmented = fragmentHandler.fragment(
-          payload: payload,
-          senderPubkey: otherPubkey,
-        );
-
-        for (final fragment in fragmented.fragments) {
-          // Sign each fragment with the other peer's key
-          await otherProtocolHandler.signPacket(fragment);
-          await router.processPacket(
-            fragment,
-            transport: PeerTransport.bleDirect,
-            rssi: -60,
-          );
-        }
-
-        expect(reassembledPayload, isNotNull);
-        expect(reassembledPayload, equals(payload));
-      });
-    });
-
-    // =========================================================================
     // Packet Processing - ACK/NACK
     // =========================================================================
 
@@ -615,7 +581,9 @@ void main() {
 
       test('fires onPeerAnnounced callback with libp2p transport', () async {
         PeerTransport? receivedTransport;
-        router.onPeerAnnounced = (_, transport, {bool isNew = false}) {
+        router.onPeerAnnounced =
+            (_, transport,
+                {bool isNew = false, String? previousLibp2pAddress}) {
           receivedTransport = transport;
         };
 

@@ -6,7 +6,6 @@ import 'package:bitchat_transport/src/models/identity.dart';
 import 'package:bitchat_transport/src/models/packet.dart';
 import 'package:bitchat_transport/src/models/peer.dart';
 import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
 import 'package:bitchat_transport/src/routing/message_router.dart';
 import 'package:bitchat_transport/src/store/store.dart';
 
@@ -45,14 +44,12 @@ void main() {
       identity: aliceIdentity,
       store: aliceStore,
       protocolHandler: aliceProtocol,
-      fragmentHandler: FragmentHandler(),
     );
 
     bobRouter = MessageRouter(
       identity: bobIdentity,
       store: bobStore,
       protocolHandler: bobProtocol,
-      fragmentHandler: FragmentHandler(),
     );
   });
 
@@ -80,7 +77,7 @@ void main() {
       // Bob's router processes the BLE packet
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false}) {
+      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? previousLibp2pAddress}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -109,7 +106,7 @@ void main() {
 
     test('ANNOUNCE with libp2p address roundtrips correctly', () async {
       const address = '/ip4/192.168.1.1/tcp/4001/p2p/QmHash123';
-      final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
+      final announcePayload = aliceProtocol.createAnnouncePayload(addresses: [address]);
 
       final packet = BitchatPacket(
         type: PacketType.announce,
@@ -121,7 +118,7 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       AnnounceData? receivedAnnounce;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false}) {
+      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? previousLibp2pAddress}) {
         receivedAnnounce = data;
       };
 
@@ -133,11 +130,13 @@ void main() {
       );
 
       expect(receivedAnnounce, isNotNull);
-      expect(receivedAnnounce!.libp2pAddress, equals(address));
+      expect(receivedAnnounce!.libp2pAddresses, equals([address]));
 
-      // Verify libp2p address stored in Redux
+      // BLE ANNOUNCE stores addresses as backups, not as verified libp2pAddress
       final peerState = bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
-      expect(peerState!.libp2pAddress, equals(address));
+      expect(peerState!.libp2pAddress, isNull);
+      expect(peerState.libp2pHostId, equals('QmHash123'));
+      expect(peerState.libp2pHostAddrs, contains('/ip4/192.168.1.1/tcp/4001'));
     });
   });
 
@@ -268,7 +267,7 @@ void main() {
       // Bob's router processes it
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false}) {
+      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? previousLibp2pAddress}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -294,7 +293,7 @@ void main() {
 
     test('libp2p ANNOUNCE with address roundtrips correctly', () async {
       const address = '/ip6/::1/udp/4001/udx';
-      final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
+      final announcePayload = aliceProtocol.createAnnouncePayload(addresses: [address]);
 
       final packet = BitchatPacket(
         type: PacketType.announce,
@@ -306,7 +305,7 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       AnnounceData? receivedAnnounce;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false}) {
+      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? previousLibp2pAddress}) {
         receivedAnnounce = data;
       };
 
@@ -316,7 +315,7 @@ void main() {
         libp2pPeerId: 'peer-alice-id',
       );
 
-      expect(receivedAnnounce!.libp2pAddress, equals(address));
+      expect(receivedAnnounce!.libp2pAddresses, equals([address]));
     });
   });
 
@@ -445,7 +444,7 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       int announceCount = 0;
-      bobRouter.onPeerAnnounced = (_, __, {bool isNew = false}) {
+      bobRouter.onPeerAnnounced = (_, __, {bool isNew = false, String? previousLibp2pAddress}) {
         announceCount++;
       };
 
@@ -490,7 +489,7 @@ void main() {
 
       // Then: Alice announces via libp2p with address
       const libp2pAddr = '/ip4/10.0.0.1/tcp/4001/p2p/QmAlice';
-      final libp2pAnnouncePayload = aliceProtocol.createAnnouncePayload(address: libp2pAddr);
+      final libp2pAnnouncePayload = aliceProtocol.createAnnouncePayload(addresses: [libp2pAddr]);
       final libp2pPacket = BitchatPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,

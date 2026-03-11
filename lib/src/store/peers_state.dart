@@ -36,6 +36,9 @@ class DiscoveredPeerState {
   /// Service UUID (for correlation on iOS)
   final String? serviceUuid;
 
+  /// Number of connection attempts
+  final int connectionAttempts;
+
   /// Number of consecutive failed connection attempts (for backoff)
   final int consecutiveFailures;
 
@@ -53,6 +56,7 @@ class DiscoveredPeerState {
     this.lastError,
     this.publicKey,
     this.serviceUuid,
+    this.connectionAttempts = 0,
     this.consecutiveFailures = 0,
     this.nextRetryAfter,
   });
@@ -82,6 +86,7 @@ class DiscoveredPeerState {
     String? lastError,
     Uint8List? publicKey,
     String? serviceUuid,
+    int? connectionAttempts,
     int? consecutiveFailures,
     DateTime? nextRetryAfter,
   }) {
@@ -96,6 +101,7 @@ class DiscoveredPeerState {
       lastError: lastError ?? this.lastError,
       publicKey: publicKey ?? this.publicKey,
       serviceUuid: serviceUuid ?? this.serviceUuid,
+      connectionAttempts: connectionAttempts ?? this.connectionAttempts,
       consecutiveFailures: consecutiveFailures ?? this.consecutiveFailures,
       nextRetryAfter: nextRetryAfter ?? this.nextRetryAfter,
     );
@@ -112,6 +118,7 @@ class DiscoveredPeerState {
           isConnected == other.isConnected &&
           lastError == other.lastError &&
           serviceUuid == other.serviceUuid &&
+          connectionAttempts == other.connectionAttempts &&
           consecutiveFailures == other.consecutiveFailures &&
           nextRetryAfter == other.nextRetryAfter;
 
@@ -123,6 +130,7 @@ class DiscoveredPeerState {
     isConnected,
     lastError,
     serviceUuid,
+    connectionAttempts,
     consecutiveFailures,
     nextRetryAfter,
   );
@@ -335,7 +343,7 @@ class PeersState {
   /// Online friends - friends connected via libp2p only (not nearby via BLE).
   /// Use this for the "Friends Online" section in UI.
   List<PeerState> get onlineFriends =>
-      peers.values.where((p) => p.isFriend && p.isConnected && p.libp2pAddress != null).toList();
+      peers.values.where((p) => p.isFriend && p.isConnected && !p.hasBleConnection && p.libp2pAddress != null).toList();
 
   /// Count of connected peers
   int get connectedCount => connectedPeers.length;

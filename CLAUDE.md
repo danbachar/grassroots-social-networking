@@ -29,6 +29,41 @@ This is by design - the application layer (GSG) handles message persistence and 
 
 ---
 
+## Critical: always be precise, critical, but helpful.
+
+## CRITICAL: NO Legacy or Compatibility Code — EVER
+
+**IMPORTANT**: NEVER write backward-compatible code, migration shims, or compatibility layers. This applies to ALL code changes including protocol changes, API changes, data format changes, and refactors.
+
+- ❌ **NO** `// Legacy - kept for compatibility` comments
+- ❌ **NO** keeping both old and new implementations
+- ❌ **NO** backward-compatible encoding/decoding (e.g., "old receivers will still parse this")
+- ❌ **NO** migration paths or version-gated behavior
+- ❌ **NO** fallback logic for old formats or protocols
+- ✅ **DO** fully replace old code with new implementation
+- ✅ **DO** remove unused imports and dead code
+- ✅ **DO** update all call sites when changing APIs
+- ✅ **DO** change protocols/formats cleanly without worrying about old versions
+- ❌ **NO** `PeerStore` - use Redux store (`AppState.peers`) only
+
+---
+
+## CRITICAL: NO Store-and-Forward / NO Relaying
+
+**IMPORTANT**: Bitchat does NOT implement store-and-forward or message relaying.
+
+- ❌ **NO caching** messages for offline peers
+- ❌ **NO relaying** messages through intermediate peers
+- ❌ **NO forwarding** packets on behalf of other peers
+
+Messages are sent **directly** to the recipient:
+- If the recipient is **online and reachable** → message is delivered
+- If the recipient is **offline** → message **fails** and sender must retry later
+
+This is by design - the application layer (GSG) handles message persistence and retry logic.
+
+---
+
 ## BLE Service UUID Architecture
 
 **IMPORTANT**: Each device advertises a **unique** BLE service UUID composed of two parts:

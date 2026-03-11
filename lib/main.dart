@@ -15,7 +15,6 @@ import 'package:cryptography/cryptography.dart';
 import 'chat_screen.dart';
 import 'chat_models.dart';
 import 'settings_screen.dart';
-import 'package:redux_remote_devtools/redux_remote_devtools.dart';
 
 // Global notification plugin instance
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -71,57 +70,6 @@ Future<BitchatIdentity> _initIdentity() async {
   print('Public Key Bytes: ${identity.publicKey.length} bytes');
   print('Nickname: ${identity.nickname}');
   return identity;
-}
-
-Map<String, dynamic> _serializeAppState(AppState state) {
-  return {
-    'bleTransportState': state.transports.bleState.name,
-    'libp2pTransportState': state.transports.libp2pState.name,
-    'peers': {
-      'discoveredBlePeers': {
-        for (final e in state.peers.discoveredBlePeers.entries)
-          e.key: {
-            'transportId': e.value.transportId,
-            'displayName': e.value.displayName,
-            'rssi': e.value.rssi,
-            'isConnecting': e.value.isConnecting,
-            'isConnected': e.value.isConnected,
-            'lastError': e.value.lastError,
-            'serviceUuid': e.value.serviceUuid,
-            'lastSeen': e.value.lastSeen.toIso8601String(),
-          },
-      },
-      'peers': {
-        for (final e in state.peers.peers.entries)
-          e.key: {
-            'nickname': e.value.nickname,
-            'connectionState': e.value.connectionState.name,
-            'transport': e.value.transport.name,
-            'activeTransport': e.value.activeTransport.name,
-            'rssi': e.value.rssi,
-            'bleDeviceId': e.value.bleDeviceId,
-            'libp2pAddress': e.value.libp2pAddress,
-            'isFriend': e.value.isFriend,
-            'lastSeen': e.value.lastSeen?.toIso8601String(),
-          },
-      },
-    },
-    'messages': {
-      'conversationCount': state.messages.conversations.length,
-      'unreadCounts': state.messages.unreadCounts,
-      'outgoingCount': state.messages.outgoingMessages.length,
-      'incomingCount': state.messages.incomingMessages.length,
-    },
-    'friendships': {
-      for (final e in state.friendships.friendships.entries)
-        e.key: {
-          'nickname': e.value.nickname,
-          'status': e.value.status.name,
-          'libp2pAddress': e.value.libp2pAddress,
-        },
-    },
-    'settings': state.settings.toJson(),
-  };
 }
 
 void main() async {
@@ -214,9 +162,9 @@ class _BitchatHomeState extends State<BitchatHome>
   // Track nickname changes for animation
   final Map<String, _NicknameChange> _nicknameChanges = {};
   
-  // Transport availability derived from Redux store
-  bool get _bleAvailable => appStore.state.transports.bleState.isUsable;
-  bool get _libp2pAvailable => appStore.state.transports.libp2pState.isUsable;
+  // Transport availability flags
+  bool _bleAvailable = true;
+  bool _libp2pAvailable = true;
 
   /// Check if libp2p host is available for friend requests
   bool get _hasLibp2pHost => _bitchat?.libp2pHostId != null;
@@ -230,8 +178,10 @@ class _BitchatHomeState extends State<BitchatHome>
   /// Computed full multiaddress string combining first address with host ID
   String? get _myLibp2pAddress {
     final hostId = _myLibp2pHostId;
-    final addrs = _myLibp2pHostAddrs;
     if (hostId == null) return null;
+    final publicAddr = _bitchat?.publicLibp2pMultiaddr;
+    if (publicAddr != null) return '$publicAddr/p2p/$hostId';
+    final addrs = _myLibp2pHostAddrs;
     if (addrs.isNotEmpty) return '${addrs.first}/p2p/$hostId';
     return '/p2p/$hostId';
   }
@@ -265,8 +215,12 @@ class _BitchatHomeState extends State<BitchatHome>
     });
   }
 
-  void _onConnectivityChanged(List<ConnectivityResult> results) {
+  Future<void> _onConnectivityChanged(List<ConnectivityResult> results) async {
     _log.i('🌐 Connectivity changed: $results');
+
+    // Refresh the public IPv6 so the next friend announce has the current address
+    await _bitchat?.refreshLibp2pAddress();
+    await _announceToFriends();
   }
 
   void _checkPendingChat() {
@@ -299,6 +253,9 @@ class _BitchatHomeState extends State<BitchatHome>
   Future<void> _initialize() async {
     try {
       final identity = await _initIdentity();
+
+      // Dispatch initializing status
+      appStore.dispatch(SetInitializingAction());
 
       final bitchat = Bitchat(
         identity: identity,
@@ -338,9 +295,12 @@ class _BitchatHomeState extends State<BitchatHome>
 
       final success = await bitchat.initialize();
       if (!success) {
-        _log.e('Bitchat initialization failed');
+        appStore.dispatch(SetErrorAction('Failed: ${bitchat.status}'));
         return;
       }
+
+      // Dispatch online status
+      appStore.dispatch(SetOnlineAction());
 
       // Hydrate Redux store with existing friends from FriendshipStore
       await _hydrateFriendsFromStore();
@@ -348,7 +308,7 @@ class _BitchatHomeState extends State<BitchatHome>
       // Start periodic friend announce timer
       _startFriendAnnounceTimer();
     } catch (e) {
-      _log.e('Initialization error: $e');
+      appStore.dispatch(SetErrorAction('Error: $e'));
     }
   }
 
@@ -596,20 +556,28 @@ class _BitchatHomeState extends State<BitchatHome>
     final peerState = appStore.state.peers.getPeerByPubkey(pubkey);
     if (peerState != null && peerState.isFriend) {
       if (block.libp2pAddress != null) {
-        // Friend has libp2p address - update Redux and establish connection
+        final previousAddress = peerState.libp2pAddress;
+        final addressChanged = previousAddress != block.libp2pAddress;
+
+        // Update Redux with the new address
         appStore.dispatch(AssociateLibp2pAddressAction(
           publicKey: pubkey,
           address: block.libp2pAddress!,
         ));
 
-        // Parse address and attempt connection
-        final libp2pParts = _parseLibp2pAddress(block.libp2pAddress!);
-        if (libp2pParts != null && _bitchat != null) {
-          final (hostId, baseAddr) = libp2pParts;
-          await _bitchat!.connectToLibp2pHost(
-            hostId: hostId,
-            hostAddrs: [baseAddr],
-          );
+        // Only (re)connect if the address changed or there's no existing connection
+        if (addressChanged) {
+          if (addressChanged && previousAddress != null && previousAddress.isNotEmpty) {
+            _log.i('Friend $senderHex libp2p address changed: $previousAddress → ${block.libp2pAddress}');
+          }
+          final libp2pParts = _parseLibp2pAddress(block.libp2pAddress!);
+          if (libp2pParts != null && _bitchat != null) {
+            final (hostId, baseAddr) = libp2pParts;
+            await _bitchat!.connectToLibp2pHost(
+              hostId: hostId,
+              hostAddrs: [baseAddr],
+            );
+          }
         }
       } else {
         // Friend no longer has libp2p address (disabled libp2p)
@@ -1997,6 +1965,8 @@ class _BitchatHomeState extends State<BitchatHome>
       MaterialPageRoute(
         builder: (context) => SettingsScreen(
           store: appStore,
+          bleAvailable: _bleAvailable,
+          libp2pAvailable: _libp2pAvailable,
           onSettingsChanged: () {
             setState(() {});
           },

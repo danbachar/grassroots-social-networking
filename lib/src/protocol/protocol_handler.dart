@@ -19,13 +19,11 @@ class ProtocolHandler {
 
   /// Create ANNOUNCE payload
   ///
-  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr?]
+  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrCount(1) + (addrLen(2) + addr) * addrCount]
   ///
-  /// The address field is only populated when sending to friends.
-  /// For non-friends or broadcast, addrLen is 0.
-  Uint8List createAnnouncePayload({String? address}) {
+  /// Addresses are ordered by priority (IPv6, relay, STUN).
+  Uint8List createAnnouncePayload({List<String> addresses = const []}) {
     final nicknameBytes = Uint8List.fromList(identity.nickname.codeUnits);
-    final addressBytes = address != null ? Uint8List.fromList(address.codeUnits) : Uint8List(0);
     final buffer = BytesBuilder();
 
     // Pubkey (32 bytes)
@@ -40,12 +38,14 @@ class ProtocolHandler {
     buffer.addByte(nicknameBytes.length);
     buffer.add(nicknameBytes);
 
-    // Address length (2 bytes) + address
-    final addrLenBytes = ByteData(2);
-    addrLenBytes.setUint16(0, addressBytes.length, Endian.big);
-    buffer.add(addrLenBytes.buffer.asUint8List());
-    if (addressBytes.isNotEmpty) {
-      buffer.add(addressBytes);
+    // Address count (1 byte) + repeated (addrLen(2) + addr)
+    buffer.addByte(addresses.length);
+    for (final addr in addresses) {
+      final addrBytes = Uint8List.fromList(addr.codeUnits);
+      final addrLenBytes = ByteData(2);
+      addrLenBytes.setUint16(0, addrBytes.length, Endian.big);
+      buffer.add(addrLenBytes.buffer.asUint8List());
+      buffer.add(addrBytes);
     }
 
     return buffer.toBytes();
@@ -84,8 +84,7 @@ class ProtocolHandler {
 
   /// Decode ANNOUNCE payload
   ///
-  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr?]
-  /// Returns: AnnounceData with public key, nickname, version, and optional address
+  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrCount(1) + (addrLen(2) + addr) * addrCount]
   AnnounceData decodeAnnounce(Uint8List data) {
     var offset = 0;
 
@@ -104,14 +103,19 @@ class ProtocolHandler {
     final nickname = String.fromCharCodes(data.sublist(offset, offset + nicknameLength));
     offset += nicknameLength;
 
-    // Address length (2 bytes) + address (optional - may not exist in old payloads)
-    String? address;
-    if (offset + 2 <= data.length) {
-      final addrLength = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
-          .getUint16(0, Endian.big);
-      offset += 2;
-      if (addrLength > 0 && offset + addrLength <= data.length) {
-        address = String.fromCharCodes(data.sublist(offset, offset + addrLength));
+    // Address count (1 byte) + repeated (addrLen(2) + addr)
+    final addresses = <String>[];
+    if (offset < data.length) {
+      final addrCount = data[offset];
+      offset += 1;
+      for (var i = 0; i < addrCount && offset + 2 <= data.length; i++) {
+        final addrLength = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+            .getUint16(0, Endian.big);
+        offset += 2;
+        if (addrLength > 0 && offset + addrLength <= data.length) {
+          addresses.add(String.fromCharCodes(data.sublist(offset, offset + addrLength)));
+          offset += addrLength;
+        }
       }
     }
 
@@ -119,7 +123,7 @@ class ProtocolHandler {
       publicKey: Uint8List.fromList(pubkey),
       nickname: nickname,
       protocolVersion: version,
-      libp2pAddress: address,
+      libp2pAddresses: addresses,
     );
   }
 
@@ -182,15 +186,15 @@ class AnnounceData {
   final Uint8List publicKey;
   final String nickname;
   final int protocolVersion;
-  final String? libp2pAddress;
+  final List<String> libp2pAddresses;
 
   const AnnounceData({
     required this.publicKey,
     required this.nickname,
     required this.protocolVersion,
-    this.libp2pAddress,
+    this.libp2pAddresses = const [],
   });
 
   @override
-  String toString() => 'AnnounceData($nickname, v$protocolVersion${libp2pAddress != null ? ", addr: $libp2pAddress" : ""})';
+  String toString() => 'AnnounceData($nickname, v$protocolVersion${libp2pAddresses.isNotEmpty ? ", addrs: $libp2pAddresses" : ""})';
 }

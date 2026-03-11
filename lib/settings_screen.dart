@@ -2,11 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:redux/redux.dart';
 import 'src/store/app_state.dart';
 import 'src/store/settings_actions.dart';
-import 'src/transport/transport_service.dart';
 
 /// Settings screen for configuring transport protocols
 class SettingsScreen extends StatefulWidget {
   final Store<AppState> store;
+
+  /// Whether BLE is available on this device
+  final bool bleAvailable;
+
+  /// Whether libp2p is available
+  final bool libp2pAvailable;
 
   /// Callback when settings are changed
   final VoidCallback? onSettingsChanged;
@@ -14,6 +19,8 @@ class SettingsScreen extends StatefulWidget {
   const SettingsScreen({
     super.key,
     required this.store,
+    this.bleAvailable = true,
+    this.libp2pAvailable = true,
     this.onSettingsChanged,
   });
 
@@ -80,7 +87,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: 'Bluetooth',
             subtitle: 'Connect to nearby peers via BLE',
             value: _bluetoothEnabled,
-            available: widget.store.state.transports.bleState != TransportState.error,
+            available: widget.bleAvailable,
             onChanged: _onBluetoothChanged,
             priority: 1,
           ),
@@ -92,7 +99,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: 'Internet (libp2p)',
             subtitle: 'Connect to peers over the Internet',
             value: _libp2pEnabled,
-            available: widget.store.state.transports.libp2pState != TransportState.error,
+            available: widget.libp2pAvailable,
             onChanged: _onLibp2pChanged,
             priority: 2,
           ),

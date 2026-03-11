@@ -27,7 +27,7 @@ void main() {
         final payload = handler.createAnnouncePayload();
 
         // Verify payload structure
-        expect(payload.length, greaterThanOrEqualTo(32 + 2 + 1 + 'TestUser'.length + 2));
+        expect(payload.length, greaterThanOrEqualTo(32 + 2 + 1 + 'TestUser'.length + 1));
 
         // Public key (first 32 bytes)
         final pubkeyFromPayload = payload.sublist(0, 32);
@@ -48,24 +48,24 @@ void main() {
       test('creates payload without address when not provided', () {
         final payload = handler.createAnnouncePayload();
 
-        // Address length should be 0 (2 bytes at the end)
+        // Address count should be 0 (1 byte at the end)
         final offset = 32 + 2 + 1 + 'TestUser'.length;
-        final addrLenData = ByteData.view(payload.buffer, payload.offsetInBytes + offset, 2);
-        final addrLen = addrLenData.getUint16(0, Endian.big);
-        expect(addrLen, equals(0));
+        expect(payload[offset], equals(0));
       });
 
-      test('includes libp2p address when provided', () {
+      test('includes libp2p addresses when provided', () {
         final testAddress = '/ip4/127.0.0.1/tcp/4001/p2p/QmTest';
-        final payload = handler.createAnnouncePayload(address: testAddress);
+        final payload = handler.createAnnouncePayload(addresses: [testAddress]);
 
-        // Find address in payload
+        // Find address count and first address in payload
         final offset = 32 + 2 + 1 + 'TestUser'.length;
-        final addrLenData = ByteData.view(payload.buffer, payload.offsetInBytes + offset, 2);
+        expect(payload[offset], equals(1)); // addrCount = 1
+
+        final addrLenData = ByteData.view(payload.buffer, payload.offsetInBytes + offset + 1, 2);
         final addrLen = addrLenData.getUint16(0, Endian.big);
         expect(addrLen, equals(testAddress.length));
 
-        final address = String.fromCharCodes(payload.sublist(offset + 2, offset + 2 + addrLen));
+        final address = String.fromCharCodes(payload.sublist(offset + 3, offset + 3 + addrLen));
         expect(address, equals(testAddress));
       });
 
@@ -81,7 +81,7 @@ void main() {
         final payload = emptyHandler.createAnnouncePayload();
 
         // Should have valid structure with 0-length nickname
-        expect(payload.length, equals(32 + 2 + 1 + 2)); // pubkey + version + nickLen(0) + addrLen(0)
+        expect(payload.length, equals(32 + 2 + 1 + 1)); // pubkey + version + nickLen(0) + addrCount(0)
         expect(payload[34], equals(0)); // nickname length = 0
       });
     });
@@ -94,22 +94,34 @@ void main() {
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
         expect(decoded.protocolVersion, equals(1));
-        expect(decoded.libp2pAddress, isNull);
+        expect(decoded.libp2pAddresses, isEmpty);
       });
 
-      test('decodes announce with libp2p address', () {
+      test('decodes announce with libp2p addresses', () {
         final testAddress = '/ip4/192.168.1.100/tcp/5000/p2p/QmExample';
-        final payload = handler.createAnnouncePayload(address: testAddress);
+        final payload = handler.createAnnouncePayload(addresses: [testAddress]);
         final decoded = handler.decodeAnnounce(payload);
 
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
         expect(decoded.protocolVersion, equals(1));
-        expect(decoded.libp2pAddress, equals(testAddress));
+        expect(decoded.libp2pAddresses, equals([testAddress]));
       });
 
-      test('handles announce without address field (legacy)', () {
-        // Create minimal payload (pubkey + version + nickname, no address)
+      test('decodes announce with multiple addresses', () {
+        final addresses = [
+          '/ip6/::1/udp/1234/udx/p2p/QmIPv6',
+          '/ip4/1.2.3.4/p2p/QmRelay/p2p-circuit/p2p/QmMe',
+          '/ip4/5.6.7.8/udp/5678/udx/p2p/QmSTUN',
+        ];
+        final payload = handler.createAnnouncePayload(addresses: addresses);
+        final decoded = handler.decodeAnnounce(payload);
+
+        expect(decoded.libp2pAddresses, equals(addresses));
+      });
+
+      test('handles announce without address field', () {
+        // Create minimal payload (pubkey + version + nickname, no address count byte)
         final nicknameBytes = utf8.encode('OldPeer');
         final buffer = ByteData(32 + 2 + 1 + nicknameBytes.length);
         var offset = 0;
@@ -130,11 +142,11 @@ void main() {
         final decoded = handler.decodeAnnounce(payload);
 
         expect(decoded.nickname, equals('OldPeer'));
-        expect(decoded.libp2pAddress, isNull); // No address field
+        expect(decoded.libp2pAddresses, isEmpty);
       });
 
       test('handles empty nickname in payload', () {
-        final buffer = ByteData(32 + 2 + 1 + 2);
+        final buffer = ByteData(32 + 2 + 1 + 1);
         var offset = 0;
 
         // Public key
@@ -148,14 +160,14 @@ void main() {
         // Nickname length = 0
         buffer.setUint8(offset++, 0);
 
-        // Address length = 0
-        buffer.setUint16(offset, 0, Endian.big);
+        // Address count = 0
+        buffer.setUint8(offset, 0);
 
         final payload = buffer.buffer.asUint8List();
         final decoded = handler.decodeAnnounce(payload);
 
         expect(decoded.nickname, equals(''));
-        expect(decoded.libp2pAddress, isNull);
+        expect(decoded.libp2pAddresses, isEmpty);
       });
     });
 
@@ -392,7 +404,7 @@ void main() {
     group('round-trip encoding/decoding', () {
       test('announce payload round-trip', () {
         final originalPayload = handler.createAnnouncePayload(
-          address: '/ip4/10.0.0.1/tcp/8000/p2p/QmRoundTrip',
+          addresses: ['/ip4/10.0.0.1/tcp/8000/p2p/QmRoundTrip'],
         );
         final decoded = handler.decodeAnnounce(originalPayload);
 
@@ -404,7 +416,7 @@ void main() {
         });
         final reEncodedHandler = ProtocolHandler(identity: reEncodedIdentity);
         final reEncodedPayload = reEncodedHandler.createAnnouncePayload(
-          address: decoded.libp2pAddress,
+          addresses: decoded.libp2pAddresses,
         );
 
         expect(reEncodedPayload, equals(originalPayload));

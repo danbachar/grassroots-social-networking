@@ -16,7 +16,4 @@ export 'friendships_reducer.dart';
 export 'settings_state.dart';
 export 'settings_actions.dart';
 export 'settings_reducer.dart';
-export 'transports_state.dart';
-export 'transports_actions.dart';
-export 'transports_reducer.dart';
 export 'persistence_service.dart';

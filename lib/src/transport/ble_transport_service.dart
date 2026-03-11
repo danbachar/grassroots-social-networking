@@ -71,14 +71,14 @@ class BleTransportService extends TransportService {
 
   /// Called when a BLE packet is deserialized and ready for routing.
   /// The coordinator wires this to MessageRouter.processPacket().
-  void Function(BitchatPacket packet, {String? bleDeviceId, int rssi})?
+  void Function(BitchatPacket packet, {String? bleDeviceId, int rssi, BleRole? bleRole})?
       onBlePacketReceived;
 
   /// Called when a peer disconnects at the BLE level.
   void Function(Peer peer)? onPeerDisconnected;
-  
+
   // ===== Convenience getters for Redux state =====
-  
+
   /// Get peers state from Redux store
   PeersState get _peersState => store.state.peers;
 
@@ -131,7 +131,7 @@ class BleTransportService extends TransportService {
 
   /// Get peer by public key
   PeerState? getPeer(Uint8List pubkey) => _peersState.getPeerByPubkey(pubkey);
-  
+
   /// Get all discovered BLE peers (before ANNOUNCE)
   List<DiscoveredPeerState> get discoveredPeers => _peersState.discoveredBlePeersList;
 
@@ -218,7 +218,6 @@ class BleTransportService extends TransportService {
 
   /// Trigger a new scan for peers
   Future<void> scan({Duration? timeout}) async {
-    // _log.d('Starting BLE scan${timeout != null ? " for ${timeout.inSeconds}s" : ""}');
     await _central.startScan(timeout: timeout);
   }
 
@@ -242,21 +241,22 @@ class BleTransportService extends TransportService {
   void associatePeerWithPubkey(String peerId, Uint8List pubkey) {
     // Dispatch action to associate the device with pubkey in Redux store
     // Redux store is the single source of truth
-    store.dispatch(AssociateBleDeviceAction(publicKey: pubkey, deviceId: peerId));
+    // Note: role is determined by the caller (central or peripheral callback)
+    store.dispatch(AssociateBleDeviceAction(publicKey: pubkey, deviceId: peerId, role: BleRole.central));
   }
 
   @override
   String? getPeerIdForPubkey(Uint8List pubkey) {
-    // Look up in Redux store
+    // Look up in Redux store — prefer central ID (tried first by sendToPeer)
     final peer = store.state.peers.getPeerByPubkey(pubkey);
     return peer?.bleDeviceId;
   }
 
   @override
   Uint8List? getPubkeyForPeerId(String peerId) {
-    // Look up in Redux store - find peer with matching bleDeviceId
+    // Look up in Redux store - find peer with matching BLE device ID (either role)
     for (final peer in store.state.peers.peersList) {
-      if (peer.bleDeviceId == peerId) {
+      if (peer.bleCentralDeviceId == peerId || peer.blePeripheralDeviceId == peerId) {
         return peer.publicKey;
       }
     }
@@ -281,7 +281,7 @@ class BleTransportService extends TransportService {
   ///
   /// Deserializes and forwards to the MessageRouter via [onBlePacketReceived].
   /// The router handles dedup, ANNOUNCE processing, message targeting, etc.
-  void onPacketReceived(Uint8List data, {String? fromDeviceId, required int rssi}) {
+  void onPacketReceived(Uint8List data, {String? fromDeviceId, required int rssi, BleRole? bleRole}) {
     // Block processing if BLE has been stopped
     if (_stopped) {
       _log.d('Ignoring packet received after BLE stopped');
@@ -290,7 +290,7 @@ class BleTransportService extends TransportService {
 
     try {
       final packet = BitchatPacket.deserialize(data);
-      onBlePacketReceived?.call(packet, bleDeviceId: fromDeviceId, rssi: rssi);
+      onBlePacketReceived?.call(packet, bleDeviceId: fromDeviceId, rssi: rssi, bleRole: bleRole);
     } catch (e) {
       _log.e('Failed to deserialize packet: $e');
     }
@@ -302,11 +302,11 @@ class BleTransportService extends TransportService {
     _log.d('BLE peer connected: $bleDeviceId');
   }
 
-  void onPeerBleDisconnected(Uint8List pubkey) {
+  void onPeerBleDisconnected(Uint8List pubkey, {BleRole? role}) {
     final peer = _peersState.getPeerByPubkey(pubkey);
     if (peer != null) {
-      store.dispatch(PeerBleDisconnectedAction(pubkey));
-      _log.i('Peer disconnected: ${peer.displayName}');
+      store.dispatch(PeerBleDisconnectedAction(pubkey, role: role));
+      _log.i('Peer disconnected (${role?.name ?? "all"}): ${peer.displayName}');
       onPeerDisconnected?.call(_peerStateToLegacyPeer(peer));
     }
   }
@@ -314,8 +314,8 @@ class BleTransportService extends TransportService {
   // ===== BLE Callbacks =====
 
   void _onCentralDataReceived(String deviceId, Uint8List data, int rssi) {
-    onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi);
-    
+    onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi, bleRole: BleRole.central);
+
     _dataController.add(TransportDataEvent(
       peerId: deviceId,
       transport: TransportType.ble,
@@ -324,8 +324,8 @@ class BleTransportService extends TransportService {
   }
 
   void _onPeripheralDataReceived(String deviceId, Uint8List data, int rssi) {
-    onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi);
-    
+    onPacketReceived(data, fromDeviceId: deviceId, rssi: rssi, bleRole: BleRole.peripheral);
+
     _dataController.add(TransportDataEvent(
       peerId: deviceId,
       transport: TransportType.ble,
@@ -346,9 +346,6 @@ class BleTransportService extends TransportService {
     final existing = _peersState.getDiscoveredBlePeer(device.deviceId);
     final isNew = existing == null;
 
-    _log.i('DeviceDiscovered: ${device.deviceId}, isNew: $isNew, isConnected: ${existing?.isConnected}, isConnecting: ${existing?.isConnecting}');
-    
-    // TODO: rename the action to new device discovered
     if (isNew) {
       store.dispatch(BleDeviceDiscoveredAction(
         deviceId: device.deviceId,
@@ -357,7 +354,7 @@ class BleTransportService extends TransportService {
         serviceUuid: device.serviceUuid,
       ));
     }
-    
+
     // Also update RSSI for connected Peers (those who have sent ANNOUNCE)
     final pubkey = getPubkeyForPeerId(device.deviceId);
     if (pubkey != null) {
@@ -365,59 +362,58 @@ class BleTransportService extends TransportService {
     }
 
     if (!isNew && (existing.isConnected || existing.isConnecting)) return;
-    
+
+    // Check if we're in backoff period
+    if (existing != null && existing.isInBackoff) {
+      return; // Skip connection attempt — still in backoff
+    }
+
     _autoConnectToPeer(device.deviceId);
   }
-  
+
   /// Automatically connect to a discovered peer and send ANNOUNCE
   Future<bool> _autoConnectToPeer(String deviceId) async {
-    // _log.i('Auto-connecting to peer: $deviceId');
-    
     // Skip if already connected
     if (_isConnected(deviceId)) {
-      // TODO: why is autoConnectToPeer being called so many times?
-      // _log.d('Already connected to $deviceId, skipping auto-connect');
       return false;
     }
-    
+
     // Skip if already connecting
     final discovered = _peersState.getDiscoveredBlePeer(deviceId);
     if (discovered?.isConnecting == true) {
-      // _log.d('Already connecting to $deviceId');
       return false;
     }
-    
+
     // Mark as connecting in store
     store.dispatch(BleDeviceConnectingAction(deviceId));
-    
+
     try {
       final success = await _central.connectToDevice(deviceId);
-      
+
       if (success) {
         _log.i('Successfully connected to $deviceId');
         store.dispatch(BleDeviceConnectedAction(deviceId));
         return true;
       } else {
-        // _log.w('Failed to connect to $deviceId');
         store.dispatch(BleDeviceConnectionFailedAction(deviceId, error: 'Connection failed'));
         return false;
       }
     } catch (e) {
-      // _log.e('Error auto-connecting to $deviceId: $e');
       store.dispatch(BleDeviceConnectionFailedAction(deviceId, error: e.toString()));
       return false;
     }
   }
 
   void _handleConnectionChange(String deviceId, bool connected, {required bool isCentral}) {
+    final role = isCentral ? BleRole.central : BleRole.peripheral;
+
     if (connected) {
       store.dispatch(BleDeviceConnectedAction(deviceId));
-      // _log.i('Peer connected: $deviceId (via ${isCentral ? "central" : "peripheral"})');
     } else {
       store.dispatch(BleDeviceDisconnectedAction(deviceId));
       final pubkey = getPubkeyForPeerId(deviceId);
       if (pubkey != null) {
-        onPeerBleDisconnected(pubkey);
+        onPeerBleDisconnected(pubkey, role: role);
       }
     }
 

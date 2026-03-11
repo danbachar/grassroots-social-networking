@@ -1,6 +1,11 @@
 import 'dart:typed_data';
 import '../models/peer.dart';
 
+/// Which BLE role our device played in the connection.
+/// - central: we scanned and connected to the remote peer
+/// - peripheral: the remote peer connected to us
+enum BleRole { central, peripheral }
+
 /// Base class for peer-related actions
 abstract class PeerAction {}
 
@@ -12,7 +17,7 @@ class BleDeviceDiscoveredAction extends PeerAction {
   final String? displayName;
   final int rssi;
   final String? serviceUuid;
-  
+
   BleDeviceDiscoveredAction({
     required this.deviceId,
     this.displayName,
@@ -25,7 +30,7 @@ class BleDeviceDiscoveredAction extends PeerAction {
 class BleDeviceRssiUpdatedAction extends PeerAction {
   final String deviceId;
   final int rssi;
-  
+
   BleDeviceRssiUpdatedAction({
     required this.deviceId,
     required this.rssi,
@@ -35,14 +40,14 @@ class BleDeviceRssiUpdatedAction extends PeerAction {
 /// Mark a discovered BLE device as connecting
 class BleDeviceConnectingAction extends PeerAction {
   final String deviceId;
-  
+
   BleDeviceConnectingAction(this.deviceId);
 }
 
 /// Mark a discovered BLE device as connected (transport level)
 class BleDeviceConnectedAction extends PeerAction {
   final String deviceId;
-  
+
   BleDeviceConnectedAction(this.deviceId);
 }
 
@@ -50,28 +55,28 @@ class BleDeviceConnectedAction extends PeerAction {
 class BleDeviceConnectionFailedAction extends PeerAction {
   final String deviceId;
   final String? error;
-  
+
   BleDeviceConnectionFailedAction(this.deviceId, {this.error});
 }
 
 /// Mark a discovered BLE device as disconnected
 class BleDeviceDisconnectedAction extends PeerAction {
   final String deviceId;
-  
+
   BleDeviceDisconnectedAction(this.deviceId);
 }
 
 /// Remove a discovered BLE device
 class BleDeviceRemovedAction extends PeerAction {
   final String deviceId;
-  
+
   BleDeviceRemovedAction(this.deviceId);
 }
 
 /// Remove stale discovered BLE devices
 class StaleDiscoveredBlePeersRemovedAction extends PeerAction {
   final Duration staleThreshold;
-  
+
   StaleDiscoveredBlePeersRemovedAction(this.staleThreshold);
 }
 
@@ -84,7 +89,7 @@ class ClearDiscoveredBlePeersAction extends PeerAction {}
 class Libp2pPeerDiscoveredAction extends PeerAction {
   final String peerId;
   final String? displayName;
-  
+
   Libp2pPeerDiscoveredAction({
     required this.peerId,
     this.displayName,
@@ -96,23 +101,33 @@ class ClearDiscoveredLibp2pPeersAction extends PeerAction {}
 
 // ===== Peer Identity Actions (after ANNOUNCE) =====
 
-/// An ANNOUNCE packet was received - add or update peer identity
+/// An ANNOUNCE packet was received - add or update peer identity.
+///
+/// Only one of [bleCentralDeviceId] or [blePeripheralDeviceId] should be set
+/// per action, based on which BLE role our device played.
 class PeerAnnounceReceivedAction extends PeerAction {
   final Uint8List publicKey;
   final String nickname;
   final int protocolVersion;
   final int rssi;
   final PeerTransport transport;
-  final String? bleDeviceId;
+
+  /// BLE device ID from our central role (we connected to them)
+  final String? bleCentralDeviceId;
+
+  /// BLE device ID from our peripheral role (they connected to us)
+  final String? blePeripheralDeviceId;
+
   final String? libp2pAddress;
-  
+
   PeerAnnounceReceivedAction({
     required this.publicKey,
     required this.nickname,
     required this.protocolVersion,
     required this.rssi,
     this.transport = PeerTransport.bleDirect,
-    this.bleDeviceId,
+    this.bleCentralDeviceId,
+    this.blePeripheralDeviceId,
     this.libp2pAddress,
   });
 }
@@ -121,45 +136,48 @@ class PeerAnnounceReceivedAction extends PeerAction {
 class PeerRssiUpdatedAction extends PeerAction {
   final Uint8List publicKey;
   final int rssi;
-  
+
   PeerRssiUpdatedAction({
     required this.publicKey,
     required this.rssi,
   });
 }
 
-/// Mark peer as disconnected from BLE
+/// Mark peer as disconnected from BLE.
+/// If [role] is provided, only clears the device ID for that role.
+/// If [role] is null, clears both BLE device IDs.
 class PeerBleDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
-  
-  PeerBleDisconnectedAction(this.publicKey);
+  final BleRole? role;
+
+  PeerBleDisconnectedAction(this.publicKey, {this.role});
 }
 
 /// Mark peer as disconnected from libp2p
 class PeerLibp2pDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
-  
+
   PeerLibp2pDisconnectedAction(this.publicKey);
 }
 
 /// Mark peer as fully disconnected
 class PeerDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
-  
+
   PeerDisconnectedAction(this.publicKey);
 }
 
 /// Remove peer completely
 class PeerRemovedAction extends PeerAction {
   final Uint8List publicKey;
-  
+
   PeerRemovedAction(this.publicKey);
 }
 
 /// Remove stale peers that haven't been seen
 class StalePeersRemovedAction extends PeerAction {
   final Duration staleThreshold;
-  
+
   StalePeersRemovedAction(this.staleThreshold);
 }
 
@@ -168,14 +186,16 @@ class ClearAllPeersAction extends PeerAction {}
 
 // ===== Association Actions =====
 
-/// Associate a BLE device ID with a pubkey
+/// Associate a BLE device ID with a pubkey for a specific role
 class AssociateBleDeviceAction extends PeerAction {
   final Uint8List publicKey;
   final String deviceId;
-  
+  final BleRole role;
+
   AssociateBleDeviceAction({
     required this.publicKey,
     required this.deviceId,
+    required this.role,
   });
 }
 

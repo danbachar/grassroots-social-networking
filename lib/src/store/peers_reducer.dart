@@ -1,16 +1,23 @@
+import 'dart:math' as math;
 import '../models/peer.dart';
 import 'peers_state.dart';
 import 'peers_actions.dart';
 
+/// Initial backoff delay in seconds after first failure
+const _initialBackoffSeconds = 5;
+
+/// Maximum backoff delay in seconds (cap)
+const _maxBackoffSeconds = 120;
+
 /// Reducer for peers-related state
 PeersState peersReducer(PeersState state, dynamic action) {
   // ===== BLE Discovery Actions =====
-  
+
   if (action is BleDeviceDiscoveredAction) {
     // TODO: why is nickname here? it comes in the announce
     final existing = state.discoveredBlePeers[action.deviceId];
     final now = DateTime.now();
-    
+
     if (existing == null) {
       // New discovery
       final newPeer = DiscoveredPeerState(
@@ -31,8 +38,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = existing.copyWith(
         rssi: action.rssi,
         lastSeen: now,
-        displayName: (action.displayName?.isNotEmpty ?? false) 
-            ? action.displayName 
+        displayName: (action.displayName?.isNotEmpty ?? false)
+            ? action.displayName
             : existing.displayName,
         serviceUuid: action.serviceUuid ?? existing.serviceUuid,
       );
@@ -42,7 +49,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
       );
     }
   }
-  
+
   if (action is BleDeviceRssiUpdatedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
@@ -57,7 +64,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is BleDeviceConnectingAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
@@ -71,14 +78,24 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is BleDeviceConnectedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
-      final updated = existing.copyWith(
+      // Reset backoff on successful connection
+      final updated = DiscoveredPeerState(
+        transportId: existing.transportId,
+        displayName: existing.displayName,
+        rssi: existing.rssi,
+        discoveredAt: existing.discoveredAt,
+        lastSeen: existing.lastSeen,
         isConnecting: false,
         isConnected: true,
         lastError: null,
+        publicKey: existing.publicKey,
+        serviceUuid: existing.serviceUuid,
+        consecutiveFailures: 0,
+        nextRetryAfter: null,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -87,14 +104,30 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is BleDeviceConnectionFailedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
-      final updated = existing.copyWith(
+      // Calculate exponential backoff: min(initialDelay * 2^(failures), maxDelay)
+      final newFailures = existing.consecutiveFailures + 1;
+      final backoffSeconds = math.min(
+        _initialBackoffSeconds * (1 << (newFailures - 1)),
+        _maxBackoffSeconds,
+      );
+
+      final updated = DiscoveredPeerState(
+        transportId: existing.transportId,
+        displayName: existing.displayName,
+        rssi: existing.rssi,
+        discoveredAt: existing.discoveredAt,
+        lastSeen: existing.lastSeen,
         isConnecting: false,
         isConnected: false,
         lastError: action.error,
+        publicKey: existing.publicKey,
+        serviceUuid: existing.serviceUuid,
+        consecutiveFailures: newFailures,
+        nextRetryAfter: DateTime.now().add(Duration(seconds: backoffSeconds)),
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -103,10 +136,11 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is BleDeviceDisconnectedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
+      // Preserve backoff state on disconnect (don't reset)
       final updated = existing.copyWith(
         isConnecting: false,
         isConnected: false,
@@ -118,13 +152,13 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is BleDeviceRemovedAction) {
     final newMap = Map<String, DiscoveredPeerState>.from(state.discoveredBlePeers);
     newMap.remove(action.deviceId);
     return state.copyWith(discoveredBlePeers: newMap);
   }
-  
+
   if (action is StaleDiscoveredBlePeersRemovedAction) {
     final now = DateTime.now();
     final newMap = Map<String, DiscoveredPeerState>.from(state.discoveredBlePeers);
@@ -134,17 +168,17 @@ PeersState peersReducer(PeersState state, dynamic action) {
     });
     return state.copyWith(discoveredBlePeers: newMap);
   }
-  
+
   if (action is ClearDiscoveredBlePeersAction) {
     return state.copyWith(discoveredBlePeers: {});
   }
-  
+
   // ===== Libp2p Discovery Actions =====
-  
+
   if (action is Libp2pPeerDiscoveredAction) {
     final existing = state.discoveredLibp2pPeers[action.peerId];
     final now = DateTime.now();
-    
+
     if (existing == null) {
       final newPeer = DiscoveredPeerState(
         transportId: action.peerId,
@@ -165,22 +199,22 @@ PeersState peersReducer(PeersState state, dynamic action) {
       );
     }
   }
-  
+
   if (action is ClearDiscoveredLibp2pPeersAction) {
     return state.copyWith(discoveredLibp2pPeers: {});
   }
-  
+
   // ===== Peer Identity Actions =====
-  
+
   if (action is PeerAnnounceReceivedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
     final now = DateTime.now();
-    
+
     final isBle = action.transport == PeerTransport.bleDirect;
 
     if (existing == null) {
-      // New peer
+      // New peer — set only the field matching the role
       final newPeer = PeerState(
         publicKey: action.publicKey,
         nickname: action.nickname,
@@ -189,7 +223,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: action.rssi,
         protocolVersion: action.protocolVersion,
         lastSeen: now,
-        bleDeviceId: action.bleDeviceId,
+        bleCentralDeviceId: action.bleCentralDeviceId,
+        blePeripheralDeviceId: action.blePeripheralDeviceId,
         lastBleSeen: isBle ? now : null,
         libp2pAddress: action.libp2pAddress,
       );
@@ -198,8 +233,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       );
     } else {
       // Update existing peer.
-      // Use direct constructor (not copyWith) because bleDeviceId may
-      // legitimately become null when the peer is no longer nearby via BLE.
+      // Merge BLE IDs: only update the field that's provided in this action,
+      // preserve the other from existing state.
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: action.nickname,
@@ -208,7 +243,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: action.rssi,
         protocolVersion: action.protocolVersion,
         lastSeen: now,
-        bleDeviceId: action.bleDeviceId,
+        bleCentralDeviceId: action.bleCentralDeviceId ?? existing.bleCentralDeviceId,
+        blePeripheralDeviceId: action.blePeripheralDeviceId ?? existing.blePeripheralDeviceId,
         lastBleSeen: isBle ? now : existing.lastBleSeen,
         libp2pAddress: action.libp2pAddress ?? existing.libp2pAddress,
         isFriend: existing.isFriend,
@@ -220,7 +256,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
       );
     }
   }
-  
+
   if (action is PeerRssiUpdatedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -235,16 +271,25 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is PeerBleDisconnectedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
     if (existing != null) {
+      // Determine which BLE IDs to clear based on role
+      final clearCentral = action.role == null || action.role == BleRole.central;
+      final clearPeripheral = action.role == null || action.role == BleRole.peripheral;
+
+      final newCentralId = clearCentral ? null : existing.bleCentralDeviceId;
+      final newPeripheralId = clearPeripheral ? null : existing.blePeripheralDeviceId;
+      final hasAnyBle = newCentralId != null || newPeripheralId != null;
+
       // If no other transport, mark as disconnected
-      final newConnectionState = existing.libp2pAddress != null
+      final newConnectionState = (hasAnyBle || existing.libp2pAddress != null)
           ? existing.connectionState
           : PeerConnectionState.disconnected;
-      // Construct directly to clear bleDeviceId (copyWith with null keeps old value)
+
+      // Construct directly to allow clearing nullable fields
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
@@ -253,8 +298,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: existing.rssi,
         protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
-        bleDeviceId: null,  // Clear BLE device ID
-        lastBleSeen: null,
+        bleCentralDeviceId: newCentralId,
+        blePeripheralDeviceId: newPeripheralId,
+        lastBleSeen: hasAnyBle ? existing.lastBleSeen : null,
         libp2pAddress: existing.libp2pAddress,
         isFriend: existing.isFriend,
         libp2pHostId: existing.libp2pHostId,
@@ -266,13 +312,13 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is PeerLibp2pDisconnectedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
     if (existing != null) {
       // If no other transport, mark as disconnected
-      final newConnectionState = existing.bleDeviceId != null
+      final newConnectionState = existing.hasBleConnection
           ? existing.connectionState
           : PeerConnectionState.disconnected;
       // Construct directly to clear libp2pAddress (copyWith with null keeps old value)
@@ -284,7 +330,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: existing.rssi,
         protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
-        bleDeviceId: existing.bleDeviceId,
+        bleCentralDeviceId: existing.bleCentralDeviceId,
+        blePeripheralDeviceId: existing.blePeripheralDeviceId,
         lastBleSeen: existing.lastBleSeen,
         libp2pAddress: null,  // Clear libp2p address
         isFriend: existing.isFriend,
@@ -297,7 +344,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is PeerDisconnectedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -311,14 +358,14 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state;
   }
-  
+
   if (action is PeerRemovedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final newMap = Map<String, PeerState>.from(state.peers);
     newMap.remove(pubkeyHex);
     return state.copyWith(peers: newMap);
   }
-  
+
   // TODO: Add stale detection for libp2p-only peers (peers connected solely via
   // libp2p that go silent should eventually be marked disconnected).
   if (action is StalePeersRemovedAction) {
@@ -326,12 +373,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final newMap = Map<String, PeerState>.from(state.peers);
     final staleKeys = <String>[];
     newMap.forEach((key, peer) {
-      // Clear stale bleDeviceId if no BLE ANNOUNCE received within threshold.
-      // Without this, a peer that keeps sending libp2p ANNOUNCEs retains a
-      // stale bleDeviceId forever via the ?? operator in
-      // PeerAnnounceReceivedAction, making them appear in "Nearby" instead of
-      // "Friends Online".
-      if (peer.bleDeviceId != null && peer.lastBleSeen != null) {
+      // Clear stale BLE IDs if no BLE ANNOUNCE received within threshold.
+      if (peer.hasBleConnection && peer.lastBleSeen != null) {
         final timeSinceBleSeen = now.difference(peer.lastBleSeen!);
         if (timeSinceBleSeen > action.staleThreshold) {
           newMap[key] = PeerState(
@@ -342,7 +385,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
             rssi: peer.rssi,
             protocolVersion: peer.protocolVersion,
             lastSeen: peer.lastSeen,
-            bleDeviceId: null,
+            bleCentralDeviceId: null,
+            blePeripheralDeviceId: null,
             lastBleSeen: null,
             libp2pAddress: peer.libp2pAddress,
             isFriend: peer.isFriend,
@@ -360,7 +404,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         if (peer.isFriend) {
           // Friends are marked as disconnected when stale (no ANNOUNCE received).
           // Keep libp2pHostId/libp2pHostAddrs for reconnection when they come back.
-          // Clear bleDeviceId (out of BLE range) and libp2pAddress (active connection).
+          // Clear BLE IDs (out of BLE range) and libp2pAddress (active connection).
           newMap[key] = PeerState(
             publicKey: peer.publicKey,
             nickname: peer.nickname,
@@ -369,7 +413,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
             rssi: -100,
             protocolVersion: peer.protocolVersion,
             lastSeen: peer.lastSeen,
-            bleDeviceId: null,
+            bleCentralDeviceId: null,
+            blePeripheralDeviceId: null,
             lastBleSeen: null,
             libp2pAddress: null,  // Clear active connection address
             isFriend: true,
@@ -386,25 +431,27 @@ PeersState peersReducer(PeersState state, dynamic action) {
     }
     return state.copyWith(peers: newMap);
   }
-  
+
   if (action is ClearAllPeersAction) {
     return state.copyWith(peers: {});
   }
-  
+
   // ===== Association Actions =====
-  
+
   if (action is AssociateBleDeviceAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
     if (existing != null) {
-      final updated = existing.copyWith(bleDeviceId: action.deviceId);
+      final updated = action.role == BleRole.central
+          ? existing.copyWith(bleCentralDeviceId: action.deviceId)
+          : existing.copyWith(blePeripheralDeviceId: action.deviceId);
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
       );
     }
     return state;
   }
-  
+
   if (action is AssociateLibp2pAddressAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -468,7 +515,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
     if (existing != null) {
       // If peer has no BLE connection, remove them entirely
       // (they were only reachable via libp2p friendship)
-      if (existing.bleDeviceId == null) {
+      if (!existing.hasBleConnection) {
         final newMap = Map<String, PeerState>.from(state.peers);
         newMap.remove(pubkeyHex);
         return state.copyWith(peers: newMap);
@@ -483,7 +530,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: existing.rssi,
         protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
-        bleDeviceId: existing.bleDeviceId,
+        bleCentralDeviceId: existing.bleCentralDeviceId,
+        blePeripheralDeviceId: existing.blePeripheralDeviceId,
         lastBleSeen: existing.lastBleSeen,
         // Clear all libp2p/friend fields
         isFriend: false,

@@ -70,6 +70,7 @@ class MessageRouter {
     BitchatPacket packet, {
     required PeerTransport transport,
     String? bleDeviceId,
+    BleRole? bleRole,
     String? libp2pPeerId,
     int rssi = -100,
   }) async {
@@ -86,6 +87,7 @@ class MessageRouter {
         packet,
         transport: transport,
         bleDeviceId: bleDeviceId,
+        bleRole: bleRole,
         libp2pPeerId: libp2pPeerId,
         rssi: rssi,
       );
@@ -123,6 +125,7 @@ class MessageRouter {
     BitchatPacket packet, {
     required PeerTransport transport,
     String? bleDeviceId,
+    BleRole? bleRole,
     String? libp2pPeerId,
     int rssi = -100,
   }) {
@@ -136,6 +139,7 @@ class MessageRouter {
     // bleDeviceId by matching their service UUID (derived from pubkey).
     // If the peer is NOT nearby, bleDeviceId stays null — correct behavior.
     String? resolvedBleDeviceId = bleDeviceId;
+    BleRole? resolvedBleRole = bleRole;
     DiscoveredPeerState? discoveredPeer;
     if (bleDeviceId != null) {
       discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
@@ -144,9 +148,15 @@ class MessageRouter {
       final theirServiceUuid = BitchatIdentity.deriveServiceUuid(pubkey);
       discoveredPeer =
           _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
-      if (discoveredPeer != null) {
-        // Found the peer in BLE scan results — use their BLE device ID
+      if (discoveredPeer != null && bleDeviceId == null) {
+        // Only use scan-discovered device ID when no transport-provided ID exists.
+        // This handles non-BLE transports (e.g., libp2p) where the peer is also
+        // nearby via BLE. When bleDeviceId IS provided (BLE transport), we keep it
+        // because Android MAC randomization means the scan-discovered MAC may differ
+        // from the actual connected MAC.
         resolvedBleDeviceId = discoveredPeer.transportId;
+        // If we found via scan, that means our central discovered them
+        resolvedBleRole ??= BleRole.central;
       }
     }
     if (discoveredPeer != null) {
@@ -161,19 +171,34 @@ class MessageRouter {
       libp2pAddress = libp2pPeerId;
     }
 
+    // Set the correct BLE device ID field based on role
+    String? centralId;
+    String? peripheralId;
+    if (resolvedBleDeviceId != null && resolvedBleRole != null) {
+      if (resolvedBleRole == BleRole.central) {
+        centralId = resolvedBleDeviceId;
+      } else {
+        peripheralId = resolvedBleDeviceId;
+      }
+    }
+
     store.dispatch(PeerAnnounceReceivedAction(
       publicKey: pubkey,
       nickname: data.nickname,
       protocolVersion: data.protocolVersion,
       rssi: effectiveRssi,
       transport: transport,
-      bleDeviceId: resolvedBleDeviceId,
+      bleCentralDeviceId: centralId,
+      blePeripheralDeviceId: peripheralId,
       libp2pAddress: libp2pAddress,
     ));
 
-    if (resolvedBleDeviceId != null) {
-      store.dispatch(
-          AssociateBleDeviceAction(publicKey: pubkey, deviceId: resolvedBleDeviceId));
+    if (resolvedBleDeviceId != null && resolvedBleRole != null) {
+      store.dispatch(AssociateBleDeviceAction(
+        publicKey: pubkey,
+        deviceId: resolvedBleDeviceId,
+        role: resolvedBleRole,
+      ));
     }
 
     _log.i(

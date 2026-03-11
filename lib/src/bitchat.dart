@@ -479,7 +479,7 @@ class Bitchat {
 
       // Disconnect all peers that were connected via BLE
       for (final peer in _peersState.peersList) {
-        if (peer.bleDeviceId != null) {
+        if (peer.hasBleConnection) {
           store.dispatch(PeerBleDisconnectedAction(peer.publicKey));
         }
       }
@@ -554,7 +554,7 @@ class Bitchat {
     // Determine which transport will be used
     MessageTransport? transport;
     if (_isBleEnabledInSettings && _bleAvailable && _bleService != null &&
-        peer != null && peer.isReachable && peer.bleDeviceId != null) {
+        peer != null && peer.isReachable && peer.hasBleConnection) {
       transport = MessageTransport.ble;
     } else {
       final peerHostId = peer?.libp2pHostId;
@@ -594,7 +594,11 @@ class Bitchat {
 
     // Try BLE first if that's the selected transport
     if (transport == MessageTransport.ble) {
-      final bleDeviceId = resolvedPeer.bleDeviceId!;
+      final bleDeviceId = resolvedPeer.bleDeviceId;
+      if (bleDeviceId == null) {
+        _log.w('BLE device ID unexpectedly null for ${resolvedPeer.displayName}');
+        return null;
+      }
       _log.d('Sending via BLE to ${resolvedPeer.displayName}');
 
       bool success;
@@ -824,11 +828,12 @@ class Bitchat {
     if (_bleService == null) return;
 
     // Forward BLE packets to the MessageRouter for processing
-    _bleService!.onBlePacketReceived = (packet, {String? bleDeviceId, int rssi = -100}) {
+    _bleService!.onBlePacketReceived = (packet, {String? bleDeviceId, int rssi = -100, BleRole? bleRole}) {
       _messageRouter.processPacket(
         packet,
         transport: PeerTransport.bleDirect,
         bleDeviceId: bleDeviceId,
+        bleRole: bleRole,
         rssi: rssi,
       );
     };

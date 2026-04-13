@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:bitchat_transport/bitchat_transport.dart';
 import 'package:bitchat_transport/src/mesh/bloom_filter.dart';
+import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
 import 'package:cryptography/cryptography.dart';
 
 void main() {
@@ -149,6 +150,66 @@ void main() {
 
       // False positive rate should be low (< 5%)
       expect(falsePositives, lessThan(50));
+    });
+  });
+
+  group('FragmentHandler', () {
+    late FragmentHandler handler;
+    late Uint8List testPubkey;
+
+    setUp(() {
+      handler = FragmentHandler();
+      testPubkey = Uint8List.fromList(List.generate(32, (i) => i));
+    });
+
+    tearDown(() {
+      handler.dispose();
+    });
+
+    test('does not fragment small payloads', () {
+      final smallPayload = Uint8List(100);
+      expect(handler.needsFragmentation(smallPayload), isFalse);
+    });
+
+    test('fragments large payloads', () {
+      final largePayload = Uint8List(1000);
+      expect(handler.needsFragmentation(largePayload), isTrue);
+    });
+
+    test('fragments and reassembles correctly', () {
+      final payload = Uint8List.fromList(List.generate(1500, (i) => i % 256));
+
+      final fragmented = handler.fragment(
+        payload: payload,
+        senderPubkey: testPubkey,
+      );
+
+      expect(fragmented.fragments.length, greaterThan(1));
+      expect(fragmented.fragments.first.type, equals(PacketType.fragmentStart));
+      expect(fragmented.fragments.last.type, equals(PacketType.fragmentEnd));
+
+      // Process all fragments
+      Uint8List? result;
+      for (final fragment in fragmented.fragments) {
+        result = handler.processFragment(fragment);
+      }
+
+      // Last fragment should trigger reassembly
+      expect(result, isNotNull);
+      expect(result, equals(payload));
+    });
+
+    test('returns null for incomplete fragments', () {
+      final payload = Uint8List.fromList(List.generate(1500, (i) => i % 256));
+
+      final fragmented = handler.fragment(
+        payload: payload,
+        senderPubkey: testPubkey,
+      );
+
+      // Process only first fragment
+      final result = handler.processFragment(fragmented.fragments.first);
+      expect(result, isNull);
     });
   });
 

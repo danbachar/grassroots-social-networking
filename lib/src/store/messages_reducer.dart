@@ -141,7 +141,7 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
       timestamp: action.timestamp,
       isOutgoing: action.isOutgoing,
       messageType: ChatMessageType.values[action.messageType],
-      libp2pAddress: action.libp2pAddress,
+      udpAddress: action.udpAddress,
       messageId: action.messageId,
     );
 

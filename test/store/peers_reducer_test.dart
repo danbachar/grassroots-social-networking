@@ -41,7 +41,6 @@ void main() {
       expect(peer.serviceUuid, 'uuid-abc');
       expect(peer.isConnecting, false);
       expect(peer.isConnected, false);
-      expect(peer.connectionAttempts, 0);
       expect(peer.consecutiveFailures, 0);
       expect(peer.nextRetryAfter, isNull);
     });
@@ -145,7 +144,7 @@ void main() {
   // =========================================================================
 
   group('BleDeviceConnectingAction', () {
-    test('sets isConnecting=true and increments connectionAttempts', () {
+    test('sets isConnecting=true', () {
       final now = DateTime.now();
       final initial = PeersState(
         discoveredBlePeers: {
@@ -154,7 +153,6 @@ void main() {
             rssi: -60,
             discoveredAt: now,
             lastSeen: now,
-            connectionAttempts: 2,
           ),
         },
       );
@@ -164,7 +162,6 @@ void main() {
 
       final peer = result.discoveredBlePeers['device-1']!;
       expect(peer.isConnecting, true);
-      expect(peer.connectionAttempts, 3);
     });
 
     test('is a no-op for unknown device', () {
@@ -550,9 +547,40 @@ void main() {
       final peer = result.peers[hex]!;
       expect(peer.bleCentralDeviceId, isNull);
       expect(peer.blePeripheralDeviceId, 'ble-peripheral-1');
-      expect(peer.bleDeviceId, 'ble-peripheral-1'); // convenience getter
-      expect(peer.connectionState, PeerConnectionState.connected);
-      expect(peer.lastBleSeen, isNotNull);
+      expect(peer.bleDeviceId, 'ble-peripheral-1'); // fallback to peripheral
+    });
+
+    test('preserves both BLE IDs on sequential ANNOUNCEs from different roles', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+
+      // First: central ANNOUNCE
+      var state = peersReducer(PeersState.initial, PeerAnnounceReceivedAction(
+        publicKey: pubkey,
+        nickname: 'Alice',
+        protocolVersion: 1,
+        rssi: -55,
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: 'central-id',
+      ));
+
+      expect(state.peers[hex]!.bleCentralDeviceId, 'central-id');
+      expect(state.peers[hex]!.blePeripheralDeviceId, isNull);
+
+      // Second: peripheral ANNOUNCE — should NOT overwrite central
+      state = peersReducer(state, PeerAnnounceReceivedAction(
+        publicKey: pubkey,
+        nickname: 'Alice',
+        protocolVersion: 1,
+        rssi: -50,
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral-id',
+      ));
+
+      final peer = state.peers[hex]!;
+      expect(peer.bleCentralDeviceId, 'central-id');
+      expect(peer.blePeripheralDeviceId, 'peripheral-id');
+      expect(peer.bleDeviceId, 'central-id'); // convenience getter prefers central
     });
 
     test('updates existing peer', () {
@@ -574,8 +602,8 @@ void main() {
         nickname: 'NewNick',
         protocolVersion: 3,
         rssi: -40,
-        transport: PeerTransport.libp2p,
-        libp2pAddresses: ['/ip4/1.2.3.4/tcp/4001/p2p/QmTest'],
+        transport: PeerTransport.udp,
+        udpAddress: '[2001:db8::1]:4001',
       );
 
       final result = peersReducer(initial, action);
@@ -584,8 +612,8 @@ void main() {
       expect(peer.nickname, 'NewNick');
       expect(peer.protocolVersion, 3);
       expect(peer.rssi, -40);
-      expect(peer.transport, PeerTransport.libp2p);
-      expect(peer.libp2pAddress, '/ip4/1.2.3.4/tcp/4001/p2p/QmTest');
+      expect(peer.transport, PeerTransport.udp);
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
       expect(peer.connectionState, PeerConnectionState.connected);
     });
 
@@ -602,6 +630,38 @@ void main() {
 
       final hex = _pubkeyHex(pubkey);
       expect(result.peers[hex]!.connectionState, PeerConnectionState.connected);
+    });
+
+    test('UDP ANNOUNCE does not clear existing BLE IDs', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            bleCentralDeviceId: 'central-id',
+            blePeripheralDeviceId: 'peripheral-id',
+          ),
+        },
+      );
+      final action = PeerAnnounceReceivedAction(
+        publicKey: pubkey,
+        nickname: 'Alice',
+        protocolVersion: 1,
+        rssi: -40,
+        transport: PeerTransport.udp,
+        udpAddress: '[2001:db8::1]:4001',
+        // No BLE device IDs — should preserve existing
+      );
+
+      final result = peersReducer(initial, action);
+
+      final peer = result.peers[hex]!;
+      expect(peer.bleCentralDeviceId, 'central-id');
+      expect(peer.blePeripheralDeviceId, 'peripheral-id');
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
   });
 
@@ -643,11 +703,11 @@ void main() {
   });
 
   // =========================================================================
-  // PeerBleDisconnectedAction
+  // PeerBleDisconnectedAction — role-specific clearing
   // =========================================================================
 
   group('PeerBleDisconnectedAction', () {
-    test('marks disconnected if no libp2p address', () {
+    test('clears both BLE IDs when no role specified', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -656,7 +716,8 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
-            bleCentralDeviceId: 'ble-1',
+            bleCentralDeviceId: 'central-1',
+            blePeripheralDeviceId: 'peripheral-1',
           ),
         },
       );
@@ -668,9 +729,10 @@ void main() {
       expect(peer.connectionState, PeerConnectionState.disconnected);
       expect(peer.bleCentralDeviceId, isNull);
       expect(peer.blePeripheralDeviceId, isNull);
+      expect(peer.bleDeviceId, isNull);
     });
 
-    test('keeps connected if has libp2p address', () {
+    test('clears only central ID when role=central', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -679,8 +741,79 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
-            bleCentralDeviceId: 'ble-1',
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+            bleCentralDeviceId: 'central-1',
+            blePeripheralDeviceId: 'peripheral-1',
+          ),
+        },
+      );
+      final action = PeerBleDisconnectedAction(pubkey, role: BleRole.central);
+
+      final result = peersReducer(initial, action);
+
+      final peer = result.peers[hex]!;
+      expect(peer.bleCentralDeviceId, isNull);
+      expect(peer.blePeripheralDeviceId, 'peripheral-1');
+      // Still has peripheral, so stays connected
+      expect(peer.connectionState, PeerConnectionState.connected);
+    });
+
+    test('clears only peripheral ID when role=peripheral', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            bleCentralDeviceId: 'central-1',
+            blePeripheralDeviceId: 'peripheral-1',
+          ),
+        },
+      );
+      final action = PeerBleDisconnectedAction(pubkey, role: BleRole.peripheral);
+
+      final result = peersReducer(initial, action);
+
+      final peer = result.peers[hex]!;
+      expect(peer.bleCentralDeviceId, 'central-1');
+      expect(peer.blePeripheralDeviceId, isNull);
+      expect(peer.connectionState, PeerConnectionState.connected);
+    });
+
+    test('marks disconnected if no BLE IDs remain and no UDP address', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            bleCentralDeviceId: 'central-1',
+          ),
+        },
+      );
+      final action = PeerBleDisconnectedAction(pubkey, role: BleRole.central);
+
+      final result = peersReducer(initial, action);
+
+      final peer = result.peers[hex]!;
+      expect(peer.connectionState, PeerConnectionState.disconnected);
+      expect(peer.bleCentralDeviceId, isNull);
+    });
+
+    test('keeps connected if has UDP address', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            bleCentralDeviceId: 'central-1',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
@@ -692,38 +825,15 @@ void main() {
       expect(peer.connectionState, PeerConnectionState.connected);
       expect(peer.bleCentralDeviceId, isNull);
       expect(peer.blePeripheralDeviceId, isNull);
-      expect(peer.libp2pAddress, '/ip4/1.2.3.4/tcp/4001/p2p/QmTest');
-    });
-
-    test('clears both central and peripheral BLE device IDs', () {
-      final pubkey = _testPubkey(1);
-      final hex = _pubkeyHex(pubkey);
-      final initial = PeersState(
-        peers: {
-          hex: PeerState(
-            publicKey: pubkey,
-            nickname: 'Alice',
-            connectionState: PeerConnectionState.connected,
-            bleCentralDeviceId: 'ble-central-1',
-            blePeripheralDeviceId: 'ble-peripheral-1',
-          ),
-        },
-      );
-      final action = PeerBleDisconnectedAction(pubkey);
-
-      final result = peersReducer(initial, action);
-
-      final peer = result.peers[hex]!;
-      expect(peer.bleCentralDeviceId, isNull);
-      expect(peer.blePeripheralDeviceId, isNull);
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
   });
 
   // =========================================================================
-  // PeerLibp2pDisconnectedAction
+  // PeerUdpDisconnectedAction
   // =========================================================================
 
-  group('PeerLibp2pDisconnectedAction', () {
+  group('PeerUdpDisconnectedAction', () {
     test('marks disconnected if no BLE device', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
@@ -733,20 +843,21 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
-      final action = PeerLibp2pDisconnectedAction(pubkey);
+      final action = PeerUdpDisconnectedAction(pubkey);
 
       final result = peersReducer(initial, action);
 
       final peer = result.peers[hex]!;
       expect(peer.connectionState, PeerConnectionState.disconnected);
-      expect(peer.libp2pAddress, isNull);
+      // udpAddress is preserved — it's the last known location for reconnection
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
 
-    test('keeps connected if has BLE device', () {
+    test('keeps connected if has BLE device (central)', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -755,22 +866,23 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
-            bleCentralDeviceId: 'ble-1',
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+            bleCentralDeviceId: 'central-1',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
-      final action = PeerLibp2pDisconnectedAction(pubkey);
+      final action = PeerUdpDisconnectedAction(pubkey);
 
       final result = peersReducer(initial, action);
 
       final peer = result.peers[hex]!;
       expect(peer.connectionState, PeerConnectionState.connected);
-      expect(peer.bleCentralDeviceId, 'ble-1');
-      expect(peer.libp2pAddress, isNull);
+      expect(peer.bleCentralDeviceId, 'central-1');
+      // udpAddress is preserved — it's the last known location for reconnection
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
 
-    test('clears libp2pAddress', () {
+    test('preserves udpAddress for reconnection', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -779,15 +891,17 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
-      final action = PeerLibp2pDisconnectedAction(pubkey);
+      final action = PeerUdpDisconnectedAction(pubkey);
 
       final result = peersReducer(initial, action);
 
-      expect(result.peers[hex]!.libp2pAddress, isNull);
+      // UDP address must never be cleared on disconnect — it's
+      // the last known location and the only way to attempt reconnection.
+      expect(result.peers[hex]!.udpAddress, '[2001:db8::1]:4001');
     });
   });
 
@@ -820,11 +934,11 @@ void main() {
   });
 
   // =========================================================================
-  // AssociateBleDeviceAction
+  // AssociateBleDeviceAction — role-based
   // =========================================================================
 
   group('AssociateBleDeviceAction', () {
-    test('sets bleCentralDeviceId on existing peer', () {
+    test('sets bleCentralDeviceId when role=central', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -837,16 +951,17 @@ void main() {
       );
       final action = AssociateBleDeviceAction(
         publicKey: pubkey,
-        deviceId: 'ble-device-99',
+        deviceId: 'ble-central-99',
         role: BleRole.central,
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.peers[hex]!.bleCentralDeviceId, 'ble-device-99');
+      expect(result.peers[hex]!.bleCentralDeviceId, 'ble-central-99');
+      expect(result.peers[hex]!.blePeripheralDeviceId, isNull);
     });
 
-    test('sets blePeripheralDeviceId when role is peripheral', () {
+    test('sets blePeripheralDeviceId when role=peripheral', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -859,13 +974,14 @@ void main() {
       );
       final action = AssociateBleDeviceAction(
         publicKey: pubkey,
-        deviceId: 'ble-device-99',
+        deviceId: 'ble-peripheral-99',
         role: BleRole.peripheral,
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.peers[hex]!.blePeripheralDeviceId, 'ble-device-99');
+      expect(result.peers[hex]!.bleCentralDeviceId, isNull);
+      expect(result.peers[hex]!.blePeripheralDeviceId, 'ble-peripheral-99');
     });
 
     test('is a no-op for unknown peer', () {
@@ -883,39 +999,33 @@ void main() {
   });
 
   // =========================================================================
-  // AssociateLibp2pAddressAction
+  // AssociateUdpAddressAction
   // =========================================================================
 
-  group('AssociateLibp2pAddressAction', () {
-    test('sets libp2pAddress and hostId without overwriting libp2pHostAddrs', () {
+  group('AssociateUdpAddressAction', () {
+    test('sets udpAddress', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
-      final existingAddrs = ['/ip6/2001:db8::1/udp/4001/quic', '/ip4/5.6.7.8/udp/4001/quic'];
       final initial = PeersState(
         peers: {
           hex: PeerState(
             publicKey: pubkey,
             nickname: 'Alice',
-            libp2pHostId: 'QmTest',
-            libp2pHostAddrs: existingAddrs,
           ),
         },
       );
-      final action = AssociateLibp2pAddressAction(
+      final action = AssociateUdpAddressAction(
         publicKey: pubkey,
-        address: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+        address: '[2001:db8::1]:4001',
       );
 
       final result = peersReducer(initial, action);
 
       final peer = result.peers[hex]!;
-      expect(peer.libp2pAddress, '/ip4/1.2.3.4/tcp/4001/p2p/QmTest');
-      expect(peer.libp2pHostId, 'QmTest');
-      // libp2pHostAddrs preserved from ANNOUNCE, not overwritten
-      expect(peer.libp2pHostAddrs, existingAddrs);
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
 
-    test('clears libp2pAddress when address is empty', () {
+    test('clears udpAddress when address is empty', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -923,11 +1033,11 @@ void main() {
           hex: PeerState(
             publicKey: pubkey,
             nickname: 'Alice',
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
-      final action = AssociateLibp2pAddressAction(
+      final action = AssociateUdpAddressAction(
         publicKey: pubkey,
         address: '',
       );
@@ -935,20 +1045,20 @@ void main() {
       final result = peersReducer(initial, action);
 
       // When address is empty, copyWith with null keeps old value for
-      // libp2pAddress. The reducer passes: libp2pAddress: action.address.isEmpty ? null : action.address
-      // But copyWith(libp2pAddress: null) preserves old value due to ?? semantics.
+      // udpAddress. The reducer passes: udpAddress: action.address.isEmpty ? null : action.address
+      // But copyWith(udpAddress: null) preserves old value due to ?? semantics.
       // This documents the actual behavior of the reducer.
       final peer = result.peers[hex]!;
       // The reducer uses copyWith which can't clear nullable fields to null.
-      // So the old libp2pAddress is preserved. This is a known copyWith limitation.
-      expect(peer.libp2pAddress, '/ip4/1.2.3.4/tcp/4001/p2p/QmTest');
+      // So the old udpAddress is preserved. This is a known copyWith limitation.
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
 
     test('is a no-op for unknown peer', () {
       const state = PeersState.initial;
-      final action = AssociateLibp2pAddressAction(
+      final action = AssociateUdpAddressAction(
         publicKey: _testPubkey(99),
-        address: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
+        address: '[2001:db8::1]:4001',
       );
 
       final result = peersReducer(state, action);
@@ -1027,8 +1137,8 @@ void main() {
             publicKey: pubkey,
             nickname: 'Alice',
             isFriend: true,
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
-            // bleDeviceId is null
+            udpAddress: '[2001:db8::1]:4001',
+            // no BLE device IDs
           ),
         },
       );
@@ -1040,7 +1150,7 @@ void main() {
       expect(result.peers, isEmpty);
     });
 
-    test('clears isFriend and libp2p fields but keeps peer if has BLE', () {
+    test('clears isFriend and UDP fields but keeps peer if has BLE central', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -1050,10 +1160,8 @@ void main() {
             nickname: 'Alice',
             connectionState: PeerConnectionState.connected,
             isFriend: true,
-            bleCentralDeviceId: 'ble-1',
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
-            libp2pHostId: 'QmTest',
-            libp2pHostAddrs: const ['/ip4/1.2.3.4/tcp/4001'],
+            bleCentralDeviceId: 'central-1',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
@@ -1064,12 +1172,34 @@ void main() {
       expect(result.peers.containsKey(hex), true);
       final peer = result.peers[hex]!;
       expect(peer.isFriend, false);
-      expect(peer.libp2pAddress, isNull);
-      expect(peer.libp2pHostId, isNull);
-      expect(peer.libp2pHostAddrs, isNull);
-      expect(peer.bleCentralDeviceId, 'ble-1');
+      expect(peer.udpAddress, isNull);
+      expect(peer.bleCentralDeviceId, 'central-1');
       expect(peer.connectionState, PeerConnectionState.connected);
       expect(peer.transport, PeerTransport.bleDirect);
+    });
+
+    test('keeps peer if has BLE peripheral', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            isFriend: true,
+            blePeripheralDeviceId: 'peripheral-1',
+          ),
+        },
+      );
+      final action = FriendRemovedAction(pubkey);
+
+      final result = peersReducer(initial, action);
+
+      expect(result.peers.containsKey(hex), true);
+      final peer = result.peers[hex]!;
+      expect(peer.isFriend, false);
+      expect(peer.blePeripheralDeviceId, 'peripheral-1');
     });
 
     test('is a no-op for unknown peer', () {
@@ -1109,7 +1239,7 @@ void main() {
       expect(result.peers.containsKey(hex), false);
     });
 
-    test('marks stale friend peers as disconnected and preserves libp2pHostId', () {
+    test('marks stale friend peers as disconnected', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final now = DateTime.now();
@@ -1121,10 +1251,9 @@ void main() {
             connectionState: PeerConnectionState.connected,
             lastSeen: now.subtract(const Duration(minutes: 10)),
             isFriend: true,
-            bleCentralDeviceId: 'ble-1',
-            libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmTest',
-            libp2pHostId: 'QmTest',
-            libp2pHostAddrs: const ['/ip4/1.2.3.4/tcp/4001'],
+            bleCentralDeviceId: 'central-1',
+            blePeripheralDeviceId: 'peripheral-1',
+            udpAddress: '[2001:db8::1]:4001',
           ),
         },
       );
@@ -1139,9 +1268,40 @@ void main() {
       expect(peer.rssi, -100);
       expect(peer.bleCentralDeviceId, isNull);
       expect(peer.blePeripheralDeviceId, isNull);
-      expect(peer.libp2pAddress, isNull);
-      expect(peer.libp2pHostId, 'QmTest');
-      expect(peer.libp2pHostAddrs, ['/ip4/1.2.3.4/tcp/4001']);
+      expect(peer.bleDeviceId, isNull);
+      // udpAddress is preserved — it's the last known location for reconnection
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
+    });
+
+    test('clears stale BLE IDs when lastBleSeen exceeds threshold', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final now = DateTime.now();
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            lastSeen: now, // recently seen via UDP
+            bleCentralDeviceId: 'central-1',
+            blePeripheralDeviceId: 'peripheral-1',
+            lastBleSeen: now.subtract(const Duration(minutes: 5)), // stale BLE
+            udpAddress: '[2001:db8::1]:4001',
+          ),
+        },
+      );
+      final action = StalePeersRemovedAction(const Duration(minutes: 2));
+
+      final result = peersReducer(initial, action);
+
+      final peer = result.peers[hex]!;
+      // BLE IDs cleared because lastBleSeen is stale
+      expect(peer.bleCentralDeviceId, isNull);
+      expect(peer.blePeripheralDeviceId, isNull);
+      // But peer stays connected via UDP
+      expect(peer.connectionState, PeerConnectionState.connected);
+      expect(peer.udpAddress, '[2001:db8::1]:4001');
     });
 
     test('keeps fresh peers unchanged', () {
@@ -1192,6 +1352,111 @@ void main() {
       // Disconnected peers are not considered for stale removal
       // (reducer checks connectionState != connected first)
       expect(result.peers.containsKey(hex), true);
+    });
+  });
+
+  // =========================================================================
+  // PeerState convenience getters
+  // =========================================================================
+
+  group('PeerState getters', () {
+    test('hasBleConnection is true with central ID', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+        bleCentralDeviceId: 'central-1',
+      );
+      expect(peer.hasBleConnection, true);
+      expect(peer.bleDeviceId, 'central-1');
+    });
+
+    test('hasBleConnection is true with peripheral ID', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+        blePeripheralDeviceId: 'peripheral-1',
+      );
+      expect(peer.hasBleConnection, true);
+      expect(peer.bleDeviceId, 'peripheral-1');
+    });
+
+    test('hasBleConnection is false with no IDs', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+      );
+      expect(peer.hasBleConnection, false);
+      expect(peer.bleDeviceId, isNull);
+    });
+
+    test('bleDeviceId prefers central over peripheral', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+        bleCentralDeviceId: 'central-1',
+        blePeripheralDeviceId: 'peripheral-1',
+      );
+      expect(peer.bleDeviceId, 'central-1');
+    });
+
+    test('isReachable with BLE', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+        blePeripheralDeviceId: 'peripheral-1',
+      );
+      expect(peer.isReachable, true);
+    });
+
+    test('activeTransport prefers BLE', () {
+      final peer = PeerState(
+        publicKey: _testPubkey(1),
+        nickname: 'Alice',
+        bleCentralDeviceId: 'central-1',
+        udpAddress: '[2001:db8::1]:4001',
+      );
+      expect(peer.activeTransport, PeerTransport.bleDirect);
+    });
+  });
+
+  // =========================================================================
+  // DiscoveredPeerState backoff getters
+  // =========================================================================
+
+  group('DiscoveredPeerState backoff', () {
+    test('isInBackoff is false when nextRetryAfter is null', () {
+      final now = DateTime.now();
+      final peer = DiscoveredPeerState(
+        transportId: 'device-1',
+        rssi: -60,
+        discoveredAt: now,
+        lastSeen: now,
+      );
+      expect(peer.isInBackoff, false);
+    });
+
+    test('isInBackoff is true when nextRetryAfter is in the future', () {
+      final now = DateTime.now();
+      final peer = DiscoveredPeerState(
+        transportId: 'device-1',
+        rssi: -60,
+        discoveredAt: now,
+        lastSeen: now,
+        nextRetryAfter: now.add(const Duration(seconds: 30)),
+      );
+      expect(peer.isInBackoff, true);
+    });
+
+    test('isInBackoff is false when nextRetryAfter is in the past', () {
+      final now = DateTime.now();
+      final peer = DiscoveredPeerState(
+        transportId: 'device-1',
+        rssi: -60,
+        discoveredAt: now,
+        lastSeen: now,
+        nextRetryAfter: now.subtract(const Duration(seconds: 1)),
+      );
+      expect(peer.isInBackoff, false);
     });
   });
 

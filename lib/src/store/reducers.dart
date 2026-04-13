@@ -1,5 +1,4 @@
 import 'app_state.dart';
-import 'actions.dart';
 import 'peers_actions.dart';
 import 'peers_reducer.dart';
 import 'messages_actions.dart';
@@ -8,6 +7,10 @@ import 'friendships_actions.dart';
 import 'friendships_reducer.dart';
 import 'settings_actions.dart';
 import 'settings_reducer.dart';
+import 'signaling_actions.dart';
+import 'signaling_reducer.dart';
+import 'transports_actions.dart';
+import 'transports_reducer.dart';
 
 /// Root reducer that handles all actions
 AppState appReducer(AppState state, dynamic action) {
@@ -39,43 +42,18 @@ AppState appReducer(AppState state, dynamic action) {
     );
   }
 
-  if (action is SetInitializingAction) {
+  // Handle transport state actions via transportsReducer
+  if (action is TransportAction) {
     return state.copyWith(
-      connectionStatus: TransportConnectionStatus.initializing,
+      transports: transportsReducer(state.transports, action),
     );
   }
 
-  if (action is SetOnlineAction) {
+  // Handle signaling actions via signalingReducer
+  if (action is SignalingAction) {
     return state.copyWith(
-      connectionStatus: TransportConnectionStatus.online,
+      signaling: signalingReducer(state.signaling, action),
     );
-  }
-
-  if (action is SetErrorAction) {
-    return state.copyWith(
-      connectionStatus: TransportConnectionStatus.error,
-      errorMessage: action.message,
-    );
-  }
-
-  if (action is ScanStartedAction) {
-    // Only change to scanning if we're currently online
-    if (state.connectionStatus == TransportConnectionStatus.online) {
-      return state.copyWith(
-        connectionStatus: TransportConnectionStatus.scanning,
-      );
-    }
-    return state;
-  }
-
-  if (action is ScanCompletedAction) {
-    // Only change to online if we're currently scanning
-    if (state.connectionStatus == TransportConnectionStatus.scanning) {
-      return state.copyWith(
-        connectionStatus: TransportConnectionStatus.online,
-      );
-    }
-    return state;
   }
 
   return state;

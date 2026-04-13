@@ -6,7 +6,7 @@ import '../models/peer.dart';
 /// Immutable version for Redux state.
 @immutable
 class DiscoveredPeerState {
-  /// Transport-specific identifier (BLE device ID, libp2p peer ID, etc.)
+  /// Transport-specific identifier (BLE device ID, etc.)
   final String transportId;
 
   /// Human-readable name (from BLE advertising, etc.)
@@ -36,14 +36,14 @@ class DiscoveredPeerState {
   /// Service UUID (for correlation on iOS)
   final String? serviceUuid;
 
-  /// Number of connection attempts
-  final int connectionAttempts;
-
   /// Number of consecutive failed connection attempts (for backoff)
   final int consecutiveFailures;
 
   /// Earliest time we can retry connection (null = can retry now)
   final DateTime? nextRetryAfter;
+
+  /// Whether this device was manually disconnected and should not auto-connect
+  final bool isBlacklisted;
 
   const DiscoveredPeerState({
     required this.transportId,
@@ -56,9 +56,9 @@ class DiscoveredPeerState {
     this.lastError,
     this.publicKey,
     this.serviceUuid,
-    this.connectionAttempts = 0,
     this.consecutiveFailures = 0,
     this.nextRetryAfter,
+    this.isBlacklisted = false,
   });
 
   /// Signal quality indicator (0.0 - 1.0), derived from rssi
@@ -86,9 +86,9 @@ class DiscoveredPeerState {
     String? lastError,
     Uint8List? publicKey,
     String? serviceUuid,
-    int? connectionAttempts,
     int? consecutiveFailures,
     DateTime? nextRetryAfter,
+    bool? isBlacklisted,
   }) {
     return DiscoveredPeerState(
       transportId: transportId ?? this.transportId,
@@ -101,9 +101,9 @@ class DiscoveredPeerState {
       lastError: lastError ?? this.lastError,
       publicKey: publicKey ?? this.publicKey,
       serviceUuid: serviceUuid ?? this.serviceUuid,
-      connectionAttempts: connectionAttempts ?? this.connectionAttempts,
       consecutiveFailures: consecutiveFailures ?? this.consecutiveFailures,
       nextRetryAfter: nextRetryAfter ?? this.nextRetryAfter,
+      isBlacklisted: isBlacklisted ?? this.isBlacklisted,
     );
   }
 
@@ -118,9 +118,9 @@ class DiscoveredPeerState {
           isConnected == other.isConnected &&
           lastError == other.lastError &&
           serviceUuid == other.serviceUuid &&
-          connectionAttempts == other.connectionAttempts &&
           consecutiveFailures == other.consecutiveFailures &&
-          nextRetryAfter == other.nextRetryAfter;
+          nextRetryAfter == other.nextRetryAfter &&
+          isBlacklisted == other.isBlacklisted;
 
   @override
   int get hashCode => Object.hash(
@@ -130,9 +130,9 @@ class DiscoveredPeerState {
     isConnected,
     lastError,
     serviceUuid,
-    connectionAttempts,
     consecutiveFailures,
     nextRetryAfter,
+    isBlacklisted,
   );
 
   @override
@@ -157,20 +157,27 @@ class PeerState {
   final String? blePeripheralDeviceId;
 
   /// When the last BLE ANNOUNCE was received from this peer.
-  /// Used to detect stale BLE IDs (peer left BLE range but still on libp2p).
+  /// Used to detect stale BLE IDs (peer left BLE range but still on UDP).
   final DateTime? lastBleSeen;
 
-  /// Libp2p address if connected via libp2p
-  final String? libp2pAddress;
+  /// UDP address if connected via UDP (ip:port format)
+  final String? udpAddress;
+
+  /// Link-local IPv6 address (fe80::...:port) for same-LAN fallback.
+  /// Only available from BLE-nearby peers. Tried before global address.
+  final String? linkLocalAddress;
 
   /// Whether this peer is a friend (friendship established)
   final bool isFriend;
 
-  /// Libp2p host ID (PeerId string) for transport-level addressing
-  final String? libp2pHostId;
+  /// Whether this peer is well-connected and can serve as a signaling node
+  final bool isWellConnected;
 
-  /// Libp2p host addresses (multiaddrs) for reconnection
-  final List<String>? libp2pHostAddrs;
+  /// Whether there is a live UDX connection to this peer.
+  /// Set true when UDX handshake completes, false when the stream closes.
+  /// Unlike [udpAddress] (which is preserved for reconnection), this reflects
+  /// the actual transport-level connection state right now.
+  final bool hasLiveUdpConnection;
 
   const PeerState({
     required this.publicKey,
@@ -183,10 +190,11 @@ class PeerState {
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
     this.lastBleSeen,
-    this.libp2pAddress,
+    this.udpAddress,
+    this.linkLocalAddress,
     this.isFriend = false,
-    this.libp2pHostId,
-    this.libp2pHostAddrs,
+    this.isWellConnected = false,
+    this.hasLiveUdpConnection = false,
   });
 
   /// Hex representation of public key (for map keys)
@@ -205,14 +213,20 @@ class PeerState {
   /// Prefers central (we initiated) since sendToPeer tries central service first.
   String? get bleDeviceId => bleCentralDeviceId ?? blePeripheralDeviceId;
 
-  /// Whether this peer is reachable via any transport
-  bool get isReachable => hasBleConnection || libp2pAddress != null;
+  /// Whether this peer is potentially reachable via any transport.
+  /// For UDP, a stored address is sufficient (we can attempt to connect).
+  /// See [isLiveReachable] for actual live connection status.
+  bool get isReachable => hasBleConnection || udpAddress != null;
+
+  /// Whether this peer has a live, active connection right now.
+  /// Use this for UI "online" status — not for signaling/discovery.
+  bool get isLiveReachable => hasBleConnection || hasLiveUdpConnection;
 
   /// The currently active transport based on available connections.
-  /// BLE is preferred when available; falls back to libp2p, then stored value.
+  /// BLE is preferred when available; falls back to UDP, then stored value.
   PeerTransport get activeTransport {
     if (hasBleConnection) return PeerTransport.bleDirect;
-    if (libp2pAddress != null) return PeerTransport.libp2p;
+    if (udpAddress != null) return PeerTransport.udp;
     return transport;
   }
 
@@ -234,10 +248,11 @@ class PeerState {
     String? bleCentralDeviceId,
     String? blePeripheralDeviceId,
     DateTime? lastBleSeen,
-    String? libp2pAddress,
+    String? udpAddress,
+    String? linkLocalAddress,
     bool? isFriend,
-    String? libp2pHostId,
-    List<String>? libp2pHostAddrs,
+    bool? isWellConnected,
+    bool? hasLiveUdpConnection,
   }) {
     return PeerState(
       publicKey: publicKey ?? this.publicKey,
@@ -250,10 +265,11 @@ class PeerState {
       bleCentralDeviceId: bleCentralDeviceId ?? this.bleCentralDeviceId,
       blePeripheralDeviceId: blePeripheralDeviceId ?? this.blePeripheralDeviceId,
       lastBleSeen: lastBleSeen ?? this.lastBleSeen,
-      libp2pAddress: libp2pAddress ?? this.libp2pAddress,
+      udpAddress: udpAddress ?? this.udpAddress,
+      linkLocalAddress: linkLocalAddress ?? this.linkLocalAddress,
       isFriend: isFriend ?? this.isFriend,
-      libp2pHostId: libp2pHostId ?? this.libp2pHostId,
-      libp2pHostAddrs: libp2pHostAddrs ?? this.libp2pHostAddrs,
+      isWellConnected: isWellConnected ?? this.isWellConnected,
+      hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
     );
   }
 
@@ -269,9 +285,11 @@ class PeerState {
           rssi == other.rssi &&
           bleCentralDeviceId == other.bleCentralDeviceId &&
           blePeripheralDeviceId == other.blePeripheralDeviceId &&
-          libp2pAddress == other.libp2pAddress &&
+          udpAddress == other.udpAddress &&
+          linkLocalAddress == other.linkLocalAddress &&
           isFriend == other.isFriend &&
-          libp2pHostId == other.libp2pHostId;
+          isWellConnected == other.isWellConnected &&
+          hasLiveUdpConnection == other.hasLiveUdpConnection;
 
   @override
   int get hashCode => Object.hash(
@@ -282,9 +300,11 @@ class PeerState {
     rssi,
     bleCentralDeviceId,
     blePeripheralDeviceId,
-    libp2pAddress,
+    udpAddress,
+    linkLocalAddress,
     isFriend,
-    libp2pHostId,
+    isWellConnected,
+    hasLiveUdpConnection,
   );
 }
 
@@ -294,15 +314,11 @@ class PeersState {
   /// Discovered BLE peers (before ANNOUNCE), keyed by device ID
   final Map<String, DiscoveredPeerState> discoveredBlePeers;
 
-  /// Discovered libp2p peers (before ANNOUNCE), keyed by peer ID
-  final Map<String, DiscoveredPeerState> discoveredLibp2pPeers;
-
   /// Identified peers (after ANNOUNCE), keyed by pubkey hex
   final Map<String, PeerState> peers;
 
   const PeersState({
     this.discoveredBlePeers = const {},
-    this.discoveredLibp2pPeers = const {},
     this.peers = const {},
   });
 
@@ -312,9 +328,6 @@ class PeersState {
 
   /// All discovered BLE peers as list
   List<DiscoveredPeerState> get discoveredBlePeersList => discoveredBlePeers.values.toList();
-
-  /// All discovered libp2p peers as list
-  List<DiscoveredPeerState> get discoveredLibp2pPeersList => discoveredLibp2pPeers.values.toList();
 
   /// All identified peers as list
   List<PeerState> get peersList => peers.values.toList();
@@ -332,18 +345,22 @@ class PeersState {
   List<PeerState> get nearbyBlePeers =>
       peers.values.where((p) => p.isConnected && p.hasBleConnection).toList();
 
-  /// Peers reachable via libp2p
-  List<PeerState> get libp2pPeers =>
-      peers.values.where((p) => p.libp2pAddress != null).toList();
+  /// Peers with a live UDP connection
+  List<PeerState> get udpPeers =>
+      peers.values.where((p) => p.hasLiveUdpConnection).toList();
 
   /// All friends
   List<PeerState> get friends =>
       peers.values.where((p) => p.isFriend).toList();
 
-  /// Online friends - friends connected via libp2p only (not nearby via BLE).
+  /// Online friends - friends with a live UDP connection (not nearby via BLE).
   /// Use this for the "Friends Online" section in UI.
   List<PeerState> get onlineFriends =>
-      peers.values.where((p) => p.isFriend && p.isConnected && !p.hasBleConnection && p.libp2pAddress != null).toList();
+      peers.values.where((p) => p.isFriend && p.isConnected && p.hasLiveUdpConnection).toList();
+
+  /// Well-connected friends that can serve as signaling nodes
+  List<PeerState> get wellConnectedFriends =>
+      peers.values.where((p) => p.isFriend && p.isWellConnected && p.isReachable).toList();
 
   /// Count of connected peers
   int get connectedCount => connectedPeers.length;
@@ -385,12 +402,10 @@ class PeersState {
 
   PeersState copyWith({
     Map<String, DiscoveredPeerState>? discoveredBlePeers,
-    Map<String, DiscoveredPeerState>? discoveredLibp2pPeers,
     Map<String, PeerState>? peers,
   }) {
     return PeersState(
       discoveredBlePeers: discoveredBlePeers ?? this.discoveredBlePeers,
-      discoveredLibp2pPeers: discoveredLibp2pPeers ?? this.discoveredLibp2pPeers,
       peers: peers ?? this.peers,
     );
   }
@@ -401,13 +416,11 @@ class PeersState {
       other is PeersState &&
           runtimeType == other.runtimeType &&
           mapEquals(discoveredBlePeers, other.discoveredBlePeers) &&
-          mapEquals(discoveredLibp2pPeers, other.discoveredLibp2pPeers) &&
           mapEquals(peers, other.peers);
 
   @override
   int get hashCode => Object.hash(
     discoveredBlePeers.length,
-    discoveredLibp2pPeers.length,
     peers.length,
   );
 }

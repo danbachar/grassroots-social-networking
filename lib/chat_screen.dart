@@ -6,6 +6,7 @@ import 'package:bitchat_transport/bitchat_transport.dart';
 import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
+import 'package:uuid/uuid.dart';
 
 /// Chat screen for a conversation with a specific peer
 class ChatScreen extends StatefulWidget {
@@ -16,7 +17,7 @@ class ChatScreen extends StatefulWidget {
   final VoidCallback? onSendFriendRequest;
   final VoidCallback? onAcceptFriendRequest;
   final VoidCallback? onUnfriend;
-  final String? myLibp2pAddress;
+  final String? myUdpAddress;
 
   const ChatScreen({
     super.key,
@@ -27,7 +28,7 @@ class ChatScreen extends StatefulWidget {
     this.onSendFriendRequest,
     this.onAcceptFriendRequest,
     this.onUnfriend,
-    this.myLibp2pAddress,
+    this.myUdpAddress,
   });
 
   @override
@@ -93,19 +94,18 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _sendMessage() async {
+  static const _uuid = Uuid();
+
+  void _sendMessage() {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
 
     _messageController.clear();
 
-    // Send via Bitchat using SayBlock - get messageId for tracking
-    final block = SayBlock(content: text);
-    _log.i("Sending '$text' to peer ${widget.peer.displayName}");
-    final messageId =
-        await widget.bitchat.send(widget.peer.publicKey, block.serialize());
+    // Generate message ID upfront so we can show the message immediately
+    final messageId = _uuid.v4().substring(0, 8);
 
-    // Save outgoing message to Redux store with messageId for status tracking
+    // Save to conversation immediately so the message appears in the UI
     widget.store.dispatch(SaveChatMessageAction(
       senderPubkeyHex: _myHex,
       recipientPubkeyHex: _peerHex,
@@ -115,6 +115,12 @@ class _ChatScreenState extends State<ChatScreen> {
     ));
 
     _scrollToBottom();
+
+    // Send in the background — status updates (sending → sent/delivered/failed)
+    // will be dispatched by Bitchat.send() and reflected via the status icon
+    final block = SayBlock(content: text);
+    debugPrint("Sending '$text' to peer ${widget.peer.displayName}");
+    widget.bitchat.send(widget.peer.publicKey, block.serialize(), messageId: messageId);
   }
 
   void _scrollToBottom() {
@@ -425,7 +431,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _resendMessage(ChatMessageState message) async {
-    _log.i("Resending '${message.content}' to peer ${widget.peer.displayName}");
+    debugPrint("Resending '${message.content}' to peer ${widget.peer.displayName}");
 
     // Send via Bitchat using SayBlock
     final block = SayBlock(content: message.content);
@@ -436,7 +442,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     if (messageId != null) {
       // Update the old message's status would be complex, so we just log success
-      _log.i("Resend successful with new messageId: $messageId");
+      debugPrint("Resend successful with new messageId: $messageId");
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Message resent'),
@@ -464,14 +470,18 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             _buildInfoRow('Public Key', _peerHex),
             const SizedBox(height: 8),
-            _buildInfoRow('Status', widget.peer.connectionState.name),
+            _buildInfoRow('Bluetooth',
+                widget.peer.hasBleConnection
+                    ? 'Connected (${widget.peer.bleCentralDeviceId != null && widget.peer.blePeripheralDeviceId != null ? 'central + peripheral' : widget.peer.bleCentralDeviceId != null ? 'central' : 'peripheral'})'
+                    : 'Not connected'),
+            const SizedBox(height: 8),
+            _buildInfoRow('Internet',
+                widget.peer.udpAddress != null
+                    ? widget.peer.udpAddress!
+                    : 'No address'),
             if (_isFriend) ...[
               const SizedBox(height: 8),
               _buildInfoRow('Friendship', 'Friends ✓'),
-              if (_friendship?.libp2pAddress != null) ...[
-                const SizedBox(height: 8),
-                _buildInfoRow('LibP2P', _friendship!.libp2pAddress!),
-              ],
             ],
           ],
         ),

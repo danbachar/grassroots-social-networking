@@ -13,8 +13,8 @@ class ChatMessage {
   final bool isOutgoing;
   final ChatMessageType messageType;
 
-  /// For friendship messages: the libp2p address involved
-  final String? libp2pAddress;
+  /// For friendship messages: the UDP address involved
+  final String? udpAddress;
 
   /// Message ID for tracking delivery/read status (outgoing messages only)
   final String? messageId;
@@ -25,7 +25,7 @@ class ChatMessage {
     required this.content,
     required this.isOutgoing,
     this.messageType = ChatMessageType.text,
-    this.libp2pAddress,
+    this.udpAddress,
     this.messageId,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();
@@ -40,7 +40,7 @@ class ChatMessage {
   factory ChatMessage.friendRequestSent({
     required String senderPubkeyHex,
     required String recipientPubkeyHex,
-    String? libp2pAddress,
+    String? udpAddress,
     String? message,
   }) =>
       ChatMessage(
@@ -49,14 +49,14 @@ class ChatMessage {
         content: message ?? 'Sent a friend request',
         isOutgoing: true,
         messageType: ChatMessageType.friendRequestSent,
-        libp2pAddress: libp2pAddress,
+        udpAddress: udpAddress,
       );
 
   /// Create a friend request received message
   factory ChatMessage.friendRequestReceived({
     required String senderPubkeyHex,
     required String recipientPubkeyHex,
-    String? libp2pAddress,
+    String? udpAddress,
     String? message,
   }) =>
       ChatMessage(
@@ -65,14 +65,14 @@ class ChatMessage {
         content: message ?? 'Wants to be friends',
         isOutgoing: false,
         messageType: ChatMessageType.friendRequestReceived,
-        libp2pAddress: libp2pAddress,
+        udpAddress: udpAddress,
       );
 
   /// Create a friend request accepted message (they accepted ours)
   factory ChatMessage.friendRequestAccepted({
     required String senderPubkeyHex,
     required String recipientPubkeyHex,
-    String? libp2pAddress,
+    String? udpAddress,
   }) =>
       ChatMessage(
         senderPubkeyHex: senderPubkeyHex,
@@ -80,7 +80,7 @@ class ChatMessage {
         content: 'Accepted your friend request',
         isOutgoing: false,
         messageType: ChatMessageType.friendRequestAccepted,
-        libp2pAddress: libp2pAddress,
+        udpAddress: udpAddress,
       );
 
   /// Create a friend request accepted by us message

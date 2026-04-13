@@ -10,24 +10,34 @@ class SetBluetoothEnabledAction extends SettingsAction {
   SetBluetoothEnabledAction(this.enabled);
 }
 
-/// Set libp2p enabled state
-class SetLibp2pEnabledAction extends SettingsAction {
+/// Set UDP enabled state
+class SetUdpEnabledAction extends SettingsAction {
   final bool enabled;
 
-  SetLibp2pEnabledAction(this.enabled);
+  SetUdpEnabledAction(this.enabled);
 }
 
 /// Update both transport settings at once
 class UpdateTransportSettingsAction extends SettingsAction {
   final bool? bluetoothEnabled;
-  final bool? libp2pEnabled;
+  final bool? udpEnabled;
   final List<TransportProtocol>? transportPriority;
 
   UpdateTransportSettingsAction({
     this.bluetoothEnabled,
-    this.libp2pEnabled,
+    this.udpEnabled,
     this.transportPriority,
   });
+}
+
+/// Configure the bootstrap anchor server address.
+///
+/// The anchor's public key is derived from the owner's identity —
+/// only the address needs to be stored.
+class SetAnchorServerAction extends SettingsAction {
+  final String? anchorAddress;
+
+  SetAnchorServerAction({this.anchorAddress});
 }
 
 /// Hydrate settings from persistence

@@ -1,191 +1,81 @@
 # Claude Instructions for Bitchat Transport
-## CRITICAL: always be precise, critical, but helpful. Prefer to ask rather than assume if you have unclarities
-## CRITICAL: NO Legacy or Compatibility Code
 
-**IMPORTANT**: When refactoring, DO NOT keep old code "for legacy" or "for compatibility".
+## Working Style
+Always be precise, critical, and helpful. Prefer to ask rather than assume if you have unclarities.
 
-- ❌ **NO** `// Legacy - kept for compatibility` comments
-- ❌ **NO** keeping both old and new implementations
-- ✅ **DO** fully replace old code with new implementation
-- ✅ **DO** remove unused imports and dead code
-- ✅ **DO** update all call sites when changing APIs
-- ❌ **NO** `PeerStore` - use Redux store (`AppState.peers`) only
+## Project Philosophy
 
----
+Bitchat is a **peer-to-peer messaging transport** — a thin layer that moves packets between devices over Bluetooth (BLE) and the Internet (UDP). It is not an application; it is the plumbing that applications like GSG build on top of.
 
-## CRITICAL: NO Store-and-Forward / NO Relaying
+**Core principles:**
 
-**IMPORTANT**: Bitchat does NOT implement store-and-forward or message relaying.
+- **Direct delivery only.** Messages go straight from sender to recipient. If the recipient is unreachable, the send fails and the caller decides what to do. There is no caching, no store-and-forward queue, no relaying of message content through intermediaries. The application layer owns persistence and retry logic.
+- **Identity is a key pair.** Every device holds an Ed25519 key pair. The public key *is* the peer's identity — nicknames are cosmetic. All trust decisions flow from cryptographic verification.
+- **Two transports, one interface.** BLE covers nearby peers without Internet; UDP covers the globe. Both transports surface the same abstraction to the coordinator: connect, send, receive, disconnect. BLE is preferred when both are available.
+- **Clean breaks, not compatibility shims.** When refactoring, fully replace old code. No legacy wrappers, no "kept for compatibility" comments, no dead code. Update every call site.
 
-- ❌ **NO caching** messages for offline peers
-- ❌ **NO relaying** messages through intermediate peers
-- ❌ **NO forwarding** packets on behalf of other peers
+## No Legacy or Compatibility Code
 
-Messages are sent **directly** to the recipient:
-- If the recipient is **online and reachable** → message is delivered
-- If the recipient is **offline** → message **fails** and sender must retry later
+When refactoring, DO NOT keep old code "for legacy" or "for compatibility". Fully replace old implementations, remove unused imports and dead code, and update all call sites. There is no `PeerStore` — use the Redux store (`AppState.peers`) exclusively.
 
-This is by design - the application layer (GSG) handles message persistence and retry logic.
+## No Store-and-Forward / No Relaying
 
----
+Bitchat does NOT cache, relay, or forward messages on behalf of other peers. A send either succeeds (recipient is online and reachable) or fails immediately. The application layer handles retry. This is a deliberate design choice — keeping the transport layer stateless and simple.
 
-## Critical: always be precise, critical, but helpful.
+## BLE Discovery & Identity
 
-## CRITICAL: NO Legacy or Compatibility Code — EVER
+Each device advertises a unique BLE service UUID: a static Grassroots prefix (derived from the project name) followed by the tail of the device's public key. Scanners filter by this prefix to ignore non-Grassroots devices (headphones, smartwatches, etc.) before even connecting.
 
-**IMPORTANT**: NEVER write backward-compatible code, migration shims, or compatibility layers. This applies to ALL code changes including protocol changes, API changes, data format changes, and refactors.
+After connecting, GATT service discovery confirms the peer has the Bitchat characteristic (defense-in-depth). Then an ANNOUNCE exchange reveals the full public key, nickname, and signature. Only after cryptographic verification is the peer considered identified. The BLE layer maintains a mapping from platform-level device IDs to public keys.
 
-- ❌ **NO** `// Legacy - kept for compatibility` comments
-- ❌ **NO** keeping both old and new implementations
-- ❌ **NO** backward-compatible encoding/decoding (e.g., "old receivers will still parse this")
-- ❌ **NO** migration paths or version-gated behavior
-- ❌ **NO** fallback logic for old formats or protocols
-- ✅ **DO** fully replace old code with new implementation
-- ✅ **DO** remove unused imports and dead code
-- ✅ **DO** update all call sites when changing APIs
-- ✅ **DO** change protocols/formats cleanly without worrying about old versions
-- ❌ **NO** `PeerStore` - use Redux store (`AppState.peers`) only
+## Well-Connected Friends & Hole-Punching
 
----
+Most mobile devices sit behind NAT and cannot accept incoming UDP connections from the public Internet. A **well-connected** device is one that has a globally routable public address — it can be reached directly by anyone.
 
-## CRITICAL: NO Store-and-Forward / NO Relaying
+Well-connected friends play a special role: they act as **signaling relays** to help two NAT'd peers find each other. The flow is:
 
-**IMPORTANT**: Bitchat does NOT implement store-and-forward or message relaying.
+1. Each device registers its current address with its well-connected friends.
+2. When peer A wants to reach peer B, A asks a mutual well-connected friend for B's address.
+3. The friend coordinates a simultaneous hole-punch: it tells both A and B to send packets to each other at the same time, punching holes in both NATs.
+4. Once the holes are open, A and B communicate directly — the well-connected friend is no longer in the path.
 
-- ❌ **NO caching** messages for offline peers
-- ❌ **NO relaying** messages through intermediate peers
-- ❌ **NO forwarding** packets on behalf of other peers
+**Important:** Well-connected friends relay *signaling metadata* (addresses, punch timing), never message content. This preserves the direct-delivery principle.
 
-Messages are sent **directly** to the recipient:
-- If the recipient is **online and reachable** → message is delivered
-- If the recipient is **offline** → message **fails** and sender must retry later
+**Signaling is friend-only.** A well-connected device only coordinates hole-punches between peers that are both its friends. It only registers friends' addresses in its address table, only responds to address queries for friends, and only sends PUNCH_INITIATE to friends. This is a trust boundary — we don't relay for arbitrary peers.
 
-This is by design - the application layer (GSG) handles message persistence and retry logic.
+## Redux Architecture
 
----
+All peer and transport state lives in an immutable Redux store (`AppState`). Key slices: `PeersState` (discovered BLE devices + identified peers), `TransportsState` (per-transport lifecycle + public address), `MessagesState`, `FriendshipsState`, `SettingsState`. UI reads from the store and subscribes to changes. Actions describe events; reducers produce the next state. No mutable singletons.
 
-## BLE Service UUID Architecture
+## Transport Layer
 
-**IMPORTANT**: Each device advertises a **unique** BLE service UUID composed of two parts:
-- **First 8 bytes**: Static Grassroots identifier (`84c40316-0871-e5ad`) — first 8 bytes of SHA-256("grassroots")
-- **Last 8 bytes**: Last 8 bytes of the device's Ed25519 public key
+Two transports are available, toggled independently in settings:
 
-This allows identifying Grassroots devices **before connecting** by checking the advertised UUID prefix.
+- **Bluetooth (BLE)** — local, no Internet required. Preferred when both are available.
+- **Internet (UDP via UDX)** — global reach, requires Internet. Uses hole-punching for NAT traversal.
 
-### How It Works
+The `TransportState` lifecycle for each transport is: `uninitialized → initializing → ready → active` (plus `error` and `disposed`). A transport is "usable" when it is `ready` or `active`.
 
-1. **Advertising (Peripheral Mode)**:
-   - Each device advertises with UUID = `grassroots_prefix + last_64_bits(publicKey)`
-   - The prefix `84c40316-0871-e5ad` identifies the device as a Grassroots peer
+User-facing UI strings should say "Internet", not "UDP" or internal protocol names.
 
-2. **Scanning (Central Mode)**:
-   - Devices scan for all BLE devices advertising service UUIDs
-   - **Filter by Grassroots prefix**: only process devices whose UUID starts with `84c403160871e5ad`
-   - Non-Grassroots devices (headphones, smartwatches) are skipped immediately
+## Single Public Address
 
-3. **Connection & Service Discovery**:
-   - Connect to Grassroots-prefixed devices
-   - Perform GATT service discovery as defense-in-depth
-   - Check for Bitchat characteristic (UUID: `0000ff01-0000-1000-8000-00805f9b34fb`)
-   - If characteristic NOT found → disconnect (spoofed prefix or corrupt device)
-   - If characteristic found → proceed to ANNOUNCE exchange
+Each device advertises exactly **one UDP address** — the public address discovered via an external service (seeip.org). Never advertise LAN/private addresses. Never add a second address field to the ANNOUNCE. If the public address doesn't work on the local network (hairpin routing failure), the solution is to fix the transport layer (e.g. fall back to raw UDP), not to add LAN addresses.
 
-4. **ANNOUNCE Exchange & Verification**:
-   - After service discovery confirms Bitchat peer, exchange ANNOUNCE packets
-   - ANNOUNCE contains: full public key, nickname, signature
-   - Receiving device verifies the signature and stores the mapping: `BLE_Device_ID -> PublicKey`
+## Peer Address Persistence
 
-5. **Identity Mapping**:
-   - BLE layer knows devices by MAC address / device ID
-   - Application layer (GSG) knows peers by Ed25519 public key
-   - Bitchat maintains the mapping between these identities
+Never unilaterally clear a peer's stored UDP address. Update it when a new valid address arrives (from ANNOUNCE, signaling, or observation), and clear it only when the peer explicitly tells us they no longer have one. Stale peer cleanup, our-side disconnects, and transport restarts must not null out `udpAddress` — it is the last known location and the only way to attempt reconnection. This applies to friends and non-friends alike.
 
-### DO NOT:
-- ❌ Use a single fixed service UUID for all devices
-- ❌ Skip the Grassroots prefix filter during scanning
-- ❌ Assume UUID prefix match means peer is verified (ANNOUNCE still required)
+## Transport Independence
 
-### DO:
-- ✅ Derive UUID from Grassroots prefix + last 8 bytes of public key
-- ✅ Filter scan results by Grassroots UUID prefix
-- ✅ Keep GATT characteristic check as defense-in-depth after connection
-- ✅ Exchange ANNOUNCE packets after confirming Bitchat peer
-- ✅ Maintain BLE Device ID ↔ Public Key mapping
-
-## NO Store-and-Forward
-
-**IMPORTANT**: Bitchat does NOT implement store-and-forward messaging.
-
-- Messages to offline peers simply **fail** - they are NOT cached
-- The sender must retry later when the peer is online
-- This is by design to keep the protocol simple and avoid message accumulation
-- If a peer is unreachable via any enabled transport (BLE or libp2p), `send()` returns `false`
-
-### DO NOT:
-- ❌ Cache messages for offline peers
-- ❌ Implement store-and-forward queues
-- ❌ Automatically retry sending to offline peers
-- ❌ Hold messages in memory waiting for peers to reconnect
-
-### DO:
-- ✅ Return `false` immediately if peer is unreachable
-- ✅ Let the application layer handle retry logic if needed
-- ✅ Try all available transports (BLE first, then libp2p) before failing
-
-## Redux Architecture for Peers
-
-All peer state is managed through Redux:
-
-### State Structure
-- `AppState.peers` → `PeersState`
-  - `discoveredBlePeers: Map<String, DiscoveredPeerState>` - Pre-ANNOUNCE BLE devices
-  - `peers: Map<String, PeerState>` - Post-ANNOUNCE identified peers
-
-### Key Actions
-- `BleDeviceDiscoveredAction` - BLE scan found a device
-- `BleDeviceConnectedAction` / `BleDeviceDisconnectedAction` - Connection state
-- `PeerAnnounceReceivedAction` - ANNOUNCE packet received (peer identified)
-- `PeerRssiUpdatedAction` - Signal strength updated
-- `StaleDiscoveredBlePeersRemovedAction` / `StalePeersRemovedAction` - Cleanup
-
-### UI Pattern
-```dart
-// Read peers from Redux store
-Map<String, Peer> get _peers {
-  return {
-    for (var p in appStore.state.peers.connectedPeers) 
-      p.pubkeyHex: _peerStateToLegacy(p)
-  };
-}
-
-// Subscribe to store changes
-appStore.onChange.listen((_) => setState(() {}));
-```
-
-## Transport Layer Settings
-
-### Transport Priority
-When both transports are enabled and a peer is reachable via both:
-1. **Bluetooth (BLE)** is preferred - faster, no Internet needed, works for nearby peers
-2. **libp2p (Internet)** is fallback - works globally but requires Internet
-
-### Disabling Transports
-- When Bluetooth is disabled: stop advertising, stop scanning, no BLE communication
-- When libp2p is disabled: stop libp2p host, no Internet communication
-- At least one transport should remain enabled for the app to function
-
-### Per-Peer Addresses
-Each peer can have both a BLE address and a libp2p address stored:
-- `PeerState.bleDeviceId` - BLE device ID (MAC on Android, UUID on iOS)
-- `PeerState.libp2pAddress` - libp2p multiaddress
-- Messages route through the best available transport based on peer availability
+BLE and UDP are independent transports. Disabling or losing one must have **zero effect** on the other's connection state, peer reachability, or online status. A peer connected via UDP remains online regardless of BLE state. The stale peer logic, the UI, and the reducer must all respect this: never let a BLE disconnection degrade UDP-derived state.
 
 ## Code References
 
-- Service UUID derivation: `lib/src/models/identity.dart` → `deriveServiceUuid()` static method, `bleServiceUuid` getter
-- Grassroots UUID prefix: `lib/src/models/identity.dart` → `BitchatIdentity.grassrootsUuidPrefix`
-- Scan prefix filtering: `lib/src/ble/ble_central_service.dart` → `_onScanResults()`
-- Peripheral advertising: `lib/src/ble/ble_peripheral_service.dart` → `startAdvertising()`
-- Central scanning: `lib/src/ble/ble_central_service.dart` → `startScan()` and `_onScanResults()`
-- ANNOUNCE handling: `lib/src/transport/ble_transport_service.dart` → `_handleAnnounce()`
-- Redux store: `lib/src/store/` → `peers_state.dart`, `peers_actions.dart`, `peers_reducer.dart`
+- Identity & service UUID: `lib/src/models/identity.dart`
+- BLE scanning & filtering: `lib/src/ble/ble_central_service.dart`
+- BLE advertising: `lib/src/ble/ble_peripheral_service.dart`
+- UDP transport: `lib/src/transport/udp_transport_service.dart`
+- ANNOUNCE handling: `lib/src/routing/message_router.dart`
+- Coordinator: `lib/src/bitchat.dart`
+- Redux store: `lib/src/store/`

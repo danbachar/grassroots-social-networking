@@ -69,15 +69,30 @@ void main() {
         expect(hexOnly, matches(RegExp(r'^[0-9a-f]{32}$')));
       });
 
-      test('UUID is derived from last 16 bytes of public key', () {
+      test('UUID starts with Grassroots prefix and ends with last 8 bytes of pubkey', () {
         final uuid = identity.bleServiceUuid;
         final hexOnly = uuid.replaceAll('-', '');
 
-        // Manually compute expected hex from last 16 bytes of pubkey
-        final last16 = identity.publicKey.sublist(16, 32);
-        final expectedHex =
-            last16.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-        expect(hexOnly, equals(expectedHex));
+        // First 16 hex chars = Grassroots prefix
+        expect(hexOnly.substring(0, 16),
+            equals(BitchatIdentity.grassrootsUuidPrefix));
+
+        // Last 16 hex chars = last 8 bytes of pubkey
+        final last8 = identity.publicKey.sublist(24, 32);
+        final expectedSuffix =
+            last8.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+        expect(hexOnly.substring(16), equals(expectedSuffix));
+      });
+
+      test('deriveServiceUuid static method matches bleServiceUuid getter', () {
+        expect(BitchatIdentity.deriveServiceUuid(identity.publicKey),
+            equals(identity.bleServiceUuid));
+      });
+
+      test('grassrootsUuidPrefix is 8 bytes (16 hex chars)', () {
+        expect(BitchatIdentity.grassrootsUuidPrefix.length, equals(16));
+        expect(BitchatIdentity.grassrootsUuidPrefix,
+            matches(RegExp(r'^[0-9a-f]{16}$')));
       });
 
       test('different identities produce different UUIDs', () async {
@@ -110,12 +125,6 @@ void main() {
             .join(':')
             .toUpperCase();
         expect(fingerprint, equals(expectedHex));
-      });
-    });
-
-    group('validate()', () {
-      test('does not throw for valid identity', () async {
-        await expectLater(identity.validate(), completes);
       });
     });
 
@@ -160,12 +169,6 @@ void main() {
         final json = identity.toJson();
         final restored = BitchatIdentity.fromMap(json);
         expect(restored.shortFingerprint, equals(identity.shortFingerprint));
-      });
-
-      test('restored identity passes validate()', () async {
-        final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
-        await expectLater(restored.validate(), completes);
       });
     });
 

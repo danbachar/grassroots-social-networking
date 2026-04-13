@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:logger/logger.dart';
+import 'package:flutter/foundation.dart';
 
 /// Result of permission request
 enum PermissionResult {
@@ -21,7 +21,6 @@ enum PermissionResult {
 /// - Android <12: BLUETOOTH, BLUETOOTH_ADMIN, ACCESS_FINE_LOCATION
 /// - iOS: Bluetooth (handled automatically), Location for background
 class PermissionHandler {
-  final Logger _log = Logger();
   
   /// Check if all required permissions are granted
   Future<bool> hasRequiredPermissions() async {
@@ -37,7 +36,7 @@ class PermissionHandler {
   /// 
   /// Returns [PermissionResult] indicating success/failure
   Future<PermissionResult> requestPermissions() async {
-    _log.i('Requesting BLE permissions');
+    debugPrint('Requesting BLE permissions');
     
     if (Platform.isAndroid) {
       return await _requestAndroidPermissions();
@@ -80,12 +79,12 @@ class PermissionHandler {
     }
     
     if (anyPermanentlyDenied) {
-      _log.w('Bluetooth permissions permanently denied');
+      debugPrint('Bluetooth permissions permanently denied');
       return PermissionResult.permanentlyDenied;
     }
     
     if (anyDenied) {
-      _log.w('Bluetooth permissions denied');
+      debugPrint('Bluetooth permissions denied');
       return PermissionResult.denied;
     }
     
@@ -93,16 +92,16 @@ class PermissionHandler {
     final locationStatus = await Permission.locationWhenInUse.request();
     
     if (locationStatus.isPermanentlyDenied) {
-      _log.w('Location permission permanently denied');
+      debugPrint('Location permission permanently denied');
       return PermissionResult.permanentlyDenied;
     }
     
     if (locationStatus.isDenied) {
-      _log.w('Location permission denied');
+      debugPrint('Location permission denied');
       return PermissionResult.denied;
     }
     
-    _log.i('All permissions granted');
+    debugPrint('All permissions granted');
     return PermissionResult.granted;
   }
   
@@ -112,14 +111,14 @@ class PermissionHandler {
     // iOS handles Bluetooth permissions automatically via Info.plist
     // since iOS 13+. No need to check bluetooth permission explicitly.
     // Just return true as Bluetooth will be granted automatically when used
-    _log.i('iOS: Bluetooth permissions handled by Info.plist');
+    debugPrint('iOS: Bluetooth permissions handled by Info.plist');
     return true;
   }
   
   Future<PermissionResult> _requestIOSPermissions() async {
     // iOS 13+ handles Bluetooth automatically via Info.plist
     // No explicit permission request needed for Bluetooth
-    _log.i('iOS: Bluetooth permissions granted automatically via Info.plist');
+    debugPrint('iOS: Bluetooth permissions granted automatically via Info.plist');
     return PermissionResult.granted;
   }
   

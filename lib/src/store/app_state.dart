@@ -3,36 +3,14 @@ import 'peers_state.dart';
 import 'messages_state.dart';
 import 'friendships_state.dart';
 import 'settings_state.dart';
-
-/// Transport connection status
-enum TransportConnectionStatus {
-  /// Not initialized
-  uninitialized,
-
-  /// Initializing transports
-  initializing,
-
-  /// Ready but not active
-  ready,
-
-  /// Active and online
-  online,
-
-  /// Currently scanning for devices
-  scanning,
-
-  /// Error state
-  error,
-}
+import 'signaling_state.dart';
+import 'transports_state.dart';
 
 /// Main application state for redux
 @immutable
 class AppState {
-  /// Current transport connection status
-  final TransportConnectionStatus connectionStatus;
-
-  /// Error message if in error state
-  final String? errorMessage;
+  /// Per-transport lifecycle state
+  final TransportsState transports;
 
   /// Peers state (discovered and connected peers)
   final PeersState peers;
@@ -46,90 +24,78 @@ class AppState {
   /// Settings state (transport settings)
   final SettingsState settings;
 
+  /// Signaling state (address registration, hole-punch attempts)
+  final SignalingState signaling;
+
   const AppState({
-    this.connectionStatus = TransportConnectionStatus.uninitialized,
-    this.errorMessage,
+    this.transports = const TransportsState(),
     this.peers = const PeersState(),
     this.messages = const MessagesState(),
     this.friendships = const FriendshipsState(),
     this.settings = const SettingsState(),
+    this.signaling = const SignalingState(),
   });
-  
+
   /// Initial state
   static const AppState initial = AppState();
-  
+
   // ===== Convenience getters that derive from peers state =====
-  
+
   /// Number of nearby peers (discovered BLE devices)
   int get nearbyPeerCount => peers.discoveredBleCount;
-  
+
   /// Number of connected peers (after ANNOUNCE)
   int get connectedPeerCount => peers.connectedCount;
-  
-  /// Number of online friends (friends connected via libp2p only)
+
+  /// Number of online friends (friends connected via UDP only)
   int get onlineFriendsCount => peers.onlineFriends.length;
-  
+
+  // ===== Convenience getters derived from transports state =====
+
+  /// Get display string for connection status
+  String get statusDisplayString => transports.statusDisplayString;
+
+  /// Whether status indicates a healthy/running state
+  bool get isHealthy => transports.isHealthy;
+
   /// Create a copy with updated values
   AppState copyWith({
-    TransportConnectionStatus? connectionStatus,
-    String? errorMessage,
+    TransportsState? transports,
     PeersState? peers,
     MessagesState? messages,
     FriendshipsState? friendships,
     SettingsState? settings,
+    SignalingState? signaling,
   }) {
     return AppState(
-      connectionStatus: connectionStatus ?? this.connectionStatus,
-      errorMessage: errorMessage ?? this.errorMessage,
+      transports: transports ?? this.transports,
       peers: peers ?? this.peers,
       messages: messages ?? this.messages,
       friendships: friendships ?? this.friendships,
       settings: settings ?? this.settings,
+      signaling: signaling ?? this.signaling,
     );
   }
-  
-  /// Get display string for connection status
-  String get statusDisplayString {
-    switch (connectionStatus) {
-      case TransportConnectionStatus.uninitialized:
-        return 'Initializing...';
-      case TransportConnectionStatus.initializing:
-        return 'Starting BLE...';
-      case TransportConnectionStatus.ready:
-        return 'Ready';
-      case TransportConnectionStatus.online:
-        return 'Online';
-      case TransportConnectionStatus.scanning:
-        return 'Scanning for peers...';
-      case TransportConnectionStatus.error:
-        return errorMessage ?? 'Error';
-    }
-  }
-  
-  /// Whether status indicates a healthy/running state
-  bool get isHealthy => 
-      connectionStatus == TransportConnectionStatus.online ||
-      connectionStatus == TransportConnectionStatus.scanning;
-  
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is AppState &&
           runtimeType == other.runtimeType &&
-          connectionStatus == other.connectionStatus &&
-          errorMessage == other.errorMessage &&
+          transports == other.transports &&
           peers == other.peers &&
           messages == other.messages &&
           friendships == other.friendships &&
-          settings == other.settings;
+          settings == other.settings &&
+          signaling == other.signaling;
 
   @override
   int get hashCode => Object.hash(
-        connectionStatus,
-        errorMessage,
+        transports,
         peers,
         messages,
         friendships,
         settings,
+        signaling,
       );
 }

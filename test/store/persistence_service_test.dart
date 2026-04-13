@@ -15,9 +15,7 @@ FriendshipState makeFriendship({
   required String pubkey,
   FriendshipStatus status = FriendshipStatus.accepted,
   String? nickname,
-  String? libp2pAddress,
-  String? libp2pHostId,
-  List<String>? libp2pHostAddrs,
+  String? udpAddress,
   String? message,
   DateTime? createdAt,
   DateTime? updatedAt,
@@ -27,9 +25,7 @@ FriendshipState makeFriendship({
     peerPubkeyHex: pubkey,
     nickname: nickname,
     status: status,
-    libp2pAddress: libp2pAddress,
-    libp2pHostId: libp2pHostId,
-    libp2pHostAddrs: libp2pHostAddrs,
+    udpAddress: udpAddress,
     message: message,
     createdAt: createdAt ?? now,
     updatedAt: updatedAt ?? now,
@@ -42,7 +38,7 @@ ChatMessageState makeMessage({
   String content = 'hello',
   bool isOutgoing = true,
   ChatMessageType messageType = ChatMessageType.text,
-  String? libp2pAddress,
+  String? udpAddress,
   String? messageId,
   DateTime? timestamp,
 }) {
@@ -53,7 +49,7 @@ ChatMessageState makeMessage({
     timestamp: timestamp ?? DateTime.utc(2025, 1, 15, 12, 0, 0),
     isOutgoing: isOutgoing,
     messageType: messageType,
-    libp2pAddress: libp2pAddress,
+    udpAddress: udpAddress,
     messageId: messageId,
   );
 }
@@ -104,9 +100,7 @@ void main() {
         pubkey: peerA,
         nickname: 'Alice',
         status: FriendshipStatus.accepted,
-        libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmAlice',
-        libp2pHostId: 'QmAlice',
-        libp2pHostAddrs: const ['/ip4/1.2.3.4/tcp/4001'],
+        udpAddress: '1.2.3.4:4001',
         message: 'Hi!',
       );
       final state = FriendshipsState(friendships: {peerA: friendship});
@@ -124,10 +118,7 @@ void main() {
       expect(loaded.peerPubkeyHex, equals(peerA));
       expect(loaded.nickname, equals('Alice'));
       expect(loaded.status, equals(FriendshipStatus.accepted));
-      expect(
-          loaded.libp2pAddress, equals('/ip4/1.2.3.4/tcp/4001/p2p/QmAlice'));
-      expect(loaded.libp2pHostId, equals('QmAlice'));
-      expect(loaded.libp2pHostAddrs, equals(['/ip4/1.2.3.4/tcp/4001']));
+      expect(loaded.udpAddress, equals('1.2.3.4:4001'));
       expect(loaded.message, equals('Hi!'));
     });
 
@@ -160,99 +151,7 @@ void main() {
           equals(FriendshipStatus.pending));
     });
 
-    test('migrates from old key format (list of objects)', () async {
-      final createdAt = DateTime.utc(2025, 1, 10, 8, 0, 0);
-      final updatedAt = DateTime.utc(2025, 1, 12, 10, 0, 0);
-      final oldFormatList = [
-        {
-          'peerPubkeyHex': peerA,
-          'libp2pAddress': '/ip4/10.0.0.1/tcp/4001/p2p/QmOld',
-          'libp2pHostId': 'QmOld',
-          'libp2pHostAddrs': ['/ip4/10.0.0.1/tcp/4001'],
-          'nickname': 'OldAlice',
-          'status': FriendshipStatus.accepted.index,
-          'createdAt': createdAt.toIso8601String(),
-          'updatedAt': updatedAt.toIso8601String(),
-          'message': 'Be my friend',
-          // Legacy fields that should be ignored
-          'isOnline': true,
-          'lastOnline': '2025-01-12T10:00:00.000Z',
-        },
-        {
-          'peerPubkeyHex': peerB,
-          'libp2pAddress': null,
-          'libp2pHostId': null,
-          'nickname': 'OldBob',
-          'status': FriendshipStatus.pending.index,
-          'createdAt': createdAt.toIso8601String(),
-          'updatedAt': updatedAt.toIso8601String(),
-          'message': null,
-        },
-      ];
-
-      SharedPreferences.setMockInitialValues({
-        'bitchat_friendships': jsonEncode(oldFormatList),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadFriendships();
-
-      expect(result.friendships.length, equals(2));
-      expect(result.friendships[peerA]!.nickname, equals('OldAlice'));
-      expect(result.friendships[peerA]!.status,
-          equals(FriendshipStatus.accepted));
-      expect(result.friendships[peerA]!.libp2pAddress,
-          equals('/ip4/10.0.0.1/tcp/4001/p2p/QmOld'));
-      expect(result.friendships[peerA]!.libp2pHostId, equals('QmOld'));
-      expect(result.friendships[peerA]!.libp2pHostAddrs,
-          equals(['/ip4/10.0.0.1/tcp/4001']));
-      expect(result.friendships[peerA]!.message, equals('Be my friend'));
-      expect(result.friendships[peerA]!.createdAt, equals(createdAt));
-      expect(result.friendships[peerA]!.updatedAt, equals(updatedAt));
-
-      expect(result.friendships[peerB]!.nickname, equals('OldBob'));
-      expect(result.friendships[peerB]!.status,
-          equals(FriendshipStatus.pending));
-
-      // Verify migration saved to new key and removed old key
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bitchat_friendships_v2'), isNotNull);
-      expect(prefs.getString('bitchat_friendships'), isNull);
-    });
-
-    test('prefers v2 key over old key', () async {
-      final v2Friendship = makeFriendship(
-        pubkey: peerA,
-        nickname: 'NewAlice',
-        status: FriendshipStatus.accepted,
-      );
-      final v2State = FriendshipsState(friendships: {peerA: v2Friendship});
-
-      final oldFormatList = [
-        {
-          'peerPubkeyHex': peerB,
-          'nickname': 'OldBob',
-          'status': FriendshipStatus.pending.index,
-          'createdAt': DateTime.utc(2025, 1, 1).toIso8601String(),
-          'updatedAt': DateTime.utc(2025, 1, 1).toIso8601String(),
-        },
-      ];
-
-      SharedPreferences.setMockInitialValues({
-        'bitchat_friendships_v2': jsonEncode(v2State.toJson()),
-        'bitchat_friendships': jsonEncode(oldFormatList),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadFriendships();
-
-      // Should load from v2, not old key
-      expect(result.friendships.length, equals(1));
-      expect(result.friendships.containsKey(peerA), isTrue);
-      expect(result.friendships[peerA]!.nickname, equals('NewAlice'));
-    });
-
-    test('returns empty FriendshipsState on corrupt v2 data', () async {
+    test('returns empty FriendshipsState on corrupt data', () async {
       SharedPreferences.setMockInitialValues({
         'bitchat_friendships_v2': 'this is not json{{{',
       });
@@ -263,32 +162,6 @@ void main() {
       expect(result.friendships, isEmpty);
     });
 
-    test('returns empty FriendshipsState on corrupt old format data',
-        () async {
-      SharedPreferences.setMockInitialValues({
-        'bitchat_friendships': 'not valid json!!!',
-      });
-      service = PersistenceService();
-
-      final result = await service.loadFriendships();
-
-      expect(result.friendships, isEmpty);
-    });
-
-    test(
-        'returns empty FriendshipsState when old format has invalid structure',
-        () async {
-      // Old format is supposed to be a list, but provide an object
-      SharedPreferences.setMockInitialValues({
-        'bitchat_friendships': jsonEncode({'unexpected': 'object'}),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadFriendships();
-
-      // Should fail to cast to List and fall through to empty
-      expect(result.friendships, isEmpty);
-    });
   });
 
   // ===================================================================
@@ -299,19 +172,19 @@ void main() {
       final result = await service.loadSettings();
 
       expect(result.bluetoothEnabled, isTrue);
-      expect(result.libp2pEnabled, isTrue);
+      expect(result.udpEnabled, isTrue);
       expect(result.transportPriority, equals(const [
         TransportProtocol.bluetooth,
-        TransportProtocol.libp2p,
+        TransportProtocol.udp,
       ]));
     });
 
     test('loads settings from v2 key', () async {
       const settings = SettingsState(
         bluetoothEnabled: false,
-        libp2pEnabled: true,
+        udpEnabled: true,
         transportPriority: [
-          TransportProtocol.libp2p,
+          TransportProtocol.udp,
           TransportProtocol.bluetooth,
         ],
       );
@@ -324,63 +197,14 @@ void main() {
       final result = await service.loadSettings();
 
       expect(result.bluetoothEnabled, isFalse);
-      expect(result.libp2pEnabled, isTrue);
+      expect(result.udpEnabled, isTrue);
       expect(result.transportPriority, equals(const [
-        TransportProtocol.libp2p,
+        TransportProtocol.udp,
         TransportProtocol.bluetooth,
       ]));
     });
 
-    test('migrates from old key format', () async {
-      final settingsJson = {
-        'bluetoothEnabled': false,
-        'libp2pEnabled': false,
-        'transportPriority': ['libp2p', 'bluetooth'],
-      };
-
-      SharedPreferences.setMockInitialValues({
-        'bitchat_transport_settings': jsonEncode(settingsJson),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadSettings();
-
-      expect(result.bluetoothEnabled, isFalse);
-      expect(result.libp2pEnabled, isFalse);
-      expect(result.transportPriority, equals(const [
-        TransportProtocol.libp2p,
-        TransportProtocol.bluetooth,
-      ]));
-
-      // Verify migration saved to new key and removed old key
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bitchat_settings_v2'), isNotNull);
-      expect(prefs.getString('bitchat_transport_settings'), isNull);
-    });
-
-    test('prefers v2 key over old key', () async {
-      const v2Settings = SettingsState(
-        bluetoothEnabled: false,
-        libp2pEnabled: true,
-      );
-      final oldSettings = {
-        'bluetoothEnabled': true,
-        'libp2pEnabled': false,
-      };
-
-      SharedPreferences.setMockInitialValues({
-        'bitchat_settings_v2': jsonEncode(v2Settings.toJson()),
-        'bitchat_transport_settings': jsonEncode(oldSettings),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadSettings();
-
-      expect(result.bluetoothEnabled, isFalse);
-      expect(result.libp2pEnabled, isTrue);
-    });
-
-    test('returns default SettingsState on corrupt v2 data', () async {
+    test('returns default SettingsState on corrupt data', () async {
       SharedPreferences.setMockInitialValues({
         'bitchat_settings_v2': 'garbage data {{{',
       });
@@ -389,19 +213,7 @@ void main() {
       final result = await service.loadSettings();
 
       expect(result.bluetoothEnabled, isTrue);
-      expect(result.libp2pEnabled, isTrue);
-    });
-
-    test('returns default SettingsState on corrupt old format data', () async {
-      SharedPreferences.setMockInitialValues({
-        'bitchat_transport_settings': 'not json at all',
-      });
-      service = PersistenceService();
-
-      final result = await service.loadSettings();
-
-      expect(result.bluetoothEnabled, isTrue);
-      expect(result.libp2pEnabled, isTrue);
+      expect(result.udpEnabled, isTrue);
     });
 
     test('handles partial settings JSON gracefully', () async {
@@ -417,10 +229,10 @@ void main() {
 
       expect(result.bluetoothEnabled, isFalse);
       // Defaults for missing fields
-      expect(result.libp2pEnabled, isTrue);
+      expect(result.udpEnabled, isTrue);
       expect(result.transportPriority, equals(const [
         TransportProtocol.bluetooth,
-        TransportProtocol.libp2p,
+        TransportProtocol.udp,
       ]));
     });
   });
@@ -565,7 +377,7 @@ void main() {
         recipient: peerB,
         content: 'Sent a friend request',
         messageType: ChatMessageType.friendRequestSent,
-        libp2pAddress: '/ip4/1.2.3.4/tcp/4001',
+        udpAddress: '[2001:db8::1]:4001',
       );
       final friendReqReceived = makeMessage(
         sender: peerB,
@@ -573,7 +385,7 @@ void main() {
         content: 'Wants to be friends',
         isOutgoing: false,
         messageType: ChatMessageType.friendRequestReceived,
-        libp2pAddress: '/ip4/5.6.7.8/tcp/4001',
+        udpAddress: '[2001:db8::2]:4001',
       );
       final friendReqAccepted = makeMessage(
         sender: peerB,
@@ -604,8 +416,8 @@ void main() {
           equals(ChatMessageType.friendRequestSent));
       expect(conversations[peerB]![2].messageType,
           equals(ChatMessageType.friendRequestReceived));
-      expect(conversations[peerB]![2].libp2pAddress,
-          equals('/ip4/5.6.7.8/tcp/4001'));
+      expect(conversations[peerB]![2].udpAddress,
+          equals('[2001:db8::2]:4001'));
       expect(conversations[peerB]![3].messageType,
           equals(ChatMessageType.friendRequestAccepted));
     });
@@ -624,7 +436,7 @@ void main() {
           FriendshipsState(friendships: {peerA: friendship});
       const settingsState = SettingsState(
         bluetoothEnabled: false,
-        libp2pEnabled: true,
+        udpEnabled: true,
       );
       final msg = makeMessage(
         sender: peerA,
@@ -659,9 +471,7 @@ void main() {
         pubkey: peerA,
         nickname: 'RoundTripAlice',
         status: FriendshipStatus.received,
-        libp2pAddress: '/ip4/192.168.1.1/tcp/4001/p2p/QmRT',
-        libp2pHostId: 'QmRT',
-        libp2pHostAddrs: const ['/ip4/192.168.1.1/tcp/4001'],
+        udpAddress: '[2001:db8::1]:4001',
         message: 'round trip message',
       );
       final friendshipsState =
@@ -680,11 +490,7 @@ void main() {
       expect(loadedFriendship.peerPubkeyHex, equals(peerA));
       expect(loadedFriendship.nickname, equals('RoundTripAlice'));
       expect(loadedFriendship.status, equals(FriendshipStatus.received));
-      expect(loadedFriendship.libp2pAddress,
-          equals('/ip4/192.168.1.1/tcp/4001/p2p/QmRT'));
-      expect(loadedFriendship.libp2pHostId, equals('QmRT'));
-      expect(loadedFriendship.libp2pHostAddrs,
-          equals(['/ip4/192.168.1.1/tcp/4001']));
+      expect(loadedFriendship.udpAddress, equals('[2001:db8::1]:4001'));
       expect(loadedFriendship.message, equals('round trip message'));
       expect(loadedFriendship.createdAt, equals(friendship.createdAt));
       expect(loadedFriendship.updatedAt, equals(friendship.updatedAt));
@@ -693,9 +499,9 @@ void main() {
     test('round-trip: flush then load returns same settings', () async {
       const settings = SettingsState(
         bluetoothEnabled: false,
-        libp2pEnabled: false,
+        udpEnabled: false,
         transportPriority: [
-          TransportProtocol.libp2p,
+          TransportProtocol.udp,
           TransportProtocol.bluetooth,
         ],
       );
@@ -708,9 +514,9 @@ void main() {
       loadService.dispose();
 
       expect(loaded.bluetoothEnabled, isFalse);
-      expect(loaded.libp2pEnabled, isFalse);
+      expect(loaded.udpEnabled, isFalse);
       expect(loaded.transportPriority, equals(const [
-        TransportProtocol.libp2p,
+        TransportProtocol.udp,
         TransportProtocol.bluetooth,
       ]));
     });
@@ -782,7 +588,7 @@ void main() {
       final settingsJson =
           jsonDecode(settingsData!) as Map<String, dynamic>;
       expect(settingsJson['bluetoothEnabled'], isTrue);
-      expect(settingsJson['libp2pEnabled'], isTrue);
+      expect(settingsJson['udpEnabled'], isTrue);
 
       final conversationsJson =
           jsonDecode(conversationsData!) as Map<String, dynamic>;
@@ -1055,9 +861,7 @@ void main() {
       loadService.dispose();
 
       final f = loaded.friendships[peerA]!;
-      expect(f.libp2pAddress, isNull);
-      expect(f.libp2pHostId, isNull);
-      expect(f.libp2pHostAddrs, isNull);
+      expect(f.udpAddress, isNull);
       expect(f.nickname, isNull);
       expect(f.message, isNull);
       expect(f.status, equals(FriendshipStatus.pending));
@@ -1098,35 +902,5 @@ void main() {
       expect(unreads[peerA], equals(2));
     });
 
-    test(
-        'all FriendshipStatus values round-trip through old format migration',
-        () async {
-      final now = DateTime.utc(2025, 1, 1);
-      final oldList = FriendshipStatus.values.map((status) {
-        return {
-          'peerPubkeyHex':
-              'peer${status.index}${'0' * 60}'.substring(0, 64),
-          'nickname': 'Peer ${status.name}',
-          'status': status.index,
-          'createdAt': now.toIso8601String(),
-          'updatedAt': now.toIso8601String(),
-        };
-      }).toList();
-
-      SharedPreferences.setMockInitialValues({
-        'bitchat_friendships': jsonEncode(oldList),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadFriendships();
-
-      expect(result.friendships.length,
-          equals(FriendshipStatus.values.length));
-      for (final status in FriendshipStatus.values) {
-        final key =
-            'peer${status.index}${'0' * 60}'.substring(0, 64);
-        expect(result.friendships[key]!.status, equals(status));
-      }
-    });
   });
 }

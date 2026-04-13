@@ -81,6 +81,60 @@ class BitchatIdentity {
 
   /// BLE Service UUID for this identity.
   String get bleServiceUuid => deriveServiceUuid(publicKey);
+
+  /// Derive the anchor server's Ed25519 keypair from this identity's seed.
+  ///
+  /// The anchor's key is a deterministic subkey:
+  ///   anchorSeed = SHA-256(ownerSeed || "bitchat-anchor")
+  ///
+  /// This means:
+  /// - The owner always knows the anchor's pubkey (no manual config).
+  /// - The derived seed is exported once and deployed to the server.
+  /// - The anchor has its own distinct keypair — compromising it doesn't
+  ///   reveal the owner's key (SHA-256 is one-way).
+  Future<SimpleKeyPair> deriveAnchorKeyPair() async {
+    final ownerSeed = privateKey.sublist(0, 32);
+    final domain = Uint8List.fromList('bitchat-anchor'.codeUnits);
+    final input = Uint8List(ownerSeed.length + domain.length)
+      ..setAll(0, ownerSeed)
+      ..setAll(ownerSeed.length, domain);
+
+    final hash = await Sha256().hash(input);
+    final anchorSeed = Uint8List.fromList(hash.bytes);
+
+    final algorithm = Ed25519();
+    return algorithm.newKeyPairFromSeed(anchorSeed);
+  }
+
+  /// Get the anchor server's public key hex (derived deterministically).
+  Future<String> get anchorPubkeyHex async {
+    final kp = await deriveAnchorKeyPair();
+    final pk = await kp.extractPublicKey();
+    return Uint8List.fromList(pk.bytes)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+  }
+
+  /// Get the anchor server's public key bytes (derived deterministically).
+  Future<Uint8List> get anchorPublicKey async {
+    final kp = await deriveAnchorKeyPair();
+    final pk = await kp.extractPublicKey();
+    return Uint8List.fromList(pk.bytes);
+  }
+
+  /// Export the anchor server's seed (32 bytes) for deployment.
+  ///
+  /// This is the only secret the server needs. Give it to the server via
+  /// the `--seed` CLI flag or an identity file.
+  Future<Uint8List> get anchorSeed async {
+    final ownerSeed = privateKey.sublist(0, 32);
+    final domain = Uint8List.fromList('bitchat-anchor'.codeUnits);
+    final input = Uint8List(ownerSeed.length + domain.length)
+      ..setAll(0, ownerSeed)
+      ..setAll(ownerSeed.length, domain);
+    final hash = await Sha256().hash(input);
+    return Uint8List.fromList(hash.bytes);
+  }
   
   /// Get fingerprint (first 8 bytes of SHA-256 hash of public key) for display
   /// Full verification uses the complete public key

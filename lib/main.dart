@@ -1,15 +1,16 @@
+import 'package:flutter/foundation.dart';
 import 'package:bitchat_transport/bitchat_transport.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:logger/logger.dart' show Logger;
+import 'package:logger/logger.dart' show Logger, Level;
+import 'src/debug/log_buffer.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'dart:async';
 import 'package:cryptography/cryptography.dart';
 import 'chat_screen.dart';
@@ -39,7 +40,7 @@ Future<BitchatIdentity> _initIdentity() async {
   const storage = FlutterSecureStorage();
   var identityValue = await storage.read(key: 'identity');
   if (identityValue == null) {
-    print('No identity found, generating new one.');
+    debugPrint('No identity found, generating new one.');
     final algorithm = Ed25519();
     final keyPair = await algorithm.newKeyPair();
     final seed = await keyPair.extractPrivateKeyBytes(); // 32-byte seed
@@ -60,20 +61,135 @@ Future<BitchatIdentity> _initIdentity() async {
     identityValue = jsonEncode(id.toJson());
     await storage.write(key: 'identity', value: identityValue);
   } else {
-    print('Identity found in secure storage.');
+    debugPrint('Identity found in secure storage.');
   }
 
   final BitchatIdentity identity =
       BitchatIdentity.fromMap(jsonDecode(identityValue));
 
-  print('Private Key Bytes (Seed): ${identity.privateKey.length} bytes');
-  print('Public Key Bytes: ${identity.publicKey.length} bytes');
-  print('Nickname: ${identity.nickname}');
+  debugPrint('Private Key Bytes (Seed): ${identity.privateKey.length} bytes');
+  debugPrint('Public Key Bytes: ${identity.publicKey.length} bytes');
+  debugPrint('Nickname: ${identity.nickname}');
   return identity;
+}
+
+Map<String, dynamic> _serializeAppState(AppState state) {
+  return {
+    'bleTransportState': state.transports.bleState.name,
+    'udpTransportState': state.transports.udpState.name,
+    'peers': {
+      'discoveredBlePeers': {
+        for (final e in state.peers.discoveredBlePeers.entries)
+          e.key: {
+            'transportId': e.value.transportId,
+            'displayName': e.value.displayName,
+            'rssi': e.value.rssi,
+            'isConnecting': e.value.isConnecting,
+            'isConnected': e.value.isConnected,
+            'lastError': e.value.lastError,
+            'serviceUuid': e.value.serviceUuid,
+            'lastSeen': e.value.lastSeen.toIso8601String(),
+          },
+      },
+      'peers': {
+        for (final e in state.peers.peers.entries)
+          e.key: {
+            'nickname': e.value.nickname,
+            'connectionState': e.value.connectionState.name,
+            'transport': e.value.transport.name,
+            'activeTransport': e.value.activeTransport.name,
+            'rssi': e.value.rssi,
+            'bleDeviceId': e.value.bleDeviceId,
+            'udpAddress': e.value.udpAddress,
+            'isFriend': e.value.isFriend,
+            'lastSeen': e.value.lastSeen?.toIso8601String(),
+          },
+      },
+    },
+    'messages': {
+      'conversationCount': state.messages.conversations.length,
+      'unreadCounts': state.messages.unreadCounts,
+      'outgoingCount': state.messages.outgoingMessages.length,
+      'incomingCount': state.messages.incomingMessages.length,
+    },
+    'friendships': {
+      for (final e in state.friendships.friendships.entries)
+        e.key: {
+          'nickname': e.value.nickname,
+          'status': e.value.status.name,
+          'udpAddress': e.value.udpAddress,
+        },
+    },
+    'settings': state.settings.toJson(),
+  };
+}
+
+/// Set up debug log capture by intercepting debugPrint.
+///
+/// The logger package outputs via print/debugPrint. We intercept this to
+/// also feed the in-memory LogBuffer, which drives the Debug Logs screen.
+void _setupDebugLogCapture() {
+  final originalDebugPrint = debugPrint;
+  debugPrint = (String? message, {int? wrapWidth}) {
+    // Forward to original console output
+    originalDebugPrint(message, wrapWidth: wrapWidth);
+
+    // Parse the log line to extract level and feed the buffer
+    if (message != null && message.isNotEmpty) {
+      final entry = _parseLogLine(message);
+      if (entry != null) {
+        LogBuffer.instance.addEntry(entry);
+      }
+    }
+  };
+}
+
+/// Parse a logger output line to extract the level and clean message.
+LogEntry? _parseLogLine(String line) {
+  // Strip ANSI codes
+  final clean = line.replaceAll(RegExp(r'\x1B\[[0-9;]*m'), '').trim();
+  if (clean.isEmpty) return null;
+
+  // Skip box-drawing borders (┌ ├ └ │ alone)
+  if (RegExp(r'^[┌├└─┄]+$').hasMatch(clean)) return null;
+
+  // Skip Flutter framework noise
+  if (clean.startsWith('I/flutter') || clean.startsWith('D/') || clean.startsWith('W/')) {
+    return null;
+  }
+
+  // Detect level from emoji markers.
+  // Logger package uses: ⛔=error, ⚠️=warning, 💡=info, 🐛=debug
+  // App code uses: 📨📦🤝=debug (message parsing), Persisted=debug
+  Level level = Level.debug;
+  String message = clean;
+
+  if (clean.contains('⛔')) {
+    level = Level.error;
+  } else if (clean.contains('⚠️')) {
+    level = Level.warning;
+  } else if (clean.contains('💡')) {
+    level = Level.info;
+  } else if (clean.contains('🐛') || clean.contains('📨') || clean.contains('📦') || clean.contains('🤝')) {
+    level = Level.debug;
+  }
+
+  // Strip the box-drawing prefix (│ )
+  message = message.replaceFirst(RegExp(r'^│\s*'), '');
+
+  return LogEntry(
+    level: level,
+    message: message,
+    timestamp: DateTime.now(),
+  );
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Capture all Flutter print output (including Logger) into the debug log buffer.
+  // This feeds the Debug Logs screen in Settings.
+  _setupDebugLogCapture();
 
   // Create persistence service and load persisted state
   persistenceService = PersistenceService();
@@ -155,36 +271,18 @@ class _BitchatHomeState extends State<BitchatHome>
   BitchatIdentity? _identity;
   Bitchat? _bitchat;
   Timer? _refreshTimer;
-  Timer? _friendAnnounceTimer;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   int _currentIndex = 1; // Start on "Around" tab (center)
 
   // Track nickname changes for animation
   final Map<String, _NicknameChange> _nicknameChanges = {};
   
-  // Transport availability flags
-  bool _bleAvailable = true;
-  bool _libp2pAvailable = true;
+  // Transport availability derived from Redux store
+  bool get _bleAvailable => appStore.state.transports.bleState.isUsable;
+  bool get _udpAvailable => appStore.state.transports.udpState.isUsable;
 
-  /// Check if libp2p host is available for friend requests
-  bool get _hasLibp2pHost => _bitchat?.libp2pHostId != null;
-
-  /// Get host ID for friend requests (null if not available)
-  String? get _myLibp2pHostId => _bitchat?.libp2pHostId;
-
-  /// Get host addresses for friend requests (empty if not available)
-  List<String> get _myLibp2pHostAddrs => _bitchat?.libp2pHostAddrs ?? [];
-
-  /// Computed full multiaddress string combining first address with host ID
-  String? get _myLibp2pAddress {
-    final hostId = _myLibp2pHostId;
-    if (hostId == null) return null;
-    final publicAddr = _bitchat?.publicLibp2pMultiaddr;
-    if (publicAddr != null) return '$publicAddr/p2p/$hostId';
-    final addrs = _myLibp2pHostAddrs;
-    if (addrs.isNotEmpty) return '${addrs.first}/p2p/$hostId';
-    return '/p2p/$hostId';
-  }
+  /// Get our UDP address for friend communication
+  String? get _myUdpAddress => _bitchat?.udpAddress;
   
   /// Get nearby peers from Redux store (BLE-connected peers in physical proximity).
   /// For the "Nearby" section - only peers reachable via Bluetooth.
@@ -193,6 +291,21 @@ class _BitchatHomeState extends State<BitchatHome>
     return {
       for (var p in peersState.nearbyBlePeers) p.pubkeyHex: p
     };
+  }
+
+  /// Get discovered but unconnected nearby devices
+  List<DiscoveredPeerState> get _unconnectedDevices {
+    final peersState = appStore.state.peers;
+    // Map of currently connected device IDs
+    final connectedDeviceIds = peersState.peersList
+        .where((p) => p.hasBleConnection)
+        .expand((p) => [p.bleCentralDeviceId, p.blePeripheralDeviceId])
+        .where((id) => id != null)
+        .toSet();
+
+    return peersState.discoveredBlePeersList
+        .where((d) => !connectedDeviceIds.contains(d.transportId) && !d.isConnected)
+        .toList();
   }
 
   @override
@@ -215,12 +328,8 @@ class _BitchatHomeState extends State<BitchatHome>
     });
   }
 
-  Future<void> _onConnectivityChanged(List<ConnectivityResult> results) async {
-    _log.i('🌐 Connectivity changed: $results');
-
-    // Refresh the public IPv6 so the next friend announce has the current address
-    await _bitchat?.refreshLibp2pAddress();
-    await _announceToFriends();
+  void _onConnectivityChanged(List<ConnectivityResult> results) {
+    debugPrint('🌐 Connectivity changed: $results');
   }
 
   void _checkPendingChat() {
@@ -243,7 +352,6 @@ class _BitchatHomeState extends State<BitchatHome>
   void dispose() {
     _connectivitySubscription?.cancel();
     _refreshTimer?.cancel();
-    _friendAnnounceTimer?.cancel();
     _bitchat?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
@@ -254,20 +362,17 @@ class _BitchatHomeState extends State<BitchatHome>
     try {
       final identity = await _initIdentity();
 
-      // Dispatch initializing status
-      appStore.dispatch(SetInitializingAction());
-
       final bitchat = Bitchat(
         identity: identity,
         store: appStore,
       );
 
-      bitchat.onMessageReceived = (messageId, senderPubkey, payload) {
-        // print('Received ${payload.length} bytes from $senderPubkey');
-        _handleIncomingMessage(messageId, senderPubkey, payload);
+      bitchat.onMessageReceived = (messageId, senderPubkey, payload, transport) {
+        _handleIncomingMessage(messageId, senderPubkey, payload, transport);
       };
 
-      bitchat.onLibp2pInitialized = _onLibp2pBecameAvailable;
+      // Friend presence is handled at the transport layer; no app-layer
+      // callback needed for UDP initialization.
 
       // bitchat.onPeerConnected = (peer) {
       //   print('Peer connected: ${peer.displayName}');
@@ -295,25 +400,18 @@ class _BitchatHomeState extends State<BitchatHome>
 
       final success = await bitchat.initialize();
       if (!success) {
-        appStore.dispatch(SetErrorAction('Failed: ${bitchat.status}'));
+        debugPrint('Bitchat initialization failed');
         return;
       }
 
-      // Dispatch online status
-      appStore.dispatch(SetOnlineAction());
-
       // Hydrate Redux store with existing friends from FriendshipStore
       await _hydrateFriendsFromStore();
-
-      // Start periodic friend announce timer
-      _startFriendAnnounceTimer();
     } catch (e) {
-      appStore.dispatch(SetErrorAction('Error: $e'));
+      debugPrint('Initialization error: $e');
     }
   }
 
   /// Hydrate Redux store with friends from persistent FriendshipStore
-  /// and attempt to reconnect to each friend via libp2p if available.
   Future<void> _hydrateFriendsFromStore() async {
     for (final friendship in appStore.state.friendships.friends) {
       final pubkey = ChatMessage.hexToPubkey(friendship.peerPubkeyHex);
@@ -324,128 +422,64 @@ class _BitchatHomeState extends State<BitchatHome>
         nickname: friendship.nickname,
       ));
 
-      // If friend has libp2p info, associate it and attempt connection
-      if (friendship.libp2pAddress != null && friendship.libp2pAddress!.isNotEmpty) {
-        appStore.dispatch(AssociateLibp2pAddressAction(
+      // If friend has UDP info, associate it
+      if (friendship.udpAddress != null && friendship.udpAddress!.isNotEmpty) {
+        appStore.dispatch(AssociateUdpAddressAction(
           publicKey: pubkey,
-          address: friendship.libp2pAddress!,
+          address: friendship.udpAddress!,
         ));
-
-        // Attempt to reconnect if libp2p is available
-        if (friendship.libp2pHostId != null && friendship.libp2pHostAddrs != null) {
-          await _bitchat?.connectToLibp2pHost(
-            hostId: friendship.libp2pHostId!,
-            hostAddrs: friendship.libp2pHostAddrs!,
-          );
-        }
       }
     }
   }
 
-  /// Called when libp2p becomes available (initialized or toggled on)
-  Future<void> _onLibp2pBecameAvailable() async {
-    _log.i('libp2p initialized - broadcasting address to friends');
+  // Friend presence is handled at the transport layer via unified ANNOUNCE
+  // messages. BLE and UDP broadcasts include address for friends automatically.
 
-    // Send immediate FriendAnnounce with our new libp2p address
-    // (instead of waiting for the next 10-second cycle)
-    // The _myLibp2pAddress getter will automatically get the new address from _bitchat
-    await _announceToFriends();
-
-    // Friends will receive FriendAnnounce with libp2pAddress and connect
-  }
-
-  /// Start periodic announcements to friends
-  void _startFriendAnnounceTimer() {
-    _friendAnnounceTimer?.cancel();
-    // Announce to friends every 10 seconds
-    _friendAnnounceTimer = Timer.periodic(const Duration(seconds: 10), (_) {
-      _announceToFriends();
-    });
-    // Also send an initial announce
-    _announceToFriends();
-  }
-
-  /// Send FriendAnnounce block to all friends
-  /// Always sends announce, with or without libp2p address
-  Future<void> _announceToFriends() async {
-    if (_bitchat == null || _identity == null) return;
-
-    final friends = appStore.state.friendships.friends;
-    if (friends.isEmpty) return;
-
-    // Create announce block - libp2pAddress is null if libp2p unavailable
-    final block = FriendAnnounceBlock(
-      libp2pAddress: _myLibp2pAddress,  // Can be null
-      nickname: _identity!.nickname,
-    );
-    final data = block.serialize();
-
-    for (final friend in friends) {
-      final pubkey = ChatMessage.hexToPubkey(friend.peerPubkeyHex);
-      // Try to send via BLE first, then libp2p
-      await _bitchat!.send(pubkey, data);
-    }
-  }
-
-  Future<void> _handleIncomingMessage(
-      String messageId, Uint8List senderPubkey, Uint8List payload) async {
+  Future<void> _handleIncomingMessage(String messageId,
+      Uint8List senderPubkey, Uint8List payload, MessageTransport transport) async {
     final senderHex = ChatMessage.pubkeyToHex(senderPubkey);
-    debugPrint('📨 Message ID: $messageId');
     final myHex = ChatMessage.pubkeyToHex(_identity!.publicKey);
 
-    debugPrint('📨 _handleIncomingMessage: ${payload.length} bytes from $senderHex');
-    debugPrint('📨 First byte (block type): 0x${payload[0].toRadixString(16)}');
-
-    // Try to parse as a block
-    debugPrint('📨 Attempting to parse payload of ${payload.length} bytes, first byte: ${payload.isNotEmpty ? payload[0] : "empty"}');
     final block = Block.tryDeserialize(payload);
 
     if (block != null) {
-      debugPrint('📨 Parsed block type: ${block.type}, runtimeType: ${block.runtimeType}');
-      await _handleBlock(block, senderHex, myHex, messageId, senderPubkey);
+      await _handleBlock(
+          block, senderHex, myHex, messageId, senderPubkey, transport);
     } else {
-      debugPrint('📨 Failed to parse as block - dropping message');
+      debugPrint('📨 Failed to parse block (${payload.length} bytes from $senderHex) - dropping');
     }
   }
 
   Future<void> _handleBlock(Block block, String senderHex, String myHex,
-      String messageId, Uint8List senderPubkey) async {
+      String messageId, Uint8List senderPubkey, MessageTransport transport) async {
     // Find sender name
     final peer = _peers.values
         .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == senderHex)
         .firstOrNull;
     final senderName = peer?.displayName ?? 'Unknown';
-
-    debugPrint('📦 _handleBlock: block.type=${block.type}, block.runtimeType=${block.runtimeType}');
-    debugPrint('📦 _handleBlock: block.type.value=${block.type.value}');
-    debugPrint('📦 _handleBlock: is FriendshipAcceptBlock? ${block is FriendshipAcceptBlock}');
+    final transportName = transport == MessageTransport.udp ? 'UDX' : 'BLE';
 
     switch (block.type) {
       case BlockType.say:
-        _log.i('Handling SayBlock from $senderName ($senderHex)');
         final sayBlock = block as SayBlock;
+        debugPrint('💬 [$transportName] Message from $senderName: "${sayBlock.content}"');
         await _handleTextMessage(
             senderHex, myHex, sayBlock.content, messageId, senderPubkey);
 
       case BlockType.friendshipOffer:
-        _log.i('Hansdling FriendshipOfferBlock from $senderName ($senderHex)');
+        debugPrint('Hansdling FriendshipOfferBlock from $senderName ($senderHex)');
         final offerBlock = block as FriendshipOfferBlock;
         await _handleFriendshipOffer(senderHex, myHex, offerBlock, senderName);
 
       case BlockType.friendshipAccept:
-        _log.i('Handling FriendshipAcceptBlock from $senderName ($senderHex)');
+        debugPrint('Handling FriendshipAcceptBlock from $senderName ($senderHex)');
         final acceptBlock = block as FriendshipAcceptBlock;
         await _handleFriendshipAccept(
             senderHex, myHex, acceptBlock, senderName);
 
       case BlockType.friendshipRevoke:
-        _log.i('Handling FriendshipRevokeBlock from $senderName ($senderHex)');
+        debugPrint('Handling FriendshipRevokeBlock from $senderName ($senderHex)');
         await _handleFriendshipRevoke(senderHex);
-
-      case BlockType.friendAnnounce:
-        _log.i('Handling FriendAnnounceBlock from $senderName ($senderHex)');
-        final announceBlock = block as FriendAnnounceBlock;
-        await _handleFriendAnnounce(senderHex, announceBlock);
     }
   }
 
@@ -510,7 +544,7 @@ class _BitchatHomeState extends State<BitchatHome>
       await _showFriendRequestNotification(senderHex, senderName);
     }
 
-    // libp2p connection will be established when FriendAnnounce is received
+    // UDP connection will be established when ANNOUNCE is received
   }
 
   Future<void> _handleFriendshipAccept(
@@ -545,62 +579,7 @@ class _BitchatHomeState extends State<BitchatHome>
     ));
     debugPrint('🤝 Chat message saved');
 
-    // libp2p connection will be established when FriendAnnounce is received
-  }
-
-  Future<void> _handleFriendAnnounce(
-      String senderHex, FriendAnnounceBlock block) async {
-    final pubkey = ChatMessage.hexToPubkey(senderHex);
-
-    // Update Redux state - ALWAYS, not just when there's an address
-    final peerState = appStore.state.peers.getPeerByPubkey(pubkey);
-    if (peerState != null && peerState.isFriend) {
-      if (block.libp2pAddress != null) {
-        final previousAddress = peerState.libp2pAddress;
-        final addressChanged = previousAddress != block.libp2pAddress;
-
-        // Update Redux with the new address
-        appStore.dispatch(AssociateLibp2pAddressAction(
-          publicKey: pubkey,
-          address: block.libp2pAddress!,
-        ));
-
-        // Only (re)connect if the address changed or there's no existing connection
-        if (addressChanged) {
-          if (addressChanged && previousAddress != null && previousAddress.isNotEmpty) {
-            _log.i('Friend $senderHex libp2p address changed: $previousAddress → ${block.libp2pAddress}');
-          }
-          final libp2pParts = _parseLibp2pAddress(block.libp2pAddress!);
-          if (libp2pParts != null && _bitchat != null) {
-            final (hostId, baseAddr) = libp2pParts;
-            await _bitchat!.connectToLibp2pHost(
-              hostId: hostId,
-              hostAddrs: [baseAddr],
-            );
-          }
-        }
-      } else {
-        // Friend no longer has libp2p address (disabled libp2p)
-        // Clear the address and disconnect if connected via libp2p
-        appStore.dispatch(AssociateLibp2pAddressAction(
-          publicKey: pubkey,
-          address: '',  // Empty string clears
-        ));
-
-        // TODO: Disconnect libp2p connection if one exists
-        // _bitchat?.disconnectFromLibp2pHost(hostId);
-      }
-    }
-  }
-
-  /// Parse libp2p multiaddress into (hostId, baseAddr)
-  /// Example: /ip6/::1/udp/12345/p2p/QmHostId → (QmHostId, /ip6/::1/udp/12345)
-  (String, String)? _parseLibp2pAddress(String libp2pAddress) {
-    final parts = libp2pAddress.split('/p2p/');
-    if (parts.length == 2) {
-      return (parts[1], parts[0]);
-    }
-    return null;
+    // UDP connection will be established when ANNOUNCE is received
   }
 
   /// Handle being unfriended by someone
@@ -708,7 +687,7 @@ class _BitchatHomeState extends State<BitchatHome>
           onSendFriendRequest: () => _sendFriendRequest(peer),
           onAcceptFriendRequest: () => _acceptFriendRequest(peer),
           onUnfriend: () => _unfriend(peerHex),
-          myLibp2pAddress: _myLibp2pAddress,
+          myUdpAddress: _myUdpAddress,
         ),
       ),
     );
@@ -736,7 +715,7 @@ class _BitchatHomeState extends State<BitchatHome>
       nickname: peer.displayName,
     ));
 
-    // Create the friendship offer block (no libp2p info)
+    // Create the friendship offer block
     final block = FriendshipOfferBlock(
       message: 'Hey, let\'s be friends!',
     );
@@ -788,7 +767,7 @@ class _BitchatHomeState extends State<BitchatHome>
       nickname: peer.displayName,
     ));
 
-    // Create the friendship accept block (no libp2p info)
+    // Create the friendship accept block
     final block = FriendshipAcceptBlock();
 
     // Send via Bitchat (works over BLE)
@@ -806,7 +785,7 @@ class _BitchatHomeState extends State<BitchatHome>
       messageType: ChatMessageType.friendRequestAcceptedByUs.index,
     ));
 
-    // libp2p connection will be established when FriendAnnounce is received
+    // UDP connection will be established when ANNOUNCE is received
   }
 
   Future<void> _declineFriendRequest(String peerHex) async {
@@ -1363,7 +1342,7 @@ class _BitchatHomeState extends State<BitchatHome>
               const Icon(Icons.bluetooth, size: 18, color: Colors.blueGrey),
               const SizedBox(width: 8),
               Text(
-                'Nearby (${_peers.length})',
+                'Nearby (${_peers.length + _unconnectedDevices.length})',
                 style: const TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
@@ -1376,7 +1355,7 @@ class _BitchatHomeState extends State<BitchatHome>
         const SizedBox(height: 8),
 
         Expanded(
-          child: _peers.isEmpty
+          child: (_peers.isEmpty && _unconnectedDevices.isEmpty)
               ? const Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -1396,15 +1375,25 @@ class _BitchatHomeState extends State<BitchatHome>
                     ],
                   ),
                 )
-              : ListView.builder(
-                  itemCount: _peers.length,
-                  itemBuilder: (context, index) {
-                    // Sort peers by RSSI (strongest first)
-                    final sortedPeers = _peers.values.toList()
-                      ..sort((a, b) => b.rssi.compareTo(a.rssi));
-                    final peer = sortedPeers[index];
-                    return _buildPeerListItem(peer);
-                  },
+              : ListView(
+                  children: [
+                    if (_peers.isNotEmpty) ...[
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Text('Connected Peers', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 12)),
+                      ),
+                      ...(_peers.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi)))
+                          .map((peer) => _buildPeerListItem(peer)),
+                    ],
+                    if (_unconnectedDevices.isNotEmpty) ...[
+                      const Padding(
+                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Text('Discovered Grassroots Devices', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 12)),
+                      ),
+                      ...(_unconnectedDevices..sort((a, b) => b.rssi.compareTo(a.rssi)))
+                          .map((device) => _buildUnconnectedDeviceListItem(device)),
+                    ]
+                  ],
                 ),
         ),
       ],
@@ -1617,6 +1606,18 @@ class _BitchatHomeState extends State<BitchatHome>
                 ],
               ),
               const SizedBox(width: 8),
+              if (peer.hasBleConnection)
+                IconButton(
+                  icon: const Icon(Icons.bluetooth_disabled, size: 20),
+                  color: Colors.redAccent,
+                  tooltip: 'Disconnect BLE',
+                  onPressed: () {
+                    _bitchat?.disconnectBlePeer(peer.pubkeyHex);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Disconnecting from ${peer.displayName}')),
+                    );
+                  },
+                ),
               // Friend request / Chat button
               if (!isFriend && !hasPendingRequest)
                 IconButton(
@@ -1639,6 +1640,72 @@ class _BitchatHomeState extends State<BitchatHome>
             ],
           ),
           onTap: () => _openChat(peer),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUnconnectedDeviceListItem(DiscoveredPeerState device) {
+    // RSSI signal strength indicator
+    IconData signalIcon;
+    Color signalColor;
+    if (device.rssi < -80) {
+      signalIcon = Icons.signal_cellular_alt_1_bar;
+      signalColor = Colors.red;
+    } else if (device.rssi < -60) {
+      signalIcon = Icons.signal_cellular_alt_2_bar;
+      signalColor = Colors.orange;
+    } else {
+      signalIcon = Icons.signal_cellular_alt;
+      signalColor = Colors.green;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Card(
+        margin: EdgeInsets.zero,
+        elevation: 1,
+        color: Colors.grey.withOpacity(0.05),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: Colors.grey.withOpacity(0.2)),
+        ),
+        child: ListTile(
+          leading: const CircleAvatar(
+            backgroundColor: Colors.grey,
+            child: Icon(Icons.bluetooth, color: Colors.white),
+          ),
+          title: Text(
+            device.displayName ?? 'Unknown Grassroots Device',
+            style: const TextStyle(fontWeight: FontWeight.normal, color: Colors.grey),
+          ),
+          subtitle: Row(
+            children: [
+              Icon(signalIcon, color: signalColor, size: 14),
+              const SizedBox(width: 4),
+              Text(
+                '${device.rssi} dBm · Discovered: ${_formatSecondsAgo(device.discoveredAt)}',
+                style: const TextStyle(fontSize: 12),
+              ),
+            ],
+          ),
+          trailing: device.isConnecting
+              ? const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : IconButton(
+                  icon: const Icon(Icons.bluetooth_connected),
+                  color: Colors.blue,
+                  tooltip: 'Connect manually',
+                  onPressed: () {
+                    _bitchat?.connectBleDevice(device.transportId);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Connecting to ${device.displayName ?? 'device'}...')),
+                    );
+                  },
+                ),
         ),
       ),
     );
@@ -1878,13 +1945,13 @@ class _BitchatHomeState extends State<BitchatHome>
             ),
             const SizedBox(height: 8),
 
-            // libp2p status
+            // UDP status
             _buildTransportStatusRow(
               icon: Icons.public,
               iconColor: Colors.green,
-              name: 'Internet (libp2p)',
-              enabled: appStore.state.settings.libp2pEnabled,
-              available: _libp2pAvailable,
+              name: 'Internet (UDP)',
+              enabled: appStore.state.settings.udpEnabled,
+              available: _udpAvailable,
             ),
             
             const Divider(height: 24),
@@ -1965,8 +2032,6 @@ class _BitchatHomeState extends State<BitchatHome>
       MaterialPageRoute(
         builder: (context) => SettingsScreen(
           store: appStore,
-          bleAvailable: _bleAvailable,
-          libp2pAvailable: _libp2pAvailable,
           onSettingsChanged: () {
             setState(() {});
           },

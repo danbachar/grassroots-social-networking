@@ -10,8 +10,8 @@ enum TransportType {
   /// WebRTC-based P2P transport (STUN/TURN/TURNS)
   webrtc,
 
-  /// LibP2P-based transport
-  libp2p,
+  /// UDP-based transport (dart_udx)
+  udp,
 }
 
 /// Display metadata for a transport service.
@@ -134,9 +134,6 @@ abstract class TransportService {
   /// Current state of the transport
   TransportState get state;
 
-  /// Stream of state changes
-  Stream<TransportState> get stateStream;
-
   /// Stream of received data events
   Stream<TransportDataEvent> get dataStream;
 
@@ -175,15 +172,6 @@ abstract class TransportService {
   /// - Can be restarted with [start]
   Future<void> stop();
 
-  /// Connect to a specific peer by their transport-specific ID.
-  ///
-  /// Returns true if connection was initiated successfully.
-  /// The actual connection result will come through [connectionStream].
-  Future<bool> connectToPeer(String peerId);
-
-  /// Disconnect from a specific peer.
-  Future<void> disconnectFromPeer(String peerId);
-
   /// Send data to a specific peer.
   ///
   /// Returns true if the data was sent (or queued) successfully.
@@ -192,13 +180,9 @@ abstract class TransportService {
 
   /// Broadcast data to all connected peers.
   ///
-  /// If [friendData] and [friendDeviceIds] are provided, peers in
-  /// [friendDeviceIds] receive [friendData] while all others receive [data].
-  Future<void> broadcast(
-    Uint8List data, {
-    Uint8List? friendData,
-    Set<String>? friendDeviceIds,
-  });
+  /// [excludePeerIds] can be used to exclude specific peers
+  /// (e.g., to skip friends who get a separate addressed ANNOUNCE).
+  Future<void> broadcast(Uint8List data, {Set<String>? excludePeerIds});
 
   /// Associate a peer with a public key.
   ///
@@ -216,5 +200,11 @@ abstract class TransportService {
   ///
   /// After this call, the transport cannot be used again.
   Future<void> dispose();
+}
+
+/// Convenience extension on TransportState
+extension TransportStateX on TransportState {
+  /// Whether this state represents a usable (initialized) transport
+  bool get isUsable => this == TransportState.ready || this == TransportState.active;
 }
 

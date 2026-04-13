@@ -66,6 +66,20 @@ class BleDeviceDisconnectedAction extends PeerAction {
   BleDeviceDisconnectedAction(this.deviceId);
 }
 
+/// Blacklist a discovered BLE device to prevent auto-reconnection
+class BleDeviceBlacklistedAction extends PeerAction {
+  final String deviceId;
+
+  BleDeviceBlacklistedAction(this.deviceId);
+}
+
+/// Unblacklist a discovered BLE device so it can be reconnected
+class BleDeviceUnblacklistedAction extends PeerAction {
+  final String deviceId;
+
+  BleDeviceUnblacklistedAction(this.deviceId);
+}
+
 /// Remove a discovered BLE device
 class BleDeviceRemovedAction extends PeerAction {
   final String deviceId;
@@ -83,21 +97,6 @@ class StaleDiscoveredBlePeersRemovedAction extends PeerAction {
 /// Clear all discovered BLE peers
 class ClearDiscoveredBlePeersAction extends PeerAction {}
 
-// ===== Libp2p Discovery Actions =====
-
-/// A libp2p peer was discovered
-class Libp2pPeerDiscoveredAction extends PeerAction {
-  final String peerId;
-  final String? displayName;
-
-  Libp2pPeerDiscoveredAction({
-    required this.peerId,
-    this.displayName,
-  });
-}
-
-/// Clear all discovered libp2p peers
-class ClearDiscoveredLibp2pPeersAction extends PeerAction {}
 
 // ===== Peer Identity Actions (after ANNOUNCE) =====
 
@@ -118,7 +117,8 @@ class PeerAnnounceReceivedAction extends PeerAction {
   /// BLE device ID from our peripheral role (they connected to us)
   final String? blePeripheralDeviceId;
 
-  final List<String> libp2pAddresses;
+  final String? udpAddress;
+  final String? linkLocalAddress;
 
   PeerAnnounceReceivedAction({
     required this.publicKey,
@@ -128,7 +128,8 @@ class PeerAnnounceReceivedAction extends PeerAction {
     this.transport = PeerTransport.bleDirect,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
-    this.libp2pAddresses = const [],
+    this.udpAddress,
+    this.linkLocalAddress,
   });
 }
 
@@ -153,11 +154,23 @@ class PeerBleDisconnectedAction extends PeerAction {
   PeerBleDisconnectedAction(this.publicKey, {this.role});
 }
 
-/// Mark peer as disconnected from libp2p
-class PeerLibp2pDisconnectedAction extends PeerAction {
+/// A UDX connection to a peer was established or closed.
+/// Updates [PeerState.hasLiveUdpConnection].
+class PeerUdpConnectionChangedAction extends PeerAction {
+  final String pubkeyHex;
+  final bool connected;
+
+  PeerUdpConnectionChangedAction({
+    required this.pubkeyHex,
+    required this.connected,
+  });
+}
+
+/// Mark peer as disconnected from UDP
+class PeerUdpDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
 
-  PeerLibp2pDisconnectedAction(this.publicKey);
+  PeerUdpDisconnectedAction(this.publicKey);
 }
 
 /// Mark peer as fully disconnected
@@ -178,7 +191,12 @@ class PeerRemovedAction extends PeerAction {
 class StalePeersRemovedAction extends PeerAction {
   final Duration staleThreshold;
 
-  StalePeersRemovedAction(this.staleThreshold);
+  /// Pubkey hexes of peers with live UDP connections that should NOT be
+  /// marked stale. The coordinator populates this from the UDP service
+  /// since the reducer has no access to transport-layer state.
+  final Set<String> liveUdpPeers;
+
+  StalePeersRemovedAction(this.staleThreshold, {this.liveUdpPeers = const {}});
 }
 
 /// Clear all peers
@@ -199,12 +217,12 @@ class AssociateBleDeviceAction extends PeerAction {
   });
 }
 
-/// Associate a libp2p address with a pubkey
-class AssociateLibp2pAddressAction extends PeerAction {
+/// Associate a UDP address with a pubkey
+class AssociateUdpAddressAction extends PeerAction {
   final Uint8List publicKey;
   final String address;
 
-  AssociateLibp2pAddressAction({
+  AssociateUdpAddressAction({
     required this.publicKey,
     required this.address,
   });

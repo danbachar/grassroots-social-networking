@@ -7,16 +7,20 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(bluetoothEnabled: action.enabled);
   }
 
-  if (action is SetLibp2pEnabledAction) {
-    return state.copyWith(libp2pEnabled: action.enabled);
+  if (action is SetUdpEnabledAction) {
+    return state.copyWith(udpEnabled: action.enabled);
   }
 
   if (action is UpdateTransportSettingsAction) {
     return state.copyWith(
       bluetoothEnabled: action.bluetoothEnabled,
-      libp2pEnabled: action.libp2pEnabled,
+      udpEnabled: action.udpEnabled,
       transportPriority: action.transportPriority,
     );
+  }
+
+  if (action is SetAnchorServerAction) {
+    return state.copyWith(anchorAddress: action.anchorAddress);
   }
 
   if (action is HydrateSettingsAction) {

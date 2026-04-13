@@ -1,0 +1,6 @@
+{
+  "friends": [
+    {"pubkey": "c9f4cdb0_REPLACE_WITH_FULL_64_CHAR_HEX", "nickname": "close"},
+    {"pubkey": "cb9a96bc_REPLACE_WITH_FULL_64_CHAR_HEX", "nickname": "far"}
+  ]
+}

@@ -3,7 +3,7 @@ import 'dart:typed_data';
 /// Transport type for message tracking
 enum MessageTransport {
   ble,
-  libp2p,
+  udp,
 }
 
 /// Message delivery status
@@ -142,8 +142,8 @@ class SaveChatMessageAction extends MessageAction {
   /// Message type (text, friend request, etc.)
   final int messageType; // ChatMessageType.index
 
-  /// For friendship messages: the libp2p address involved
-  final String? libp2pAddress;
+  /// For friendship messages: the UDP address involved
+  final String? udpAddress;
 
   SaveChatMessageAction({
     required this.senderPubkeyHex,
@@ -153,7 +153,7 @@ class SaveChatMessageAction extends MessageAction {
     DateTime? timestamp,
     this.messageId,
     this.messageType = 0, // ChatMessageType.text
-    this.libp2pAddress,
+    this.udpAddress,
   }) : timestamp = timestamp ?? DateTime.now();
 }
 

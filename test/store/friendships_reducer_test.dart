@@ -396,8 +396,8 @@ void main() {
       });
     });
 
-    group('UpdateFriendshipLibp2pInfoAction', () {
-      test('updates libp2p fields on existing friendship', () {
+    group('UpdateFriendshipUdpAddressAction', () {
+      test('updates UDP address on existing friendship', () {
         final now = DateTime.now();
         final existingFriendship = FriendshipState(
           peerPubkeyHex: peerA,
@@ -410,31 +410,25 @@ void main() {
           friendships: {peerA: existingFriendship},
         );
 
-        final action = UpdateFriendshipLibp2pInfoAction(
+        final action = UpdateFriendshipUdpAddressAction(
           peerPubkeyHex: peerA,
-          libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmPeer123',
-          libp2pHostId: 'QmPeer123',
-          libp2pHostAddrs: ['/ip4/1.2.3.4/tcp/4001', '/ip4/5.6.7.8/tcp/4001'],
+          udpAddress: '[2001:db8::1]:4001',
         );
 
         final newState = friendshipsReducer(state, action);
 
         final friendship = newState.friendships[peerA]!;
-        expect(friendship.libp2pAddress, equals('/ip4/1.2.3.4/tcp/4001/p2p/QmPeer123'));
-        expect(friendship.libp2pHostId, equals('QmPeer123'));
-        expect(friendship.libp2pHostAddrs, equals(['/ip4/1.2.3.4/tcp/4001', '/ip4/5.6.7.8/tcp/4001']));
+        expect(friendship.udpAddress, equals('[2001:db8::1]:4001'));
         expect(friendship.updatedAt.isAfter(now) || friendship.updatedAt.isAtSameMomentAs(now), isTrue);
       });
 
-      test('updates only provided libp2p fields, preserving others', () {
+      test('updates UDP address when provided', () {
         final now = DateTime.now();
         final existingFriendship = FriendshipState(
           peerPubkeyHex: peerA,
           nickname: 'Alice',
           status: FriendshipStatus.accepted,
-          libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmOld',
-          libp2pHostId: 'QmOld',
-          libp2pHostAddrs: const ['/ip4/1.2.3.4/tcp/4001'],
+          udpAddress: '[2001:db8::1]:4001',
           createdAt: now,
           updatedAt: now,
         );
@@ -442,26 +436,23 @@ void main() {
           friendships: {peerA: existingFriendship},
         );
 
-        // Only update the address, leave hostId and hostAddrs unchanged
-        final action = UpdateFriendshipLibp2pInfoAction(
+        final action = UpdateFriendshipUdpAddressAction(
           peerPubkeyHex: peerA,
-          libp2pAddress: '/ip4/9.8.7.6/tcp/4001/p2p/QmOld',
+          udpAddress: '[2001:db8::2]:4001',
         );
 
         final newState = friendshipsReducer(state, action);
 
         final friendship = newState.friendships[peerA]!;
-        expect(friendship.libp2pAddress, equals('/ip4/9.8.7.6/tcp/4001/p2p/QmOld'));
-        expect(friendship.libp2pHostId, equals('QmOld'));
-        expect(friendship.libp2pHostAddrs, equals(['/ip4/1.2.3.4/tcp/4001']));
+        expect(friendship.udpAddress, equals('[2001:db8::2]:4001'));
       });
 
       test('is no-op if friendship does not exist', () {
         const state = FriendshipsState.initial;
 
-        final action = UpdateFriendshipLibp2pInfoAction(
+        final action = UpdateFriendshipUdpAddressAction(
           peerPubkeyHex: peerA,
-          libp2pAddress: '/ip4/1.2.3.4/tcp/4001/p2p/QmPeer123',
+          udpAddress: '[2001:db8::1]:4001',
         );
 
         final newState = friendshipsReducer(state, action);

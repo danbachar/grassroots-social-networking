@@ -130,14 +130,12 @@ FriendshipsState friendshipsReducer(FriendshipsState state, FriendshipAction act
     return state.copyWith(friendships: action.friendships);
   }
 
-  if (action is UpdateFriendshipLibp2pInfoAction) {
+  if (action is UpdateFriendshipUdpAddressAction) {
     final existing = state.friendships[action.peerPubkeyHex];
     if (existing == null) return state;
 
     final friendship = existing.copyWith(
-      libp2pAddress: action.libp2pAddress ?? existing.libp2pAddress,
-      libp2pHostId: action.libp2pHostId ?? existing.libp2pHostId,
-      libp2pHostAddrs: action.libp2pHostAddrs ?? existing.libp2pHostAddrs,
+      udpAddress: action.udpAddress ?? existing.udpAddress,
       updatedAt: DateTime.now(),
     );
     return state.copyWith(

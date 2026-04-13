@@ -54,7 +54,7 @@ void main() {
       // Add one more message with a later timestamp
       final action = MessageSendingAction(
         messageId: 'new-msg',
-        transport: MessageTransport.libp2p,
+        transport: MessageTransport.udp,
         recipientPubkey: testRecipientPubkey,
         payloadSize: 256,
         timestamp: DateTime(2025, 6, 1),
@@ -146,7 +146,7 @@ void main() {
 
       final action = MessageSentAction(
         messageId: 'msg-new',
-        transport: MessageTransport.libp2p,
+        transport: MessageTransport.udp,
         recipientPubkey: testRecipientPubkey,
         payloadSize: 256,
         timestamp: testTimestamp,
@@ -157,7 +157,7 @@ void main() {
       expect(newState.outgoingMessages.length, 1);
       final msg = newState.outgoingMessages['msg-new']!;
       expect(msg.status, MessageStatus.sent);
-      expect(msg.transport, MessageTransport.libp2p);
+      expect(msg.transport, MessageTransport.udp);
       expect(msg.payloadSize, 256);
       expect(msg.sentAt, testTimestamp);
     });
@@ -179,7 +179,7 @@ void main() {
       // MessageSentAction for a non-existing message should create + trim
       final action = MessageSentAction(
         messageId: 'brand-new',
-        transport: MessageTransport.libp2p,
+        transport: MessageTransport.udp,
         recipientPubkey: testRecipientPubkey,
         payloadSize: 100,
         timestamp: DateTime(2025, 6, 1),
@@ -275,7 +275,7 @@ void main() {
       const state = MessagesState.initial;
       final action = MessageReceivedAction(
         messageId: 'inc-1',
-        transport: MessageTransport.libp2p,
+        transport: MessageTransport.udp,
         senderPubkey: testSenderPubkey,
         payloadSize: 512,
         timestamp: testTimestamp,
@@ -286,7 +286,7 @@ void main() {
       expect(newState.incomingMessages.length, 1);
       final msg = newState.incomingMessages['inc-1']!;
       expect(msg.messageId, 'inc-1');
-      expect(msg.transport, MessageTransport.libp2p);
+      expect(msg.transport, MessageTransport.udp);
       expect(msg.senderPubkey, testSenderPubkey);
       expect(msg.payloadSize, 512);
       expect(msg.receivedAt, testTimestamp);
@@ -308,7 +308,7 @@ void main() {
 
       final action = MessageReceivedAction(
         messageId: 'inc-new',
-        transport: MessageTransport.libp2p,
+        transport: MessageTransport.udp,
         senderPubkey: testSenderPubkey,
         payloadSize: 100,
         timestamp: DateTime(2025, 6, 1),
@@ -447,7 +447,7 @@ void main() {
       expect(conv.first.content, 'Message 1');
     });
 
-    test('preserves messageType and libp2pAddress fields', () {
+    test('preserves messageType and udpAddress fields', () {
       const state = MessagesState.initial;
       final action = SaveChatMessageAction(
         senderPubkeyHex: senderHex,
@@ -456,7 +456,7 @@ void main() {
         isOutgoing: true,
         timestamp: testTimestamp,
         messageType: ChatMessageType.friendRequestSent.index,
-        libp2pAddress: '/ip4/127.0.0.1/tcp/4001',
+        udpAddress: '[::1]:4001',
         messageId: 'fr-1',
       );
 
@@ -464,7 +464,7 @@ void main() {
 
       final msg = newState.conversations[recipientHex]!.first;
       expect(msg.messageType, ChatMessageType.friendRequestSent);
-      expect(msg.libp2pAddress, '/ip4/127.0.0.1/tcp/4001');
+      expect(msg.udpAddress, '[::1]:4001');
       expect(msg.messageId, 'fr-1');
     });
   });
@@ -543,7 +543,7 @@ void main() {
         'timestamp': '2025-01-15T12:00:00.000',
         'isOutgoing': true,
         'messageType': 0,
-        'libp2pAddress': null,
+        'udpAddress': null,
         'messageId': null,
       };
 

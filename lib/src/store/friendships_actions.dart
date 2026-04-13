@@ -75,17 +75,13 @@ class HydrateFriendshipsAction extends FriendshipAction {
   HydrateFriendshipsAction(this.friendships);
 }
 
-/// Update friendship's libp2p info (e.g., after reconnection)
-class UpdateFriendshipLibp2pInfoAction extends FriendshipAction {
+/// Update friendship's UDP address (e.g., after reconnection)
+class UpdateFriendshipUdpAddressAction extends FriendshipAction {
   final String peerPubkeyHex;
-  final String? libp2pAddress;
-  final String? libp2pHostId;
-  final List<String>? libp2pHostAddrs;
+  final String? udpAddress;
 
-  UpdateFriendshipLibp2pInfoAction({
+  UpdateFriendshipUdpAddressAction({
     required this.peerPubkeyHex,
-    this.libp2pAddress,
-    this.libp2pHostId,
-    this.libp2pHostAddrs,
+    this.udpAddress,
   });
 }

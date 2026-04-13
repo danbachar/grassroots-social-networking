@@ -4,6 +4,7 @@ import 'package:redux/redux.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:bitchat_transport/src/routing/message_router.dart';
 import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
+import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
 import 'package:bitchat_transport/src/models/identity.dart';
 import 'package:bitchat_transport/src/models/packet.dart';
 import 'package:bitchat_transport/src/models/peer.dart';
@@ -15,10 +16,10 @@ Uint8List buildAnnouncePayload({
   required Uint8List pubkey,
   String nickname = 'OtherPeer',
   String? address,
-  List<String> addresses = const [],
 }) {
   final nicknameBytes = Uint8List.fromList(nickname.codeUnits);
-  final allAddresses = address != null ? [address] : addresses;
+  final addressBytes =
+      address != null ? Uint8List.fromList(address.codeUnits) : Uint8List(0);
   final buffer = BytesBuilder();
 
   buffer.add(pubkey);
@@ -30,13 +31,11 @@ Uint8List buildAnnouncePayload({
   buffer.addByte(nicknameBytes.length);
   buffer.add(nicknameBytes);
 
-  buffer.addByte(allAddresses.length);
-  for (final addr in allAddresses) {
-    final addrBytes = Uint8List.fromList(addr.codeUnits);
-    final addrLenBytes = ByteData(2);
-    addrLenBytes.setUint16(0, addrBytes.length, Endian.big);
-    buffer.add(addrLenBytes.buffer.asUint8List());
-    buffer.add(addrBytes);
+  final addrLenBytes = ByteData(2);
+  addrLenBytes.setUint16(0, addressBytes.length, Endian.big);
+  buffer.add(addrLenBytes.buffer.asUint8List());
+  if (addressBytes.isNotEmpty) {
+    buffer.add(addressBytes);
   }
 
   return buffer.toBytes();
@@ -50,6 +49,7 @@ void main() {
     late BitchatIdentity otherIdentity;
     late ProtocolHandler protocolHandler;
     late ProtocolHandler otherProtocolHandler;
+    late FragmentHandler fragmentHandler;
     late Uint8List otherPubkey;
 
     setUp(() async {
@@ -73,10 +73,13 @@ void main() {
 
       protocolHandler = ProtocolHandler(identity: identity);
       otherProtocolHandler = ProtocolHandler(identity: otherIdentity);
+      fragmentHandler = FragmentHandler();
+
       router = MessageRouter(
         identity: identity,
         store: store,
         protocolHandler: protocolHandler,
+        fragmentHandler: fragmentHandler,
       );
 
       otherPubkey = otherIdentity.publicKey;
@@ -118,9 +121,9 @@ void main() {
         router.onMessageReceived = (_, __, ___) => anyCalled = true;
         router.onAckReceived = (_) => anyCalled = true;
         router.onReadReceiptReceived = (_) => anyCalled = true;
-        router.onPeerAnnounced =
-            (_, __, {bool isNew = false, String? previousLibp2pAddress}) =>
-                anyCalled = true;
+        router.onPeerAnnounced = (_, __,
+                {bool isNew = false, String? udpPeerId}) =>
+            anyCalled = true;
 
         // Create packet without signing (zero signature)
         final p = BitchatPacket(
@@ -202,6 +205,7 @@ void main() {
           p,
           transport: PeerTransport.bleDirect,
           bleDeviceId: 'ble-device-1',
+          bleRole: BleRole.central,
           rssi: -60,
         );
 
@@ -210,10 +214,10 @@ void main() {
         expect(peer!.bleDeviceId, equals('ble-device-1'));
       });
 
-      test('stores libp2p addresses as backups from BLE ANNOUNCE', () async {
+      test('includes udpAddress from ANNOUNCE payload', () async {
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
-          address: '/ip4/10.0.0.1/tcp/4001/p2p/QmTest',
+          address: '[2001:db8::a]:4001',
         );
         final p = await signedPacket(
           type: PacketType.announce,
@@ -228,19 +232,38 @@ void main() {
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
-        // BLE ANNOUNCE does NOT set libp2pAddress (no verified connection)
-        expect(peer!.libp2pAddress, isNull);
-        // Addresses stored as backups for connection attempts
-        expect(peer.libp2pHostId, equals('QmTest'));
-        expect(peer.libp2pHostAddrs, contains('/ip4/10.0.0.1/tcp/4001'));
+        expect(
+          peer!.udpAddress,
+          equals('[2001:db8::a]:4001'),
+        );
+      });
+
+      test('drops unsupported IPv4 udpAddress from ANNOUNCE payload', () async {
+        final payload = buildAnnouncePayload(
+          pubkey: otherPubkey,
+          address: '203.0.113.5:4001',
+        );
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+          rssi: -50,
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.udpAddress, isNull);
       });
 
       test('fires onPeerAnnounced callback', () async {
         AnnounceData? receivedData;
         PeerTransport? receivedTransport;
         router.onPeerAnnounced =
-            (data, transport,
-                {bool isNew = false, String? previousLibp2pAddress}) {
+            (data, transport, {bool isNew = false, String? udpPeerId}) {
           receivedData = data;
           receivedTransport = transport;
         };
@@ -275,8 +298,7 @@ void main() {
 
         int announceCount = 0;
         router.onPeerAnnounced =
-            (_, __, {bool isNew = false, String? previousLibp2pAddress}) =>
-                announceCount++;
+            (_, __, {bool isNew = false, String? udpPeerId}) => announceCount++;
 
         await router.processPacket(
           p,
@@ -439,6 +461,42 @@ void main() {
     });
 
     // =========================================================================
+    // BLE Packet Processing - Fragments
+    // =========================================================================
+
+    group('processPacket - fragments', () {
+      test('reassembles fragmented message and delivers', () async {
+        Uint8List? reassembledPayload;
+        router.onMessageReceived = (_, __, payload) {
+          reassembledPayload = payload;
+        };
+
+        final payload = Uint8List(1000);
+        for (var i = 0; i < payload.length; i++) {
+          payload[i] = i % 256;
+        }
+
+        final fragmented = fragmentHandler.fragment(
+          payload: payload,
+          senderPubkey: otherPubkey,
+        );
+
+        for (final fragment in fragmented.fragments) {
+          // Sign each fragment with the other peer's key
+          await otherProtocolHandler.signPacket(fragment);
+          await router.processPacket(
+            fragment,
+            transport: PeerTransport.bleDirect,
+            rssi: -60,
+          );
+        }
+
+        expect(reassembledPayload, isNotNull);
+        expect(reassembledPayload, equals(payload));
+      });
+    });
+
+    // =========================================================================
     // Packet Processing - ACK/NACK
     // =========================================================================
 
@@ -527,15 +585,15 @@ void main() {
     });
 
     // =========================================================================
-    // LibP2P Packet Processing - ANNOUNCE
+    // UDP Packet Processing - ANNOUNCE
     // =========================================================================
 
-    group('processPacket (libp2p) - ANNOUNCE', () {
+    group('processPacket (UDP) - ANNOUNCE', () {
       test('decodes ANNOUNCE and dispatches to Redux', () async {
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
-          nickname: 'LibPeer',
-          address: '/ip4/1.2.3.4/tcp/4001/p2p/QmExample',
+          nickname: 'UdpPeer',
+          address: '[2001:db8::1]:4001',
         );
         final p = await signedPacket(
           type: PacketType.announce,
@@ -544,21 +602,24 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-123',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-123',
         );
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
-        expect(peer!.nickname, equals('LibPeer'));
-        expect(peer.transport, equals(PeerTransport.libp2p));
+        expect(peer!.nickname, equals('UdpPeer'));
+        expect(peer.transport, equals(PeerTransport.udp));
         expect(
-          peer.libp2pAddress,
-          equals('/ip4/1.2.3.4/tcp/4001/p2p/QmExample'),
+          peer.udpAddress,
+          equals('[2001:db8::1]:4001'),
         );
       });
 
-      test('uses peerId as fallback address when not in payload', () async {
+      test('does not use peerId as fallback address when not in payload',
+          () async {
+        // udpPeerId is a hex pubkey, not an ip:port address — it must not
+        // be stored as udpAddress.
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
           nickname: 'NoPeer',
@@ -570,20 +631,19 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'fallback-peer-id',
+          transport: PeerTransport.udp,
+          udpPeerId: 'fallback-peer-id',
         );
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
-        expect(peer!.libp2pAddress, equals('fallback-peer-id'));
+        expect(peer!.udpAddress, isNull);
       });
 
-      test('fires onPeerAnnounced callback with libp2p transport', () async {
+      test('fires onPeerAnnounced callback with UDP transport', () async {
         PeerTransport? receivedTransport;
         router.onPeerAnnounced =
-            (_, transport,
-                {bool isNew = false, String? previousLibp2pAddress}) {
+            (_, transport, {bool isNew = false, String? udpPeerId}) {
           receivedTransport = transport;
         };
 
@@ -595,19 +655,19 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-456',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-456',
         );
 
-        expect(receivedTransport, equals(PeerTransport.libp2p));
+        expect(receivedTransport, equals(PeerTransport.udp));
       });
     });
 
     // =========================================================================
-    // LibP2P Packet Processing - MESSAGE
+    // UDP Packet Processing - MESSAGE
     // =========================================================================
 
-    group('processPacket (libp2p) - MESSAGE', () {
+    group('processPacket (UDP) - MESSAGE', () {
       test('delivers message via onMessageReceived', () async {
         String? receivedId;
         Uint8List? receivedPubkey;
@@ -627,8 +687,8 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-789',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-789',
         );
 
         expect(receivedId, isNotNull);
@@ -636,8 +696,7 @@ void main() {
         expect(receivedPayload, equals(msgPayload));
       });
 
-      test('triggers onAckRequested with correct transport and peerId',
-          () async {
+      test('triggers onAckRequested with canonical UDP peer id', () async {
         PeerTransport? ackTransport;
         String? ackPeerId;
         String? ackMessageId;
@@ -656,19 +715,30 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-ack-test',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-ack-test',
         );
 
-        expect(ackTransport, equals(PeerTransport.libp2p));
-        expect(ackPeerId, equals('peer-ack-test'));
+        expect(ackTransport, equals(PeerTransport.udp));
+        expect(
+          ackPeerId,
+          equals(
+            otherPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join(),
+          ),
+        );
         expect(ackMessageId, equals(p.packetId));
       });
 
-      test('does not trigger onAckRequested for BLE messages', () async {
-        bool ackRequested = false;
+      test('triggers onAckRequested for BLE messages too', () async {
+        PeerTransport? ackTransport;
+        String? ackPeerId;
+        String? ackMessageId;
         router.onMessageReceived = (_, __, ___) {};
-        router.onAckRequested = (_, __, ___) => ackRequested = true;
+        router.onAckRequested = (transport, peerId, messageId) {
+          ackTransport = transport;
+          ackPeerId = peerId;
+          ackMessageId = messageId;
+        };
 
         final p = await signedPacket(
           type: PacketType.message,
@@ -682,15 +752,17 @@ void main() {
           rssi: -60,
         );
 
-        expect(ackRequested, isFalse);
+        expect(ackTransport, equals(PeerTransport.bleDirect));
+        expect(ackPeerId, isNull);
+        expect(ackMessageId, equals(p.packetId));
       });
     });
 
     // =========================================================================
-    // LibP2P Packet Processing - ACK
+    // UDP Packet Processing - ACK
     // =========================================================================
 
-    group('processPacket (libp2p) - ACK', () {
+    group('processPacket (UDP) - ACK', () {
       test('delivers ACK via onAckReceived', () async {
         String? receivedId;
         router.onAckReceived = (id) => receivedId = id;
@@ -703,8 +775,8 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-abc',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-abc',
         );
 
         expect(receivedId, equals(messageId));
@@ -712,10 +784,10 @@ void main() {
     });
 
     // =========================================================================
-    // LibP2P Packet Processing - ReadReceipt
+    // UDP Packet Processing - ReadReceipt
     // =========================================================================
 
-    group('processPacket (libp2p) - ReadReceipt', () {
+    group('processPacket (UDP) - ReadReceipt', () {
       test('delivers read receipt via onReadReceiptReceived', () async {
         String? receivedId;
         router.onReadReceiptReceived = (id) => receivedId = id;
@@ -728,8 +800,8 @@ void main() {
 
         await router.processPacket(
           p,
-          transport: PeerTransport.libp2p,
-          libp2pPeerId: 'peer-def',
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-def',
         );
 
         expect(receivedId, equals(messageId));

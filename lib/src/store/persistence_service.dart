@@ -10,15 +10,10 @@ import 'messages_state.dart';
 
 /// Service for persisting Redux state to SharedPreferences
 class PersistenceService {
-  // Storage keys - using v2 to avoid conflicts with old stores during migration
   static const String _friendshipsKey = 'bitchat_friendships_v2';
   static const String _settingsKey = 'bitchat_settings_v2';
   static const String _conversationsKey = 'bitchat_conversations_v2';
   static const String _unreadCountsKey = 'bitchat_unread_counts_v2';
-
-  // Old storage keys (for migration)
-  static const String _oldFriendshipsKey = 'bitchat_friendships';
-  static const String _oldSettingsKey = 'bitchat_transport_settings';
 
   /// Debounce timer for batching writes
   Timer? _debounceTimer;
@@ -44,34 +39,7 @@ class PersistenceService {
   /// Load friendships from storage
   Future<FriendshipsState> loadFriendships() async {
     final prefs = await _preferences;
-
-    // Try new key first
-    var data = prefs.getString(_friendshipsKey);
-
-    // Fall back to old key and migrate
-    if (data == null) {
-      data = prefs.getString(_oldFriendshipsKey);
-      if (data != null) {
-        debugPrint('Migrating friendships from old storage format');
-        // Old format was a list of friendships, new format has a wrapper
-        try {
-          final oldList = jsonDecode(data) as List<dynamic>;
-          final friendships = <String, FriendshipState>{};
-          for (final json in oldList) {
-            final f = _migrateOldFriendship(json as Map<String, dynamic>);
-            friendships[f.peerPubkeyHex] = f;
-          }
-          final state = FriendshipsState(friendships: friendships);
-          // Save in new format
-          await prefs.setString(_friendshipsKey, jsonEncode(state.toJson()));
-          // Clear old key
-          await prefs.remove(_oldFriendshipsKey);
-          return state;
-        } catch (e) {
-          debugPrint('Failed to migrate old friendships: $e');
-        }
-      }
-    }
+    final data = prefs.getString(_friendshipsKey);
 
     if (data == null) return const FriendshipsState();
 
@@ -83,49 +51,10 @@ class PersistenceService {
     }
   }
 
-  /// Migrate old Friendship format (had isOnline, lastOnline fields)
-  FriendshipState _migrateOldFriendship(Map<String, dynamic> json) {
-    return FriendshipState(
-      peerPubkeyHex: json['peerPubkeyHex'] as String,
-      libp2pAddress: json['libp2pAddress'] as String?,
-      libp2pHostId: json['libp2pHostId'] as String?,
-      libp2pHostAddrs: json['libp2pHostAddrs'] != null
-          ? List<String>.from(json['libp2pHostAddrs'] as List)
-          : null,
-      nickname: json['nickname'] as String?,
-      status: FriendshipStatus.values[json['status'] as int],
-      createdAt: DateTime.parse(json['createdAt'] as String),
-      updatedAt: DateTime.parse(json['updatedAt'] as String),
-      message: json['message'] as String?,
-      // isOnline and lastOnline are no longer persisted
-    );
-  }
-
   /// Load settings from storage
   Future<SettingsState> loadSettings() async {
     final prefs = await _preferences;
-
-    // Try new key first
-    var data = prefs.getString(_settingsKey);
-
-    // Fall back to old key and migrate
-    if (data == null) {
-      data = prefs.getString(_oldSettingsKey);
-      if (data != null) {
-        debugPrint('Migrating settings from old storage format');
-        try {
-          final settings = SettingsState.fromJson(
-              jsonDecode(data) as Map<String, dynamic>);
-          // Save in new format
-          await prefs.setString(_settingsKey, jsonEncode(settings.toJson()));
-          // Clear old key
-          await prefs.remove(_oldSettingsKey);
-          return settings;
-        } catch (e) {
-          debugPrint('Failed to migrate old settings: $e');
-        }
-      }
-    }
+    final data = prefs.getString(_settingsKey);
 
     if (data == null) return const SettingsState();
 

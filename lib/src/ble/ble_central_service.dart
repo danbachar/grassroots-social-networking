@@ -1,38 +1,30 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'package:collection/collection.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:logger/logger.dart';
 import '../models/identity.dart';
+import 'package:flutter/foundation.dart';
 
-/// Discovered BLE device info
+/// Discovered BLE device info (transient DTO for callbacks, not stored)
 class DiscoveredDevice {
   final String deviceId;
   final String? name;
   final String serviceUuid;
   final int rssi;
-  final DateTime discoveredAt;
-  final BluetoothDevice device;
 
   DiscoveredDevice({
     required this.deviceId,
     this.name,
     required this.serviceUuid,
     required this.rssi,
-    required this.device,
-  }) : discoveredAt = DateTime.now();
+  });
 }
 
 /// Connected peer via Central role
 class ConnectedPeer {
   final String deviceId;
   final BluetoothDevice device;
-  final BluetoothCharacteristic characteristic;
+  BluetoothCharacteristic characteristic;
   final int rssi;
-
-  /// Negotiated ATT MTU for this connection.
-  /// The max application-level write size is `mtu - 3` (ATT overhead).
-  final int mtu;
-
   DateTime lastActivity;
 
   ConnectedPeer({
@@ -40,7 +32,6 @@ class ConnectedPeer {
     required this.device,
     required this.characteristic,
     required this.rssi,
-    this.mtu = 23,
   }) : lastActivity = DateTime.now();
 }
 
@@ -57,8 +48,11 @@ typedef CentralConnectionCallback = void Function(String deviceId, bool connecte
 ///
 /// Scans for devices advertising our service UUID pattern and
 /// connects to them for mesh communication.
+///
+/// Discovery state is managed externally via Redux. This service only
+/// holds connected peer state (with GATT handles) and delegates all
+/// discovery tracking to the caller via [onDeviceDiscovered].
 class BleCentralService {
-  final Logger _log = Logger();
 
   /// Our service UUID (to filter scan results and identify peers)
   final String serviceUuid;
@@ -69,17 +63,17 @@ class BleCentralService {
   /// Scan timeout
   static const Duration scanTimeout = Duration(seconds: 10);
 
-  /// Connection timeout
-  static const Duration connectionTimeout = Duration(seconds: 15);
-
-  /// Discovered devices, keyed by device ID
-  final Map<String, DiscoveredDevice> _discovered = {};
+  /// Connection timeout (kept short to avoid blocking connections to actual peers)
+  static const Duration connectionTimeout = Duration(seconds: 5);
 
   /// Connected peripherals, keyed by device ID
   final Map<String, ConnectedPeer> _connected = {};
 
   /// Stream subscriptions
   final List<StreamSubscription> _subscriptions = [];
+
+  /// Scan results subscription (tracked separately to avoid duplicates)
+  StreamSubscription? _scanSubscription;
 
   /// Callback when data is received
   CentralDataCallback? onDataReceived;
@@ -98,14 +92,6 @@ class BleCentralService {
   /// Number of connected peripherals
   int get connectedCount => _connected.length;
 
-  /// Get discovered devices sorted by RSSI (strongest signal first)
-  List<DiscoveredDevice> get discoveredDevices {
-    final devices = _discovered.values.toList();
-    // Sort by RSSI descending (higher RSSI = stronger signal, e.g., -40 > -80)
-    devices.sort((a, b) => b.rssi.compareTo(a.rssi));
-    return devices;
-  }
-
   /// Get connected peers sorted by RSSI (strongest signal first)
   List<ConnectedPeer> get connectedPeers {
     final peers = _connected.values.toList();
@@ -113,55 +99,47 @@ class BleCentralService {
     return peers;
   }
 
-  /// All connected device IDs
-  Set<String> get connectedDeviceIds => _connected.keys.toSet();
-
   /// Initialize the central service
   Future<void> initialize() async {
-    _log.i('Initializing BLE central service');
+    debugPrint('Initializing BLE central service');
 
     // Check if Bluetooth is available
     if (!await FlutterBluePlus.isSupported) {
       throw UnsupportedError('Bluetooth not supported on this device');
     }
 
-    // Wait for Bluetooth to be on (on iOS, initial state can be 'unknown')
+    // Wait for Bluetooth to be on
     final state = await FlutterBluePlus.adapterState.first;
     if (state != BluetoothAdapterState.on) {
-      _log.i('Bluetooth state is $state, waiting for it to turn on...');
-      await FlutterBluePlus.adapterState
-          .firstWhere((s) => s == BluetoothAdapterState.on)
-          .timeout(
-            const Duration(seconds: 10),
-            onTimeout: () {
-              _log.w('Timeout waiting for Bluetooth to turn on');
-              return BluetoothAdapterState.unknown;
-            },
-          );
+      debugPrint('Bluetooth is not on: $state');
+      // Could prompt user to enable Bluetooth
     }
 
-    // Set up scan results listener once (not per-scan to avoid subscription leak)
-    _subscriptions.add(
-      FlutterBluePlus.scanResults.listen(_onScanResults),
-    );
-
-    _log.i('BLE central initialized');
+    debugPrint('BLE central initialized');
   }
 
   /// Start scanning for peers
   Future<void> startScan({Duration? timeout}) async {
     if (isScanning) {
-      // _log.w('Already scanning');
+      debugPrint('Already scanning, ignoring startScan call');
       return;
     }
 
-    // _log.i('Starting BLE scan');
-
     try {
+      // Cancel previous scan subscription to prevent duplicate callbacks
+      if (_scanSubscription != null) {
+        await _scanSubscription!.cancel();
+        _subscriptions.remove(_scanSubscription);
+        _scanSubscription = null;
+      }
+
+      // Listen for scan results
+      _scanSubscription = FlutterBluePlus.scanResults.listen(_onScanResults);
+      _subscriptions.add(_scanSubscription!);
+
       // Start scanning
       // Note: We scan for all devices and filter manually because
       // some platforms have issues with service UUID filtering
-      // Scan results listener is set up once in initialize()
       await FlutterBluePlus.startScan(
         timeout: timeout ?? scanTimeout,
         androidScanMode: AndroidScanMode.lowLatency,
@@ -169,9 +147,8 @@ class BleCentralService {
 
       // Wait for scan to actually complete by listening to isScanning stream
       await FlutterBluePlus.isScanning.firstWhere((scanning) => !scanning);
-      // _log.i('Scan completed');
     } catch (e) {
-      _log.e('Failed to start scan: $e');
+      debugPrint('Failed to start scan: $e');
       rethrow;
     }
   }
@@ -181,42 +158,28 @@ class BleCentralService {
     if (!isScanning) return;
 
     await FlutterBluePlus.stopScan();
-    _log.i('Scan stopped');
+    debugPrint('Scan stopped');
   }
 
-  /// Connect to a discovered device
+  /// Connect to a device by its ID.
+  ///
+  /// Uses [BluetoothDevice.fromId] to obtain the device handle — no local
+  /// discovery cache is needed because Redux is the single source of truth
+  /// for discovery state.
+  ///
+  /// After connecting, searches ALL GATT services for the Bitchat characteristic
+  /// UUID (0000ff01-...). This correctly identifies Bitchat peers regardless of
+  /// their advertised service UUID.
   Future<bool> connectToDevice(String deviceId) async {
-    final discovered = _discovered[deviceId];
-    if (discovered == null) {
-      // _log.w('Device not found: $deviceId');
-      return false;
-    }
-
     if (_connected.containsKey(deviceId)) {
-      // _log.w('Already connected to: $deviceId');
       return true;
     }
 
-    // _log.i('Connecting to: $deviceId');
-
     try {
-      final device = discovered.device;
+      final device = BluetoothDevice.fromId(deviceId);
 
       // Connect with timeout
       await device.connect(timeout: connectionTimeout);
-
-      // Negotiate MTU for better throughput.
-      // On Android, we must explicitly request a larger MTU (default is only 23).
-      // On iOS, MTU is auto-negotiated — requestMtu() throws, so we catch and
-      // fall back to mtuNow.
-      int negotiatedMtu;
-      try {
-        negotiatedMtu = await device.requestMtu(515);
-        _log.i('Negotiated MTU with $deviceId: $negotiatedMtu');
-      } catch (_) {
-        negotiatedMtu = device.mtuNow;
-        _log.d('Using platform-negotiated MTU for $deviceId: $negotiatedMtu');
-      }
 
       // Listen for disconnection
       _subscriptions.add(
@@ -230,38 +193,26 @@ class BleCentralService {
       // Discover services
       final services = await device.discoverServices();
 
-      // Find our service
-      BluetoothService? targetService;
-      for (final service in services) {
-        if (service.uuid.toString().toLowerCase() ==
-            discovered.serviceUuid.toLowerCase()) {
-          targetService = service;
-          break;
-        }
-      }
-
-      if (targetService == null) {
-        // _log.w("Service not found on device: $deviceId");
-        await device.disconnect();
-        return false;
-      }
-
-      // Find our characteristic
-      // Note: flutter_blue_plus may return short-form UUIDs (e.g., "ff01")
-      // while we define full 128-bit UUIDs, so we need to compare the short form
-      final shortCharUuid = characteristicUuid.substring(4, 8).toLowerCase(); // Extract "ff01" from "0000ff01-..."
+      // Search ALL services for the Bitchat characteristic UUID.
+      // Per architecture: we can't know if a device is a Bitchat peer until
+      // after connection and service discovery. The characteristic UUID is
+      // fixed across all Bitchat peers.
+      final shortCharUuid = characteristicUuid.substring(4, 8).toLowerCase(); // "ff01"
       BluetoothCharacteristic? targetChar;
-      for (final char in targetService.characteristics) {
-        final charUuidStr = char.uuid.toString().toLowerCase();
-        // Match either the full UUID or the short form
-        if (charUuidStr == characteristicUuid.toLowerCase() ||
-            charUuidStr == shortCharUuid) {
-          targetChar = char;
-          break;
+      for (final service in services) {
+        for (final char in service.characteristics) {
+          final charUuidStr = char.uuid.toString().toLowerCase();
+          if (charUuidStr == characteristicUuid.toLowerCase() ||
+              charUuidStr == shortCharUuid) {
+            targetChar = char;
+            break;
+          }
         }
+        if (targetChar != null) break;
       }
 
       if (targetChar == null) {
+        // Not a Bitchat peer (e.g., headphones, smartwatch)
         await device.disconnect();
         return false;
       }
@@ -276,21 +227,18 @@ class BleCentralService {
         }),
       );
 
-      // Store connection with RSSI and negotiated MTU
+      // Store connection (RSSI defaults to -100, will be updated on next scan)
       _connected[deviceId] = ConnectedPeer(
         deviceId: deviceId,
         device: device,
         characteristic: targetChar,
-        rssi: discovered.rssi,
-        mtu: negotiatedMtu,
+        rssi: -100,
       );
 
-      // _log.i('Connected to: $deviceId');
       onConnectionChanged?.call(deviceId, true);
 
       return true;
     } catch (e) {
-      // _log.e('Failed to connect to $deviceId: $e');
       return false;
     }
   }
@@ -303,7 +251,7 @@ class BleCentralService {
     try {
       await peer.device.disconnect();
     } catch (e) {
-      // _log.e('Error disconnecting from $deviceId: $e');
+      // debugPrint('Error disconnecting from $deviceId: $e');
     }
 
     _onDeviceDisconnected(deviceId);
@@ -311,7 +259,7 @@ class BleCentralService {
 
   /// Disconnect from all connected devices
   Future<void> disconnectAll() async {
-    _log.i('Disconnecting all ${_connected.length} connected devices');
+    debugPrint('Disconnecting all ${_connected.length} connected devices');
 
     // Clear callbacks first to stop receiving data
     // This prevents processing packets after BLE is disabled
@@ -327,84 +275,127 @@ class BleCentralService {
     }
   }
 
-  /// Get the negotiated MTU for a connected device.
-  /// Returns null if the device is not connected.
-  int? getMtuForDevice(String deviceId) => _connected[deviceId]?.mtu;
-
   /// Send data to a connected peripheral.
+  /// Uses write-without-response to avoid GATT busy errors from queued writes.
   ///
-  /// Uses allowLongWrite as a safety net so that
-  /// writes larger than MTU-3 are handled via the Prepare Write / Execute Write
-  /// BLE procedure instead of being silently truncated or rejected.
+  /// On iOS, CoreBluetooth can invalidate GATT service handles between
+  /// discoverServices() and a later write(). If the write fails, we
+  /// re-discover services to get a fresh characteristic handle and retry once.
   Future<bool> sendData(String deviceId, Uint8List data) async {
     final peer = _connected[deviceId];
     if (peer == null) {
-      _log.w('Cannot send to disconnected device: $deviceId');
+      debugPrint('Cannot send to disconnected device: $deviceId');
       return false;
     }
 
     try {
-      await peer.characteristic.write(
-        data,
-        withoutResponse: false,
-        allowLongWrite: true,
-      );
+      await peer.characteristic.write(data, withoutResponse: true);
       peer.lastActivity = DateTime.now();
       return true;
     } catch (e) {
-      _log.e('Failed to send data to $deviceId: $e');
-      return false;
+      debugPrint('Write failed for $deviceId, refreshing GATT services: $e');
+
+      // Re-discover services to get a fresh characteristic handle.
+      // iOS can invalidate the old handle between connection and first write.
+      final freshChar = await _refreshCharacteristic(peer);
+      if (freshChar == null) {
+        debugPrint('Service refresh failed for $deviceId, disconnecting');
+        _connected.remove(deviceId);
+        onConnectionChanged?.call(deviceId, false);
+        return false;
+      }
+
+      // Retry once with the fresh handle.
+      try {
+        peer.characteristic = freshChar;
+        await freshChar.write(data, withoutResponse: true);
+        peer.lastActivity = DateTime.now();
+        debugPrint('Retry write succeeded for $deviceId after service refresh');
+        return true;
+      } catch (retryError) {
+        debugPrint('Retry write also failed for $deviceId, disconnecting');
+        _connected.remove(deviceId);
+        onConnectionChanged?.call(deviceId, false);
+        return false;
+      }
+    }
+  }
+
+  /// Re-discover GATT services on a connected device and return a fresh
+  /// characteristic handle, or null if the service/characteristic is gone.
+  Future<BluetoothCharacteristic?> _refreshCharacteristic(
+      ConnectedPeer peer) async {
+    try {
+      final services = await peer.device.discoverServices();
+      final shortCharUuid =
+          characteristicUuid.substring(4, 8).toLowerCase(); // "ff01"
+      for (final service in services) {
+        for (final char in service.characteristics) {
+          final charUuidStr = char.uuid.toString().toLowerCase();
+          if (charUuidStr == characteristicUuid.toLowerCase() ||
+              charUuidStr == shortCharUuid) {
+            return char;
+          }
+        }
+      }
+      return null;
+    } catch (e) {
+      debugPrint('Failed to refresh services for ${peer.deviceId}: $e');
+      return null;
+    }
+  }
+
+  /// Send data to all connected peripherals (sorted by signal strength)
+  Future<void> broadcastData(Uint8List data, {Set<String>? excludeDevices}) async {
+    // Sort by RSSI descending (strongest signal first)
+    final peers = _connected.values.toList();
+    peers.sort((a, b) => b.rssi.compareTo(a.rssi));
+
+    for (final peer in peers) {
+      if (excludeDevices != null && excludeDevices.contains(peer.deviceId)) continue;
+      await sendData(peer.deviceId, data);
     }
   }
 
   // ===== Event handlers =====
+  // Filter by Grassroots UUID prefix to only discover Grassroots devices.
+  // Each device advertises a UUID starting with a static 8-byte prefix
+  // (first 8 bytes of SHA-256("grassroots")), followed by 8 bytes from their pubkey.
+  Guid? findGrassrootsService(List<Guid> serviceUuids) {
+    return serviceUuids.firstWhereOrNull(
+      (uuid) {
+        final uuidStr = uuid.toString().toLowerCase();
+        final uuidHex = uuidStr.replaceAll('-', '');
+        return uuidHex.startsWith(BitchatIdentity.grassrootsUuidPrefix);
+      });
+  }
+  bool isGrassrootsDevice(ScanResult result) {
+    if (result.advertisementData.serviceUuids.isEmpty) return false;
+
+    final grassrootsService = findGrassrootsService(result.advertisementData.serviceUuids);
+    return grassrootsService != null;
+  }
 
   void _onScanResults(List<ScanResult> results) {
     for (final result in results) {
-      if (result.advertisementData.serviceUuids.isEmpty) continue;
+      final isGrassrootsPeer = isGrassrootsDevice(result);
+      if (isGrassrootsPeer) {
+        final deviceId = result.device.remoteId.str;
+        final uuidStr = findGrassrootsService(result.advertisementData.serviceUuids)!.toString().toLowerCase();
 
-      final uuidStr = result.advertisementData.serviceUuids.first.toString().toLowerCase();
-
-      // Filter by Grassroots UUID prefix — skip non-Grassroots devices
-      // (headphones, smartwatches, etc.)
-      final uuidHex = uuidStr.replaceAll('-', '');
-      _log.d('Scan: ${result.device.remoteId.str} uuid=$uuidStr hex=$uuidHex prefix=${BitchatIdentity.grassrootsUuidPrefix} match=${uuidHex.startsWith(BitchatIdentity.grassrootsUuidPrefix)}');
-      if (!uuidHex.startsWith(BitchatIdentity.grassrootsUuidPrefix)) continue;
-
-      final deviceId = result.device.remoteId.str;
-
-      final existing = _discovered[deviceId];
-      if (existing == null) {
-        // New device discovered
-        final discovered = DiscoveredDevice(
+        onDeviceDiscovered?.call(DiscoveredDevice(
           deviceId: deviceId,
           name: result.advertisementData.advName,
           serviceUuid: uuidStr,
           rssi: result.rssi,
-          device: result.device,
-        );
+        ));
 
-        _discovered[deviceId] = discovered;
-        onDeviceDiscovered?.call(discovered);
-      } else {
-        // Already discovered - update RSSI and notify
-        final updated = DiscoveredDevice(
-          deviceId: deviceId,
-          name: result.advertisementData.advName,
-          serviceUuid: uuidStr,
-          rssi: result.rssi,
-          device: result.device,
-        );
-        _discovered[deviceId] = updated;
-
-        // Notify with updated RSSI (callback can decide to update UI)
-        onDeviceDiscovered?.call(updated);
       }
     }
   }
 
   void _onDataReceived(String deviceId, Uint8List data) {
-    _log.d('Data received from $deviceId: ${data.length} bytes');
+    debugPrint('Data received from $deviceId: ${data.length} bytes');
 
     final peer = _connected[deviceId];
     if (peer != null) {
@@ -412,13 +403,13 @@ class BleCentralService {
       // Pass RSSI along with the data
       onDataReceived?.call(deviceId, data, peer.rssi);
     } else {
-      _log.w('Data received from unknown device: $deviceId');
+      debugPrint('Data received from unknown device: $deviceId');
     }
   }
 
   void _onDeviceDisconnected(String deviceId) {
     _connected.remove(deviceId);
-    _log.i('Disconnected from: $deviceId');
+    debugPrint('Disconnected from: $deviceId');
     onConnectionChanged?.call(deviceId, false);
   }
 
@@ -439,6 +430,5 @@ class BleCentralService {
 
     _subscriptions.clear();
     _connected.clear();
-    _discovered.clear();
   }
 }

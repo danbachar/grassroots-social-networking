@@ -1,0 +1,21 @@
+%==============================================================================
+\section{BLE Medium}
+\label{sec:ble}
+%==============================================================================
+This section specifies how the networking API (Section~\ref{sec:api}) is realized over Bluetooth Low Energy.
+%------------------------------------------------------------------------------
+\subsection{BLE Identity and Advertising}
+\label{sec:ble-identity}
+%------------------------------------------------------------------------------
+Each agent advertises a BLE GATT service whose 128-bit (16-byte) UUID has two parts: a fixed 8-byte \emph{Grassroots prefix} common to all Grassroots agents, and an 8-byte \emph{agent suffix} derived from the agent's public key (e.g., the first 8 bytes of its SHA-256 hash). The prefix enables general discovery of any nearby Grassroots agent; the suffix enables recognition of a specific agent before connection, by anyone who knows that agent's public key.
+%------------------------------------------------------------------------------
+\subsection{BLE Discovery}
+\label{sec:ble-discovery}
+%------------------------------------------------------------------------------
+\func{getPeers()} performs a BLE scan for devices whose service UUID matches the Grassroots prefix. \func{onPeerDiscovered(cb)} fires for each matching device found.
+Upon successful BLE connection, an ANNOUNCE packet is exchanged containing the agent's full 32-byte public key and a human-readable nickname. No Bluetooth bonding or pairing confirmation is required; application-level encryption (using the Ed25519 keys) is used instead.
+%------------------------------------------------------------------------------
+\subsection{BLE Communication}
+\label{sec:ble-comm}
+%------------------------------------------------------------------------------
+\func{send(pubKey, payload)} transmits the byte payload over the established BLE GATT connection. The BLE networking layer handles fragmentation and reassembly for payloads exceeding the BLE MTU. \func{onReceive(cb)} delivers reassembled payloads to the runtime.

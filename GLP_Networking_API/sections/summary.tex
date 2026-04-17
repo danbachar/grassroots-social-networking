@@ -1,0 +1,69 @@
+%==============================================================================
+\section{Complete API Summary}
+\label{sec:summary}
+%==============================================================================
+The following table summarizes the complete networking API.  This is the interface that replaces the Dart \code{IsolateManager}.  All functions in Section~\ref{sec:api} are medium-agnostic.  The system predicates in Section~\ref{sec:rv-predicates} support the rendezvous protocol (Section~\ref{sec:rendezvous}).
+\begin{longtable}{L{2.2cm} L{4.5cm} L{3cm} L{4cm}}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Category}} &
+\textcolor{white}{\textbf{Function}} &
+\textcolor{white}{\textbf{Direction}} &
+\textcolor{white}{\textbf{madGLP Role}} \\
+\midrule
+\endhead
+\multicolumn{4}{l}{\textbf{Identity}} \\
+\midrule
+Setup & \func{putIdentity()} & Runtime $\to$ Network & Generate agent key pair \\
+\rowcolor{rowgray}
+Query & \func{getIdentity()} & Runtime $\leftarrow$ Network & Retrieve agent public key \\
+\midrule
+\multicolumn{4}{l}{\textbf{Discovery}} \\
+\midrule
+Scan & \func{getPeers()} & Runtime $\to$ Network & Find reachable agents \\
+\rowcolor{rowgray}
+Notify & \func{onPeerDiscovered(cb)} & Runtime $\leftarrow$ Network & Register agent-to-pubkey mapping \\
+Connect & \func{onPeerConnected(cb)} & Runtime $\leftarrow$ Network & Agent is now reachable \\
+\rowcolor{rowgray}
+Disconnect & \func{onPeerDisconnected(cb)} & Runtime $\leftarrow$ Network & Agent no longer reachable; queue messages \\
+Reachable & \func{isPeerReachable(pk)} & Runtime $\to$ Network & Check before send \\
+\rowcolor{rowgray}
+Connectivity & \func{onConnectivityStatus(cb)} & Runtime $\leftarrow$ Network & Report IP address changes \\
+Gen link & \func{generatePeerLink()} & Runtime $\to$ Network & Create shareable identity URI \\
+\rowcolor{rowgray}
+Use link & \func{consumePeerLink(uri)} & Runtime $\to$ Network & Import peer from URI \\
+\midrule
+\multicolumn{4}{l}{\textbf{Communication}} \\
+\midrule
+\rowcolor{rowgray}
+Send & \func{send(pubKey, payload)} & Runtime $\to$ Network & Implements madGLP Send transaction \\
+Receive & \func{onReceive(cb)} & Runtime $\leftarrow$ Network & Feeds madGLP Receive transaction \\
+\midrule
+\multicolumn{4}{l}{\textbf{System Predicates (Section~\ref{sec:rv-predicates})}} \\
+\midrule
+\rowcolor{rowgray}
+Peer address & \code{peer\_address(PubKey, Addr)} & GLP $\leftarrow$ Network & Observe connected peer's public address \\
+UDP punch & \code{punch\_udp(Addr)} & GLP $\to$ Network & Open NAT mapping for hole-punching \\
+\rowcolor{rowgray}
+Verify & \code{verify\_friendship(Proof, A, B, Result)} & GLP $\leftarrow$ Network & Verify friendship attestation \\
+\bottomrule
+\end{longtable}
+\subsection{Correspondence to IsolateManager}
+The following table shows how each \code{IsolateManager} responsibility maps to networking calls:
+\begin{longtable}{L{5cm} L{4cm} L{4.5cm}}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{IsolateManager}} &
+\textcolor{white}{\textbf{Networking}} &
+\textcolor{white}{\textbf{Notes}} \\
+\midrule
+\endhead
+Route message to target isolate & \func{send(pubKey, payload)} & Resolve agent name to pubkey, serialize, transmit \\
+\rowcolor{rowgray}
+Deliver to isolate's incoming stream & \func{onReceive(cb)} & Deserialize, dispatch to Receive transaction \\
+Register isolate for agent & \func{onPeerConnected(cb)} & BLE/UDX connection replaces isolate spawn \\
+\rowcolor{rowgray}
+Cold-call to index-0 serializer & \func{send(pubKey, payload)} & Same primitive; \code{msg\_type} field distinguishes regular from cold-call \\
+Global link assignment delivery & \func{send(pubKey, payload)} & Same primitive; \code{msg\_type} field distinguishes \\
+\bottomrule
+\end{longtable}

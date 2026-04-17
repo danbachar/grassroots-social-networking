@@ -1,0 +1,79 @@
+%==============================================================================
+\section{Networking API}
+\label{sec:api}
+%==============================================================================
+This section specifies the interface between the madGLP runtime and the networking layer. The interface is independent of the underlying communication medium.
+%------------------------------------------------------------------------------
+\subsection{Identity}
+\label{sec:identity}
+%------------------------------------------------------------------------------
+Each agent has an Ed25519 key pair. The 32-byte public key serves as the agent's globally unique identity, used for addressing, authentication, and encryption. Identity is persistent across sessions.
+\begin{longtable}{L{4cm} L{4.5cm} L{5.5cm}}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Function}} &
+\textcolor{white}{\textbf{Signature}} &
+\textcolor{white}{\textbf{Description}} \\
+\midrule
+\endhead
+Generate identity & \func{putIdentity()} & Generate and persist an Ed25519 key pair. \\
+\rowcolor{rowgray}
+Retrieve identity & \func{getIdentity()} $\to$ \code{PubKey} & Return the agent's public key. \\
+\bottomrule
+\end{longtable}
+%------------------------------------------------------------------------------
+\subsection{Peer Discovery and Connection}
+\label{sec:discovery}
+%------------------------------------------------------------------------------
+The networking layer notifies the runtime when peers become reachable or unreachable, regardless of the underlying medium.
+
+When two agents cannot discover each other via BLE proximity, they may exchange identities out-of-band using \func{generatePeerLink()} and \func{consumePeerLink(uri)}.
+\begin{longtable}{L{4cm} L{5cm} L{5cm}}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Function}} &
+\textcolor{white}{\textbf{Signature}} &
+\textcolor{white}{\textbf{Description}} \\
+\midrule
+\endhead
+Scan for peers & \func{getPeers()} $\to$ \code{List<Peer>} & Discover currently reachable peers. \\
+\rowcolor{rowgray}
+Peer discovered & \func{onPeerDiscovered(cb)} & Callback when a new peer is detected. The callback receives the peer's public key and nickname. \\
+Peer connected & \func{onPeerConnected(cb)} & Callback when a peer becomes reachable for communication. \\
+\rowcolor{rowgray}
+Peer disconnected & \func{onPeerDisconnected(cb)} & Callback when a peer is no longer reachable. \\
+Check reachability & \func{isPeerReachable(pk)} $\to$ \code{bool} & Whether the given peer is currently reachable via any medium. \\
+\rowcolor{rowgray}
+Connectivity status & \func{onConnectivityStatus(cb)} & Callback when the networking layer detects a change in the agent's public IP address.  Triggers the rendezvous protocol (Section~\ref{sec:rendezvous}).  Fired on startup and on address change. \\
+Generate peer link & \func{generatePeerLink()} $\to$ \code{URI} & Generate a URI encoding the agent's public key, nickname, and optionally its current IP address and the addresses of its rendezvous agents. Suitable for transmission via QR code, messaging app, email, or any other out-of-band channel. \\
+\rowcolor{rowgray}
+Consume peer link & \func{consumePeerLink(uri)} $\to$ \code{PubKey} & Parse an incoming peer link, register the remote agent's identity, and attempt to establish connectivity (via the included address or via shared rendezvous agents). Returns the remote agent's public key. \\
+\bottomrule
+\end{longtable}
+%------------------------------------------------------------------------------
+\subsection{Point-to-Point Communication}
+\label{sec:p2p}
+%------------------------------------------------------------------------------
+The networking layer provides reliable delivery of arbitrary byte payloads between peers.
+\begin{longtable}{L{4cm} L{5.5cm} L{4.5cm}}
+\toprule
+\rowcolor{headerblue}
+\textcolor{white}{\textbf{Function}} &
+\textcolor{white}{\textbf{Signature}} &
+\textcolor{white}{\textbf{Description}} \\
+\midrule
+\endhead
+Send payload & \func{send(pubKey, payload)} & Send a byte payload to the peer identified by \code{pubKey}. \\
+\rowcolor{rowgray}
+Receive payload & \func{onReceive(cb)} & Register callback for incoming payloads. The callback receives the sender's public key and the byte payload. \\
+\bottomrule
+\end{longtable}
+%------------------------------------------------------------------------------
+\subsection{Networking Assumptions}
+\label{sec:assumptions}
+%------------------------------------------------------------------------------
+The networking layer must satisfy the following assumptions for madGLP correctness:
+\textbf{Fair message delivery:} Every message passed to \func{send()} is eventually delivered to the recipient, assuming the recipient eventually becomes reachable. Messages to temporarily-unreachable peers are queued and delivered when connectivity is restored.
+\textbf{Atomic message delivery:} Each message is delivered as a complete unit. If a message is fragmented across multiple packets, the networking layer reassembles them before delivery.
+\textbf{Integrity:} Messages are not corrupted in transit. The networking layer provides encryption and integrity checks.
+\textbf{Authentication:} The sender's identity (public key) is authenticated. A received message from public key $pk$ was indeed sent by the agent holding the corresponding private key.

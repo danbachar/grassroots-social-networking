@@ -1,0 +1,21 @@
+%==============================================================================
+\section{IP Medium}
+\label{sec:ip}
+%==============================================================================
+This section specifies how the networking API (Section~\ref{sec:api}) is realized over the Internet.  Communication uses UDP with UDX (reliable multiplexed streams over UDP) for data transport.  NAT traversal is handled by the rendezvous protocol (Section~\ref{sec:rendezvous}).
+
+%------------------------------------------------------------------------------
+\subsection{IP Connection}
+\label{sec:ip-connection}
+%------------------------------------------------------------------------------
+Once a UDP path is established (either directly or via hole-punching), agents open a UDX stream over it. UDX provides reliable, ordered, congestion-controlled delivery over UDP, satisfying the networking assumptions (Section~\ref{sec:assumptions}).
+
+Upon establishing the UDX stream, the peers perform a mutual authentication handshake using their Ed25519 keys via the Noise protocol XX pattern (Curve25519 for key exchange, ChaCha20-Poly1305 for encryption, SHA-256 for hashing). Both peers already know each other's public keys from prior friendship establishment. The XX pattern provides mutual authentication and forward secrecy without requiring prior key exchange.
+
+\func{onPeerConnected(cb)} fires when the UDX stream is established and authenticated. \func{onPeerDisconnected(cb)} fires when the stream drops.
+
+%------------------------------------------------------------------------------
+\subsection{IP Communication}
+\label{sec:ip-comm}
+%------------------------------------------------------------------------------
+\func{send(pubKey, payload)} transmits the byte payload over the authenticated UDX stream. Each message is length-prefixed (4-byte big-endian length followed by payload bytes) to provide message framing. \func{onReceive(cb)} delivers complete, deframed messages to the runtime.

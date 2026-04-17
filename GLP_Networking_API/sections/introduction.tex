@@ -1,0 +1,11 @@
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+Multiagent deterministic GLP (madGLP)~\cite{shapiro2026implementing} is a distributed runtime for Grassroots Logic Programs (GLP)~\cite{shapiro2025glp} in which autonomous agents communicate via message passing. The current implementation runs agents as Dart isolates on a single workstation, with an \code{IsolateManager} routing messages between them~\cite{shapiro2026implementing}. This document specifies the networking API required to replace the \code{IsolateManager}, enabling madGLP agents to run on separate devices communicating peer-to-peer.
+The networking API is medium-agnostic: the same interface is used regardless of the underlying communication medium. Two media are specified:
+\begin{itemize}
+\item \textbf{BLE} (Bluetooth Low Energy): for communication between physically proximate devices, enabling offline, infrastructure-free operation.
+\item \textbf{IP} (Internet Protocol): for communication between devices at arbitrary distance, using UDX streams over UDP with rendezvous agents for signaling and NAT traversal.
+\end{itemize}
+BLE serves as the bootstrap medium where agents first meet face-to-face and establish trust. IP extends that connectivity beyond physical proximity. The networking layer selects the available medium transparently; the madGLP runtime is unaware of which medium carries a given message.
+The application-level protocols---the social graph~\cite{shapiro2025atomic}, friendship, introduction---are implemented entirely in GLP agent code and are not part of this networking specification. To the networking layer, all madGLP messages are opaque payloads.

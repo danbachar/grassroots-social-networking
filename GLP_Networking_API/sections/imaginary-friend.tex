@@ -1,0 +1,16 @@
+%------------------------------------------------------------------------------
+\subsection{Imaginary Friend}
+\label{sec:imaginary-friend}
+%------------------------------------------------------------------------------
+An \emph{imaginary friend} is a madGLP subagent---a machine (home server, cloud instance, Raspberry~Pi) owned and controlled by a real agent---that extends the owner's presence on the network.  Unlike a well-connected friend, which is an independent peer, an imaginary friend is subordinate to its owner.
+
+\paragraph{Key certification.}
+The owner generates an Ed25519 subkey for the imaginary friend and signs it with the owner's master key, producing a \emph{subkey certificate} that binds the imaginary friend's public key to the owner's identity.  Any agent holding the owner's public key can verify the certificate and thereby recognize the imaginary friend as an authorized representative.
+
+\paragraph{Social graph.}
+An imaginary friend does not appear as an independent node in the social graph.  It is always presented alongside its subkey certificate, making the ownership relation explicit and verifiable.  Agents that are friends with the owner may interact with the imaginary friend, but do not separately befriend the machine.
+
+\paragraph{Networking role.}
+An imaginary friend runs on infrastructure with a static, globally-routable IP address: any agent can reach it directly without hole-punching.  It can therefore serve as a rendezvous agent (Section~\ref{sec:rendezvous}) for the owner and the owner's friends.  In addition, an imaginary friend provides always-on presence: it maintains connections on the owner's behalf when the owner's smartphone is offline, to facilitate eventual hole-punching between the owner's new address and its peers.
+
+An imaginary friend is optional.  The smartphone agent is fully functional without one; the imaginary friend adds always-on reachability and rendezvous capability for agents who want it.

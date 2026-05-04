@@ -19,16 +19,21 @@ class ProtocolHandler {
 
   /// Create ANNOUNCE payload
   ///
-  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr? + llAddrLen(2) + llAddr?]
-  ///
-  /// The address field is included when the sender has a UDP address.
-  /// Omitted (addrLen 0) only for BLE announcements to non-friends (privacy).
-  /// The link-local address is optional and only included for BLE friends on
-  /// the same LAN — used as a faster alternative to global IPv6.
-  Uint8List createAnnouncePayload({String? address, String? linkLocalAddress}) {
+  /// Format:
+  /// [pubkey(32) + version(2) + nickLen(1) + nick
+  ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
+  Uint8List createAnnouncePayload({
+    String? address,
+    String? linkLocalAddress,
+    Iterable<String> addressCandidates = const [],
+  }) {
     final nicknameBytes = Uint8List.fromList(identity.nickname.codeUnits);
-    final addressBytes = address != null ? Uint8List.fromList(address.codeUnits) : Uint8List(0);
-    final llAddrBytes = linkLocalAddress != null ? Uint8List.fromList(linkLocalAddress.codeUnits) : Uint8List(0);
+    final candidates = <String>{
+      if (address != null && address.isNotEmpty) address,
+      if (linkLocalAddress != null && linkLocalAddress.isNotEmpty)
+        linkLocalAddress,
+      ...addressCandidates.where((candidate) => candidate.isNotEmpty),
+    };
     final buffer = BytesBuilder();
 
     // Pubkey (32 bytes)
@@ -43,20 +48,16 @@ class ProtocolHandler {
     buffer.addByte(nicknameBytes.length);
     buffer.add(nicknameBytes);
 
-    // Address length (2 bytes) + address
-    final addrLenBytes = ByteData(2);
-    addrLenBytes.setUint16(0, addressBytes.length, Endian.big);
-    buffer.add(addrLenBytes.buffer.asUint8List());
-    if (addressBytes.isNotEmpty) {
-      buffer.add(addressBytes);
-    }
-
-    // Link-local address length (2 bytes) + link-local address
-    final llAddrLenBytes = ByteData(2);
-    llAddrLenBytes.setUint16(0, llAddrBytes.length, Endian.big);
-    buffer.add(llAddrLenBytes.buffer.asUint8List());
-    if (llAddrBytes.isNotEmpty) {
-      buffer.add(llAddrBytes);
+    // Candidate address set.
+    final candidateCountBytes = ByteData(2);
+    candidateCountBytes.setUint16(0, candidates.length, Endian.big);
+    buffer.add(candidateCountBytes.buffer.asUint8List());
+    for (final candidate in candidates) {
+      final candidateBytes = Uint8List.fromList(candidate.codeUnits);
+      final candidateLenBytes = ByteData(2);
+      candidateLenBytes.setUint16(0, candidateBytes.length, Endian.big);
+      buffer.add(candidateLenBytes.buffer.asUint8List());
+      buffer.add(candidateBytes);
     }
 
     return buffer.toBytes();
@@ -95,8 +96,9 @@ class ProtocolHandler {
 
   /// Decode ANNOUNCE payload
   ///
-  /// Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr? + llAddrLen(2) + llAddr?]
-  /// Returns: AnnounceData with public key, nickname, version, optional address, and optional link-local
+  /// Format:
+  /// [pubkey(32) + version(2) + nickLen(1) + nick
+  ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
   AnnounceData decodeAnnounce(Uint8List data) {
     var offset = 0;
 
@@ -112,32 +114,42 @@ class ProtocolHandler {
     // Nickname length (1 byte) + nickname
     final nicknameLength = data[offset];
     offset += 1;
-    final nickname = String.fromCharCodes(data.sublist(offset, offset + nicknameLength));
+    final nickname =
+        String.fromCharCodes(data.sublist(offset, offset + nicknameLength));
     offset += nicknameLength;
 
-    // Address length (2 bytes) + address (optional - may not exist in old payloads)
-    String? address;
-    if (offset + 2 <= data.length) {
-      final addrLength = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
-          .getUint16(0, Endian.big);
-      offset += 2;
-      if (addrLength > 0 && offset + addrLength <= data.length) {
-        address = String.fromCharCodes(data.sublist(offset, offset + addrLength));
-        offset += addrLength;
-      }
+    if (offset + 2 > data.length) {
+      throw const FormatException('ANNOUNCE payload missing candidates');
     }
 
-    // Link-local address length (2 bytes) + link-local address (optional)
-    String? linkLocalAddress;
-    if (offset + 2 <= data.length) {
-      final llAddrLength = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
-          .getUint16(0, Endian.big);
-      offset += 2;
-      if (llAddrLength > 0 && offset + llAddrLength <= data.length) {
-        linkLocalAddress = String.fromCharCodes(data.sublist(offset, offset + llAddrLength));
-        offset += llAddrLength;
+    final addressCandidates = <String>{};
+    final candidateCount =
+        ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+            .getUint16(0, Endian.big);
+    offset += 2;
+    for (var i = 0; i < candidateCount; i++) {
+      if (offset + 2 > data.length) {
+        throw const FormatException('ANNOUNCE candidate length missing');
       }
+      final candidateLength =
+          ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+              .getUint16(0, Endian.big);
+      offset += 2;
+      if (offset + candidateLength > data.length) {
+        throw const FormatException('ANNOUNCE candidate truncated');
+      }
+      if (candidateLength > 0) {
+        addressCandidates.add(
+          String.fromCharCodes(
+            data.sublist(offset, offset + candidateLength),
+          ),
+        );
+      }
+      offset += candidateLength;
     }
+
+    final address = _firstNonLinkLocalCandidate(addressCandidates);
+    final linkLocalAddress = _firstLinkLocalCandidate(addressCandidates);
 
     return AnnounceData(
       publicKey: Uint8List.fromList(pubkey),
@@ -145,6 +157,7 @@ class ProtocolHandler {
       protocolVersion: version,
       udpAddress: address,
       linkLocalAddress: linkLocalAddress,
+      addressCandidates: addressCandidates,
     );
   }
 
@@ -176,7 +189,8 @@ class ProtocolHandler {
   Future<void> signPacket(BitchatPacket packet) async {
     final algorithm = Ed25519();
     final signableBytes = packet.getSignableBytes();
-    final signature = await algorithm.sign(signableBytes, keyPair: identity.keyPair);
+    final signature =
+        await algorithm.sign(signableBytes, keyPair: identity.keyPair);
     packet.signature = Uint8List.fromList(signature.bytes);
   }
 
@@ -200,6 +214,32 @@ class ProtocolHandler {
       return false;
     }
   }
+
+  String? _firstNonLinkLocalCandidate(Iterable<String> candidates) {
+    for (final candidate in candidates) {
+      if (!_isLinkLocalCandidate(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  String? _firstLinkLocalCandidate(Iterable<String> candidates) {
+    for (final candidate in candidates) {
+      if (_isLinkLocalCandidate(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  bool _isLinkLocalCandidate(String candidate) {
+    final lower = candidate.toLowerCase();
+    if (lower.startsWith('[')) {
+      final end = lower.indexOf(']');
+      final host = end == -1 ? lower.substring(1) : lower.substring(1, end);
+      return host.startsWith('fe80:');
+    }
+    final colon = lower.lastIndexOf(':');
+    final host = colon == -1 ? lower : lower.substring(0, colon);
+    return host.startsWith('169.254.');
+  }
 }
 
 /// Decoded ANNOUNCE data
@@ -209,6 +249,7 @@ class AnnounceData {
   final int protocolVersion;
   final String? udpAddress;
   final String? linkLocalAddress;
+  final Set<String> addressCandidates;
 
   const AnnounceData({
     required this.publicKey,
@@ -216,8 +257,12 @@ class AnnounceData {
     required this.protocolVersion,
     this.udpAddress,
     this.linkLocalAddress,
+    this.addressCandidates = const {},
   });
 
   @override
-  String toString() => 'AnnounceData($nickname, v$protocolVersion${udpAddress != null ? ", addr: $udpAddress" : ""}${linkLocalAddress != null ? ", ll: $linkLocalAddress" : ""})';
+  String toString() => 'AnnounceData($nickname, v$protocolVersion'
+      '${udpAddress != null ? ", addr: $udpAddress" : ""}'
+      '${linkLocalAddress != null ? ", ll: $linkLocalAddress" : ""}'
+      '${addressCandidates.isNotEmpty ? ", candidates: $addressCandidates" : ""})';
 }

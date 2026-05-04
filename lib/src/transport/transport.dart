@@ -17,6 +17,7 @@ export 'udp_transport_service.dart';
 export 'hole_punch_service.dart';
 export 'public_address_discovery.dart';
 export 'address_utils.dart';
+export 'connection_service.dart';
 
 // Re-export BLE types needed for advanced usage
 export '../ble/ble_central_service.dart' show DiscoveredDevice, ConnectedPeer;

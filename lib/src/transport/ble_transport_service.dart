@@ -268,9 +268,21 @@ class BleTransportService extends TransportService {
 
   @override
   String? getPeerIdForPubkey(Uint8List pubkey) {
-    // Look up in Redux store — prefer central ID (tried first by sendToPeer)
+    // Look up in Redux store — only return a currently connected path.
     final peer = store.state.peers.getPeerByPubkey(pubkey);
-    return peer?.bleDeviceId;
+    if (peer == null) return null;
+
+    final centralId = peer.bleCentralDeviceId;
+    if (centralId != null && _isConnected(centralId)) {
+      return centralId;
+    }
+
+    final peripheralId = peer.blePeripheralDeviceId;
+    if (peripheralId != null && _isConnected(peripheralId)) {
+      return peripheralId;
+    }
+
+    return null;
   }
 
   @override

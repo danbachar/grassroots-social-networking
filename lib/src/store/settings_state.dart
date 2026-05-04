@@ -29,6 +29,45 @@ extension TransportProtocolDisplay on TransportProtocol {
 
 /// Immutable transport settings for Redux store
 @immutable
+class RendezvousServerSettings {
+  final String address;
+  final String pubkeyHex;
+
+  const RendezvousServerSettings({
+    required this.address,
+    required this.pubkeyHex,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'address': address,
+        'pubkeyHex': pubkeyHex,
+      };
+
+  factory RendezvousServerSettings.fromJson(Map<String, dynamic> json) {
+    return RendezvousServerSettings(
+      address: json['address'] as String? ?? '',
+      pubkeyHex: json['pubkeyHex'] as String? ?? '',
+    );
+  }
+
+  String get normalizedPubkeyHex => pubkeyHex.toLowerCase();
+
+  String get configKey => '$normalizedPubkeyHex@${address.trim()}';
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RendezvousServerSettings &&
+          runtimeType == other.runtimeType &&
+          address == other.address &&
+          pubkeyHex == other.pubkeyHex;
+
+  @override
+  int get hashCode => Object.hash(address, pubkeyHex);
+}
+
+/// Immutable transport settings for Redux store
+@immutable
 class SettingsState {
   /// Whether Bluetooth transport is enabled
   final bool bluetoothEnabled;
@@ -40,12 +79,17 @@ class SettingsState {
   /// Default: Bluetooth first, then UDP
   final List<TransportProtocol> transportPriority;
 
-  /// Bootstrap anchor server address (e.g. "[2600:1234::1]:9514").
-  /// Null means no anchor configured.
-  ///
-  /// The anchor's public key is not stored here — it is derived
-  /// deterministically from the owner's identity at runtime.
+  /// Rendezvous server address (e.g. "[2600:1234::1]:9514").
+  /// Null means no rendezvous server configured.
   final String? anchorAddress;
+
+  /// Rendezvous server public key hex (64 chars, 32 bytes).
+  /// The server has its own independent Ed25519 keypair — this must
+  /// be configured explicitly (not derived from the owner's key).
+  final String? anchorPubkeyHex;
+
+  /// Full configured rendezvous server list.
+  final List<RendezvousServerSettings> rendezvousServers;
 
   const SettingsState({
     this.bluetoothEnabled = true,
@@ -55,6 +99,8 @@ class SettingsState {
       TransportProtocol.udp,
     ],
     this.anchorAddress,
+    this.anchorPubkeyHex,
+    this.rendezvousServers = const [],
   });
 
   static const SettingsState initial = SettingsState();
@@ -75,23 +121,59 @@ class SettingsState {
     return null;
   }
 
-  /// Whether an anchor server is configured.
-  bool get hasAnchor => anchorAddress != null && anchorAddress!.isNotEmpty;
+  List<RendezvousServerSettings> get configuredRendezvousServers {
+    final merged = <RendezvousServerSettings>[];
+    final seen = <String>{};
+
+    for (final server in rendezvousServers) {
+      final key = server.configKey;
+      if (server.address.trim().isEmpty || server.pubkeyHex.trim().isEmpty) {
+        continue;
+      }
+      if (seen.add(key)) {
+        merged.add(server);
+      }
+    }
+
+    if (anchorAddress != null &&
+        anchorAddress!.isNotEmpty &&
+        anchorPubkeyHex != null &&
+        anchorPubkeyHex!.isNotEmpty) {
+      final legacy = RendezvousServerSettings(
+        address: anchorAddress!,
+        pubkeyHex: anchorPubkeyHex!,
+      );
+      if (seen.add(legacy.configKey)) {
+        merged.add(legacy);
+      }
+    }
+
+    return List<RendezvousServerSettings>.unmodifiable(merged);
+  }
+
+  /// Whether a rendezvous server is fully configured (address + pubkey).
+  bool get hasAnchor => configuredRendezvousServers.isNotEmpty;
 
   SettingsState copyWith({
     bool? bluetoothEnabled,
     bool? udpEnabled,
     List<TransportProtocol>? transportPriority,
+    List<RendezvousServerSettings>? rendezvousServers,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? anchorAddress = _sentinel,
+    Object? anchorPubkeyHex = _sentinel,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
       udpEnabled: udpEnabled ?? this.udpEnabled,
       transportPriority: transportPriority ?? this.transportPriority,
+      rendezvousServers: rendezvousServers ?? this.rendezvousServers,
       anchorAddress: identical(anchorAddress, _sentinel)
           ? this.anchorAddress
           : anchorAddress as String?,
+      anchorPubkeyHex: identical(anchorPubkeyHex, _sentinel)
+          ? this.anchorPubkeyHex
+          : anchorPubkeyHex as String?,
     );
   }
 
@@ -100,9 +182,18 @@ class SettingsState {
         'udpEnabled': udpEnabled,
         'transportPriority': transportPriority.map((t) => t.name).toList(),
         'anchorAddress': anchorAddress,
+        'anchorPubkeyHex': anchorPubkeyHex,
+        'rendezvousServers':
+            rendezvousServers.map((server) => server.toJson()).toList(),
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
+    final rendezvousServers = (json['rendezvousServers'] as List<dynamic>?)
+            ?.map((entry) => RendezvousServerSettings.fromJson(
+                entry as Map<String, dynamic>))
+            .toList() ??
+        const <RendezvousServerSettings>[];
+
     return SettingsState(
       bluetoothEnabled: json['bluetoothEnabled'] as bool? ?? true,
       udpEnabled: json['udpEnabled'] as bool? ?? true,
@@ -114,6 +205,8 @@ class SettingsState {
               .toList() ??
           const [TransportProtocol.bluetooth, TransportProtocol.udp],
       anchorAddress: json['anchorAddress'] as String?,
+      anchorPubkeyHex: json['anchorPubkeyHex'] as String?,
+      rendezvousServers: rendezvousServers,
     );
   }
 
@@ -125,7 +218,9 @@ class SettingsState {
           bluetoothEnabled == other.bluetoothEnabled &&
           udpEnabled == other.udpEnabled &&
           listEquals(transportPriority, other.transportPriority) &&
-          anchorAddress == other.anchorAddress;
+          anchorAddress == other.anchorAddress &&
+          anchorPubkeyHex == other.anchorPubkeyHex &&
+          listEquals(rendezvousServers, other.rendezvousServers);
 
   @override
   int get hashCode => Object.hash(
@@ -133,11 +228,13 @@ class SettingsState {
         udpEnabled,
         Object.hashAll(transportPriority),
         anchorAddress,
+        anchorPubkeyHex,
+        Object.hashAll(rendezvousServers),
       );
 
   @override
-  String toString() =>
-      'SettingsState(bt: $bluetoothEnabled, udp: $udpEnabled)';
+  String toString() => 'SettingsState(bt: $bluetoothEnabled, udp: $udpEnabled, '
+      'rendezvous: ${configuredRendezvousServers.length})';
 }
 
 /// Sentinel for copyWith — distinguishes "not passed" from "passed null".

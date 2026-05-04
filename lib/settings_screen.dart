@@ -1,8 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:redux/redux.dart';
 import 'debug_log_screen.dart';
 import 'src/store/app_state.dart';
 import 'src/store/settings_actions.dart';
+import 'src/store/settings_state.dart';
+import 'src/store/transports_state.dart';
 import 'src/transport/transport_service.dart';
 
 /// Settings screen for configuring transport protocols
@@ -11,11 +16,17 @@ class SettingsScreen extends StatefulWidget {
 
   /// Callback when settings are changed
   final VoidCallback? onSettingsChanged;
+  final Future<bool> Function(String address, String pubkeyHex)?
+      onAddRendezvousServer;
+  final Future<void> Function(String address, String pubkeyHex)?
+      onRemoveRendezvousServer;
 
   const SettingsScreen({
     super.key,
     required this.store,
     this.onSettingsChanged,
+    this.onAddRendezvousServer,
+    this.onRemoveRendezvousServer,
   });
 
   @override
@@ -25,8 +36,11 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _bluetoothEnabled;
   late bool _udpEnabled;
+  bool _isSavingAnchor = false;
+  StreamSubscription<AppState>? _storeSubscription;
 
   late final TextEditingController _anchorAddressController;
+  late final TextEditingController _anchorPubkeyController;
 
   @override
   void initState() {
@@ -34,14 +48,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _bluetoothEnabled = widget.store.state.settings.bluetoothEnabled;
     _udpEnabled = widget.store.state.settings.udpEnabled;
 
-    final settings = widget.store.state.settings;
-    _anchorAddressController =
-        TextEditingController(text: settings.anchorAddress ?? '');
+    _anchorAddressController = TextEditingController();
+    _anchorPubkeyController = TextEditingController();
+    _storeSubscription = widget.store.onChange.listen((state) {
+      final settings = state.settings;
+      if (_bluetoothEnabled != settings.bluetoothEnabled) {
+        _bluetoothEnabled = settings.bluetoothEnabled;
+      }
+      if (_udpEnabled != settings.udpEnabled) {
+        _udpEnabled = settings.udpEnabled;
+      }
+      if (mounted) {
+        setState(() {});
+      }
+    });
   }
 
   @override
   void dispose() {
+    _storeSubscription?.cancel();
     _anchorAddressController.dispose();
+    _anchorPubkeyController.dispose();
     super.dispose();
   }
 
@@ -93,7 +120,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: 'Bluetooth',
             subtitle: 'Connect to nearby peers via BLE',
             value: _bluetoothEnabled,
-            available: widget.store.state.transports.bleState != TransportState.error,
+            available:
+                widget.store.state.transports.bleState != TransportState.error,
             onChanged: _onBluetoothChanged,
             priority: 1,
           ),
@@ -105,7 +133,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             title: 'Internet',
             subtitle: 'Connect to peers over the Internet',
             value: _udpEnabled,
-            available: widget.store.state.transports.udpState != TransportState.error,
+            available:
+                widget.store.state.transports.udpState != TransportState.error,
             onChanged: _onUdpChanged,
             priority: 2,
           ),
@@ -278,9 +307,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ),
         subtitle: Text(
-          !available
-              ? 'Not available on this device'
-              : subtitle,
+          !available ? 'Not available on this device' : subtitle,
           style: TextStyle(
             color: isEnabled ? Colors.grey[400] : Colors.grey,
             fontSize: 13,
@@ -301,6 +328,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final isWellConnected = transports.isWellConnected;
     final publicAddress = transports.publicAddress;
     final publicIp = transports.publicIp;
+    final connectionType = transports.networkConnectionType;
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
@@ -339,6 +367,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       color: Colors.grey[500],
                     ),
                   ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Icon(
+                        _networkTypeIcon(connectionType),
+                        size: 14,
+                        color: Colors.grey[400],
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Connection type: ${connectionType.displayName}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.grey[400],
+                        ),
+                      ),
+                    ],
+                  ),
                   if (publicIp != null || publicAddress != null) ...[
                     const SizedBox(height: 6),
                     Text(
@@ -357,6 +403,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
+  }
+
+  IconData _networkTypeIcon(NetworkConnectionType connectionType) {
+    switch (connectionType) {
+      case NetworkConnectionType.wifi:
+        return Icons.wifi;
+      case NetworkConnectionType.cellular:
+        return Icons.signal_cellular_alt;
+      case NetworkConnectionType.ethernet:
+        return Icons.settings_ethernet;
+      case NetworkConnectionType.vpn:
+        return Icons.lock_outline;
+      case NetworkConnectionType.other:
+        return Icons.device_hub_outlined;
+      case NetworkConnectionType.offline:
+        return Icons.portable_wifi_off;
+    }
   }
 
   Widget _buildInfoCard() {
@@ -399,7 +462,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _buildInfoRow(
             icon: Icons.priority_high,
             iconColor: const Color(0xFFE8A33C),
-            text: 'When both are available, Bluetooth is preferred for faster communication',
+            text:
+                'When both are available, Bluetooth is preferred for faster communication',
           ),
         ],
       ),
@@ -427,7 +491,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _buildAnchorServerSection() {
-    final hasAnchor = widget.store.state.settings.hasAnchor;
+    final servers = widget.store.state.settings.configuredRendezvousServers;
+    final hasAnchor = servers.isNotEmpty;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -440,7 +505,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const Icon(Icons.cloud_outlined, color: Color(0xFFE8A33C)),
               const SizedBox(width: 8),
               const Text(
-                'Anchor Server',
+                'Rendezvous Server',
                 style: TextStyle(
                   fontSize: 16,
                   fontWeight: FontWeight.bold,
@@ -456,8 +521,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     color: Colors.green.withOpacity(0.2),
                     borderRadius: BorderRadius.circular(4),
                   ),
-                  child: const Text(
-                    'Configured',
+                  child: Text(
+                    '${servers.length} configured',
                     style: TextStyle(fontSize: 10, color: Colors.green),
                   ),
                 ),
@@ -469,12 +534,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         const Padding(
           padding: EdgeInsets.symmetric(horizontal: 16),
           child: Text(
-            'A personal cloud server that helps your friends find each other '
-            'when you\'re not nearby. The server\'s identity is derived from '
-            'your key — just enter its address.',
+            'A lightweight server that helps peers find each other for '
+            'hole-punching. Add one or more servers below. Server is stored '
+            'only after live ANNOUNCE response. IPv6 only.',
             style: TextStyle(color: Colors.grey, fontSize: 13),
           ),
         ),
+
+        if (servers.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          for (final server in servers) _buildConfiguredAnchorTile(server),
+        ],
 
         const SizedBox(height: 12),
 
@@ -486,13 +556,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
             style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
             decoration: InputDecoration(
               labelText: 'Server address',
-              hintText: '[2600:1234::1]:9514',
+              hintText: '[2600:1234::1]:9514 or 198.51.100.5:9514',
               hintStyle: TextStyle(
                 color: Colors.grey[700],
                 fontFamily: 'monospace',
                 fontSize: 14,
               ),
               prefixIcon: const Icon(Icons.dns_outlined, size: 20),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+              contentPadding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+            ),
+          ),
+        ),
+
+        const SizedBox(height: 12),
+
+        // Public key field
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: TextField(
+            controller: _anchorPubkeyController,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
+            decoration: InputDecoration(
+              labelText: 'Server public key',
+              hintText: '64-character hex',
+              hintStyle: TextStyle(
+                color: Colors.grey[700],
+                fontFamily: 'monospace',
+                fontSize: 14,
+              ),
+              prefixIcon: const Icon(Icons.key_outlined, size: 20),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(8),
               ),
@@ -511,9 +607,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _onSaveAnchor,
-                  icon: const Icon(Icons.save_outlined, size: 18),
-                  label: const Text('Save'),
+                  onPressed: _isSavingAnchor ? null : _onSaveAnchor,
+                  icon: _isSavingAnchor
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.add_link_outlined, size: 18),
+                  label: Text(_isSavingAnchor ? 'Verifying...' : 'Add Server'),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1B3D2F),
                     foregroundColor: const Color(0xFFE8A33C),
@@ -524,22 +626,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
               ),
-              if (hasAnchor) ...[
-                const SizedBox(width: 12),
-                OutlinedButton.icon(
-                  onPressed: _onClearAnchor,
-                  icon: const Icon(Icons.clear, size: 18),
-                  label: const Text('Remove'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.red,
-                    side: const BorderSide(color: Colors.red),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
         ),
@@ -547,8 +633,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  void _onSaveAnchor() {
+  Widget _buildConfiguredAnchorTile(RendezvousServerSettings server) {
+    final shortPubkey = server.pubkeyHex.length > 16
+        ? '${server.pubkeyHex.substring(0, 16)}...'
+        : server.pubkeyHex;
+
+    return Card(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: ListTile(
+        leading: const Icon(Icons.cloud_done_outlined, color: Colors.green),
+        title: Text(
+          server.address,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+        ),
+        subtitle: Text(
+          shortPubkey,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              tooltip: 'Copy server details',
+              icon: const Icon(Icons.copy_outlined),
+              onPressed: () => _copyAnchorDetails(server),
+            ),
+            IconButton(
+              tooltip: 'Remove server',
+              icon: const Icon(Icons.delete_outline, color: Colors.red),
+              onPressed: () => _onRemoveAnchor(server),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatAnchorDetails(RendezvousServerSettings server) {
+    return '${server.address} ${server.pubkeyHex}';
+  }
+
+  Future<void> _copyAnchorDetails(RendezvousServerSettings server) async {
+    await Clipboard.setData(
+      ClipboardData(text: _formatAnchorDetails(server)),
+    );
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Rendezvous server details copied')),
+    );
+  }
+
+  Future<void> _onSaveAnchor() async {
     final address = _anchorAddressController.text.trim();
+    final pubkey = _anchorPubkeyController.text.trim();
 
     if (address.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -557,24 +696,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
       return;
     }
 
-    widget.store.dispatch(SetAnchorServerAction(anchorAddress: address));
+    if (pubkey.isEmpty ||
+        pubkey.length != 64 ||
+        !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(pubkey)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Public key must be 64 hex characters')),
+      );
+      return;
+    }
+
+    if (widget.onAddRendezvousServer == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Transport not ready. Cannot verify server yet'),
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _isSavingAnchor = true;
+    });
+
+    final saved =
+        await widget.onAddRendezvousServer!.call(address, pubkey.toLowerCase());
+
+    if (!mounted) return;
+
+    setState(() {
+      _isSavingAnchor = false;
+    });
+
+    if (!saved) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Server did not respond. Not saved'),
+        ),
+      );
+      return;
+    }
+
+    _anchorAddressController.clear();
+    _anchorPubkeyController.clear();
     widget.onSettingsChanged?.call();
 
-    setState(() {}); // refresh the "Configured" badge
+    setState(() {});
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Anchor server saved')),
+      const SnackBar(content: Text('Rendezvous server added')),
     );
   }
 
-  void _onClearAnchor() {
+  void _onRemoveAnchor(RendezvousServerSettings server) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Remove Anchor Server?'),
-        content: const Text(
-          'Your device will stop syncing its friend list to this server. '
-          'Friends will lose the signaling relay until you configure a new one.',
+        title: const Text('Remove Rendezvous Server?'),
+        content: Text(
+          'Remove ${server.address}? Reconnection after IP changes will use '
+          'remaining rendezvous servers, BLE, or friends-based signaling.',
         ),
         actions: [
           TextButton(
@@ -582,12 +762,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: const Text('Cancel'),
           ),
           TextButton(
-            onPressed: () {
+            onPressed: () async {
               Navigator.pop(context);
-              _anchorAddressController.clear();
-              widget.store.dispatch(SetAnchorServerAction(anchorAddress: null));
+              if (widget.onRemoveRendezvousServer != null) {
+                await widget.onRemoveRendezvousServer!(
+                  server.address,
+                  server.pubkeyHex,
+                );
+              } else {
+                widget.store.dispatch(RemoveRendezvousServerAction(server));
+              }
               widget.onSettingsChanged?.call();
-              setState(() {});
+              if (mounted) {
+                setState(() {});
+              }
             },
             child: const Text('Remove', style: TextStyle(color: Colors.red)),
           ),

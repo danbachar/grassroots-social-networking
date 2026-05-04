@@ -26,7 +26,6 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 final Logger _log = Logger();
 
-
 // Pending chat to open from notification
 String? _pendingChatPeerHex;
 
@@ -154,7 +153,9 @@ LogEntry? _parseLogLine(String line) {
   if (RegExp(r'^[┌├└─┄]+$').hasMatch(clean)) return null;
 
   // Skip Flutter framework noise
-  if (clean.startsWith('I/flutter') || clean.startsWith('D/') || clean.startsWith('W/')) {
+  if (clean.startsWith('I/flutter') ||
+      clean.startsWith('D/') ||
+      clean.startsWith('W/')) {
     return null;
   }
 
@@ -170,7 +171,10 @@ LogEntry? _parseLogLine(String line) {
     level = Level.warning;
   } else if (clean.contains('💡')) {
     level = Level.info;
-  } else if (clean.contains('🐛') || clean.contains('📨') || clean.contains('📦') || clean.contains('🤝')) {
+  } else if (clean.contains('🐛') ||
+      clean.contains('📨') ||
+      clean.contains('📦') ||
+      clean.contains('🤝')) {
     level = Level.debug;
   }
 
@@ -195,7 +199,8 @@ void main() async {
   persistenceService = PersistenceService();
   final friendships = await persistenceService.loadFriendships();
   final settings = await persistenceService.loadSettings();
-  final (conversations, unreadCounts) = await persistenceService.loadConversations();
+  final (conversations, unreadCounts) =
+      await persistenceService.loadConversations();
 
   // Initialize redux store with hydrated state
   appStore = Store<AppState>(
@@ -276,21 +281,19 @@ class _BitchatHomeState extends State<BitchatHome>
 
   // Track nickname changes for animation
   final Map<String, _NicknameChange> _nicknameChanges = {};
-  
+
   // Transport availability derived from Redux store
   bool get _bleAvailable => appStore.state.transports.bleState.isUsable;
   bool get _udpAvailable => appStore.state.transports.udpState.isUsable;
 
   /// Get our UDP address for friend communication
   String? get _myUdpAddress => _bitchat?.udpAddress;
-  
+
   /// Get nearby peers from Redux store (BLE-connected peers in physical proximity).
   /// For the "Nearby" section - only peers reachable via Bluetooth.
   Map<String, PeerState> get _peers {
     final peersState = appStore.state.peers;
-    return {
-      for (var p in peersState.nearbyBlePeers) p.pubkeyHex: p
-    };
+    return {for (var p in peersState.nearbyBlePeers) p.pubkeyHex: p};
   }
 
   /// Get discovered but unconnected nearby devices
@@ -304,7 +307,8 @@ class _BitchatHomeState extends State<BitchatHome>
         .toSet();
 
     return peersState.discoveredBlePeersList
-        .where((d) => !connectedDeviceIds.contains(d.transportId) && !d.isConnected)
+        .where((d) =>
+            !connectedDeviceIds.contains(d.transportId) && !d.isConnected)
         .toList();
   }
 
@@ -316,7 +320,8 @@ class _BitchatHomeState extends State<BitchatHome>
       if (mounted) setState(() {});
     });
     // Subscribe to connectivity changes
-    _connectivitySubscription = Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    _connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
     _initialize();
     // Refresh UI every second to update "seconds ago" display
     _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -367,7 +372,8 @@ class _BitchatHomeState extends State<BitchatHome>
         store: appStore,
       );
 
-      bitchat.onMessageReceived = (messageId, senderPubkey, payload, transport) {
+      bitchat.onMessageReceived =
+          (messageId, senderPubkey, payload, transport) {
         _handleIncomingMessage(messageId, senderPubkey, payload, transport);
       };
 
@@ -435,8 +441,8 @@ class _BitchatHomeState extends State<BitchatHome>
   // Friend presence is handled at the transport layer via unified ANNOUNCE
   // messages. BLE and UDP broadcasts include address for friends automatically.
 
-  Future<void> _handleIncomingMessage(String messageId,
-      Uint8List senderPubkey, Uint8List payload, MessageTransport transport) async {
+  Future<void> _handleIncomingMessage(String messageId, Uint8List senderPubkey,
+      Uint8List payload, MessageTransport transport) async {
     final senderHex = ChatMessage.pubkeyToHex(senderPubkey);
     final myHex = ChatMessage.pubkeyToHex(_identity!.publicKey);
 
@@ -446,12 +452,18 @@ class _BitchatHomeState extends State<BitchatHome>
       await _handleBlock(
           block, senderHex, myHex, messageId, senderPubkey, transport);
     } else {
-      debugPrint('📨 Failed to parse block (${payload.length} bytes from $senderHex) - dropping');
+      debugPrint(
+          '📨 Failed to parse block (${payload.length} bytes from $senderHex) - dropping');
     }
   }
 
-  Future<void> _handleBlock(Block block, String senderHex, String myHex,
-      String messageId, Uint8List senderPubkey, MessageTransport transport) async {
+  Future<void> _handleBlock(
+      Block block,
+      String senderHex,
+      String myHex,
+      String messageId,
+      Uint8List senderPubkey,
+      MessageTransport transport) async {
     // Find sender name
     final peer = _peers.values
         .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == senderHex)
@@ -462,23 +474,27 @@ class _BitchatHomeState extends State<BitchatHome>
     switch (block.type) {
       case BlockType.say:
         final sayBlock = block as SayBlock;
-        debugPrint('💬 [$transportName] Message from $senderName: "${sayBlock.content}"');
+        debugPrint(
+            '💬 [$transportName] Message from $senderName: "${sayBlock.content}"');
         await _handleTextMessage(
             senderHex, myHex, sayBlock.content, messageId, senderPubkey);
 
       case BlockType.friendshipOffer:
-        debugPrint('Hansdling FriendshipOfferBlock from $senderName ($senderHex)');
+        debugPrint(
+            'Hansdling FriendshipOfferBlock from $senderName ($senderHex)');
         final offerBlock = block as FriendshipOfferBlock;
         await _handleFriendshipOffer(senderHex, myHex, offerBlock, senderName);
 
       case BlockType.friendshipAccept:
-        debugPrint('Handling FriendshipAcceptBlock from $senderName ($senderHex)');
+        debugPrint(
+            'Handling FriendshipAcceptBlock from $senderName ($senderHex)');
         final acceptBlock = block as FriendshipAcceptBlock;
         await _handleFriendshipAccept(
             senderHex, myHex, acceptBlock, senderName);
 
       case BlockType.friendshipRevoke:
-        debugPrint('Handling FriendshipRevokeBlock from $senderName ($senderHex)');
+        debugPrint(
+            'Handling FriendshipRevokeBlock from $senderName ($senderHex)');
         await _handleFriendshipRevoke(senderHex);
     }
   }
@@ -606,7 +622,7 @@ class _BitchatHomeState extends State<BitchatHome>
     // Remove from our friend list (Redux handles both friendships and peers)
     appStore.dispatch(RemoveFriendshipAction(peerHex));
     appStore.dispatch(FriendRemovedAction(pubkey));
-    
+
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -709,19 +725,31 @@ class _BitchatHomeState extends State<BitchatHome>
     final peerHex = peer.pubkeyHex;
     final myHex = ChatMessage.pubkeyToHex(_identity!.publicKey);
 
-    // Create and record the friend request in Redux
-    appStore.dispatch(CreateFriendRequestAction(
-      peerPubkeyHex: peerHex,
-      nickname: peer.displayName,
-    ));
-
     // Create the friendship offer block
     final block = FriendshipOfferBlock(
       message: 'Hey, let\'s be friends!',
     );
 
     // Send via Bitchat
-    await _bitchat!.send(peer.publicKey, block.serialize());
+    final messageId = await _bitchat!.send(peer.publicKey, block.serialize());
+    if (messageId == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                Text('Failed to send friend request to ${peer.displayName}'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
+
+    // Create and record the friend request in Redux
+    appStore.dispatch(CreateFriendRequestAction(
+      peerPubkeyHex: peerHex,
+      nickname: peer.displayName,
+    ));
 
     // Save as a chat message in Redux
     appStore.dispatch(SaveChatMessageAction(
@@ -729,6 +757,7 @@ class _BitchatHomeState extends State<BitchatHome>
       recipientPubkeyHex: peerHex,
       content: 'Sent a friend request',
       isOutgoing: true,
+      messageId: messageId,
       messageType: ChatMessageType.friendRequestSent.index,
     ));
 
@@ -1379,19 +1408,32 @@ class _BitchatHomeState extends State<BitchatHome>
                   children: [
                     if (_peers.isNotEmpty) ...[
                       const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        child: Text('Connected Peers', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 12)),
+                        padding:
+                            EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Text('Connected Peers',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.grey,
+                                fontSize: 12)),
                       ),
-                      ...(_peers.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi)))
+                      ...(_peers.values.toList()
+                            ..sort((a, b) => b.rssi.compareTo(a.rssi)))
                           .map((peer) => _buildPeerListItem(peer)),
                     ],
                     if (_unconnectedDevices.isNotEmpty) ...[
                       const Padding(
-                        padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        child: Text('Discovered Grassroots Devices', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.grey, fontSize: 12)),
+                        padding:
+                            EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Text('Discovered Grassroots Devices',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.grey,
+                                fontSize: 12)),
                       ),
-                      ...(_unconnectedDevices..sort((a, b) => b.rssi.compareTo(a.rssi)))
-                          .map((device) => _buildUnconnectedDeviceListItem(device)),
+                      ...(_unconnectedDevices
+                            ..sort((a, b) => b.rssi.compareTo(a.rssi)))
+                          .map((device) =>
+                              _buildUnconnectedDeviceListItem(device)),
                     ]
                   ],
                 ),
@@ -1460,7 +1502,8 @@ class _BitchatHomeState extends State<BitchatHome>
     final unreadCount = appStore.state.messages.getUnreadCount(peerHex);
     final friendship = appStore.state.friendships.getFriendship(peerHex);
     final isFriend = friendship?.isAccepted ?? false;
-    final hasPendingRequest = appStore.state.friendships.hasPendingRequest(peerHex);
+    final hasPendingRequest =
+        appStore.state.friendships.hasPendingRequest(peerHex);
 
     // RSSI signal strength indicator
     IconData signalIcon;
@@ -1614,7 +1657,9 @@ class _BitchatHomeState extends State<BitchatHome>
                   onPressed: () {
                     _bitchat?.disconnectBlePeer(peer.pubkeyHex);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Disconnecting from ${peer.displayName}')),
+                      SnackBar(
+                          content:
+                              Text('Disconnecting from ${peer.displayName}')),
                     );
                   },
                 ),
@@ -1677,7 +1722,8 @@ class _BitchatHomeState extends State<BitchatHome>
           ),
           title: Text(
             device.displayName ?? 'Unknown Grassroots Device',
-            style: const TextStyle(fontWeight: FontWeight.normal, color: Colors.grey),
+            style: const TextStyle(
+                fontWeight: FontWeight.normal, color: Colors.grey),
           ),
           subtitle: Row(
             children: [
@@ -1702,7 +1748,9 @@ class _BitchatHomeState extends State<BitchatHome>
                   onPressed: () {
                     _bitchat?.connectBleDevice(device.transportId);
                     ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Connecting to ${device.displayName ?? 'device'}...')),
+                      SnackBar(
+                          content: Text(
+                              'Connecting to ${device.displayName ?? 'device'}...')),
                     );
                   },
                 ),
@@ -1934,7 +1982,7 @@ class _BitchatHomeState extends State<BitchatHome>
               ],
             ),
             const SizedBox(height: 12),
-            
+
             // BLE status
             _buildTransportStatusRow(
               icon: Icons.bluetooth,
@@ -1953,9 +2001,9 @@ class _BitchatHomeState extends State<BitchatHome>
               enabled: appStore.state.settings.udpEnabled,
               available: _udpAvailable,
             ),
-            
+
             const Divider(height: 24),
-            
+
             Text(
               '${_peers.length} connected peers',
               style: const TextStyle(color: Colors.grey),
@@ -1974,7 +2022,7 @@ class _BitchatHomeState extends State<BitchatHome>
     required bool available,
   }) {
     final isActive = enabled && available;
-    
+
     return Row(
       children: [
         Icon(
@@ -1996,13 +2044,13 @@ class _BitchatHomeState extends State<BitchatHome>
           decoration: BoxDecoration(
             color: isActive
                 ? Colors.green.withOpacity(0.2)
-                : (enabled ? Colors.orange.withOpacity(0.2) : Colors.grey.withOpacity(0.2)),
+                : (enabled
+                    ? Colors.orange.withOpacity(0.2)
+                    : Colors.grey.withOpacity(0.2)),
             borderRadius: BorderRadius.circular(4),
           ),
           child: Text(
-            isActive
-                ? 'Active'
-                : (enabled ? 'Unavailable' : 'Disabled'),
+            isActive ? 'Active' : (enabled ? 'Unavailable' : 'Disabled'),
             style: TextStyle(
               fontSize: 11,
               color: isActive
@@ -2035,6 +2083,18 @@ class _BitchatHomeState extends State<BitchatHome>
           onSettingsChanged: () {
             setState(() {});
           },
+          onAddRendezvousServer: _bitchat == null
+              ? null
+              : (address, pubkeyHex) => _bitchat!.addRendezvousServer(
+                    address: address,
+                    pubkeyHex: pubkeyHex,
+                  ),
+          onRemoveRendezvousServer: _bitchat == null
+              ? null
+              : (address, pubkeyHex) => _bitchat!.removeRendezvousServer(
+                    address: address,
+                    pubkeyHex: pubkeyHex,
+                  ),
         ),
       ),
     );

@@ -30,14 +30,33 @@ class UpdateTransportSettingsAction extends SettingsAction {
   });
 }
 
-/// Configure the bootstrap anchor server address.
+/// Configure the rendezvous server address and public key.
 ///
-/// The anchor's public key is derived from the owner's identity —
-/// only the address needs to be stored.
+/// The server has its own independent keypair — both the address and
+/// the public key must be provided.
 class SetAnchorServerAction extends SettingsAction {
   final String? anchorAddress;
+  final String? anchorPubkeyHex;
 
-  SetAnchorServerAction({this.anchorAddress});
+  SetAnchorServerAction({this.anchorAddress, this.anchorPubkeyHex});
+}
+
+class SetRendezvousServersAction extends SettingsAction {
+  final List<RendezvousServerSettings> servers;
+
+  SetRendezvousServersAction(this.servers);
+}
+
+class AddRendezvousServerAction extends SettingsAction {
+  final RendezvousServerSettings server;
+
+  AddRendezvousServerAction(this.server);
+}
+
+class RemoveRendezvousServerAction extends SettingsAction {
+  final RendezvousServerSettings server;
+
+  RemoveRendezvousServerAction(this.server);
 }
 
 /// Hydrate settings from persistence

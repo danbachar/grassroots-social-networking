@@ -3,21 +3,24 @@ FROM dart:stable AS build
 
 WORKDIR /app
 
+# Build context is the repo root (bitchat_transport/), so dart-udx is a
+# sibling of bootstrap_anchor/ inside the context.
+
 # Copy dart_udx dependency first (for caching)
-COPY ../dart-udx /app/dart-udx
+COPY dart-udx /app/dart-udx
 
 # Copy pubspec and get dependencies
-COPY pubspec.yaml .
+COPY bootstrap_anchor/pubspec.yaml .
 # Fix dart_udx path for Docker context
 RUN sed -i 's|path: ../dart-udx|path: /app/dart-udx|' pubspec.yaml
 RUN dart pub get
 
 # Copy source
-COPY lib/ lib/
-COPY bin/ bin/
+COPY bootstrap_anchor/lib/ lib/
+COPY bootstrap_anchor/bin/ bin/
 
 # Compile to native executable
-RUN dart compile exe bin/server.dart -o bin/bootstrap_anchor
+RUN dart compile exe bin/server.dart -o bin/rendezvous_server
 
 # Runtime stage — minimal image
 FROM debian:bookworm-slim
@@ -28,14 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY --from=build /app/bin/bootstrap_anchor /app/bootstrap_anchor
+COPY --from=build /app/bin/rendezvous_server /app/rendezvous_server
 
-# Friends list persisted via volume mount (restart recovery only)
+# Identity file persisted via volume mount
 VOLUME /app/data
 
 EXPOSE 9514/udp
+EXPOSE 9516/udp
 
-ENTRYPOINT ["/app/bootstrap_anchor"]
-# Replace ANCHOR_SEED_HEX and OWNER_PUBKEY_HEX at deploy time.
-# The seed is derived from the owner's key: SHA-256(ownerSeed || "bitchat-anchor")
-CMD ["--port", "9514", "--nickname", "anchor", "--seed", "ANCHOR_SEED_HEX", "--friends", "/app/data/friends.json", "--owner", "OWNER_PUBKEY_HEX"]
+ENTRYPOINT ["/app/rendezvous_server"]
+CMD ["--identity", "/app/data/identity.json", "--ipv6-port", "9516"]

@@ -267,4 +267,49 @@ void main() {
       expect(peer.displayName, equals('Bob'));
     });
   });
+
+  group('computeStaleUdpPeerPubkeys', () {
+    test('returns only connected UDP peers that missed the stale threshold', () {
+      final now = DateTime.now();
+      final stalePubkey =
+          Uint8List.fromList(List.generate(32, (i) => (i + 1) % 256));
+      final freshPubkey =
+          Uint8List.fromList(List.generate(32, (i) => (i + 33) % 256));
+      final bleOnlyPubkey =
+          Uint8List.fromList(List.generate(32, (i) => (i + 65) % 256));
+
+      String toHex(Uint8List pubkey) =>
+          pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+      final stale = computeStaleUdpPeerPubkeys(
+        peers: [
+          PeerState(
+            publicKey: stalePubkey,
+            nickname: 'Stale',
+            lastSeen: now,
+            lastUdpSeen: now.subtract(const Duration(seconds: 31)),
+          ),
+          PeerState(
+            publicKey: freshPubkey,
+            nickname: 'Fresh',
+            lastSeen: now,
+            lastUdpSeen: now.subtract(const Duration(seconds: 5)),
+          ),
+          PeerState(
+            publicKey: bleOnlyPubkey,
+            nickname: 'NearbyOnly',
+            lastSeen: now,
+          ),
+        ],
+        connectedUdpPubkeys: {
+          toHex(stalePubkey),
+          toHex(freshPubkey),
+        },
+        staleThreshold: const Duration(seconds: 20),
+        now: now,
+      );
+
+      expect(stale, equals({toHex(stalePubkey)}));
+    });
+  });
 }

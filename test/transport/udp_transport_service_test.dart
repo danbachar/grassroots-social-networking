@@ -26,6 +26,14 @@ Store<AppState> _createTestStore() {
   );
 }
 
+InternetAddress _loopbackForFamily(InternetAddressType family) =>
+    family == InternetAddressType.IPv6
+        ? InternetAddress.loopbackIPv6
+        : InternetAddress.loopbackIPv4;
+
+InternetAddress _loopbackFor(UdpTransportService service) =>
+    _loopbackForFamily(service.activeAddressType ?? InternetAddressType.IPv6);
+
 void main() {
   group('UdpTransportService', () {
     late BitchatIdentity identity;
@@ -47,11 +55,11 @@ void main() {
           identity: identity,
           store: store,
           protocolHandler: protocolHandler,
+          connectHandshakeTimeout: const Duration(milliseconds: 100),
         );
         expect(service.state, equals(TransportState.uninitialized));
         expect(service.rawSocket, isNull);
         expect(service.localPort, isNull);
-        expect(service.localAddress, isNull);
         expect(service.isMultiplexerActive, isFalse);
       });
 
@@ -60,6 +68,7 @@ void main() {
           identity: identity,
           store: store,
           protocolHandler: protocolHandler,
+          connectHandshakeTimeout: const Duration(milliseconds: 100),
         );
 
         final result = await service.initialize();
@@ -69,7 +78,24 @@ void main() {
         expect(service.rawSocket, isNotNull);
         expect(service.localPort, isNotNull);
         expect(service.localPort, greaterThan(0));
+        expect(service.activeAddressType, isNotNull);
         expect(service.isMultiplexerActive, isFalse);
+
+        await service.dispose();
+      });
+
+      test('initialize supports IPv4 and IPv6 when sockets bind', () async {
+        final service = UdpTransportService(
+          identity: identity,
+          store: store,
+          protocolHandler: protocolHandler,
+        );
+        await service.initialize();
+
+        expect(service.activeAddressTypes, contains(InternetAddressType.IPv6));
+        expect(service.activeAddressTypes, contains(InternetAddressType.IPv4));
+        expect(service.canDialAddress(InternetAddress.loopbackIPv4), isTrue);
+        expect(service.canDialAddress(InternetAddress.loopbackIPv6), isTrue);
 
         await service.dispose();
       });
@@ -233,10 +259,37 @@ void main() {
 
         final result = await service.connectToPeer(
           'deadbeef' * 8,
-          InternetAddress.loopbackIPv6,
+          _loopbackFor(service),
           12345,
         );
         expect(result, isFalse);
+
+        await service.dispose();
+      });
+
+      test('connectToPeer returns false for unreachable IPv4 endpoint',
+          () async {
+        final service = UdpTransportService(
+          identity: identity,
+          store: store,
+          protocolHandler: protocolHandler,
+          connectHandshakeTimeout: const Duration(milliseconds: 100),
+        );
+        await service.initialize();
+        service.startMultiplexer();
+
+        final result = await service.connectToPeer(
+          'deadbeef' * 8,
+          InternetAddress('203.0.113.1'),
+          65535,
+        );
+
+        expect(result, isFalse);
+        expect(service.connectedCount, equals(0));
+        expect(
+          service.lastConnectFailureKind,
+          isNotNull,
+        );
 
         await service.dispose();
       });
@@ -246,7 +299,8 @@ void main() {
     // Raw socket access for hole-punching
     // =========================================================================
     group('raw socket access', () {
-      test('raw socket is available after initialize for punch packets', () async {
+      test('raw socket is available after initialize for punch packets',
+          () async {
         final service = UdpTransportService(
           identity: identity,
           store: store,
@@ -263,7 +317,7 @@ void main() {
         // (This is how hole-punch service will use it)
         final sent = service.rawSocket!.send(
           Uint8List.fromList([0x47, 0x52, 0x53, 0x50]), // "GRSP" magic
-          InternetAddress.loopbackIPv6,
+          _loopbackFor(service),
           service.localPort!, // send to self just to verify send works
         );
         expect(sent, greaterThan(0));
@@ -285,7 +339,7 @@ void main() {
         expect(service.rawSocket, isNotNull);
         final sent = service.rawSocket!.send(
           Uint8List.fromList([0x47, 0x52, 0x53, 0x50]),
-          InternetAddress.loopbackIPv6,
+          _loopbackFor(service),
           service.localPort!,
         );
         expect(sent, greaterThan(0));
@@ -321,6 +375,8 @@ void main() {
         // Initialize both
         await alice.initialize();
         await bob.initialize();
+        expect(alice.activeAddressType, equals(bob.activeAddressType));
+        final loopback = _loopbackForFamily(bob.activeAddressType!);
 
         // Start multiplexers
         alice.startMultiplexer();
@@ -341,7 +397,7 @@ void main() {
 
         final connected = await alice.connectToPeer(
           bobPubkeyHex,
-          InternetAddress.loopbackIPv6,
+          loopback,
           bob.localPort!,
         );
 
@@ -362,6 +418,60 @@ void main() {
         expect(received, equals(testData));
 
         // Cleanup
+        await alice.dispose();
+        await bob.dispose();
+      }, timeout: const Timeout(Duration(seconds: 10)));
+
+      test('two services can connect and exchange data over IPv4 loopback',
+          () async {
+        final aliceIdentity = await _createTestIdentity('Alice');
+        final bobIdentity = await _createTestIdentity('Bob');
+        final aliceStore = _createTestStore();
+        final bobStore = _createTestStore();
+        final aliceProto = ProtocolHandler(identity: aliceIdentity);
+        final bobProto = ProtocolHandler(identity: bobIdentity);
+
+        final alice = UdpTransportService(
+          identity: aliceIdentity,
+          store: aliceStore,
+          protocolHandler: aliceProto,
+        );
+        final bob = UdpTransportService(
+          identity: bobIdentity,
+          store: bobStore,
+          protocolHandler: bobProto,
+        );
+
+        await alice.initialize();
+        await bob.initialize();
+        alice.startMultiplexer();
+        bob.startMultiplexer();
+
+        final bobReceived = Completer<Uint8List>();
+        bob.onUdpDataReceived = (peerId, data) {
+          if (!bobReceived.isCompleted) {
+            bobReceived.complete(data);
+          }
+        };
+
+        final bobPubkeyHex = bobIdentity.publicKey
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
+
+        final connected = await alice.connectToPeer(
+          bobPubkeyHex,
+          InternetAddress.loopbackIPv4,
+          bob.localPortForAddressType(InternetAddressType.IPv4)!,
+        );
+
+        expect(connected, isTrue);
+        final testData = Uint8List.fromList([4, 3, 2, 1]);
+        expect(await alice.sendToPeer(bobPubkeyHex, testData), isTrue);
+        expect(
+          await bobReceived.future.timeout(const Duration(seconds: 5)),
+          equals(testData),
+        );
+
         await alice.dispose();
         await bob.dispose();
       }, timeout: const Timeout(Duration(seconds: 10)));
@@ -387,6 +497,8 @@ void main() {
 
         await alice.initialize();
         await bob.initialize();
+        expect(alice.activeAddressType, equals(bob.activeAddressType));
+        final loopback = _loopbackForFamily(bob.activeAddressType!);
         alice.startMultiplexer();
         bob.startMultiplexer();
 
@@ -396,7 +508,7 @@ void main() {
 
         await alice.connectToPeer(
           bobPubkeyHex,
-          InternetAddress.loopbackIPv6,
+          loopback,
           bob.localPort!,
         );
         expect(alice.connectedCount, equals(1));
@@ -405,8 +517,8 @@ void main() {
         expect(alice.connectedCount, equals(0));
 
         // Sending should now fail
-        final sent = await alice.sendToPeer(
-            bobPubkeyHex, Uint8List.fromList([1, 2, 3]));
+        final sent =
+            await alice.sendToPeer(bobPubkeyHex, Uint8List.fromList([1, 2, 3]));
         expect(sent, isFalse);
 
         await alice.dispose();
@@ -447,16 +559,17 @@ void main() {
         // Phase 1: Both bind sockets (no multiplexer yet)
         await alice.initialize();
         await bob.initialize();
+        expect(alice.activeAddressType, equals(bob.activeAddressType));
+        final loopback = _loopbackForFamily(bob.activeAddressType!);
 
         // Phase 2: Exchange punch packets on raw sockets
-        final punchData = Uint8List.fromList([0x47, 0x52, 0x53, 0x50]); // "GRSP"
+        final punchData =
+            Uint8List.fromList([0x47, 0x52, 0x53, 0x50]); // "GRSP"
 
         // Alice sends punch to Bob's port
-        alice.rawSocket!.send(
-            punchData, InternetAddress.loopbackIPv6, bob.localPort!);
+        alice.rawSocket!.send(punchData, loopback, bob.localPort!);
         // Bob sends punch to Alice's port
-        bob.rawSocket!.send(
-            punchData, InternetAddress.loopbackIPv6, alice.localPort!);
+        bob.rawSocket!.send(punchData, loopback, alice.localPort!);
 
         // Small delay for packets to arrive
         await Future.delayed(const Duration(milliseconds: 100));
@@ -479,7 +592,7 @@ void main() {
 
         final connected = await alice.connectToPeer(
           bobPubkeyHex,
-          InternetAddress.loopbackIPv6,
+          loopback,
           bob.localPort!,
         );
         expect(connected, isTrue);
@@ -510,7 +623,6 @@ void main() {
           protocolHandler: protocolHandler,
         );
 
-        final states = <TransportState>[];
         // Note: stateStream is not on the abstract interface, so we test via
         // the public state getter at key points.
 

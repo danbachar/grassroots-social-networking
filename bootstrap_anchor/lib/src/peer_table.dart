@@ -1,48 +1,48 @@
-import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
-/// Tracks the owner and their explicit friend list.
+/// Tracks peers that have presented valid friendship proofs.
 ///
-/// The anchor is a personal server — it belongs to one user (the owner)
-/// and only serves the owner's friends. Strangers are ignored.
+/// The rendezvous agent has no friends list of its own and no "owner".
+/// It serves any pair of agents that can cryptographically prove they
+/// are friends — i.e. each side presents a friendship attestation signed
+/// by the other.
+///
+/// Authorization flow:
+/// 1. Agent A connects and sends a reconnect request for friend B,
+///    including A's friendship proof (signed by B).
+/// 2. The server verifies the proof via Ed25519 signature check.
+/// 3. On success, A is registered as an authorized peer and its address
+///    is recorded.
+///
+/// The peer table is purely volatile — it is populated at runtime from
+/// verified proofs and cleared on restart.
 class PeerTable {
-  /// The owner's public key hex. The anchor acts on behalf of this user.
-  final String ownerPubkeyHex;
+  /// Peers that have connected and been verified via friendship proof.
+  /// Keyed by pubkey hex.
+  final Map<String, PeerEntry> _verified = {};
 
-  /// Explicit friend list: pubkey hex → PeerEntry.
-  /// Only friends get signaling, address registration, and hole-punch coordination.
-  final Map<String, PeerEntry> _friends = {};
+  /// Transient entries for peers that connected but haven't been verified.
+  /// Kept briefly for diagnostics.
+  final Map<String, PeerEntry> _unverified = {};
 
-  /// Peers that have connected and sent a valid ANNOUNCE but aren't friends.
-  /// Kept briefly for diagnostics — they get no service.
-  final Map<String, PeerEntry> _strangers = {};
-
-  PeerTable({required this.ownerPubkeyHex});
-
-  /// Add a friend by pubkey hex. The nickname and address will be filled
-  /// when they first ANNOUNCE.
-  void addFriend(String pubkeyHex, {String? nickname}) {
-    _friends.putIfAbsent(
+  /// Register a verified peer (one that has presented a valid friendship proof).
+  void addVerified(String pubkeyHex, {String? nickname}) {
+    _verified.putIfAbsent(
       pubkeyHex,
       () => PeerEntry(
         publicKey: _hexDecode(pubkeyHex),
         nickname: nickname ?? pubkeyHex.substring(0, 8),
         pubkeyHex: pubkeyHex,
-        lastSeen: DateTime.fromMillisecondsSinceEpoch(0),
+        lastSeen: DateTime.now(),
         firstSeen: DateTime.now(),
       ),
     );
+    // Promote from unverified if present
+    _unverified.remove(pubkeyHex);
   }
 
-  /// Remove a friend.
-  void removeFriend(String pubkeyHex) {
-    _friends.remove(pubkeyHex);
-  }
-
-  /// Whether a pubkey hex is the owner or a friend — i.e. someone we serve.
-  bool isFriend(String pubkeyHex) =>
-      pubkeyHex == ownerPubkeyHex || _friends.containsKey(pubkeyHex);
+  /// Whether a pubkey hex belongs to a verified peer.
+  bool isVerified(String pubkeyHex) => _verified.containsKey(pubkeyHex);
 
   /// Update a peer's info from an ANNOUNCE.
   void upsert({
@@ -51,9 +51,9 @@ class PeerTable {
     required String pubkeyHex,
     String? udpAddress,
   }) {
-    if (isFriend(pubkeyHex)) {
-      final existing = _friends[pubkeyHex];
-      _friends[pubkeyHex] = PeerEntry(
+    if (isVerified(pubkeyHex)) {
+      final existing = _verified[pubkeyHex];
+      _verified[pubkeyHex] = PeerEntry(
         publicKey: publicKey,
         nickname: nickname,
         pubkeyHex: pubkeyHex,
@@ -62,8 +62,7 @@ class PeerTable {
         firstSeen: existing?.firstSeen ?? DateTime.now(),
       );
     } else {
-      // Track stranger briefly for logging, but give them no service.
-      _strangers[pubkeyHex] = PeerEntry(
+      _unverified[pubkeyHex] = PeerEntry(
         publicKey: publicKey,
         nickname: nickname,
         pubkeyHex: pubkeyHex,
@@ -74,56 +73,20 @@ class PeerTable {
     }
   }
 
-  PeerEntry? lookupFriend(String pubkeyHex) => _friends[pubkeyHex];
+  PeerEntry? lookupVerified(String pubkeyHex) => _verified[pubkeyHex];
 
-  /// Remove friends not seen for [maxAge].
+  /// Remove peers not seen for [maxAge].
   void removeStale(Duration maxAge) {
     final cutoff = DateTime.now().subtract(maxAge);
-    _strangers.removeWhere((_, peer) => peer.lastSeen.isBefore(cutoff));
-    // Don't remove friends from the list — they may reconnect. Just let
-    // their lastSeen go stale for diagnostics.
+    _unverified.removeWhere((_, peer) => peer.lastSeen.isBefore(cutoff));
+    // Verified peers also go stale — the proof is session-scoped.
+    _verified.removeWhere((_, peer) => peer.lastSeen.isBefore(cutoff));
   }
 
-  int get friendCount => _friends.length;
-  int get strangerCount => _strangers.length;
-  Iterable<PeerEntry> get friends => _friends.values;
-  Iterable<String> get friendPubkeyHexes => _friends.keys;
-
-  /// Load the friend list from a JSON file.
-  ///
-  /// Format: `{ "friends": ["pubkeyHex1", "pubkeyHex2", ...] }`
-  /// or: `{ "friends": [{"pubkey": "hex", "nickname": "name"}, ...] }`
-  static Future<List<FriendSpec>> loadFriendList(String path) async {
-    final file = File(path);
-    if (!await file.exists()) return [];
-
-    final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
-    final friendsList = json['friends'] as List<dynamic>? ?? [];
-    final specs = <FriendSpec>[];
-
-    for (final entry in friendsList) {
-      if (entry is String) {
-        specs.add(FriendSpec(pubkeyHex: entry));
-      } else if (entry is Map<String, dynamic>) {
-        specs.add(FriendSpec(
-          pubkeyHex: entry['pubkey'] as String,
-          nickname: entry['nickname'] as String?,
-        ));
-      }
-    }
-    return specs;
-  }
-
-  /// Save the current friend list to a JSON file.
-  Future<void> saveFriendList(String path) async {
-    final friends = _friends.values.map((f) => {
-      'pubkey': f.pubkeyHex,
-      'nickname': f.nickname,
-    }).toList();
-    await File(path).writeAsString(
-      const JsonEncoder.withIndent('  ').convert({'friends': friends}),
-    );
-  }
+  int get verifiedCount => _verified.length;
+  int get unverifiedCount => _unverified.length;
+  Iterable<PeerEntry> get verifiedPeers => _verified.values;
+  Iterable<String> get verifiedPubkeyHexes => _verified.keys;
 
   static Uint8List _hexDecode(String hex) {
     final bytes = <int>[];
@@ -132,12 +95,6 @@ class PeerTable {
     }
     return Uint8List.fromList(bytes);
   }
-}
-
-class FriendSpec {
-  final String pubkeyHex;
-  final String? nickname;
-  const FriendSpec({required this.pubkeyHex, this.nickname});
 }
 
 class PeerEntry {

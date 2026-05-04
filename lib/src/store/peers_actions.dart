@@ -97,7 +97,6 @@ class StaleDiscoveredBlePeersRemovedAction extends PeerAction {
 /// Clear all discovered BLE peers
 class ClearDiscoveredBlePeersAction extends PeerAction {}
 
-
 // ===== Peer Identity Actions (after ANNOUNCE) =====
 
 /// An ANNOUNCE packet was received - add or update peer identity.
@@ -119,6 +118,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
 
   final String? udpAddress;
   final String? linkLocalAddress;
+  final Set<String> udpAddressCandidates;
 
   PeerAnnounceReceivedAction({
     required this.publicKey,
@@ -130,6 +130,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
     this.blePeripheralDeviceId,
     this.udpAddress,
     this.linkLocalAddress,
+    this.udpAddressCandidates = const {},
   });
 }
 
@@ -166,6 +167,16 @@ class PeerUdpConnectionChangedAction extends PeerAction {
   });
 }
 
+/// A verified UDP packet was received from a peer.
+///
+/// Updates UDP-specific freshness so stale UDX sessions can be aged out even
+/// when the peer is still nearby over BLE.
+class PeerUdpSeenAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerUdpSeenAction(this.publicKey);
+}
+
 /// Mark peer as disconnected from UDP
 class PeerUdpDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
@@ -191,12 +202,7 @@ class PeerRemovedAction extends PeerAction {
 class StalePeersRemovedAction extends PeerAction {
   final Duration staleThreshold;
 
-  /// Pubkey hexes of peers with live UDP connections that should NOT be
-  /// marked stale. The coordinator populates this from the UDP service
-  /// since the reducer has no access to transport-layer state.
-  final Set<String> liveUdpPeers;
-
-  StalePeersRemovedAction(this.staleThreshold, {this.liveUdpPeers = const {}});
+  StalePeersRemovedAction(this.staleThreshold);
 }
 
 /// Clear all peers
@@ -228,6 +234,19 @@ class AssociateUdpAddressAction extends PeerAction {
   });
 }
 
+/// Update the set of rendezvous servers a peer reaches its peers through.
+/// Map keys are lowercase pubkey hexes; values are "ip:port" addresses.
+/// Driven by the RV_LIST signaling message.
+class PeerRvServersUpdatedAction extends PeerAction {
+  final Uint8List publicKey;
+  final Map<String, String> rvServers;
+
+  PeerRvServersUpdatedAction({
+    required this.publicKey,
+    required this.rvServers,
+  });
+}
+
 // ===== Friendship Actions =====
 
 /// A friendship has been established - mark peer as friend
@@ -246,4 +265,18 @@ class FriendRemovedAction extends PeerAction {
   final Uint8List publicKey;
 
   FriendRemovedAction(this.publicKey);
+}
+
+// ===== Reachability Verification Actions =====
+
+/// We successfully reached a peer at their UDP address without coordinating
+/// a hole-punch — empirical proof that they accept unsolicited inbound.
+/// Promotes the peer from "candidate" (publicly routable address) to
+/// "verified well-connected".
+class PeerDirectReachObservedAction extends PeerAction {
+  final Uint8List publicKey;
+  final DateTime observedAt;
+
+  PeerDirectReachObservedAction(this.publicKey, {DateTime? observedAt})
+      : observedAt = observedAt ?? DateTime.now();
 }

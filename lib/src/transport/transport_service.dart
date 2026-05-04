@@ -96,11 +96,19 @@ class TransportConnectionEvent {
   /// Additional info about the connection/disconnection
   final String? reason;
 
+  /// True if this connection was initiated by the remote peer (we accepted),
+  /// false if we initiated. Always false for disconnect events.
+  ///
+  /// Used to detect unsolicited inbound traffic, which is empirical proof
+  /// that our address accepts unsolicited inbound (i.e. we are well-connected).
+  final bool isIncoming;
+
   TransportConnectionEvent({
     required this.peerId,
     required this.transport,
     required this.connected,
     this.reason,
+    this.isIncoming = false,
   });
 }
 

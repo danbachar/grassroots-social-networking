@@ -55,8 +55,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     // Listen to Redux store for all state updates
-    _storeSubscription =
-        widget.store.onChange.listen((_) => _onStoreChanged());
+    _storeSubscription = widget.store.onChange.listen((_) => _onStoreChanged());
     // Mark messages as read and send read receipts when opening chat
     widget.store.dispatch(MarkMessagesReadAction(_peerHex));
     _sendReadReceipts();
@@ -120,7 +119,8 @@ class _ChatScreenState extends State<ChatScreen> {
     // will be dispatched by Bitchat.send() and reflected via the status icon
     final block = SayBlock(content: text);
     debugPrint("Sending '$text' to peer ${widget.peer.displayName}");
-    widget.bitchat.send(widget.peer.publicKey, block.serialize(), messageId: messageId);
+    widget.bitchat
+        .send(widget.peer.publicKey, block.serialize(), messageId: messageId);
   }
 
   void _scrollToBottom() {
@@ -170,10 +170,22 @@ class _ChatScreenState extends State<ChatScreen> {
         peers: peers,
         onForward: (peer) async {
           Navigator.pop(context);
-          await widget.bitchat.send(
+          final forwardedMessageId = await widget.bitchat.send(
             peer.publicKey,
             Uint8List.fromList(message.content.codeUnits),
           );
+
+          if (forwardedMessageId == null) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(this.context).showSnackBar(
+              SnackBar(
+                content:
+                    Text('Failed to forward message to ${peer.displayName}'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+            return;
+          }
 
           // Also save to Redux store as outgoing
           widget.store.dispatch(SaveChatMessageAction(
@@ -181,16 +193,16 @@ class _ChatScreenState extends State<ChatScreen> {
             recipientPubkeyHex: ChatMessage.pubkeyToHex(peer.publicKey),
             content: message.content,
             isOutgoing: true,
+            messageId: forwardedMessageId,
           ));
 
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Message forwarded to ${peer.displayName}'),
-                duration: const Duration(seconds: 2),
-              ),
-            );
-          }
+          if (!mounted) return;
+          ScaffoldMessenger.of(this.context).showSnackBar(
+            SnackBar(
+              content: Text('Message forwarded to ${peer.displayName}'),
+              duration: const Duration(seconds: 2),
+            ),
+          );
         },
       ),
     );
@@ -264,7 +276,8 @@ class _ChatScreenState extends State<ChatScreen> {
           if (_hasPendingIncoming) _buildFriendRequestBanner(),
           Expanded(
             child: Builder(builder: (context) {
-              final messages = widget.store.state.messages.getConversation(_peerHex);
+              final messages =
+                  widget.store.state.messages.getConversation(_peerHex);
               return ListView.builder(
                 controller: _scrollController,
                 padding: const EdgeInsets.all(16),
@@ -431,18 +444,33 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _resendMessage(ChatMessageState message) async {
-    debugPrint("Resending '${message.content}' to peer ${widget.peer.displayName}");
+    debugPrint(
+        "Resending '${message.content}' to peer ${widget.peer.displayName}");
+
+    final existingMessageId = message.messageId;
+    if (existingMessageId == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Cannot resend message without message ID'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
 
     // Send via Bitchat using SayBlock
     final block = SayBlock(content: message.content);
-    final messageId =
-        await widget.bitchat.send(widget.peer.publicKey, block.serialize());
+    final messageId = await widget.bitchat.send(
+      widget.peer.publicKey,
+      block.serialize(),
+      messageId: existingMessageId,
+    );
 
     if (!mounted) return;
 
     if (messageId != null) {
-      // Update the old message's status would be complex, so we just log success
-      debugPrint("Resend successful with new messageId: $messageId");
+      debugPrint("Resend successful for messageId: $messageId");
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('Message resent'),
@@ -460,30 +488,56 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _showPeerInfo() {
+    // Refresh from store so the dialog reflects the latest knownRvServers /
+    // udpAddress / connection state, not just the snapshot widget.peer was
+    // built with.
+    final peer = widget.store.state.peers.getPeerByPubkeyHex(_peerHex) ??
+        widget.peer;
+    final rvEntries = peer.knownRvServers.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text(widget.peer.displayName),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _buildInfoRow('Public Key', _peerHex),
-            const SizedBox(height: 8),
-            _buildInfoRow('Bluetooth',
-                widget.peer.hasBleConnection
-                    ? 'Connected (${widget.peer.bleCentralDeviceId != null && widget.peer.blePeripheralDeviceId != null ? 'central + peripheral' : widget.peer.bleCentralDeviceId != null ? 'central' : 'peripheral'})'
-                    : 'Not connected'),
-            const SizedBox(height: 8),
-            _buildInfoRow('Internet',
-                widget.peer.udpAddress != null
-                    ? widget.peer.udpAddress!
-                    : 'No address'),
-            if (_isFriend) ...[
+        title: Text(peer.displayName),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildInfoRow('Public Key', _peerHex),
               const SizedBox(height: 8),
-              _buildInfoRow('Friendship', 'Friends ✓'),
+              _buildInfoRow(
+                  'Bluetooth',
+                  peer.hasBleConnection
+                      ? 'Connected (${peer.bleCentralDeviceId != null && peer.blePeripheralDeviceId != null ? 'central + peripheral' : peer.bleCentralDeviceId != null ? 'central' : 'peripheral'})'
+                      : 'Not connected'),
+              const SizedBox(height: 8),
+              _buildInfoRow(
+                  'Internet',
+                  peer.udpAddress != null ? peer.udpAddress! : 'No address'),
+              if (_isFriend) ...[
+                const SizedBox(height: 8),
+                _buildInfoRow('Friendship', 'Friends ✓'),
+              ],
+              const SizedBox(height: 16),
+              Text(
+                'Rendezvous Servers',
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+              const SizedBox(height: 4),
+              if (rvEntries.isEmpty)
+                const Text(
+                  'None advertised by this peer yet.',
+                  style: TextStyle(color: Colors.grey, fontSize: 12),
+                )
+              else
+                ...rvEntries.map((entry) => _buildRvServerRow(
+                      address: entry.value,
+                      pubkeyHex: entry.key,
+                    )),
             ],
-          ],
+          ),
         ),
         actions: [
           TextButton(
@@ -498,6 +552,79 @@ class _ChatScreenState extends State<ChatScreen> {
               );
             },
             child: const Text('Copy Key'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRvServerRow({
+    required String address,
+    required String pubkeyHex,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const SizedBox(
+                width: 80,
+                child: Text('Address:',
+                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+              ),
+              Expanded(
+                child: Text(
+                  address,
+                  style:
+                      const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 16),
+                tooltip: 'Copy address',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: address));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Address copied: $address')),
+                  );
+                },
+              ),
+            ],
+          ),
+          Row(
+            children: [
+              const SizedBox(
+                width: 80,
+                child: Text('Pubkey:',
+                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+              ),
+              Expanded(
+                child: Text(
+                  pubkeyHex,
+                  style:
+                      const TextStyle(fontFamily: 'monospace', fontSize: 11),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 16),
+                tooltip: 'Copy pubkey',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: pubkeyHex));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Rendezvous pubkey copied')),
+                  );
+                },
+              ),
+            ],
           ),
         ],
       ),

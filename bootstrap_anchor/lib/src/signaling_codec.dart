@@ -1,14 +1,17 @@
 import 'dart:typed_data';
 
 /// Signaling message types — identical to the client-side SignalingType.
+///
+/// Wire byte values are stable; gaps reflect deprecated message types
+/// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the rendezvous
+/// flow switched to RECONNECT/AVAILABLE matching).
 enum SignalingType {
-  addrQuery(0x02),
-  addrResponse(0x03),
-  punchRequest(0x04),
   punchInitiate(0x05),
   punchReady(0x06),
   addrReflect(0x07),
-  friendsSync(0x08);
+  reconnect(0x08),
+  available(0x09),
+  rvList(0x0a);
 
   final int value;
   const SignalingType(this.value);
@@ -16,7 +19,8 @@ enum SignalingType {
   static SignalingType fromValue(int value) {
     return SignalingType.values.firstWhere(
       (t) => t.value == value,
-      orElse: () => throw ArgumentError('Unknown signaling type: $value'),
+      orElse: () => throw ArgumentError(
+          'Unknown signaling type: 0x${value.toRadixString(16)}'),
     );
   }
 }
@@ -25,30 +29,6 @@ enum SignalingType {
 
 sealed class SignalingMessage {
   SignalingType get type;
-}
-
-class AddrQueryMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.addrQuery;
-  final Uint8List targetPubkey;
-  AddrQueryMessage({required this.targetPubkey});
-}
-
-class AddrResponseMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.addrResponse;
-  final Uint8List targetPubkey;
-  final String? ip;
-  final int? port;
-  bool get found => ip != null && port != null;
-  AddrResponseMessage({required this.targetPubkey, this.ip, this.port});
-}
-
-class PunchRequestMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.punchRequest;
-  final Uint8List targetPubkey;
-  PunchRequestMessage({required this.targetPubkey});
 }
 
 class PunchInitiateMessage extends SignalingMessage {
@@ -76,36 +56,47 @@ class AddrReflectMessage extends SignalingMessage {
   AddrReflectMessage({required this.ip, required this.port});
 }
 
-/// Owner pushes their full friend list to the anchor server.
-class FriendsSyncMessage extends SignalingMessage {
+class ReconnectMessage extends SignalingMessage {
   @override
-  SignalingType get type => SignalingType.friendsSync;
-  final List<FriendsSyncEntry> friends;
-  FriendsSyncMessage({required this.friends});
+  SignalingType get type => SignalingType.reconnect;
+  final Uint8List peerPubkey;
+  ReconnectMessage({required this.peerPubkey});
 }
 
-class FriendsSyncEntry {
+class AvailableMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.available;
+  final Uint8List peerPubkey;
+  AvailableMessage({required this.peerPubkey});
+}
+
+class RvServerEntry {
   final Uint8List pubkey;
-  final String nickname;
-  FriendsSyncEntry({required this.pubkey, required this.nickname});
+  final String address;
+  const RvServerEntry({required this.pubkey, required this.address});
+}
+
+class RvListMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.rvList;
+  final List<RvServerEntry> entries;
+  RvListMessage({required this.entries});
 }
 
 // ===== Codec =====
 
 /// Binary encoder/decoder for signaling messages.
-/// Wire-compatible with the Flutter client's SignalingCodec.
 class SignalingCodec {
   const SignalingCodec();
 
   Uint8List encode(SignalingMessage msg) {
     return switch (msg) {
-      AddrQueryMessage() => _encodeAddrQuery(msg),
-      AddrResponseMessage() => _encodeAddrResponse(msg),
-      PunchRequestMessage() => _encodePunchRequest(msg),
       PunchInitiateMessage() => _encodePunchInitiate(msg),
       PunchReadyMessage() => _encodePunchReady(msg),
       AddrReflectMessage() => _encodeAddrReflect(msg),
-      FriendsSyncMessage() => _encodeFriendsSync(msg),
+      ReconnectMessage() => _encodeReconnect(msg),
+      AvailableMessage() => _encodeAvailable(msg),
+      RvListMessage() => _encodeRvList(msg),
     };
   }
 
@@ -117,45 +108,16 @@ class SignalingCodec {
     final payload = Uint8List.sublistView(data, 1);
 
     return switch (type) {
-      SignalingType.addrQuery => _decodeAddrQuery(payload),
-      SignalingType.addrResponse => _decodeAddrResponse(payload),
-      SignalingType.punchRequest => _decodePunchRequest(payload),
       SignalingType.punchInitiate => _decodePunchInitiate(payload),
       SignalingType.punchReady => _decodePunchReady(payload),
       SignalingType.addrReflect => _decodeAddrReflect(payload),
-      SignalingType.friendsSync => _decodeFriendsSync(payload),
+      SignalingType.reconnect => _decodeReconnect(payload),
+      SignalingType.available => _decodeAvailable(payload),
+      SignalingType.rvList => _decodeRvList(payload),
     };
   }
 
   // ===== Encoding =====
-
-  Uint8List _encodeAddrQuery(AddrQueryMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.addrQuery.value);
-    buffer.add(msg.targetPubkey);
-    return buffer.toBytes();
-  }
-
-  Uint8List _encodeAddrResponse(AddrResponseMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.addrResponse.value);
-    buffer.add(msg.targetPubkey);
-    buffer.addByte(msg.found ? 1 : 0);
-    if (msg.found) {
-      final ipBytes = Uint8List.fromList(msg.ip!.codeUnits);
-      _writeUint16(buffer, ipBytes.length);
-      buffer.add(ipBytes);
-      _writeUint16(buffer, msg.port!);
-    }
-    return buffer.toBytes();
-  }
-
-  Uint8List _encodePunchRequest(PunchRequestMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.punchRequest.value);
-    buffer.add(msg.targetPubkey);
-    return buffer.toBytes();
-  }
 
   Uint8List _encodePunchInitiate(PunchInitiateMessage msg) {
     final buffer = BytesBuilder();
@@ -185,41 +147,34 @@ class SignalingCodec {
     return buffer.toBytes();
   }
 
+  Uint8List _encodeReconnect(ReconnectMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.reconnect.value);
+    buffer.add(msg.peerPubkey);
+    return buffer.toBytes();
+  }
+
+  Uint8List _encodeAvailable(AvailableMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.available.value);
+    buffer.add(msg.peerPubkey);
+    return buffer.toBytes();
+  }
+
+  Uint8List _encodeRvList(RvListMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.rvList.value);
+    _writeUint16(buffer, msg.entries.length);
+    for (final entry in msg.entries) {
+      buffer.add(entry.pubkey);
+      final addrBytes = Uint8List.fromList(entry.address.codeUnits);
+      _writeUint16(buffer, addrBytes.length);
+      buffer.add(addrBytes);
+    }
+    return buffer.toBytes();
+  }
+
   // ===== Decoding =====
-
-  AddrQueryMessage _decodeAddrQuery(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('AddrQuery payload too short');
-    }
-    return AddrQueryMessage(
-        targetPubkey: Uint8List.fromList(data.sublist(0, 32)));
-  }
-
-  AddrResponseMessage _decodeAddrResponse(Uint8List data) {
-    if (data.length < 33) {
-      throw const FormatException('AddrResponse payload too short');
-    }
-    final targetPubkey = Uint8List.fromList(data.sublist(0, 32));
-    final found = data[32] != 0;
-    if (!found) {
-      return AddrResponseMessage(targetPubkey: targetPubkey);
-    }
-    var offset = 33;
-    final ipLen = _readUint16(data, offset);
-    offset += 2;
-    final ip = String.fromCharCodes(data.sublist(offset, offset + ipLen));
-    offset += ipLen;
-    final port = _readUint16(data, offset);
-    return AddrResponseMessage(targetPubkey: targetPubkey, ip: ip, port: port);
-  }
-
-  PunchRequestMessage _decodePunchRequest(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('PunchRequest payload too short');
-    }
-    return PunchRequestMessage(
-        targetPubkey: Uint8List.fromList(data.sublist(0, 32)));
-  }
 
   PunchInitiateMessage _decodePunchInitiate(Uint8List data) {
     if (data.length < 36) {
@@ -253,45 +208,46 @@ class SignalingCodec {
     return AddrReflectMessage(ip: ip, port: port);
   }
 
-  Uint8List _encodeFriendsSync(FriendsSyncMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.friendsSync.value);
-    _writeUint16(buffer, msg.friends.length);
-    for (final friend in msg.friends) {
-      buffer.add(friend.pubkey);
-      final nickBytes = Uint8List.fromList(friend.nickname.codeUnits);
-      buffer.addByte(nickBytes.length);
-      buffer.add(nickBytes);
+  ReconnectMessage _decodeReconnect(Uint8List data) {
+    if (data.length < 32) {
+      throw const FormatException('Reconnect payload too short');
     }
-    return buffer.toBytes();
+    return ReconnectMessage(
+        peerPubkey: Uint8List.fromList(data.sublist(0, 32)));
   }
 
-  FriendsSyncMessage _decodeFriendsSync(Uint8List data) {
-    if (data.length < 2) {
-      throw const FormatException('FriendsSync payload too short');
+  AvailableMessage _decodeAvailable(Uint8List data) {
+    if (data.length < 32) {
+      throw const FormatException('Available payload too short');
     }
-    var offset = 0;
-    final count = _readUint16(data, offset);
-    offset += 2;
+    return AvailableMessage(
+        peerPubkey: Uint8List.fromList(data.sublist(0, 32)));
+  }
 
-    final friends = <FriendsSyncEntry>[];
+  RvListMessage _decodeRvList(Uint8List data) {
+    if (data.length < 2) {
+      throw const FormatException('RvList payload too short');
+    }
+    final count = _readUint16(data, 0);
+    var offset = 2;
+    final entries = <RvServerEntry>[];
     for (var i = 0; i < count; i++) {
-      if (offset + 33 > data.length) {
-        throw FormatException('FriendsSync truncated at entry $i');
+      if (offset + 34 > data.length) {
+        throw const FormatException('RvList entry truncated');
       }
       final pubkey = Uint8List.fromList(data.sublist(offset, offset + 32));
       offset += 32;
-      final nickLen = data[offset];
-      offset += 1;
-      if (offset + nickLen > data.length) {
-        throw FormatException('FriendsSync nickname truncated at entry $i');
+      final addrLen = _readUint16(data, offset);
+      offset += 2;
+      if (offset + addrLen > data.length) {
+        throw const FormatException('RvList address truncated');
       }
-      final nickname =
-          String.fromCharCodes(data.sublist(offset, offset + nickLen));
-      offset += nickLen;
-      friends.add(FriendsSyncEntry(pubkey: pubkey, nickname: nickname));
+      final address =
+          String.fromCharCodes(data.sublist(offset, offset + addrLen));
+      offset += addrLen;
+      entries.add(RvServerEntry(pubkey: pubkey, address: address));
     }
-    return FriendsSyncMessage(friends: friends);
+    return RvListMessage(entries: entries);
   }
 
   // ===== Helpers =====

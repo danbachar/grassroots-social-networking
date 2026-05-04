@@ -2,77 +2,61 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
-import 'package:logger/logger.dart';
 
 import 'address_utils.dart';
 
-/// Discovers our public-facing IPv6 address and combines it with the local
+/// Discovers our public-facing UDP address and combines it with the local
 /// UDP port to form the address we advertise to friends.
 ///
-/// Only IPv6 is supported. The UDP transport binds to an IPv6 socket and
-/// cannot send to IPv4 destinations. If the device has no globally routable
-/// IPv6 address, Internet transport is unavailable — the device can still
-/// communicate via BLE.
-///
-/// The discovered address is included in ANNOUNCE messages so friends know
-/// where to send hole-punch packets and establish UDX connections.
+/// Discovers public IPv6 and IPv4 candidates. The discovered addresses are
+/// included in ANNOUNCE messages so peers and rendezvous servers know where
+/// to reach us.
 class PublicAddressDiscovery {
-  final Logger _log = Logger();
+  final Map<InternetAddressType, InternetAddress> _cachedPublicIps = {};
+  final Map<InternetAddressType, DateTime> _cacheTimes = {};
 
-  /// Cached public IP (refreshed periodically)
-  InternetAddress? _cachedPublicIp;
-
-  /// When the cache was last refreshed
-  DateTime? _cacheTime;
-
-  /// Cache duration (public IP doesn't change often)
+  /// Cache duration (public IP doesn't change often).
   static const Duration cacheDuration = Duration(minutes: 5);
 
-  /// The best public IP we know of (IPv6 preferred over IPv4).
-  /// Set even when the address isn't globally routable for UDP — useful
-  /// for display purposes on NAT'd devices.
-  InternetAddress? _bestPublicIp;
+  /// The best public IP we know of, preferring IPv6 for display.
+  InternetAddress? get bestPublicIp =>
+      _cachedPublicIps[InternetAddressType.IPv6] ??
+      _cachedPublicIps[InternetAddressType.IPv4];
 
-  /// The best public IP discovered so far (IPv6 > IPv4).
-  /// Available even when the device is behind NAT and has no open port.
-  InternetAddress? get bestPublicIp => _bestPublicIp;
-
-  /// Discover our public IPv6 address.
-  ///
-  /// Returns a globally routable IPv6 address, or null if unavailable.
-  /// IPv4 is not supported — the UDP transport binds to an IPv6 socket
-  /// and cannot send to IPv4 destinations. A device without IPv6 has no
-  /// Internet transport; it can still communicate via BLE.
+  /// Discover our public address for [type].
   ///
   /// Result is cached for [cacheDuration] to avoid excessive lookups.
-  Future<InternetAddress?> discoverPublicIp() async {
-    // Return cached value if fresh
-    if (_cachedPublicIp != null &&
-        _cacheTime != null &&
-        DateTime.now().difference(_cacheTime!) < cacheDuration) {
-      return _cachedPublicIp;
+  Future<InternetAddress?> discoverPublicIp({
+    InternetAddressType type = InternetAddressType.IPv6,
+  }) async {
+    final cached = _cachedPublicIps[type];
+    final cacheTime = _cacheTimes[type];
+    if (cached != null &&
+        cacheTime != null &&
+        DateTime.now().difference(cacheTime) < cacheDuration) {
+      return cached;
     }
 
-    final ipv6 = await _fetchPublicIp('https://ipv6.seeip.org');
-    if (ipv6 != null && ipv6.type == InternetAddressType.IPv6) {
-      _cachedPublicIp = ipv6;
-      _cacheTime = DateTime.now();
-      _bestPublicIp = ipv6;
-      debugPrint('Discovered public IPv6: ${ipv6.address}');
-      return ipv6;
+    final url = type == InternetAddressType.IPv6
+        ? 'https://ipv6.seeip.org'
+        : 'https://ipv4.seeip.org';
+    final discovered = await _fetchPublicIp(url);
+    if (discovered == null || discovered.type != type) {
+      debugPrint(
+        'No public ${type == InternetAddressType.IPv6 ? "IPv6" : "IPv4"} '
+        'address available for UDP transport',
+      );
+      return null;
     }
 
-    // No IPv6 — try IPv4 for display purposes (transport still won't work
-    // without IPv6, but we can show the user their public IP).
-    final ipv4 = await _fetchPublicIp('https://api.seeip.org');
-    if (ipv4 != null) {
-      _bestPublicIp = ipv4;
-      debugPrint('No public IPv6 — discovered public IPv4: ${ipv4.address}');
-    } else {
-      debugPrint('No public IPv6 address available — Internet transport unavailable');
-    }
-
-    return null;
+    _cachedPublicIps[type] = discovered;
+    _cacheTimes[type] = DateTime.now();
+    debugPrint(
+      'Discovered public '
+      '${type == InternetAddressType.IPv6 ? "IPv6" : "IPv4"}: '
+      '${discovered.address}',
+    );
+    return discovered;
   }
 
   /// Fetch our public IP from the given URL.
@@ -107,12 +91,14 @@ class PublicAddressDiscovery {
     }
   }
 
-  /// Get our public address string (public_ip:local_port).
+  /// Get our public address string for [type].
   ///
-  /// Combines the discovered public IPv6 with the given local port.
-  /// Returns null if no public IPv6 is available.
-  Future<String?> getPublicAddress(int localPort) async {
-    final ip = await discoverPublicIp();
+  /// Returns null if no public address is available for the family.
+  Future<String?> getPublicAddress(
+    int localPort, {
+    InternetAddressType type = InternetAddressType.IPv6,
+  }) async {
+    final ip = await discoverPublicIp(type: type);
     if (ip == null) return null;
     return AddressInfo(ip, localPort).toAddressString();
   }
@@ -133,10 +119,9 @@ class PublicAddressDiscovery {
       for (final iface in interfaces) {
         for (final addr in iface.addresses) {
           if (addr.isLinkLocal) {
-            // Link-local addresses need a scope/zone ID for socket ops.
-            // Dart's InternetAddress.address includes it (e.g. fe80::1%wlan0).
             final llAddr = AddressInfo(addr, localPort).toAddressString();
-            debugPrint('Discovered link-local IPv6: ${addr.address} on ${iface.name}');
+            debugPrint(
+                'Discovered link-local IPv6: ${addr.address} on ${iface.name}');
             return llAddr;
           }
         }
@@ -149,8 +134,7 @@ class PublicAddressDiscovery {
 
   /// Invalidate the cached public IP (e.g. on network change).
   void invalidateCache() {
-    _cachedPublicIp = null;
-    _cacheTime = null;
-    _bestPublicIp = null;
+    _cachedPublicIps.clear();
+    _cacheTimes.clear();
   }
 }

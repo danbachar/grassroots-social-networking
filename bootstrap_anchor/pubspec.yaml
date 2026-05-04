@@ -19,3 +19,6 @@ dependencies:
 
   # CLI argument parsing
   args: ^2.4.0
+
+dev_dependencies:
+  test: ^1.25.8

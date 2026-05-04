@@ -117,8 +117,7 @@ void main() {
         final result = appReducer(initial, action);
 
         expect(result.transports, isNot(equals(initial.transports)));
-        expect(
-            result.transports.bleState, TransportState.initializing);
+        expect(result.transports.bleState, TransportState.initializing);
 
         // Other state sections remain unchanged
         expect(result.peers, equals(initial.peers));
@@ -173,19 +172,55 @@ void main() {
 
       test('BleScanningChangedAction updates scanning flag', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          transports: const TransportsState(bleState: TransportState.active),
         );
 
-        final result =
-            appReducer(state, BleScanningChangedAction(true));
+        final result = appReducer(state, BleScanningChangedAction(true));
 
         expect(result.transports.bleScanning, isTrue);
         expect(result.transports.bleState, TransportState.active);
 
-        final result2 =
-            appReducer(result, BleScanningChangedAction(false));
+        final result2 = appReducer(result, BleScanningChangedAction(false));
         expect(result2.transports.bleScanning, isFalse);
+      });
+
+      test('NetworkConnectionTypeUpdatedAction updates connection type', () {
+        const initial = AppState.initial;
+
+        final result = appReducer(
+          initial,
+          NetworkConnectionTypeUpdatedAction(NetworkConnectionType.wifi),
+        );
+
+        expect(
+          result.transports.networkConnectionType,
+          NetworkConnectionType.wifi,
+        );
+        expect(
+            result.transports.publicAddress, initial.transports.publicAddress);
+        expect(result.transports.publicIp, initial.transports.publicIp);
+      });
+
+      test('ClearPublicConnectivityAction clears stale public network info',
+          () {
+        final state = AppState.initial.copyWith(
+          transports: const TransportsState(
+            udpState: TransportState.active,
+            publicAddress: '203.0.113.10:4242',
+            publicIp: '203.0.113.10',
+            networkConnectionType: NetworkConnectionType.cellular,
+          ),
+        );
+
+        final result = appReducer(state, ClearPublicConnectivityAction());
+
+        expect(result.transports.publicAddress, isNull);
+        expect(result.transports.publicIp, isNull);
+        expect(
+          result.transports.networkConnectionType,
+          NetworkConnectionType.cellular,
+        );
+        expect(result.transports.udpState, TransportState.active);
       });
     });
 
@@ -195,14 +230,12 @@ void main() {
     group('derived transport state', () {
       test('isHealthy is true when any transport is active', () {
         final bleActive = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          transports: const TransportsState(bleState: TransportState.active),
         );
         expect(bleActive.isHealthy, isTrue);
 
         final udpActive = AppState.initial.copyWith(
-          transports: const TransportsState(
-              udpState: TransportState.active),
+          transports: const TransportsState(udpState: TransportState.active),
         );
         expect(udpActive.isHealthy, isTrue);
 
@@ -214,14 +247,12 @@ void main() {
         expect(AppState.initial.statusDisplayString, 'Initializing...');
 
         final ready = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.ready),
+          transports: const TransportsState(bleState: TransportState.ready),
         );
         expect(ready.statusDisplayString, 'Ready');
 
         final active = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          transports: const TransportsState(bleState: TransportState.active),
         );
         expect(active.statusDisplayString, 'Online');
 
@@ -241,8 +272,7 @@ void main() {
     group('unknown actions', () {
       test('unknown action returns the same state unchanged', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          transports: const TransportsState(bleState: TransportState.active),
         );
 
         final result = appReducer(state, 'some_unknown_action');
@@ -305,8 +335,7 @@ void main() {
 
       test('PeerAction preserves transports and other sub-states', () {
         final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-              bleState: TransportState.active),
+          transports: const TransportsState(bleState: TransportState.active),
         );
 
         final action = BleDeviceDiscoveredAction(

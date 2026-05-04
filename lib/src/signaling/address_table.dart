@@ -8,11 +8,12 @@
 /// The table is volatile — entries are lost on restart. Friends re-register
 /// their addresses on startup, so this is fine.
 class AddressTable {
-  final Map<String, AddressEntry> _entries = {};
+  final Map<String, Map<String, AddressEntry>> _entries = {};
 
   /// Register (or update) a friend's address.
   void register(String pubkeyHex, String ip, int port) {
-    _entries[pubkeyHex] = AddressEntry(
+    final key = '$ip:$port';
+    _entries.putIfAbsent(pubkeyHex, () => {})[key] = AddressEntry(
       ip: ip,
       port: port,
       registeredAt: DateTime.now(),
@@ -22,7 +23,19 @@ class AddressTable {
   /// Look up a friend's address by pubkey hex.
   ///
   /// Returns null if the friend hasn't registered or was removed.
-  AddressEntry? lookup(String pubkeyHex) => _entries[pubkeyHex];
+  AddressEntry? lookup(String pubkeyHex) {
+    final entries = lookupAll(pubkeyHex);
+    if (entries.isEmpty) return null;
+    return entries.first;
+  }
+
+  /// Look up all addresses by pubkey hex, newest first.
+  List<AddressEntry> lookupAll(String pubkeyHex) {
+    final entries = _entries[pubkeyHex];
+    if (entries == null || entries.isEmpty) return const [];
+    return entries.values.toList()
+      ..sort((a, b) => b.registeredAt.compareTo(a.registeredAt));
+  }
 
   /// Remove a specific entry.
   void remove(String pubkeyHex) => _entries.remove(pubkeyHex);
@@ -33,11 +46,15 @@ class AddressTable {
   /// from friends that went offline without deregistering.
   void removeStale(Duration maxAge) {
     final cutoff = DateTime.now().subtract(maxAge);
-    _entries.removeWhere((_, entry) => entry.registeredAt.isBefore(cutoff));
+    _entries.removeWhere((_, entries) {
+      entries.removeWhere((_, entry) => entry.registeredAt.isBefore(cutoff));
+      return entries.isEmpty;
+    });
   }
 
   /// Number of registered entries.
-  int get length => _entries.length;
+  int get length =>
+      _entries.values.fold(0, (count, entries) => count + entries.length);
 
   /// All registered pubkey hexes.
   Iterable<String> get registeredPubkeys => _entries.keys;

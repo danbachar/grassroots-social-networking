@@ -4,7 +4,7 @@
 # Usage:
 #   cd bootstrap_anchor
 #   cp -r ../dart-udx ./dart-udx
-#   docker build -f Dockerfile.standalone -t bootstrap-anchor .
+#   docker build -f Dockerfile.standalone -t rendezvous-server .
 #   rm -rf ./dart-udx
 
 FROM dart:stable AS build
@@ -19,7 +19,7 @@ RUN dart pub get
 COPY lib/ lib/
 COPY bin/ bin/
 
-RUN dart compile exe bin/server.dart -o bin/bootstrap_anchor
+RUN dart compile exe bin/server.dart -o bin/rendezvous_server
 
 FROM debian:bookworm-slim
 
@@ -28,10 +28,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=build /app/bin/bootstrap_anchor /app/bootstrap_anchor
+COPY --from=build /app/bin/rendezvous_server /app/rendezvous_server
 
 VOLUME /app/data
 EXPOSE 9514/udp
+EXPOSE 9516/udp
 
-ENTRYPOINT ["/app/bootstrap_anchor"]
-CMD ["--port", "9514", "--nickname", "anchor", "--seed", "ANCHOR_SEED_HEX", "--friends", "/app/data/friends.json", "--owner", "OWNER_PUBKEY_HEX"]
+ENTRYPOINT ["/app/rendezvous_server"]
+CMD ["--identity", "/app/data/identity.json", "--ipv6-port", "9516"]

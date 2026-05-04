@@ -207,6 +207,24 @@ void main() {
   });
 
   // =========================================================================
+  // isGloballyRoutableIPv4
+  // =========================================================================
+  group('isGloballyRoutableIPv4', () {
+    test('returns true for globally routable IPv4 addresses', () {
+      expect(isGloballyRoutableIPv4(InternetAddress('8.8.8.8')), isTrue);
+      expect(isGloballyRoutableIPv4(InternetAddress('1.1.1.1')), isTrue);
+    });
+
+    test('returns false for private and special-use IPv4 ranges', () {
+      expect(isGloballyRoutableIPv4(InternetAddress('10.0.0.1')), isFalse);
+      expect(isGloballyRoutableIPv4(InternetAddress('192.168.1.1')), isFalse);
+      expect(isGloballyRoutableIPv4(InternetAddress('172.16.0.1')), isFalse);
+      expect(isGloballyRoutableIPv4(InternetAddress('100.64.0.1')), isFalse);
+      expect(isGloballyRoutableIPv4(InternetAddress('203.0.113.5')), isFalse);
+    });
+  });
+
+  // =========================================================================
   // isGloballyRoutableIPv6
   // =========================================================================
   group('isGloballyRoutableIPv6', () {
@@ -395,7 +413,11 @@ void main() {
       expect(isGloballyRoutableAddress('[::1]:4242'), isFalse);
     });
 
-    test('returns false for IPv4 address string', () {
+    test('returns true for routable IPv4 address string', () {
+      expect(isGloballyRoutableAddress('8.8.8.8:4242'), isTrue);
+    });
+
+    test('returns false for private IPv4 address string', () {
       expect(isGloballyRoutableAddress('192.168.1.1:4242'), isFalse);
     });
 

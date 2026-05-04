@@ -73,6 +73,16 @@ void main() {
       'aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344';
   const peerB =
       'eeff00112233445566778899aabbccddeeff00112233445566778899aabbccdd';
+  const rendezvousA = RendezvousServerSettings(
+    address: '[2001:db8::10]:9516',
+    pubkeyHex:
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  );
+  const rendezvousB = RendezvousServerSettings(
+    address: '198.51.100.20:9514',
+    pubkeyHex:
+        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  );
 
   late PersistenceService service;
 
@@ -147,8 +157,8 @@ void main() {
       expect(result.friendships.length, equals(2));
       expect(result.friendships[peerA]!.nickname, equals('Alice'));
       expect(result.friendships[peerB]!.nickname, equals('Bob'));
-      expect(result.friendships[peerB]!.status,
-          equals(FriendshipStatus.pending));
+      expect(
+          result.friendships[peerB]!.status, equals(FriendshipStatus.pending));
     });
 
     test('returns empty FriendshipsState on corrupt data', () async {
@@ -161,7 +171,6 @@ void main() {
 
       expect(result.friendships, isEmpty);
     });
-
   });
 
   // ===================================================================
@@ -173,10 +182,12 @@ void main() {
 
       expect(result.bluetoothEnabled, isTrue);
       expect(result.udpEnabled, isTrue);
-      expect(result.transportPriority, equals(const [
-        TransportProtocol.bluetooth,
-        TransportProtocol.udp,
-      ]));
+      expect(
+          result.transportPriority,
+          equals(const [
+            TransportProtocol.bluetooth,
+            TransportProtocol.udp,
+          ]));
     });
 
     test('loads settings from v2 key', () async {
@@ -198,10 +209,12 @@ void main() {
 
       expect(result.bluetoothEnabled, isFalse);
       expect(result.udpEnabled, isTrue);
-      expect(result.transportPriority, equals(const [
-        TransportProtocol.udp,
-        TransportProtocol.bluetooth,
-      ]));
+      expect(
+          result.transportPriority,
+          equals(const [
+            TransportProtocol.udp,
+            TransportProtocol.bluetooth,
+          ]));
     });
 
     test('returns default SettingsState on corrupt data', () async {
@@ -230,10 +243,36 @@ void main() {
       expect(result.bluetoothEnabled, isFalse);
       // Defaults for missing fields
       expect(result.udpEnabled, isTrue);
-      expect(result.transportPriority, equals(const [
-        TransportProtocol.bluetooth,
-        TransportProtocol.udp,
-      ]));
+      expect(
+          result.transportPriority,
+          equals(const [
+            TransportProtocol.bluetooth,
+            TransportProtocol.udp,
+          ]));
+    });
+
+    test('loads multiple rendezvous servers and merges legacy single server',
+        () async {
+      final settingsJson = {
+        'anchorAddress': rendezvousA.address,
+        'anchorPubkeyHex': rendezvousA.pubkeyHex,
+        'rendezvousServers': [
+          rendezvousA.toJson(),
+          rendezvousB.toJson(),
+        ],
+      };
+
+      SharedPreferences.setMockInitialValues({
+        'bitchat_settings_v2': jsonEncode(settingsJson),
+      });
+      service = PersistenceService();
+
+      final result = await service.loadSettings();
+
+      expect(
+        result.configuredRendezvousServers,
+        equals(const [rendezvousA, rendezvousB]),
+      );
     });
   });
 
@@ -242,8 +281,7 @@ void main() {
   // ===================================================================
   group('loadConversations', () {
     test('returns empty maps when no data stored', () async {
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       expect(conversations, isEmpty);
       expect(unreadCounts, isEmpty);
@@ -276,8 +314,7 @@ void main() {
       });
       service = PersistenceService();
 
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       expect(conversations.length, equals(1));
       expect(conversations[peerB]!.length, equals(2));
@@ -307,8 +344,7 @@ void main() {
       });
       service = PersistenceService();
 
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       expect(conversations.length, equals(1));
       expect(unreadCounts, isEmpty);
@@ -322,8 +358,7 @@ void main() {
       });
       service = PersistenceService();
 
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       expect(conversations, isEmpty);
       expect(unreadCounts.length, equals(2));
@@ -338,8 +373,7 @@ void main() {
       });
       service = PersistenceService();
 
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       // Conversations fail, but unread counts load independently
       expect(conversations, isEmpty);
@@ -347,8 +381,7 @@ void main() {
     });
 
     test('returns empty on corrupt unread counts data', () async {
-      final msg =
-          makeMessage(sender: peerA, recipient: peerB, content: 'x');
+      final msg = makeMessage(sender: peerA, recipient: peerB, content: 'x');
       SharedPreferences.setMockInitialValues({
         'bitchat_conversations_v2': jsonEncode({
           peerB: [msg.toJson()]
@@ -357,8 +390,7 @@ void main() {
       });
       service = PersistenceService();
 
-      final (conversations, unreadCounts) =
-          await service.loadConversations();
+      final (conversations, unreadCounts) = await service.loadConversations();
 
       // Conversations load, unread counts fail independently
       expect(conversations.length, equals(1));
@@ -410,14 +442,13 @@ void main() {
       final (conversations, _) = await service.loadConversations();
 
       expect(conversations[peerB]!.length, equals(4));
-      expect(conversations[peerB]![0].messageType,
-          equals(ChatMessageType.text));
+      expect(
+          conversations[peerB]![0].messageType, equals(ChatMessageType.text));
       expect(conversations[peerB]![1].messageType,
           equals(ChatMessageType.friendRequestSent));
       expect(conversations[peerB]![2].messageType,
           equals(ChatMessageType.friendRequestReceived));
-      expect(conversations[peerB]![2].udpAddress,
-          equals('[2001:db8::2]:4001'));
+      expect(conversations[peerB]![2].udpAddress, equals('[2001:db8::2]:4001'));
       expect(conversations[peerB]![3].messageType,
           equals(ChatMessageType.friendRequestAccepted));
     });
@@ -515,10 +546,33 @@ void main() {
 
       expect(loaded.bluetoothEnabled, isFalse);
       expect(loaded.udpEnabled, isFalse);
-      expect(loaded.transportPriority, equals(const [
-        TransportProtocol.udp,
-        TransportProtocol.bluetooth,
-      ]));
+      expect(
+          loaded.transportPriority,
+          equals(const [
+            TransportProtocol.udp,
+            TransportProtocol.bluetooth,
+          ]));
+    });
+
+    test('round-trip: flush then load returns same rendezvous servers',
+        () async {
+      final settings = SettingsState(
+        anchorAddress: rendezvousA.address,
+        anchorPubkeyHex: rendezvousA.pubkeyHex,
+        rendezvousServers: const [rendezvousA, rendezvousB],
+      );
+
+      final state = makeAppState(settings: settings);
+      await service.flush(state);
+
+      final loadService = PersistenceService();
+      final loaded = await loadService.loadSettings();
+      loadService.dispose();
+
+      expect(
+        loaded.configuredRendezvousServers,
+        equals(const [rendezvousA, rendezvousB]),
+      );
     });
 
     test('round-trip: flush then load returns same conversations', () async {
@@ -547,8 +601,7 @@ void main() {
       await service.flush(state);
 
       final loadService = PersistenceService();
-      final (loadedConvs, loadedUnread) =
-          await loadService.loadConversations();
+      final (loadedConvs, loadedUnread) = await loadService.loadConversations();
       loadService.dispose();
 
       expect(loadedConvs.length, equals(1));
@@ -585,8 +638,7 @@ void main() {
           jsonDecode(friendshipsData!) as Map<String, dynamic>;
       expect(friendshipsJson['friendships'], isEmpty);
 
-      final settingsJson =
-          jsonDecode(settingsData!) as Map<String, dynamic>;
+      final settingsJson = jsonDecode(settingsData!) as Map<String, dynamic>;
       expect(settingsJson['bluetoothEnabled'], isTrue);
       expect(settingsJson['udpEnabled'], isTrue);
 
@@ -793,8 +845,8 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       final data = prefs.getString('bitchat_friendships_v2');
       expect(data, isNotNull);
-      final loaded = FriendshipsState.fromJson(
-          jsonDecode(data!) as Map<String, dynamic>);
+      final loaded =
+          FriendshipsState.fromJson(jsonDecode(data!) as Map<String, dynamic>);
       expect(loaded.friendships[peerA]!.nickname, equals('FlushAlice'));
     });
 
@@ -828,9 +880,8 @@ void main() {
       expect(prefs.getString('bitchat_unread_counts_v2'), isNotNull);
 
       // Verify contents
-      final settingsJson =
-          jsonDecode(prefs.getString('bitchat_settings_v2')!)
-              as Map<String, dynamic>;
+      final settingsJson = jsonDecode(prefs.getString('bitchat_settings_v2')!)
+          as Map<String, dynamic>;
       expect(settingsJson['bluetoothEnabled'], isFalse);
 
       final unreadJson =
@@ -901,6 +952,5 @@ void main() {
       expect(unreads[peerB], equals(1));
       expect(unreads[peerA], equals(2));
     });
-
   });
 }

@@ -9,8 +9,7 @@ class _UnknownAction extends SettingsAction {}
 void main() {
   group('settingsReducer', () {
     group('default state', () {
-      test('initial state has bluetoothEnabled=true and udpEnabled=true',
-          () {
+      test('initial state has bluetoothEnabled=true and udpEnabled=true', () {
         const state = SettingsState.initial;
 
         expect(state.bluetoothEnabled, isTrue);
@@ -166,6 +165,77 @@ void main() {
         expect(result.bluetoothEnabled, isFalse);
         expect(result.udpEnabled, isTrue);
         expect(result.transportPriority, [TransportProtocol.udp]);
+      });
+    });
+
+    group('rendezvous server actions', () {
+      const serverA = RendezvousServerSettings(
+        address: '[2001:db8::10]:9516',
+        pubkeyHex:
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      );
+      const serverB = RendezvousServerSettings(
+        address: '198.51.100.20:9514',
+        pubkeyHex:
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      );
+
+      test('SetRendezvousServersAction stores multiple configured servers', () {
+        const state = SettingsState.initial;
+        final result = settingsReducer(
+          state,
+          SetRendezvousServersAction(const [serverA, serverB]),
+        );
+
+        expect(result.configuredRendezvousServers,
+            equals(const [serverA, serverB]));
+        expect(result.anchorAddress, equals(serverA.address));
+        expect(result.anchorPubkeyHex, equals(serverA.pubkeyHex));
+      });
+
+      test('AddRendezvousServerAction deduplicates matching server', () {
+        final state = SettingsState(
+          rendezvousServers: [serverA],
+          anchorAddress: serverA.address,
+          anchorPubkeyHex: serverA.pubkeyHex,
+        );
+
+        final result = settingsReducer(
+          state,
+          AddRendezvousServerAction(serverA),
+        );
+
+        expect(result.configuredRendezvousServers, equals(const [serverA]));
+      });
+
+      test('RemoveRendezvousServerAction removes only matching server', () {
+        final state = SettingsState(
+          rendezvousServers: [serverA, serverB],
+          anchorAddress: serverA.address,
+          anchorPubkeyHex: serverA.pubkeyHex,
+        );
+
+        final result = settingsReducer(
+          state,
+          RemoveRendezvousServerAction(serverA),
+        );
+
+        expect(result.configuredRendezvousServers, equals(const [serverB]));
+        expect(result.anchorAddress, equals(serverB.address));
+        expect(result.anchorPubkeyHex, equals(serverB.pubkeyHex));
+      });
+
+      test('SetAnchorServerAction still hydrates legacy single server', () {
+        const state = SettingsState.initial;
+        final result = settingsReducer(
+          state,
+          SetAnchorServerAction(
+            anchorAddress: serverA.address,
+            anchorPubkeyHex: serverA.pubkeyHex,
+          ),
+        );
+
+        expect(result.configuredRendezvousServers, equals(const [serverA]));
       });
     });
 

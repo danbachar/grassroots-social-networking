@@ -97,6 +97,72 @@ AddressInfo? parseIpv6AddressString(String addr) {
 bool isIpv6AddressString(String addrString) =>
     parseIpv6AddressString(addrString) != null;
 
+/// Normalize a collection of address strings, dropping malformed entries
+/// and preserving first-seen order.
+Set<String> normalizeAddressStrings(Iterable<String?> addresses) {
+  final normalized = <String>{};
+  for (final address in addresses) {
+    if (address == null || address.isEmpty) continue;
+    final parsed = parseAddressString(address);
+    if (parsed == null) continue;
+    normalized.add(parsed.toAddressString());
+  }
+  return normalized;
+}
+
+/// Parse a collection of address strings, dropping malformed entries.
+Set<AddressInfo> parseAddressCandidates(Iterable<String> addresses) {
+  final parsed = <AddressInfo>{};
+  for (final address in addresses) {
+    final candidate = parseAddressString(address);
+    if (candidate != null) {
+      parsed.add(candidate);
+    }
+  }
+  return parsed;
+}
+
+/// Check if an IP address is a globally routable IPv4 address.
+///
+/// Excludes:
+///   - Unspecified / "this network" (0.0.0.0/8)
+///   - Loopback (127.0.0.0/8)
+///   - Link-local (169.254.0.0/16)
+///   - Private RFC1918 (10/8, 172.16/12, 192.168/16)
+///   - Carrier-grade NAT (100.64.0.0/10)
+///   - IETF protocol assignments / special use (192.0.0.0/24)
+///   - Documentation/test nets (192.0.2/24, 198.51.100/24, 203.0.113/24)
+///   - Benchmarking (198.18.0.0/15)
+///   - Multicast (224.0.0.0/4)
+///   - Reserved / future use (240.0.0.0/4)
+bool isGloballyRoutableIPv4(InternetAddress addr) {
+  if (addr.type != InternetAddressType.IPv4) return false;
+
+  final bytes = addr.rawAddress;
+  if (bytes.length != 4) return false;
+
+  if (addr.isLoopback) return false;
+
+  final a = bytes[0];
+  final b = bytes[1];
+
+  if (a == 0) return false;
+  if (a == 10) return false;
+  if (a == 100 && b >= 64 && b <= 127) return false;
+  if (a == 127) return false;
+  if (a == 169 && b == 254) return false;
+  if (a == 172 && b >= 16 && b <= 31) return false;
+  if (a == 192 && b == 0 && bytes[2] == 0) return false;
+  if (a == 192 && b == 168) return false;
+  if (a == 192 && b == 0 && bytes[2] == 2) return false;
+  if (a == 198 && (b == 18 || b == 19)) return false;
+  if (a == 198 && b == 51 && bytes[2] == 100) return false;
+  if (a == 203 && b == 0 && bytes[2] == 113) return false;
+  if (a >= 224) return false;
+
+  return true;
+}
+
 /// Check if an IP address is a globally routable IPv6 address.
 ///
 /// Globally routable means it can be reached from the public internet.
@@ -175,7 +241,10 @@ bool isGloballyRoutableIPv6(InternetAddress addr) {
 bool isGloballyRoutableAddress(String addrString) {
   final parsed = parseAddressString(addrString);
   if (parsed == null) return false;
-  return isGloballyRoutableIPv6(parsed.ip);
+  if (parsed.ip.type == InternetAddressType.IPv6) {
+    return isGloballyRoutableIPv6(parsed.ip);
+  }
+  return isGloballyRoutableIPv4(parsed.ip);
 }
 
 // --- Private helpers ---

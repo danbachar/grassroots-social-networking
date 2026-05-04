@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
 import '../models/identity.dart';
@@ -52,7 +51,14 @@ class MessageRouter {
 
   /// Called when a signaling packet is received.
   /// The coordinator routes this to [SignalingService.processSignaling].
-  void Function(Uint8List senderPubkey, Uint8List payload)? onSignalingReceived;
+  /// [observedIp] / [observedPort] carry the UDP source address observed by
+  /// the transport layer (null for BLE-arrived signaling).
+  void Function(
+    Uint8List senderPubkey,
+    Uint8List payload, {
+    String? observedIp,
+    int? observedPort,
+  })? onSignalingReceived;
 
   /// Called when a verified packet arrives over UDP, providing the sender's
   /// pubkey so the coordinator can map the connection (replacing tempKey-based
@@ -83,6 +89,8 @@ class MessageRouter {
     BleRole? bleRole,
     String? udpPeerId,
     int rssi = -100,
+    String? observedIp,
+    int? observedPort,
   }) async {
     // Verify signature — drop invalid packets
     final isValid = await protocolHandler.verifyPacket(packet);
@@ -100,6 +108,12 @@ class MessageRouter {
     if (transport == PeerTransport.udp && udpPeerId != null) {
       onUdpPeerIdentified?.call(packet.senderPubkey, udpPeerId);
       effectiveUdpPeerId = _pubkeyToHex(packet.senderPubkey);
+    }
+
+    // Any verified non-ANNOUNCE packet over UDP counts as liveness traffic
+    // for that peer, even if it is an ACK, read receipt, or retransmission.
+    if (transport == PeerTransport.udp && packet.type != PacketType.announce) {
+      store.dispatch(PeerUdpSeenAction(packet.senderPubkey));
     }
 
     // ANNOUNCE always processed (peer may have updated info)
@@ -142,7 +156,11 @@ class MessageRouter {
       case PacketType.readReceipt:
         _handleReadReceipt(packet);
       case PacketType.signaling:
-        _handleSignaling(packet);
+        _handleSignaling(
+          packet,
+          observedIp: observedIp,
+          observedPort: observedPort,
+        );
     }
   }
 
@@ -161,32 +179,30 @@ class MessageRouter {
 
     int effectiveRssi = rssi;
 
-    // Resolve bleDeviceId from discovered BLE peers.
-    // Works for ALL transports: if the peer is nearby via BLE, we find their
-    // bleDeviceId by matching their service UUID (derived from pubkey).
-    // If the peer is NOT nearby, bleDeviceId stays null — correct behavior.
-    String? resolvedBleDeviceId = bleDeviceId;
-    BleRole? resolvedBleRole = bleRole;
+    // Resolve BLE metadata only for packets that actually arrived over BLE.
+    // UDP ANNOUNCEs can coincide with stale scan results; treating those as a
+    // live BLE path makes UDP-only friends appear in the Nearby/Connected list.
+    final isBleAnnounce = transport == PeerTransport.bleDirect;
+    String? resolvedBleDeviceId = isBleAnnounce ? bleDeviceId : null;
+    BleRole? resolvedBleRole = isBleAnnounce ? bleRole : null;
     DiscoveredPeerState? discoveredPeer;
-    if (bleDeviceId != null) {
+    if (isBleAnnounce && bleDeviceId != null) {
       discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
     }
-    if (discoveredPeer == null) {
+    if (isBleAnnounce && discoveredPeer == null) {
       final theirServiceUuid = BitchatIdentity.deriveServiceUuid(pubkey);
       discoveredPeer =
           _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
       if (discoveredPeer != null && bleDeviceId == null) {
         // Only use scan-discovered device ID when no transport-provided ID exists.
-        // This handles non-BLE transports (e.g., UDP) where the peer is also
-        // nearby via BLE. When bleDeviceId IS provided (BLE transport), we keep it
-        // because Android MAC randomization means the scan-discovered MAC may differ
-        // from the actual connected MAC.
+        // When bleDeviceId IS provided, keep it because Android MAC randomization
+        // means the scan-discovered MAC may differ from the actual connected MAC.
         resolvedBleDeviceId = discoveredPeer.transportId;
         // If we found via scan, that means our central discovered them
         resolvedBleRole ??= BleRole.central;
       }
     }
-    if (discoveredPeer != null) {
+    if (isBleAnnounce && discoveredPeer != null) {
       effectiveRssi = discoveredPeer.rssi;
     }
 
@@ -198,6 +214,11 @@ class MessageRouter {
     // and clear their well-connected status.
     final udpAddress = _normalizeUdpAddress(data.udpAddress);
     final linkLocalAddress = _normalizeLinkLocalAddress(data.linkLocalAddress);
+    final udpAddressCandidates = _normalizeUdpAddressCandidates([
+      ...data.addressCandidates,
+      udpAddress,
+      linkLocalAddress,
+    ]);
 
     // Set the correct BLE device ID field based on role
     String? centralId;
@@ -220,6 +241,7 @@ class MessageRouter {
       blePeripheralDeviceId: peripheralId,
       udpAddress: udpAddress,
       linkLocalAddress: linkLocalAddress,
+      udpAddressCandidates: udpAddressCandidates,
     ));
 
     if (resolvedBleDeviceId != null && resolvedBleRole != null) {
@@ -233,6 +255,8 @@ class MessageRouter {
     debugPrint(
         'Peer ${isNew ? "connected" : "updated"}: ${data.nickname} via ${transport.name}'
         '${data.udpAddress != null ? " addr=${data.udpAddress}" : ""}');
+
+    // debugPrint('Peer announced!');
 
     onPeerAnnounced?.call(data, transport, isNew: isNew, udpPeerId: udpPeerId);
   }
@@ -275,8 +299,17 @@ class MessageRouter {
     }
   }
 
-  void _handleSignaling(BitchatPacket packet) {
-    onSignalingReceived?.call(packet.senderPubkey, packet.payload);
+  void _handleSignaling(
+    BitchatPacket packet, {
+    String? observedIp,
+    int? observedPort,
+  }) {
+    onSignalingReceived?.call(
+      packet.senderPubkey,
+      packet.payload,
+      observedIp: observedIp,
+      observedPort: observedPort,
+    );
   }
 
   void _handleReadReceipt(BitchatPacket packet) {
@@ -315,21 +348,22 @@ class MessageRouter {
   String? _normalizeUdpAddress(String? udpAddress) {
     if (udpAddress == null || udpAddress.isEmpty) return null;
 
-    final parsed = parseIpv6AddressString(udpAddress);
-    if (parsed != null) {
-      return parsed.toAddressString();
-    }
-
-    final legacyParsed = parseAddressString(udpAddress);
-    if (legacyParsed != null &&
-        legacyParsed.ip.type != InternetAddressType.IPv6) {
-      debugPrint('Ignoring unsupported IPv4 UDP address from ANNOUNCE: '
-          '$udpAddress. UDP transport requires IPv6.');
-      return null;
-    }
+    final parsed = parseAddressString(udpAddress);
+    if (parsed != null) return parsed.toAddressString();
 
     debugPrint('Ignoring malformed UDP address from ANNOUNCE: $udpAddress');
     return null;
+  }
+
+  Set<String> _normalizeUdpAddressCandidates(Iterable<String?> addresses) {
+    final normalized = <String>{};
+    for (final address in addresses) {
+      final parsed = _normalizeUdpAddress(address);
+      if (parsed != null) {
+        normalized.add(parsed);
+      }
+    }
+    return normalized;
   }
 
   String? _normalizeLinkLocalAddress(String? udpAddress) {

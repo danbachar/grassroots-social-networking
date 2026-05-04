@@ -10,16 +10,19 @@ import 'package:bitchat_transport/src/models/packet.dart';
 import 'package:bitchat_transport/src/models/peer.dart';
 import 'package:bitchat_transport/src/store/store.dart';
 
-/// Helper to create a BLE ANNOUNCE payload:
-/// [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr?]
+/// Helper to create an ANNOUNCE payload:
+/// [pubkey(32) + version(2) + nickLen(1) + nick + candidateCount(2) + candidates]
 Uint8List buildAnnouncePayload({
   required Uint8List pubkey,
   String nickname = 'OtherPeer',
   String? address,
+  Set<String> addressCandidates = const {},
 }) {
   final nicknameBytes = Uint8List.fromList(nickname.codeUnits);
-  final addressBytes =
-      address != null ? Uint8List.fromList(address.codeUnits) : Uint8List(0);
+  final candidates = <String>{
+    if (address != null && address.isNotEmpty) address,
+    ...addressCandidates,
+  };
   final buffer = BytesBuilder();
 
   buffer.add(pubkey);
@@ -31,11 +34,15 @@ Uint8List buildAnnouncePayload({
   buffer.addByte(nicknameBytes.length);
   buffer.add(nicknameBytes);
 
-  final addrLenBytes = ByteData(2);
-  addrLenBytes.setUint16(0, addressBytes.length, Endian.big);
-  buffer.add(addrLenBytes.buffer.asUint8List());
-  if (addressBytes.isNotEmpty) {
-    buffer.add(addressBytes);
+  final candidateCountBytes = ByteData(2);
+  candidateCountBytes.setUint16(0, candidates.length, Endian.big);
+  buffer.add(candidateCountBytes.buffer.asUint8List());
+  for (final candidate in candidates) {
+    final candidateBytes = Uint8List.fromList(candidate.codeUnits);
+    final lenBytes = ByteData(2);
+    lenBytes.setUint16(0, candidateBytes.length, Endian.big);
+    buffer.add(lenBytes.buffer.asUint8List());
+    buffer.add(candidateBytes);
   }
 
   return buffer.toBytes();
@@ -214,6 +221,30 @@ void main() {
         expect(peer!.bleDeviceId, equals('ble-device-1'));
       });
 
+      test('resolves BLE announce from scan-discovered service UUID', () async {
+        store.dispatch(BleDeviceDiscoveredAction(
+          deviceId: 'scan-device-1',
+          serviceUuid: BitchatIdentity.deriveServiceUuid(otherPubkey),
+          rssi: -48,
+        ));
+
+        final payload = buildAnnouncePayload(pubkey: otherPubkey);
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.bleDeviceId, equals('scan-device-1'));
+        expect(peer.rssi, equals(-48));
+      });
+
       test('includes udpAddress from ANNOUNCE payload', () async {
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
@@ -238,7 +269,7 @@ void main() {
         );
       });
 
-      test('drops unsupported IPv4 udpAddress from ANNOUNCE payload', () async {
+      test('preserves IPv4 udpAddress from ANNOUNCE payload', () async {
         final payload = buildAnnouncePayload(
           pubkey: otherPubkey,
           address: '203.0.113.5:4001',
@@ -256,7 +287,38 @@ void main() {
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
-        expect(peer!.udpAddress, isNull);
+        expect(peer!.udpAddress, equals('203.0.113.5:4001'));
+      });
+
+      test('preserves UDP address candidates from ANNOUNCE payload', () async {
+        final payload = buildAnnouncePayload(
+          pubkey: otherPubkey,
+          address: '[2606:4700::1]:4001',
+          addressCandidates: const {
+            '[2606:4700::1]:4001',
+            '198.51.100.5:4002',
+          },
+        );
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+          rssi: -50,
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(
+          peer!.udpAddressCandidates,
+          containsAll(const {
+            '[2606:4700::1]:4001',
+            '198.51.100.5:4002',
+          }),
+        );
       });
 
       test('fires onPeerAnnounced callback', () async {
@@ -616,6 +678,37 @@ void main() {
         );
       });
 
+      test('does not attach scan-discovered BLE ID to UDP ANNOUNCE', () async {
+        store.dispatch(BleDeviceDiscoveredAction(
+          deviceId: 'scan-device-1',
+          serviceUuid: BitchatIdentity.deriveServiceUuid(otherPubkey),
+          rssi: -42,
+        ));
+
+        final payload = buildAnnouncePayload(
+          pubkey: otherPubkey,
+          nickname: 'UdpPeer',
+          address: '[2001:db8::1]:4001',
+        );
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-123',
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.hasBleConnection, isFalse);
+        expect(peer.bleDeviceId, isNull);
+        expect(peer.rssi, equals(-100));
+        expect(store.state.peers.nearbyBlePeers, isEmpty);
+      });
+
       test('does not use peerId as fallback address when not in payload',
           () async {
         // udpPeerId is a hex pubkey, not an ip:port address — it must not
@@ -694,6 +787,27 @@ void main() {
         expect(receivedId, isNotNull);
         expect(receivedPubkey, equals(otherPubkey));
         expect(receivedPayload, equals(msgPayload));
+      });
+
+      test('marks existing peer as seen over UDP', () async {
+        store.dispatch(FriendEstablishedAction(publicKey: otherPubkey));
+
+        final p = await signedPacket(
+          type: PacketType.message,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([9, 8, 7]),
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-seen-test',
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.lastUdpSeen, isNotNull);
+        expect(peer.lastSeen, isNotNull);
       });
 
       test('triggers onAckRequested with canonical UDP peer id', () async {

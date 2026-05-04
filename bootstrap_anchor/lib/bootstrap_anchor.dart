@@ -1,8 +1,8 @@
-/// Bitchat Bootstrap Anchor Server
+/// GLP Rendezvous Server
 ///
-/// An always-on peer that acts as a well-connected friend for the Bitchat
-/// network. Provides signaling relay, address reflection, and hole-punch
-/// coordination — but never relays message content.
+/// A lightweight, publicly-accessible agent that coordinates hole-punching
+/// between peers. Provides address reflection and signaling relay — but
+/// never relays message content.
 library;
 
 export 'src/anchor_server.dart';

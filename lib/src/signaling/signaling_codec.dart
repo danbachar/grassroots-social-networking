@@ -1,30 +1,49 @@
 import 'dart:typed_data';
 
-/// Signaling message types for well-connected friend coordination.
+/// Signaling message types for the rendezvous reconnection protocol.
 ///
 /// These ride inside [BitchatPacket] payloads with [PacketType.signaling].
 /// Authentication is handled by the outer BitchatPacket's Ed25519 signature.
+///
+/// Wire byte values are stable; gaps reflect deprecated message types
+/// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the rendezvous
+/// flow switched to RECONNECT/AVAILABLE matching).
 enum SignalingType {
-  /// "What's the address of pubkey X?" — agent → friend
-  addrQuery(0x02),
-
-  /// "Pubkey X is at ip:port Y" (or not found) — friend → agent
-  addrResponse(0x03),
-
-  /// "Please coordinate a hole-punch with pubkey X" — agent → friend
-  punchRequest(0x04),
-
-  /// "Start sending UDP to ip:port Y for hole-punch" — friend → agent
+  /// "Start sending UDP to ip:port Y for hole-punch" — facilitator → agent
+  /// (also used for direct friend-to-friend punch coordination)
   punchInitiate(0x05),
 
-  /// "I've opened my NAT, tell the other side" — agent → friend
+  /// "I've opened my NAT, tell the other side" — agent → facilitator → peer
   punchReady(0x06),
 
-  /// "Your actual public address is ip:port" — friend → agent (triggered by ANNOUNCE)
+  /// "Your actual public address is ip:port" — facilitator → agent
+  /// (STUN-equivalent reflection, triggered by ANNOUNCE)
   addrReflect(0x07),
 
-  /// "Here's my full friend list" — owner → anchor server
-  friendsSync(0x08);
+  /// "I want to reconnect to peer X" — agent → rendezvous facilitator
+  ///
+  /// Cold-call message sent when the agent's connectivity changed and it
+  /// wants the facilitator to coordinate a hole-punch with peer X. The
+  /// facilitator observes the sender's source IP/port and waits for a
+  /// matching AVAILABLE from peer X.
+  reconnect(0x08),
+
+  /// "I'm available to peer X" — agent → rendezvous facilitator
+  ///
+  /// Cold-call message sent when the agent detects peer X went silent and
+  /// wants to remain reachable for X's reconnect attempts. The facilitator
+  /// observes the sender's source IP/port and matches against any pending
+  /// RECONNECT from peer X.
+  available(0x09),
+
+  /// "Here is my list of rendezvous server pubkeys" — agent → friend
+  ///
+  /// Sent after friendship establishment, on new live connection to a friend,
+  /// and whenever the agent's RV settings change. The recipient stores the
+  /// list per-friend so that on detecting the friend went silent, it fans
+  /// out AVAILABLE to those exact servers (per the spec: B contacts A's
+  /// known rendezvous agents).
+  rvList(0x0a);
 
   final int value;
   const SignalingType(this.value);
@@ -32,7 +51,9 @@ enum SignalingType {
   static SignalingType fromValue(int value) {
     return SignalingType.values.firstWhere(
       (t) => t.value == value,
-      orElse: () => throw ArgumentError('Unknown signaling type: $value'),
+      orElse: () => throw ArgumentError(
+        'Unknown signaling type: 0x${value.toRadixString(16)}',
+      ),
     );
   }
 }
@@ -42,65 +63,6 @@ enum SignalingType {
 /// Base class for decoded signaling messages.
 sealed class SignalingMessage {
   SignalingType get type;
-}
-
-/// Agent asks a well-connected friend for another peer's address.
-class AddrQueryMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.addrQuery;
-
-  /// The public key of the peer whose address we want (32 bytes).
-  final Uint8List targetPubkey;
-
-  AddrQueryMessage({required this.targetPubkey});
-
-  @override
-  String toString() =>
-      'AddrQuery(target: ${targetPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
-}
-
-/// Response to an address query: the peer's address (or not found).
-class AddrResponseMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.addrResponse;
-
-  /// The public key that was queried (32 bytes).
-  final Uint8List targetPubkey;
-
-  /// The peer's IP address, or null if not found.
-  final String? ip;
-
-  /// The peer's UDP port, or null if not found.
-  final int? port;
-
-  /// Whether the peer was found in the address table.
-  bool get found => ip != null && port != null;
-
-  AddrResponseMessage({
-    required this.targetPubkey,
-    this.ip,
-    this.port,
-  });
-
-  @override
-  String toString() =>
-      'AddrResponse(target: ${targetPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}..., '
-      '${found ? "$ip:$port" : "not found"})';
-}
-
-/// Agent requests a well-connected friend to coordinate a hole-punch.
-class PunchRequestMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.punchRequest;
-
-  /// The public key of the peer we want to punch through to (32 bytes).
-  final Uint8List targetPubkey;
-
-  PunchRequestMessage({required this.targetPubkey});
-
-  @override
-  String toString() =>
-      'PunchRequest(target: ${targetPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
 }
 
 /// Well-connected friend tells agent to start hole-punching to a peer.
@@ -167,29 +129,75 @@ class AddrReflectMessage extends SignalingMessage {
   String toString() => 'AddrReflect($ip:$port)';
 }
 
-/// Owner pushes their full friend list to the anchor server.
+/// Agent asks a rendezvous facilitator to coordinate reconnection with a peer.
 ///
-/// Sent on first connection to the anchor and whenever the friend list changes.
-/// The anchor replaces its entire friend list with this data.
-class FriendsSyncMessage extends SignalingMessage {
+/// The agent's source address is observed by the facilitator from the
+/// containing UDP packet — no address is carried in the payload.
+class ReconnectMessage extends SignalingMessage {
   @override
-  SignalingType get type => SignalingType.friendsSync;
+  SignalingType get type => SignalingType.reconnect;
 
-  /// List of friends to sync.
-  final List<FriendsSyncEntry> friends;
+  /// The public key of the peer we want to reconnect to (32 bytes).
+  final Uint8List peerPubkey;
 
-  FriendsSyncMessage({required this.friends});
+  ReconnectMessage({required this.peerPubkey});
 
   @override
-  String toString() => 'FriendsSync(${friends.length} friends)';
+  String toString() =>
+      'Reconnect(peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
 }
 
-/// A single friend entry in a FRIENDS_SYNC message.
-class FriendsSyncEntry {
-  final Uint8List pubkey;
-  final String nickname;
+/// Agent declares availability to a peer at a rendezvous facilitator.
+///
+/// The agent's source address is observed by the facilitator from the
+/// containing UDP packet — no address is carried in the payload.
+class AvailableMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.available;
 
-  FriendsSyncEntry({required this.pubkey, required this.nickname});
+  /// The public key of the peer we want to be reachable from (32 bytes).
+  final Uint8List peerPubkey;
+
+  AvailableMessage({required this.peerPubkey});
+
+  @override
+  String toString() =>
+      'Available(peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
+}
+
+/// One rendezvous server's identity: pubkey + reachable address.
+class RvServerEntry {
+  /// 32-byte Ed25519 public key of the rendezvous server.
+  final Uint8List pubkey;
+
+  /// "ip:port" address where the rendezvous server can be reached.
+  final String address;
+
+  const RvServerEntry({required this.pubkey, required this.address});
+
+  String get pubkeyHex =>
+      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  @override
+  String toString() => 'RvServerEntry($address, ${pubkeyHex.substring(0, 8)}...)';
+}
+
+/// Agent informs a friend about its configured rendezvous servers.
+///
+/// The friend stores this list keyed by the sender's pubkey so that, on
+/// detecting the sender went silent, it can send AVAILABLE to these exact
+/// servers — matching the sender's RECONNECT (which goes to the same set).
+class RvListMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.rvList;
+
+  /// Rendezvous server entries (pubkey + address pairs).
+  final List<RvServerEntry> entries;
+
+  RvListMessage({required this.entries});
+
+  @override
+  String toString() => 'RvList(count: ${entries.length})';
 }
 
 // ===== Codec =====
@@ -199,12 +207,13 @@ class FriendsSyncEntry {
 /// Wire formats:
 ///
 /// ```
-/// ADDR_QUERY     : type(1) + targetPubkey(32)
-/// ADDR_RESPONSE  : type(1) + targetPubkey(32) + found(1) + [ipLen(2) + ipBytes + port(2)]
-/// PUNCH_REQUEST  : type(1) + targetPubkey(32)
 /// PUNCH_INITIATE : type(1) + peerPubkey(32) + ipLen(2) + ipBytes + port(2)
 /// PUNCH_READY    : type(1) + peerPubkey(32)
 /// ADDR_REFLECT   : type(1) + ipLen(2) + ipBytes + port(2)
+/// RECONNECT      : type(1) + peerPubkey(32)
+/// AVAILABLE      : type(1) + peerPubkey(32)
+/// RV_LIST        : type(1) + count(2) +
+///                  repeated(pubkey(32) + addrLen(2) + addrBytes)
 /// ```
 class SignalingCodec {
   const SignalingCodec();
@@ -213,42 +222,13 @@ class SignalingCodec {
 
   Uint8List encode(SignalingMessage msg) {
     return switch (msg) {
-      AddrQueryMessage() => _encodeAddrQuery(msg),
-      AddrResponseMessage() => _encodeAddrResponse(msg),
-      PunchRequestMessage() => _encodePunchRequest(msg),
       PunchInitiateMessage() => _encodePunchInitiate(msg),
       PunchReadyMessage() => _encodePunchReady(msg),
       AddrReflectMessage() => _encodeAddrReflect(msg),
-      FriendsSyncMessage() => _encodeFriendsSync(msg),
+      ReconnectMessage() => _encodeReconnect(msg),
+      AvailableMessage() => _encodeAvailable(msg),
+      RvListMessage() => _encodeRvList(msg),
     };
-  }
-
-  Uint8List _encodeAddrQuery(AddrQueryMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.addrQuery.value);
-    buffer.add(msg.targetPubkey);
-    return buffer.toBytes();
-  }
-
-  Uint8List _encodeAddrResponse(AddrResponseMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.addrResponse.value);
-    buffer.add(msg.targetPubkey);
-    buffer.addByte(msg.found ? 1 : 0);
-    if (msg.found) {
-      final ipBytes = Uint8List.fromList(msg.ip!.codeUnits);
-      _writeUint16(buffer, ipBytes.length);
-      buffer.add(ipBytes);
-      _writeUint16(buffer, msg.port!);
-    }
-    return buffer.toBytes();
-  }
-
-  Uint8List _encodePunchRequest(PunchRequestMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.punchRequest.value);
-    buffer.add(msg.targetPubkey);
-    return buffer.toBytes();
   }
 
   Uint8List _encodePunchInitiate(PunchInitiateMessage msg) {
@@ -279,6 +259,33 @@ class SignalingCodec {
     return buffer.toBytes();
   }
 
+  Uint8List _encodeReconnect(ReconnectMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.reconnect.value);
+    buffer.add(msg.peerPubkey);
+    return buffer.toBytes();
+  }
+
+  Uint8List _encodeAvailable(AvailableMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.available.value);
+    buffer.add(msg.peerPubkey);
+    return buffer.toBytes();
+  }
+
+  Uint8List _encodeRvList(RvListMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.rvList.value);
+    _writeUint16(buffer, msg.entries.length);
+    for (final entry in msg.entries) {
+      buffer.add(entry.pubkey);
+      final addrBytes = Uint8List.fromList(entry.address.codeUnits);
+      _writeUint16(buffer, addrBytes.length);
+      buffer.add(addrBytes);
+    }
+    return buffer.toBytes();
+  }
+
   // ===== Decoding =====
 
   /// Decode a signaling payload into a [SignalingMessage].
@@ -293,57 +300,13 @@ class SignalingCodec {
     final payload = Uint8List.sublistView(data, 1);
 
     return switch (type) {
-      SignalingType.addrQuery => _decodeAddrQuery(payload),
-      SignalingType.addrResponse => _decodeAddrResponse(payload),
-      SignalingType.punchRequest => _decodePunchRequest(payload),
       SignalingType.punchInitiate => _decodePunchInitiate(payload),
       SignalingType.punchReady => _decodePunchReady(payload),
       SignalingType.addrReflect => _decodeAddrReflect(payload),
-      SignalingType.friendsSync => _decodeFriendsSync(payload),
+      SignalingType.reconnect => _decodeReconnect(payload),
+      SignalingType.available => _decodeAvailable(payload),
+      SignalingType.rvList => _decodeRvList(payload),
     };
-  }
-
-  AddrQueryMessage _decodeAddrQuery(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('AddrQuery payload too short');
-    }
-    return AddrQueryMessage(
-      targetPubkey: Uint8List.fromList(data.sublist(0, 32)),
-    );
-  }
-
-  AddrResponseMessage _decodeAddrResponse(Uint8List data) {
-    if (data.length < 33) {
-      throw const FormatException('AddrResponse payload too short');
-    }
-    final targetPubkey = Uint8List.fromList(data.sublist(0, 32));
-    final found = data[32] != 0;
-
-    if (!found) {
-      return AddrResponseMessage(targetPubkey: targetPubkey);
-    }
-
-    var offset = 33;
-    final ipLen = _readUint16(data, offset);
-    offset += 2;
-    final ip = String.fromCharCodes(data.sublist(offset, offset + ipLen));
-    offset += ipLen;
-    final port = _readUint16(data, offset);
-
-    return AddrResponseMessage(
-      targetPubkey: targetPubkey,
-      ip: ip,
-      port: port,
-    );
-  }
-
-  PunchRequestMessage _decodePunchRequest(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('PunchRequest payload too short');
-    }
-    return PunchRequestMessage(
-      targetPubkey: Uint8List.fromList(data.sublist(0, 32)),
-    );
   }
 
   PunchInitiateMessage _decodePunchInitiate(Uint8List data) {
@@ -384,45 +347,48 @@ class SignalingCodec {
     return AddrReflectMessage(ip: ip, port: port);
   }
 
-  Uint8List _encodeFriendsSync(FriendsSyncMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.friendsSync.value);
-    _writeUint16(buffer, msg.friends.length);
-    for (final friend in msg.friends) {
-      buffer.add(friend.pubkey);
-      final nickBytes = Uint8List.fromList(friend.nickname.codeUnits);
-      buffer.addByte(nickBytes.length);
-      buffer.add(nickBytes);
+  ReconnectMessage _decodeReconnect(Uint8List data) {
+    if (data.length < 32) {
+      throw const FormatException('Reconnect payload too short');
     }
-    return buffer.toBytes();
+    return ReconnectMessage(
+      peerPubkey: Uint8List.fromList(data.sublist(0, 32)),
+    );
   }
 
-  FriendsSyncMessage _decodeFriendsSync(Uint8List data) {
-    if (data.length < 2) {
-      throw const FormatException('FriendsSync payload too short');
+  AvailableMessage _decodeAvailable(Uint8List data) {
+    if (data.length < 32) {
+      throw const FormatException('Available payload too short');
     }
-    var offset = 0;
-    final count = _readUint16(data, offset);
-    offset += 2;
+    return AvailableMessage(
+      peerPubkey: Uint8List.fromList(data.sublist(0, 32)),
+    );
+  }
 
-    final friends = <FriendsSyncEntry>[];
+  RvListMessage _decodeRvList(Uint8List data) {
+    if (data.length < 2) {
+      throw const FormatException('RvList payload too short');
+    }
+    final count = _readUint16(data, 0);
+    var offset = 2;
+    final entries = <RvServerEntry>[];
     for (var i = 0; i < count; i++) {
-      if (offset + 33 > data.length) {
-        throw FormatException('FriendsSync truncated at entry $i');
+      if (offset + 34 > data.length) {
+        throw const FormatException('RvList entry truncated');
       }
       final pubkey = Uint8List.fromList(data.sublist(offset, offset + 32));
       offset += 32;
-      final nickLen = data[offset];
-      offset += 1;
-      if (offset + nickLen > data.length) {
-        throw FormatException('FriendsSync nickname truncated at entry $i');
+      final addrLen = _readUint16(data, offset);
+      offset += 2;
+      if (offset + addrLen > data.length) {
+        throw const FormatException('RvList address truncated');
       }
-      final nickname =
-          String.fromCharCodes(data.sublist(offset, offset + nickLen));
-      offset += nickLen;
-      friends.add(FriendsSyncEntry(pubkey: pubkey, nickname: nickname));
+      final address =
+          String.fromCharCodes(data.sublist(offset, offset + addrLen));
+      offset += addrLen;
+      entries.add(RvServerEntry(pubkey: pubkey, address: address));
     }
-    return FriendsSyncMessage(friends: friends);
+    return RvListMessage(entries: entries);
   }
 
   // ===== Helpers =====

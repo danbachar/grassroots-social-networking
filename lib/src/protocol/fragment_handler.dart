@@ -6,7 +6,7 @@ import '../models/packet.dart';
 /// Result of fragmenting a large message
 class FragmentedMessage {
   final String messageId;
-  final List<BitchatPacket> fragments;
+  final List<GrassrootsPacket> fragments;
   
   FragmentedMessage({
     required this.messageId,
@@ -52,7 +52,7 @@ class _ReassemblyState {
 
 /// Handles fragmentation and reassembly of messages larger than BLE MTU.
 /// 
-/// Bitchat fragments messages > 500 bytes:
+/// Grassroots fragments messages > 500 bytes:
 /// - fragmentStart: contains metadata + first chunk
 /// - fragmentContinue: intermediate chunks
 /// - fragmentEnd: final chunk, triggers reassembly
@@ -97,14 +97,14 @@ class FragmentHandler {
     required Uint8List payload,
     required Uint8List senderPubkey,
     Uint8List? recipientPubkey,
-    int ttl = BitchatPacket.defaultTtl,
+    int ttl = GrassrootsPacket.defaultTtl,
   }) {
     if (!needsFragmentation(payload)) {
       throw ArgumentError('Payload does not need fragmentation');
     }
     
     final messageId = _uuid.v4();
-    final fragments = <BitchatPacket>[];
+    final fragments = <GrassrootsPacket>[];
     
     // Calculate number of fragments needed
     final totalFragments = (payload.length / maxFragmentPayload).ceil();
@@ -144,7 +144,7 @@ class FragmentHandler {
         );
       }
       
-      fragments.add(BitchatPacket(
+      fragments.add(GrassrootsPacket(
         type: type,
         ttl: ttl,
         senderPubkey: senderPubkey,
@@ -161,7 +161,7 @@ class FragmentHandler {
   /// 
   /// Returns the reassembled payload if this was the final fragment
   /// and all fragments have been received. Otherwise returns null.
-  Uint8List? processFragment(BitchatPacket packet) {
+  Uint8List? processFragment(GrassrootsPacket packet) {
     switch (packet.type) {
       case PacketType.fragmentStart:
         return _processFragmentStart(packet);
@@ -174,7 +174,7 @@ class FragmentHandler {
     }
   }
   
-  Uint8List? _processFragmentStart(BitchatPacket packet) {
+  Uint8List? _processFragmentStart(GrassrootsPacket packet) {
     final (messageId, totalFragments, totalSize, chunk) = 
         _decodeFragmentStart(packet.payload);
     
@@ -195,7 +195,7 @@ class FragmentHandler {
     return null;
   }
   
-  Uint8List? _processFragmentContinue(BitchatPacket packet) {
+  Uint8List? _processFragmentContinue(GrassrootsPacket packet) {
     final (messageId, fragmentIndex, chunk) = 
         _decodeFragmentContinue(packet.payload);
     
@@ -209,7 +209,7 @@ class FragmentHandler {
     return null;
   }
   
-  Uint8List? _processFragmentEnd(BitchatPacket packet) {
+  Uint8List? _processFragmentEnd(GrassrootsPacket packet) {
     final (messageId, fragmentIndex, chunk) = 
         _decodeFragmentEnd(packet.payload);
     

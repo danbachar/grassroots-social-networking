@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 import 'package:uuid/uuid.dart';
 
-/// Packet types matching Bitchat protocol.
+/// Packet types matching Grassroots protocol.
 ///
 /// Must be identical to the client-side PacketType enum values.
 enum PacketType {
@@ -26,7 +26,7 @@ enum PacketType {
   }
 }
 
-/// A Bitchat packet — wire-compatible with the Flutter client.
+/// A Grassroots packet — wire-compatible with the Flutter client.
 ///
 /// Binary format (152-byte header + variable payload):
 /// ```
@@ -40,7 +40,7 @@ enum PacketType {
 /// [88-151] : Signature (64 bytes, Ed25519)
 /// [152-N]  : Payload (variable length)
 /// ```
-class BitchatPacket {
+class GrassrootsPacket {
   static const int headerSize = 152;
   static const int maxPayloadSize = 348;
   static const int defaultTtl = 7;
@@ -56,7 +56,7 @@ class BitchatPacket {
   final Uint8List payload;
   Uint8List signature;
 
-  BitchatPacket({
+  GrassrootsPacket({
     String? packetId,
     required this.type,
     this.ttl = defaultTtl,
@@ -117,7 +117,7 @@ class BitchatPacket {
   }
 
   /// Deserialize from binary format.
-  static BitchatPacket deserialize(Uint8List data) {
+  static GrassrootsPacket deserialize(Uint8List data) {
     if (data.length < headerSize) {
       throw FormatException('Packet too small: ${data.length} < $headerSize');
     }
@@ -155,7 +155,7 @@ class BitchatPacket {
     final payload =
         Uint8List.fromList(data.sublist(offset, offset + payloadLength));
 
-    return BitchatPacket(
+    return GrassrootsPacket(
       packetId: packetId,
       type: type,
       ttl: ttl,
@@ -196,5 +196,5 @@ class BitchatPacket {
 
   @override
   String toString() =>
-      'BitchatPacket($type, ttl=$ttl, payload=${payload.length}b)';
+      'GrassrootsPacket($type, ttl=$ttl, payload=${payload.length}b)';
 }

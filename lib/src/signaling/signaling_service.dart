@@ -70,8 +70,8 @@ class SignalingService {
 
   // ===== Callbacks (set by coordinator) =====
 
-  /// Send a signaling payload wrapped in a BitchatPacket to a specific peer.
-  /// The coordinator wraps the payload in a BitchatPacket(type: signaling),
+  /// Send a signaling payload wrapped in a GrassrootsPacket to a specific peer.
+  /// The coordinator wraps the payload in a GrassrootsPacket(type: signaling),
   /// signs it, and sends it via the best available transport.
   Future<bool> Function(Uint8List recipientPubkey, Uint8List signalingPayload)?
       sendSignaling;
@@ -107,8 +107,10 @@ class SignalingService {
   void Function(Uint8List peerPubkey)? onPunchReady;
 
   /// Fired when a rendezvous facilitator reflects our observed public address.
-  /// The coordinator should update its public address with this value.
-  void Function(String ip, int port)? onAddrReflected;
+  /// The coordinator should update its public address with this value, and
+  /// treat the [senderPubkey] as having authoritatively acknowledged a
+  /// registration round-trip (the GLP spec response to a client ANNOUNCE).
+  void Function(Uint8List senderPubkey, String ip, int port)? onAddrReflected;
 
   SignalingService({
     required this.store,
@@ -334,7 +336,7 @@ class SignalingService {
 
   /// Process an incoming signaling packet.
   ///
-  /// [senderPubkey] is the authenticated sender from the outer BitchatPacket.
+  /// [senderPubkey] is the authenticated sender from the outer GrassrootsPacket.
   /// [payload] is the raw signaling payload (type byte + message data).
   /// [observedIp] / [observedPort] carry the UDP source address observed by
   /// the transport layer — used by the client's friends-based rendezvous
@@ -373,7 +375,7 @@ class SignalingService {
       case PunchReadyMessage():
         _handlePunchReady(senderPubkey, msg);
       case AddrReflectMessage():
-        _handleAddrReflect(msg);
+        _handleAddrReflect(senderPubkey, msg);
       case ReconnectMessage():
         _handleRendezvous(
           senderPubkey: senderPubkey,
@@ -640,13 +642,13 @@ class SignalingService {
 
   /// Handle ADDR_REFLECT: a facilitator telling us our observed address.
   ///
-  /// This is the STUN-equivalent for Bitchat. The facilitator saw our real
+  /// This is the STUN-equivalent for Grassroots. The facilitator saw our real
   /// NAT-translated address on the incoming UDP connection and is reflecting
   /// it back. We update our public address with this value — it has the
   /// correct external port, unlike our local-port-based guess.
-  void _handleAddrReflect(AddrReflectMessage msg) {
+  void _handleAddrReflect(Uint8List senderPubkey, AddrReflectMessage msg) {
     debugPrint('Address reflected by facilitator: ${msg.ip}:${msg.port}');
-    onAddrReflected?.call(msg.ip, msg.port);
+    onAddrReflected?.call(senderPubkey, msg.ip, msg.port);
   }
 
   // ===== Lifecycle =====

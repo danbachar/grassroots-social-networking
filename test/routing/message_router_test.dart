@@ -2,13 +2,13 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 import 'package:cryptography/cryptography.dart';
-import 'package:bitchat_transport/src/routing/message_router.dart';
-import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
-import 'package:bitchat_transport/src/models/packet.dart';
-import 'package:bitchat_transport/src/models/peer.dart';
-import 'package:bitchat_transport/src/store/store.dart';
+import 'package:grassroots_networking/src/routing/message_router.dart';
+import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
+import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/store/store.dart';
 
 /// Helper to create an ANNOUNCE payload:
 /// [pubkey(32) + version(2) + nickLen(1) + nick + candidateCount(2) + candidates]
@@ -52,8 +52,8 @@ void main() {
   group('MessageRouter', () {
     late MessageRouter router;
     late Store<AppState> store;
-    late BitchatIdentity identity;
-    late BitchatIdentity otherIdentity;
+    late GrassrootsIdentity identity;
+    late GrassrootsIdentity otherIdentity;
     late ProtocolHandler protocolHandler;
     late ProtocolHandler otherProtocolHandler;
     late FragmentHandler fragmentHandler;
@@ -62,13 +62,13 @@ void main() {
     setUp(() async {
       final algorithm = Ed25519();
       final keyPair = await algorithm.newKeyPair();
-      identity = await BitchatIdentity.create(
+      identity = await GrassrootsIdentity.create(
         keyPair: keyPair,
         nickname: 'TestUser',
       );
 
       final otherKeyPair = await algorithm.newKeyPair();
-      otherIdentity = await BitchatIdentity.create(
+      otherIdentity = await GrassrootsIdentity.create(
         keyPair: otherKeyPair,
         nickname: 'OtherPeer',
       );
@@ -98,7 +98,7 @@ void main() {
 
     /// Create a signed packet from the other peer's perspective.
     /// Must be awaited since signing is async.
-    Future<BitchatPacket> signedPacket({
+    Future<GrassrootsPacket> signedPacket({
       required PacketType type,
       Uint8List? senderPubkey,
       Uint8List? recipientPubkey,
@@ -106,7 +106,7 @@ void main() {
       String? packetId,
       ProtocolHandler? signer,
     }) async {
-      final p = BitchatPacket(
+      final p = GrassrootsPacket(
         packetId: packetId,
         type: type,
         senderPubkey: senderPubkey ?? otherPubkey,
@@ -133,7 +133,7 @@ void main() {
             anyCalled = true;
 
         // Create packet without signing (zero signature)
-        final p = BitchatPacket(
+        final p = GrassrootsPacket(
           type: PacketType.message,
           senderPubkey: otherPubkey,
           recipientPubkey: identity.publicKey,
@@ -224,7 +224,7 @@ void main() {
       test('resolves BLE announce from scan-discovered service UUID', () async {
         store.dispatch(BleDeviceDiscoveredAction(
           deviceId: 'scan-device-1',
-          serviceUuid: BitchatIdentity.deriveServiceUuid(otherPubkey),
+          serviceUuid: GrassrootsIdentity.deriveServiceUuid(otherPubkey),
           rssi: -48,
         ));
 
@@ -436,7 +436,7 @@ void main() {
         // Create a third identity for the intended recipient
         final algorithm = Ed25519();
         final thirdKeyPair = await algorithm.newKeyPair();
-        final thirdIdentity = await BitchatIdentity.create(
+        final thirdIdentity = await GrassrootsIdentity.create(
           keyPair: thirdKeyPair,
           nickname: 'ThirdParty',
         );
@@ -681,7 +681,7 @@ void main() {
       test('does not attach scan-discovered BLE ID to UDP ANNOUNCE', () async {
         store.dispatch(BleDeviceDiscoveredAction(
           deviceId: 'scan-device-1',
-          serviceUuid: BitchatIdentity.deriveServiceUuid(otherPubkey),
+          serviceUuid: GrassrootsIdentity.deriveServiceUuid(otherPubkey),
           rssi: -42,
         ));
 
@@ -929,10 +929,10 @@ void main() {
     group('processPacket - invalid/malformed packets', () {
       test('drops packet with wrong sender pubkey length via construction',
           () async {
-        // BitchatPacket constructor enforces 32-byte pubkey,
+        // GrassrootsPacket constructor enforces 32-byte pubkey,
         // so we verify that invalid construction throws
         expect(
-          () => BitchatPacket(
+          () => GrassrootsPacket(
             type: PacketType.message,
             senderPubkey: Uint8List(16), // too short
             recipientPubkey: identity.publicKey,
@@ -946,7 +946,7 @@ void main() {
       test('drops packet with wrong signature length via construction',
           () async {
         expect(
-          () => BitchatPacket(
+          () => GrassrootsPacket(
             type: PacketType.message,
             senderPubkey: otherPubkey,
             recipientPubkey: identity.publicKey,
@@ -959,17 +959,17 @@ void main() {
 
       test('deserialize rejects data shorter than header size', () {
         expect(
-          () => BitchatPacket.deserialize(Uint8List(40)),
+          () => GrassrootsPacket.deserialize(Uint8List(40)),
           throwsA(isA<FormatException>()),
         );
       });
 
       test('deserialize rejects data with unknown packet type', () {
         // Build a buffer with headerSize bytes, but with type=0xFF
-        final data = Uint8List(BitchatPacket.headerSize);
+        final data = Uint8List(GrassrootsPacket.headerSize);
         data[0] = 0xFF; // unknown type
         expect(
-          () => BitchatPacket.deserialize(data),
+          () => GrassrootsPacket.deserialize(data),
           throwsA(isA<ArgumentError>()),
         );
       });

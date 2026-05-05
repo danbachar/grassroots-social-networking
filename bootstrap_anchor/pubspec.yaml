@@ -1,5 +1,5 @@
 name: bootstrap_anchor
-description: Always-on bootstrap anchor server for Bitchat P2P network. Acts as a well-connected friend for signaling, address reflection, and hole-punch coordination.
+description: Always-on bootstrap anchor server for Grassroots P2P network. Acts as a well-connected friend for signaling, address reflection, and hole-punch coordination.
 version: 0.1.0
 publish_to: none
 
@@ -7,13 +7,13 @@ environment:
   sdk: '>=3.0.0 <4.0.0'
 
 dependencies:
-  # Ed25519 signing & verification (same as bitchat_transport)
+  # Ed25519 signing & verification (same as grassroots_networking)
   cryptography: ^2.9.0
 
   # UUID generation for packet IDs
   uuid: ^4.2.0
 
-  # UDX reliable streams over UDP (local package, same as bitchat_transport)
+  # UDX reliable streams over UDP (local package, same as grassroots_networking)
   dart_udx:
     path: ../dart-udx
 

@@ -2,16 +2,16 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
 
 void main() {
-  group('BitchatIdentity', () {
-    late BitchatIdentity identity;
+  group('GrassrootsIdentity', () {
+    late GrassrootsIdentity identity;
 
     setUp(() async {
       final algorithm = Ed25519();
       final keyPair = await algorithm.newKeyPair();
-      identity = await BitchatIdentity.create(
+      identity = await GrassrootsIdentity.create(
         keyPair: keyPair,
         nickname: 'Alice',
       );
@@ -43,7 +43,7 @@ void main() {
       test('works with different nicknames', () async {
         final algorithm = Ed25519();
         final keyPair = await algorithm.newKeyPair();
-        final id = await BitchatIdentity.create(
+        final id = await GrassrootsIdentity.create(
           keyPair: keyPair,
           nickname: 'Bob',
         );
@@ -75,7 +75,7 @@ void main() {
 
         // First 16 hex chars = Grassroots prefix
         expect(hexOnly.substring(0, 16),
-            equals(BitchatIdentity.grassrootsUuidPrefix));
+            equals(GrassrootsIdentity.grassrootsUuidPrefix));
 
         // Last 16 hex chars = last 8 bytes of pubkey
         final last8 = identity.publicKey.sublist(24, 32);
@@ -85,20 +85,20 @@ void main() {
       });
 
       test('deriveServiceUuid static method matches bleServiceUuid getter', () {
-        expect(BitchatIdentity.deriveServiceUuid(identity.publicKey),
+        expect(GrassrootsIdentity.deriveServiceUuid(identity.publicKey),
             equals(identity.bleServiceUuid));
       });
 
       test('grassrootsUuidPrefix is 8 bytes (16 hex chars)', () {
-        expect(BitchatIdentity.grassrootsUuidPrefix.length, equals(16));
-        expect(BitchatIdentity.grassrootsUuidPrefix,
+        expect(GrassrootsIdentity.grassrootsUuidPrefix.length, equals(16));
+        expect(GrassrootsIdentity.grassrootsUuidPrefix,
             matches(RegExp(r'^[0-9a-f]{16}$')));
       });
 
       test('different identities produce different UUIDs', () async {
         final algorithm = Ed25519();
         final keyPair2 = await algorithm.newKeyPair();
-        final identity2 = await BitchatIdentity.create(
+        final identity2 = await GrassrootsIdentity.create(
           keyPair: keyPair2,
           nickname: 'Bob',
         );
@@ -131,25 +131,25 @@ void main() {
     group('toJson() / fromMap() round-trip', () {
       test('serializes and deserializes preserving publicKey', () {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.publicKey, equals(identity.publicKey));
       });
 
       test('serializes and deserializes preserving privateKey', () {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.privateKey, equals(identity.privateKey));
       });
 
       test('serializes and deserializes preserving nickname', () {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.nickname, equals(identity.nickname));
       });
 
-      test('fromMap restores a working BitchatIdentity with valid keyPair', () async {
+      test('fromMap restores a working GrassrootsIdentity with valid keyPair', () async {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
 
         // keyPair should be usable - extract public key and compare
         final restoredPk = await restored.keyPair.extractPublicKey();
@@ -161,30 +161,30 @@ void main() {
 
       test('restored identity has valid bleServiceUuid', () {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.bleServiceUuid, equals(identity.bleServiceUuid));
       });
 
       test('restored identity has valid shortFingerprint', () {
         final json = identity.toJson();
-        final restored = BitchatIdentity.fromMap(json);
+        final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.shortFingerprint, equals(identity.shortFingerprint));
       });
     });
 
     group('toString()', () {
-      test('returns BitchatIdentity(nickname)', () {
-        expect(identity.toString(), equals('BitchatIdentity(Alice)'));
+      test('returns GrassrootsIdentity(nickname)', () {
+        expect(identity.toString(), equals('GrassrootsIdentity(Alice)'));
       });
 
       test('reflects the current nickname', () async {
         final algorithm = Ed25519();
         final keyPair = await algorithm.newKeyPair();
-        final id = await BitchatIdentity.create(
+        final id = await GrassrootsIdentity.create(
           keyPair: keyPair,
           nickname: 'Charlie',
         );
-        expect(id.toString(), equals('BitchatIdentity(Charlie)'));
+        expect(id.toString(), equals('GrassrootsIdentity(Charlie)'));
       });
     });
   });

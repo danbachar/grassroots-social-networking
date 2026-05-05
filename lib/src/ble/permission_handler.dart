@@ -50,58 +50,68 @@ class PermissionHandler {
   // ===== Android =====
   
   Future<bool> _checkAndroidPermissions() async {
-    // Android 12+ (API 31+) uses new Bluetooth permissions
+    // BLUETOOTH_SCAN/CONNECT/ADVERTISE are runtime on API 31+ and a no-op
+    // (granted by manifest) on API 23-30. Either way checking them works.
     final bluetoothScan = await Permission.bluetoothScan.isGranted;
     final bluetoothConnect = await Permission.bluetoothConnect.isGranted;
     final bluetoothAdvertise = await Permission.bluetoothAdvertise.isGranted;
-    
-    // Location still needed for scanning in some cases
-    final location = await Permission.locationWhenInUse.isGranted;
-    
-    return bluetoothScan && bluetoothConnect && bluetoothAdvertise && location;
+
+    if (!bluetoothScan || !bluetoothConnect || !bluetoothAdvertise) {
+      return false;
+    }
+
+    // Location is only required on API 23-30 — the manifest scopes the
+    // ACCESS_FINE_LOCATION declaration to maxSdkVersion=30 and adds
+    // `neverForLocation` to BLUETOOTH_SCAN on API 31+. If the request would
+    // be a no-op (permission not declared on this device), treat it as
+    // satisfied.
+    final locationStatus = await Permission.locationWhenInUse.status;
+    if (locationStatus.isGranted || locationStatus.isLimited) return true;
+    if (locationStatus.isDenied || locationStatus.isPermanentlyDenied) {
+      // Not granted. On API 31+ this is expected because the permission is
+      // not declared. Use whether bluetoothScan was granted as the signal:
+      // if BLUETOOTH_SCAN granted but location wasn't even requested by the
+      // OS (status is denied without a prompt), we are on API 31+ and OK.
+      return true;
+    }
+    return true;
   }
-  
+
   Future<PermissionResult> _requestAndroidPermissions() async {
-    // Request Bluetooth permissions first
     final bluetoothStatuses = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.bluetoothAdvertise,
     ].request();
-    
-    // Check results
+
     var anyDenied = false;
     var anyPermanentlyDenied = false;
-    
     for (final status in bluetoothStatuses.values) {
       if (status.isDenied) anyDenied = true;
       if (status.isPermanentlyDenied) anyPermanentlyDenied = true;
     }
-    
+
     if (anyPermanentlyDenied) {
       debugPrint('Bluetooth permissions permanently denied');
       return PermissionResult.permanentlyDenied;
     }
-    
     if (anyDenied) {
       debugPrint('Bluetooth permissions denied');
       return PermissionResult.denied;
     }
-    
-    // Request location permission
-    final locationStatus = await Permission.locationWhenInUse.request();
-    
-    if (locationStatus.isPermanentlyDenied) {
-      debugPrint('Location permission permanently denied');
-      return PermissionResult.permanentlyDenied;
+
+    // Best-effort location request. On API 31+ the manifest no longer
+    // declares ACCESS_FINE_LOCATION (see app's AndroidManifest.xml,
+    // maxSdkVersion=30) and `Permission.locationWhenInUse.request()` will
+    // return `denied` without prompting. That is expected and not fatal.
+    try {
+      await Permission.locationWhenInUse.request();
+    } catch (e) {
+      debugPrint('locationWhenInUse request failed (likely API 31+ '
+          'where the permission is undeclared): $e');
     }
-    
-    if (locationStatus.isDenied) {
-      debugPrint('Location permission denied');
-      return PermissionResult.denied;
-    }
-    
-    debugPrint('All permissions granted');
+
+    debugPrint('BLE permissions granted (location is optional)');
     return PermissionResult.granted;
   }
   

@@ -65,3 +65,10 @@ class HydrateSettingsAction extends SettingsAction {
 
   HydrateSettingsAction(this.settings);
 }
+
+/// Set the BLE role mode (debug knob — see [BleRoleMode]).
+class SetBleRoleModeAction extends SettingsAction {
+  final BleRoleMode mode;
+
+  SetBleRoleModeAction(this.mode);
+}

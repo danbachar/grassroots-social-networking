@@ -1,15 +1,8 @@
-import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
 import '../transport/address_utils.dart';
 import 'peers_state.dart';
 import 'peers_actions.dart';
-
-/// Initial backoff delay in seconds after first failure
-const _initialBackoffSeconds = 5;
-
-/// Maximum backoff delay in seconds (cap)
-const _maxBackoffSeconds = 120;
 
 /// Reducer for peers-related state
 PeersState peersReducer(PeersState state, dynamic action) {
@@ -84,21 +77,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
   if (action is BleDeviceConnectedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
-      // Reset backoff on successful connection
-      final updated = DiscoveredPeerState(
-        transportId: existing.transportId,
-        displayName: existing.displayName,
-        rssi: existing.rssi,
-        discoveredAt: existing.discoveredAt,
-        lastSeen: existing.lastSeen,
+      final updated = existing.copyWith(
         isConnecting: false,
         isConnected: true,
-        lastError: null,
-        publicKey: existing.publicKey,
-        serviceUuid: existing.serviceUuid,
-        consecutiveFailures: 0,
-        nextRetryAfter: null,
-        isBlacklisted: existing.isBlacklisted,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -111,27 +92,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
   if (action is BleDeviceConnectionFailedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
-      // Calculate exponential backoff: min(initialDelay * 2^(failures), maxDelay)
-      final newFailures = existing.consecutiveFailures + 1;
-      final backoffSeconds = math.min(
-        _initialBackoffSeconds * (1 << (newFailures - 1)),
-        _maxBackoffSeconds,
-      );
-
-      final updated = DiscoveredPeerState(
-        transportId: existing.transportId,
-        displayName: existing.displayName,
-        rssi: existing.rssi,
-        discoveredAt: existing.discoveredAt,
-        lastSeen: existing.lastSeen,
+      final updated = existing.copyWith(
         isConnecting: false,
         isConnected: false,
-        lastError: action.error,
-        publicKey: existing.publicKey,
-        serviceUuid: existing.serviceUuid,
-        consecutiveFailures: newFailures,
-        nextRetryAfter: DateTime.now().add(Duration(seconds: backoffSeconds)),
-        isBlacklisted: existing.isBlacklisted,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -144,7 +107,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
   if (action is BleDeviceDisconnectedAction) {
     final existing = state.discoveredBlePeers[action.deviceId];
     if (existing != null) {
-      // Preserve backoff state on disconnect (don't reset)
       final updated = existing.copyWith(
         isConnecting: false,
         isConnected: false,
@@ -445,74 +407,20 @@ PeersState peersReducer(PeersState state, dynamic action) {
   }
 
   if (action is StalePeersRemovedAction) {
+    // Memory pressure: forget non-friend peers we haven't heard from within
+    // [staleThreshold]. We do NOT mutate `connectionState` here — that field
+    // is exclusively driven by plugin events (BLE) and UDX events (UDP), so
+    // that both sides of a connection see the same transitions. Friends are
+    // kept regardless so we can reconnect to them later.
     final now = DateTime.now();
     final newMap = Map<String, PeerState>.from(state.peers);
     final staleKeys = <String>[];
     newMap.forEach((key, peer) {
-      var currentPeer = peer;
-
-      // Clear stale BLE IDs if no BLE ANNOUNCE was received within threshold.
-      // A BLE ID with no BLE timestamp can only be legacy/suspect state; clear
-      // it so UDP-only peers do not remain stuck in the Nearby list.
-      final hasStaleBlePath = currentPeer.hasBleConnection &&
-          (currentPeer.lastBleSeen == null ||
-              now.difference(currentPeer.lastBleSeen!) > action.staleThreshold);
-      if (hasStaleBlePath) {
-        currentPeer = PeerState(
-          publicKey: currentPeer.publicKey,
-          nickname: currentPeer.nickname,
-          connectionState: currentPeer.connectionState,
-          transport: currentPeer.transport,
-          rssi: currentPeer.rssi,
-          protocolVersion: currentPeer.protocolVersion,
-          lastSeen: currentPeer.lastSeen,
-          bleCentralDeviceId: null,
-          blePeripheralDeviceId: null,
-          lastBleSeen: null,
-          lastUdpSeen: currentPeer.lastUdpSeen,
-          udpAddress: currentPeer.udpAddress,
-          linkLocalAddress: currentPeer.linkLocalAddress,
-          udpAddressCandidates: currentPeer.udpAddressCandidates,
-          isFriend: currentPeer.isFriend,
-          lastDirectReachAt: currentPeer.lastDirectReachAt,
-          hasLiveUdpConnection: currentPeer.hasLiveUdpConnection,
-        );
-        newMap[key] = currentPeer;
-      }
-
-      if (currentPeer.connectionState != PeerConnectionState.connected) return;
-      if (currentPeer.lastSeen == null) return;
-
-      final timeSinceLastSeen = now.difference(currentPeer.lastSeen!);
+      if (peer.isFriend) return;
+      if (peer.lastSeen == null) return;
+      final timeSinceLastSeen = now.difference(peer.lastSeen!);
       if (timeSinceLastSeen > action.staleThreshold) {
-        if (currentPeer.isFriend) {
-          // Friends are marked as disconnected when stale (no ANNOUNCE received).
-          // Clear BLE IDs (out of BLE range) but preserve UDP address — it's
-          // the last known location and needed for reconnection attempts.
-          // Clearing it would make the peer unreachable, preventing signaling
-          // and removing it from wellConnectedFriends.
-          newMap[key] = PeerState(
-            publicKey: currentPeer.publicKey,
-            nickname: currentPeer.nickname,
-            connectionState: PeerConnectionState.disconnected,
-            transport: currentPeer.transport,
-            rssi: -100,
-            protocolVersion: currentPeer.protocolVersion,
-            lastSeen: currentPeer.lastSeen,
-            bleCentralDeviceId: null,
-            blePeripheralDeviceId: null,
-            lastBleSeen: null,
-            lastUdpSeen: currentPeer.lastUdpSeen,
-            udpAddress: currentPeer.udpAddress, // Preserve for reconnection
-            linkLocalAddress: currentPeer.linkLocalAddress,
-            udpAddressCandidates: currentPeer.udpAddressCandidates,
-            isFriend: true,
-            lastDirectReachAt: currentPeer.lastDirectReachAt,
-            hasLiveUdpConnection: currentPeer.hasLiveUdpConnection,
-          );
-        } else {
-          staleKeys.add(key);
-        }
+        staleKeys.add(key);
       }
     });
     for (final key in staleKeys) {

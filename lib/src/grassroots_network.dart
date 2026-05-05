@@ -22,8 +22,8 @@ import 'routing/message_router.dart';
 import 'store/store.dart';
 import 'transport/transport_service.dart';
 
-/// Configuration for Bitchat transport
-class BitchatConfig {
+/// Configuration for Grassroots transport
+class GrassrootsNetworkConfig {
   /// Whether to auto-connect to discovered peers
   final bool autoConnect;
 
@@ -48,7 +48,7 @@ class BitchatConfig {
   /// Whether to enable UDP transport (can be overridden by TransportSettingsStore)
   final bool enableUdp;
 
-  const BitchatConfig({
+  const GrassrootsNetworkConfig({
     this.autoConnect = true,
     this.autoStart = true,
     this.scanDuration,
@@ -119,40 +119,40 @@ Set<String> computeStaleUdpPeerPubkeys({
   return stale;
 }
 
-/// Main Bitchat transport API.
+/// Main Grassroots transport API.
 ///
-/// This is the entry point for GSG to use Bitchat as a transport layer.
+/// This is the entry point for GSG to use Grassroots as a transport layer.
 ///
 /// Usage:
 /// ```dart
-/// final identity = BitchatIdentity(
+/// final identity = GrassrootsIdentity(
 ///   publicKey: myPubKey,
 ///   privateKey: myPrivKey,
 ///   nickname: 'Alice',
 /// );
 ///
-/// final bitchat = Bitchat(identity: identity);
+/// final grassroots = GrassrootsNetwork(identity: identity);
 ///
-/// bitchat.onMessageReceived = (senderPubkey, payload) {
+/// grassroots.onMessageReceived = (senderPubkey, payload) {
 ///   // Handle incoming GSG block
 /// };
 ///
-/// bitchat.onPeerConnected = (peer) {
+/// grassroots.onPeerConnected = (peer) {
 ///   // Send ANNOUNCE, start cordial dissemination
 /// };
 ///
-/// await bitchat.initialize();
-/// await bitchat.start();
+/// await grassroots.initialize();
+/// await grassroots.start();
 ///
 /// // Send a message
-/// await bitchat.send(recipientPubkey, gsgBlockData);
+/// await grassroots.send(recipientPubkey, gsgBlockData);
 /// ```
-class Bitchat {
+class GrassrootsNetwork {
   /// Our identity (from GSG layer)
-  final BitchatIdentity identity;
+  final GrassrootsIdentity identity;
 
   /// Configuration
-  final BitchatConfig config;
+  final GrassrootsNetworkConfig config;
 
   /// Redux store for app state
   final Store<AppState> store;
@@ -307,9 +307,9 @@ class Bitchat {
 
   PeersState get _peersState => store.state.peers;
 
-  Bitchat({
+  GrassrootsNetwork({
     required this.identity,
-    this.config = const BitchatConfig(),
+    this.config = const GrassrootsNetworkConfig(),
     required this.store,
   }) {
     _protocolHandler = ProtocolHandler(identity: identity);
@@ -475,7 +475,7 @@ class Bitchat {
     }
 
     _initialized = true;
-    debugPrint('Initializing Bitchat transport');
+    debugPrint('Initializing Grassroots transport');
 
     bool anyTransportInitialized = false;
 
@@ -498,7 +498,7 @@ class Bitchat {
       }
 
       debugPrint(
-        'Bitchat transport initialized (BLE: $_bleAvailable, UDP: $_udpAvailable)',
+        'Grassroots transport initialized (BLE: $_bleAvailable, UDP: $_udpAvailable)',
       );
 
       // Auto-start if configured
@@ -532,7 +532,6 @@ class Bitchat {
 
       // Create BLE transport service (manages BLE manager + router)
       _bleService = BleTransportService(
-        serviceUuid: identity.bleServiceUuid,
         identity: identity,
         store: store,
         localName: config.localName ?? identity.nickname,
@@ -639,7 +638,7 @@ class Bitchat {
       return;
     }
 
-    debugPrint('Starting Bitchat transport');
+    debugPrint('Starting Grassroots transport');
 
     // Start BLE if available
     if (_bleAvailable) {
@@ -674,7 +673,7 @@ class Bitchat {
   Future<void> stop() async {
     if (!_started) return;
 
-    debugPrint('Stopping Bitchat transport');
+    debugPrint('Stopping Grassroots transport');
     _started = false;
     _announceTimer?.cancel();
     _announceTimer = null;
@@ -1140,6 +1139,7 @@ class Bitchat {
 
     // Friends rely on us to tell them which RV agents to contact when we
     // disappear. Re-broadcast whenever the list changes.
+    debugPrint("Broadcasting RV list to friends");
     _broadcastRvListToFriends();
   }
 
@@ -1469,6 +1469,15 @@ class Bitchat {
 
     // Broadcast ANNOUNCE with new nickname to all connected peers
     await _broadcastAnnounce();
+  }
+
+  /// Apply a debug change to which BLE roles this device runs.
+  /// Dispatches a Redux action and restarts the BLE transport so the new
+  /// mode takes effect immediately.
+  Future<void> setBleRoleMode(BleRoleMode mode) async {
+    if (store.state.settings.bleRoleMode == mode) return;
+    store.dispatch(SetBleRoleModeAction(mode));
+    await _bleService?.applyRoleModeChange();
   }
 
   static const _uuid = Uuid();
@@ -1948,7 +1957,7 @@ class Bitchat {
     Uint8List recipientPubkey,
     Uint8List signalingPayload,
   ) async {
-    final packet = BitchatPacket(
+    final packet = GrassrootsPacket(
       type: PacketType.signaling,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
@@ -2924,7 +2933,7 @@ class Bitchat {
 
   /// Set up SignalingService callbacks
   void _setupSignalingCallbacks() {
-    // SignalingService sends signaling payloads through us (wrapped in BitchatPacket)
+    // SignalingService sends signaling payloads through us (wrapped in GrassrootsPacket)
     _signalingService.sendSignaling =
         (recipientPubkey, signalingPayload) async {
       final bytes = await _createSignedSignalingPacket(
@@ -3026,7 +3035,23 @@ class Bitchat {
     // NAT-translated address the friend observed — correct external port included.
     // The corrected address will be broadcast to all friends on the next
     // periodic ANNOUNCE cycle.
-    _signalingService.onAddrReflected = (ip, port) {
+    _signalingService.onAddrReflected = (senderPubkey, ip, port) {
+      // The GLP-spec response to a registration ANNOUNCE is an addrReflect.
+      // If the sender is a configured (or in-flight) rendezvous server,
+      // treat it as authoritative proof of the round-trip and unblock
+      // _verifyRendezvousServerResponds. The server's separate ANNOUNCE-back
+      // is informational — relying on it is fragile because that send path
+      // is fire-and-forget and can be dropped on stream tear-down.
+      final senderHex =
+          senderPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+      if (_isRendezvousPubkeyHex(senderHex)) {
+        debugPrint(
+          '[rendezvous] Server ${senderHex.substring(0, 8)}... acknowledged '
+          'via addrReflect',
+        );
+        _completeRendezvousResponseWaiters(senderHex);
+      }
+
       final reflectedIp = InternetAddress.tryParse(ip);
       if (reflectedIp == null) return;
 
@@ -3098,17 +3123,13 @@ class Bitchat {
       onPeerDisconnected?.call(peer);
     };
 
-    // Listen to connection events for ANNOUNCE broadcasts
+    // Listen to connection events for bookkeeping only. ANNOUNCE traffic is
+    // driven exclusively by the periodic announce timer — sending on stream
+    // establishment would race with the periodic broadcast and the
+    // application's BLE-address rotation handling.
     _bleService!.connectionStream.listen((event) {
       if (event.connected) {
-        debugPrint('BLE device connected: ${event.peerId}');
-        // Send ANNOUNCE directly to the new device immediately.
-        // Don't wait for the next periodic broadcast — by then the device ID
-        // may be stale (BLE address rotation). This also ensures the
-        // peripheral side learns our identity right away (fixes Issue C:
-        // asymmetric discovery where peripheral never receives central's
-        // ANNOUNCE).
-        _sendAnnounceToDevice(event.peerId);
+        // debugPrint('BLE device connected: ${event.peerId}');
       } else {
         debugPrint('BLE device disconnected: ${event.peerId}');
         _bleFriendAnnounceSent.remove(event.peerId);
@@ -3123,7 +3144,7 @@ class Bitchat {
     // Forward UDP data to the MessageRouter for processing
     _udpService!.onUdpDataReceived = (peerId, data) {
       try {
-        final packet = BitchatPacket.deserialize(data);
+        final packet = GrassrootsPacket.deserialize(data);
         // Observed source address: the UDX remote, if known. Used by the
         // signaling matcher to learn cold-call senders' public addresses.
         final remote = _udpService!.getRemoteAddress(peerId);
@@ -3396,6 +3417,9 @@ class Bitchat {
   /// Perform a periodic scan for new BLE devices
   Future<void> _periodicScan() async {
     if (!_bleAvailable) return;
+    if (store.state.settings.bleRoleMode == BleRoleMode.peripheralOnly) {
+      return;
+    }
     try {
       store.dispatch(BleScanningChangedAction(true));
       await _bleService!.scan(timeout: config.scanDuration);
@@ -3435,11 +3459,16 @@ class Bitchat {
 
   /// Send ANNOUNCE directly to a specific BLE device ID.
   ///
-  /// Called immediately when a new BLE connection is established (either as
-  /// central or peripheral). Sends with address if the device maps to a known
-  /// friend, without address otherwise (privacy). This ensures the other side
-  /// learns our identity immediately — don't wait for the periodic broadcast
-  /// which may use stale device IDs.
+  /// Called from the periodic [_broadcastAnnounce] loop and from
+  /// [_sendFriendAnnounceToConnectedBlePaths] (which fires when we receive
+  /// an ANNOUNCE from a freshly-identified friend, to close the privacy
+  /// gap where the previous periodic broadcast had to omit our address
+  /// because we hadn't yet linked the device ID to a pubkey).
+  ///
+  /// Crucially, NOT called on BLE-connection-established events — the
+  /// connection-stream listener is bookkeeping only. ANNOUNCE traffic is
+  /// strictly cycle-driven; firing on stream establishment races the
+  /// periodic broadcast and the BLE-address-rotation handling.
   Future<bool> _sendAnnounceToDevice(String deviceId) async {
     if (_bleService == null || !_bleAvailable) return false;
 
@@ -3521,7 +3550,7 @@ class Bitchat {
       linkLocalAddress: normalizedLinkLocal,
       addressCandidates: normalizedCandidates,
     );
-    final packet = BitchatPacket(
+    final packet = GrassrootsPacket(
       type: PacketType.announce,
       ttl: 0,
       senderPubkey: identity.publicKey,
@@ -3555,7 +3584,7 @@ class Bitchat {
       address: normalizedAddress,
       addressCandidates: _candidateAddresses(),
     );
-    final packet = BitchatPacket(
+    final packet = GrassrootsPacket(
       type: PacketType.announce,
       ttl: 0,
       senderPubkey: identity.publicKey,

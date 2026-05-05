@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/src/bitchat.dart';
-import 'package:bitchat_transport/src/store/settings_state.dart';
+import 'package:grassroots_networking/src/grassroots_network.dart';
+import 'package:grassroots_networking/src/store/settings_state.dart';
 
 void main() {
   group('shouldAcceptRendezvousReply', () {

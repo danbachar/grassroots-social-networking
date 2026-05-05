@@ -6,6 +6,26 @@ enum TransportProtocol {
   udp,
 }
 
+/// Debug knob: which BLE roles this device should run.
+///
+/// In production both roles are always on (`auto`) so peer discovery is
+/// symmetric. The other modes exist so a developer can deterministically
+/// produce asymmetric topologies for testing — e.g. force one device to be
+/// peripheral-only and confirm the consumer falls back to the peripheral
+/// path for outbound sends.
+enum BleRoleMode {
+  /// Scan AND advertise (default; produces both central and peripheral paths).
+  auto,
+
+  /// Scan only — never advertise. Peers won't dial us, so we'll only ever
+  /// have `central:*` paths.
+  centralOnly,
+
+  /// Advertise only — never scan. We won't dial peers, so we'll only ever
+  /// have `peripheral:*` paths.
+  peripheralOnly,
+}
+
 /// Extension for display info
 extension TransportProtocolDisplay on TransportProtocol {
   String get displayName {
@@ -91,6 +111,9 @@ class SettingsState {
   /// Full configured rendezvous server list.
   final List<RendezvousServerSettings> rendezvousServers;
 
+  /// Which BLE roles this device should run. Default `auto`.
+  final BleRoleMode bleRoleMode;
+
   const SettingsState({
     this.bluetoothEnabled = true,
     this.udpEnabled = true,
@@ -101,6 +124,7 @@ class SettingsState {
     this.anchorAddress,
     this.anchorPubkeyHex,
     this.rendezvousServers = const [],
+    this.bleRoleMode = BleRoleMode.auto,
   });
 
   static const SettingsState initial = SettingsState();
@@ -159,6 +183,7 @@ class SettingsState {
     bool? udpEnabled,
     List<TransportProtocol>? transportPriority,
     List<RendezvousServerSettings>? rendezvousServers,
+    BleRoleMode? bleRoleMode,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? anchorAddress = _sentinel,
     Object? anchorPubkeyHex = _sentinel,
@@ -168,6 +193,7 @@ class SettingsState {
       udpEnabled: udpEnabled ?? this.udpEnabled,
       transportPriority: transportPriority ?? this.transportPriority,
       rendezvousServers: rendezvousServers ?? this.rendezvousServers,
+      bleRoleMode: bleRoleMode ?? this.bleRoleMode,
       anchorAddress: identical(anchorAddress, _sentinel)
           ? this.anchorAddress
           : anchorAddress as String?,
@@ -185,6 +211,7 @@ class SettingsState {
         'anchorPubkeyHex': anchorPubkeyHex,
         'rendezvousServers':
             rendezvousServers.map((server) => server.toJson()).toList(),
+        'bleRoleMode': bleRoleMode.name,
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -193,6 +220,12 @@ class SettingsState {
                 entry as Map<String, dynamic>))
             .toList() ??
         const <RendezvousServerSettings>[];
+
+    final roleModeName = json['bleRoleMode'] as String?;
+    final bleRoleMode = BleRoleMode.values.firstWhere(
+      (m) => m.name == roleModeName,
+      orElse: () => BleRoleMode.auto,
+    );
 
     return SettingsState(
       bluetoothEnabled: json['bluetoothEnabled'] as bool? ?? true,
@@ -207,6 +240,7 @@ class SettingsState {
       anchorAddress: json['anchorAddress'] as String?,
       anchorPubkeyHex: json['anchorPubkeyHex'] as String?,
       rendezvousServers: rendezvousServers,
+      bleRoleMode: bleRoleMode,
     );
   }
 
@@ -220,7 +254,8 @@ class SettingsState {
           listEquals(transportPriority, other.transportPriority) &&
           anchorAddress == other.anchorAddress &&
           anchorPubkeyHex == other.anchorPubkeyHex &&
-          listEquals(rendezvousServers, other.rendezvousServers);
+          listEquals(rendezvousServers, other.rendezvousServers) &&
+          bleRoleMode == other.bleRoleMode;
 
   @override
   int get hashCode => Object.hash(
@@ -230,6 +265,7 @@ class SettingsState {
         anchorAddress,
         anchorPubkeyHex,
         Object.hashAll(rendezvousServers),
+        bleRoleMode,
       );
 
   @override

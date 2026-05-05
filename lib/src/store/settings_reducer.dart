@@ -91,5 +91,9 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return action.settings;
   }
 
+  if (action is SetBleRoleModeAction) {
+    return state.copyWith(bleRoleMode: action.mode);
+  }
+
   return state;
 }

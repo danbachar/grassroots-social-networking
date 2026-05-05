@@ -1,5 +1,5 @@
 import 'package:flutter/foundation.dart';
-import 'package:bitchat_transport/bitchat_transport.dart';
+import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -35,7 +35,7 @@ late final Store<AppState> appStore;
 // Global persistence service
 late final PersistenceService persistenceService;
 
-Future<BitchatIdentity> _initIdentity() async {
+Future<GrassrootsIdentity> _initIdentity() async {
   const storage = FlutterSecureStorage();
   var identityValue = await storage.read(key: 'identity');
   if (identityValue == null) {
@@ -52,7 +52,7 @@ Future<BitchatIdentity> _initIdentity() async {
     String nickname =
         'User_${publicKeyBytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
 
-    var id = await BitchatIdentity.create(
+    var id = await GrassrootsIdentity.create(
       keyPair: keyPair,
       nickname: nickname,
     );
@@ -63,8 +63,8 @@ Future<BitchatIdentity> _initIdentity() async {
     debugPrint('Identity found in secure storage.');
   }
 
-  final BitchatIdentity identity =
-      BitchatIdentity.fromMap(jsonDecode(identityValue));
+  final GrassrootsIdentity identity =
+      GrassrootsIdentity.fromMap(jsonDecode(identityValue));
 
   debugPrint('Private Key Bytes (Seed): ${identity.privateKey.length} bytes');
   debugPrint('Public Key Bytes: ${identity.publicKey.length} bytes');
@@ -85,7 +85,6 @@ Map<String, dynamic> _serializeAppState(AppState state) {
             'rssi': e.value.rssi,
             'isConnecting': e.value.isConnecting,
             'isConnected': e.value.isConnected,
-            'lastError': e.value.lastError,
             'serviceUuid': e.value.serviceUuid,
             'lastSeen': e.value.lastSeen.toIso8601String(),
           },
@@ -258,23 +257,23 @@ class MainApp extends StatelessWidget {
       child: MaterialApp(
         navigatorKey: navigatorKey,
         theme: ThemeData.dark(),
-        home: const BitchatHome(),
+        home: const GrassrootsHome(),
       ),
     );
   }
 }
 
-class BitchatHome extends StatefulWidget {
-  const BitchatHome({super.key});
+class GrassrootsHome extends StatefulWidget {
+  const GrassrootsHome({super.key});
 
   @override
-  State<BitchatHome> createState() => _BitchatHomeState();
+  State<GrassrootsHome> createState() => _GrassrootsHomeState();
 }
 
-class _BitchatHomeState extends State<BitchatHome>
+class _GrassrootsHomeState extends State<GrassrootsHome>
     with TickerProviderStateMixin {
-  BitchatIdentity? _identity;
-  Bitchat? _bitchat;
+  GrassrootsIdentity? _identity;
+  GrassrootsNetwork? _grassroots;
   Timer? _refreshTimer;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   int _currentIndex = 1; // Start on "Around" tab (center)
@@ -287,7 +286,7 @@ class _BitchatHomeState extends State<BitchatHome>
   bool get _udpAvailable => appStore.state.transports.udpState.isUsable;
 
   /// Get our UDP address for friend communication
-  String? get _myUdpAddress => _bitchat?.udpAddress;
+  String? get _myUdpAddress => _grassroots?.udpAddress;
 
   /// Get nearby peers from Redux store (BLE-connected peers in physical proximity).
   /// For the "Nearby" section - only peers reachable via Bluetooth.
@@ -338,7 +337,7 @@ class _BitchatHomeState extends State<BitchatHome>
   }
 
   void _checkPendingChat() {
-    if (_pendingChatPeerHex != null && _bitchat != null && _identity != null) {
+    if (_pendingChatPeerHex != null && _grassroots != null && _identity != null) {
       final peerHex = _pendingChatPeerHex!;
       _pendingChatPeerHex = null;
 
@@ -357,7 +356,7 @@ class _BitchatHomeState extends State<BitchatHome>
   void dispose() {
     _connectivitySubscription?.cancel();
     _refreshTimer?.cancel();
-    _bitchat?.dispose();
+    _grassroots?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
     super.dispose();
@@ -367,12 +366,12 @@ class _BitchatHomeState extends State<BitchatHome>
     try {
       final identity = await _initIdentity();
 
-      final bitchat = Bitchat(
+      final grassroots = GrassrootsNetwork(
         identity: identity,
         store: appStore,
       );
 
-      bitchat.onMessageReceived =
+      grassroots.onMessageReceived =
           (messageId, senderPubkey, payload, transport) {
         _handleIncomingMessage(messageId, senderPubkey, payload, transport);
       };
@@ -380,12 +379,12 @@ class _BitchatHomeState extends State<BitchatHome>
       // Friend presence is handled at the transport layer; no app-layer
       // callback needed for UDP initialization.
 
-      // bitchat.onPeerConnected = (peer) {
+      // grassroots.onPeerConnected = (peer) {
       //   print('Peer connected: ${peer.displayName}');
       //   // PeerStore already has the peer - just track nickname changes
       // };
 
-      // bitchat.onPeerUpdated = (peer) {
+      // grassroots.onPeerUpdated = (peer) {
       //   print('Peer updated: ${peer.displayName}');
 
       //   // Check if nickname changed - use peerStore to get the previous state
@@ -394,19 +393,19 @@ class _BitchatHomeState extends State<BitchatHome>
       //   // This callback is mainly for nickname change animations
       // };
 
-      // bitchat.onPeerDisconnected = (peer) {
+      // grassroots.onPeerDisconnected = (peer) {
       //   print('Peer disconnected: ${peer.displayName}');
       //   // PeerStore already updated - UI will refresh via _onPeersChanged
       // };
 
       setState(() {
         _identity = identity;
-        _bitchat = bitchat;
+        _grassroots = grassroots;
       });
 
-      final success = await bitchat.initialize();
+      final success = await grassroots.initialize();
       if (!success) {
-        debugPrint('Bitchat initialization failed');
+        debugPrint('Grassroots initialization failed');
         return;
       }
 
@@ -611,13 +610,13 @@ class _BitchatHomeState extends State<BitchatHome>
 
   /// Unfriend someone - removes them from our list and notifies them
   Future<void> _unfriend(String peerHex) async {
-    if (_bitchat == null) return;
+    if (_grassroots == null) return;
 
     final pubkey = ChatMessage.hexToPubkey(peerHex);
 
     // Send the revoke message so they remove us too
     final block = FriendshipRevokeBlock();
-    await _bitchat!.send(pubkey, block.serialize());
+    await _grassroots!.send(pubkey, block.serialize());
 
     // Remove from our friend list (Redux handles both friendships and peers)
     appStore.dispatch(RemoveFriendshipAction(peerHex));
@@ -637,9 +636,9 @@ class _BitchatHomeState extends State<BitchatHome>
       String senderHex, String senderName, String content) async {
     const AndroidNotificationDetails androidDetails =
         AndroidNotificationDetails(
-      'bitchat_messages',
+      'grassroots_messages',
       'Messages',
-      channelDescription: 'Bitchat message notifications',
+      channelDescription: 'Grassroots message notifications',
       importance: Importance.high,
       priority: Priority.high,
     );
@@ -666,9 +665,9 @@ class _BitchatHomeState extends State<BitchatHome>
       String senderHex, String senderName) async {
     const AndroidNotificationDetails androidDetails =
         AndroidNotificationDetails(
-      'bitchat_friend_requests',
+      'grassroots_friend_requests',
       'Friend Requests',
-      channelDescription: 'Bitchat friend request notifications',
+      channelDescription: 'Grassroots friend request notifications',
       importance: Importance.high,
       priority: Priority.high,
     );
@@ -697,7 +696,7 @@ class _BitchatHomeState extends State<BitchatHome>
       MaterialPageRoute(
         builder: (context) => ChatScreen(
           peer: peer,
-          bitchat: _bitchat!,
+          grassroots: _grassroots!,
           myPubkey: _identity!.publicKey,
           store: appStore,
           onSendFriendRequest: () => _sendFriendRequest(peer),
@@ -710,7 +709,7 @@ class _BitchatHomeState extends State<BitchatHome>
   }
 
   Future<void> _sendFriendRequest(PeerState peer) async {
-    if (_bitchat == null || _identity == null) {
+    if (_grassroots == null || _identity == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -730,8 +729,8 @@ class _BitchatHomeState extends State<BitchatHome>
       message: 'Hey, let\'s be friends!',
     );
 
-    // Send via Bitchat
-    final messageId = await _bitchat!.send(peer.publicKey, block.serialize());
+    // Send via Grassroots
+    final messageId = await _grassroots!.send(peer.publicKey, block.serialize());
     if (messageId == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -772,7 +771,7 @@ class _BitchatHomeState extends State<BitchatHome>
   }
 
   Future<void> _acceptFriendRequest(PeerState peer) async {
-    if (_bitchat == null || _identity == null) {
+    if (_grassroots == null || _identity == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -799,8 +798,8 @@ class _BitchatHomeState extends State<BitchatHome>
     // Create the friendship accept block
     final block = FriendshipAcceptBlock();
 
-    // Send via Bitchat (works over BLE)
-    final messageId = await _bitchat!.send(peer.publicKey, block.serialize());
+    // Send via Grassroots (works over BLE)
+    final messageId = await _grassroots!.send(peer.publicKey, block.serialize());
     if (messageId == null) {
       debugPrint('⚠️ Failed to send friendship accept to ${peer.displayName}');
     }
@@ -1631,8 +1630,8 @@ class _BitchatHomeState extends State<BitchatHome>
             ],
           ),
           subtitle: Text(
-            peer.lastSeen != null
-                ? 'Last seen: ${_formatSecondsAgo(peer.lastSeen!)}'
+            peer.lastBleSeen != null
+                ? 'Last seen: ${_formatSecondsAgo(peer.lastBleSeen!)}'
                 : 'Connecting...',
           ),
           trailing: Row(
@@ -1655,7 +1654,7 @@ class _BitchatHomeState extends State<BitchatHome>
                   color: Colors.redAccent,
                   tooltip: 'Disconnect BLE',
                   onPressed: () {
-                    _bitchat?.disconnectBlePeer(peer.pubkeyHex);
+                    _grassroots?.disconnectBlePeer(peer.pubkeyHex);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
                           content:
@@ -1746,7 +1745,7 @@ class _BitchatHomeState extends State<BitchatHome>
                   color: Colors.blue,
                   tooltip: 'Connect manually',
                   onPressed: () {
-                    _bitchat?.connectBleDevice(device.transportId);
+                    _grassroots?.connectBleDevice(device.transportId);
                     ScaffoldMessenger.of(context).showSnackBar(
                       SnackBar(
                           content: Text(
@@ -1802,7 +1801,7 @@ class _BitchatHomeState extends State<BitchatHome>
   }
 
   void _lookupPeer(String hexPubkey) {
-    if (hexPubkey.isEmpty || _bitchat == null) return;
+    if (hexPubkey.isEmpty || _grassroots == null) return;
 
     try {
       // Convert hex to bytes
@@ -1813,8 +1812,8 @@ class _BitchatHomeState extends State<BitchatHome>
         ),
       );
 
-      final isReachable = _bitchat!.isPeerReachable(pubkeyBytes);
-      final peer = _bitchat!.getPeer(pubkeyBytes);
+      final isReachable = _grassroots!.isPeerReachable(pubkeyBytes);
+      final peer = _grassroots!.getPeer(pubkeyBytes);
 
       showDialog(
         context: context,
@@ -1944,6 +1943,22 @@ class _BitchatHomeState extends State<BitchatHome>
                 ? ChatMessage.pubkeyToHex(_identity!.publicKey)
                 : ''),
             maxLines: 2,
+          ),
+          const SizedBox(height: 12),
+
+          // Regenerate identity (dev / topology-test affordance).
+          // Re-rolls the Ed25519 keypair so peers re-derive lex order, BLE
+          // service UUID rotates, and the device gets to play a fresh role
+          // (central vs peripheral) on each link without uninstall + reinstall.
+          OutlinedButton.icon(
+            icon: const Icon(Icons.refresh),
+            label: const Text('Regenerate Identity'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: Colors.red,
+              side: const BorderSide(color: Colors.red),
+              minimumSize: const Size.fromHeight(44),
+            ),
+            onPressed: _identity == null ? null : _regenerateIdentity,
           ),
           const SizedBox(height: 12),
 
@@ -2083,18 +2098,21 @@ class _BitchatHomeState extends State<BitchatHome>
           onSettingsChanged: () {
             setState(() {});
           },
-          onAddRendezvousServer: _bitchat == null
+          onAddRendezvousServer: _grassroots == null
               ? null
-              : (address, pubkeyHex) => _bitchat!.addRendezvousServer(
+              : (address, pubkeyHex) => _grassroots!.addRendezvousServer(
                     address: address,
                     pubkeyHex: pubkeyHex,
                   ),
-          onRemoveRendezvousServer: _bitchat == null
+          onRemoveRendezvousServer: _grassroots == null
               ? null
-              : (address, pubkeyHex) => _bitchat!.removeRendezvousServer(
+              : (address, pubkeyHex) => _grassroots!.removeRendezvousServer(
                     address: address,
                     pubkeyHex: pubkeyHex,
                   ),
+          onBleRoleModeChanged: _grassroots == null
+              ? null
+              : (mode) => _grassroots!.setBleRoleMode(mode),
         ),
       ),
     );
@@ -2178,7 +2196,7 @@ class _BitchatHomeState extends State<BitchatHome>
           ElevatedButton(
             onPressed: () async {
               final newNickname = controller.text.trim();
-              if (newNickname.isNotEmpty && _bitchat != null) {
+              if (newNickname.isNotEmpty && _grassroots != null) {
                 Navigator.pop(context);
                 await _updateNickname(newNickname);
               }
@@ -2191,10 +2209,10 @@ class _BitchatHomeState extends State<BitchatHome>
   }
 
   Future<void> _updateNickname(String newNickname) async {
-    if (_bitchat == null || _identity == null) return;
+    if (_grassroots == null || _identity == null) return;
 
-    // Update nickname via Bitchat (broadcasts ANNOUNCE)
-    await _bitchat!.updateNickname(newNickname);
+    // Update nickname via Grassroots (broadcasts ANNOUNCE)
+    await _grassroots!.updateNickname(newNickname);
 
     // Persist to secure storage
     const storage = FlutterSecureStorage();
@@ -2209,6 +2227,116 @@ class _BitchatHomeState extends State<BitchatHome>
       const SnackBar(content: Text('Nickname updated!')),
     );
   }
+
+
+  /// Generate a brand-new Ed25519 keypair and restart Grassroots under the new
+  /// identity. Useful for testing BLE topology — the lex tie-break that
+  /// decides who dials is keyed off the service UUID (derived from pubkey),
+  /// so reshuffling the key reshuffles central/peripheral roles without an
+  /// uninstall+reinstall cycle.
+  Future<void> _regenerateIdentity() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Regenerate Identity?'),
+        content: const Text(
+          'This generates a fresh Ed25519 keypair and rebuilds the Grassroots '
+          'transport under the new identity. Your peers will see you as a '
+          'new device — existing friendships, discovered peers and BLE '
+          'connection state are dropped.\n\n'
+          'Used to flip BLE central/peripheral roles for testing without '
+          'uninstall + reinstall.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Regenerate'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    if (!mounted) return;
+
+    // Tear down the current Grassroots instance before swapping identities.
+    // dispose() stops advertising, closes GATT, cancels timers, and flushes
+    // streams — without this we'd run two transports concurrently with
+    // overlapping characteristic UUIDs, which gets confusing fast.
+    final oldGrassroots = _grassroots;
+    setState(() {
+      _grassroots = null;
+      _identity = null;
+    });
+    await oldGrassroots?.dispose();
+
+    // Fresh keypair + nickname (same shape as _initIdentity for a clean install).
+    final algorithm = Ed25519();
+    final keyPair = await algorithm.newKeyPair();
+    final pk = await keyPair.extractPublicKey();
+    final pkBytes = Uint8List.fromList(pk.bytes);
+    final nickname =
+        'User_${pkBytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
+
+    final newIdentity = await GrassrootsIdentity.create(
+      keyPair: keyPair,
+      nickname: nickname,
+    );
+
+    // Persist immediately so a crash mid-restart doesn't leave us with a
+    // stored identity that doesn't match anything in memory.
+    const storage = FlutterSecureStorage();
+    await storage.write(
+      key: 'identity',
+      value: jsonEncode(newIdentity.toJson()),
+    );
+
+    // Rebuild the transport with the new identity (mirrors _initialize).
+    final newGrassroots = GrassrootsNetwork(
+      identity: newIdentity,
+      store: appStore,
+    );
+    newGrassroots.onMessageReceived =
+        (messageId, senderPubkey, payload, transport) {
+      _handleIncomingMessage(messageId, senderPubkey, payload, transport);
+    };
+
+    if (!mounted) return;
+    setState(() {
+      _identity = newIdentity;
+      _grassroots = newGrassroots;
+    });
+
+    final ok = await newGrassroots.initialize();
+    if (!ok) {
+      debugPrint('Grassroots re-initialization failed after identity regen');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Identity regenerated but Grassroots init failed'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('New identity: ${newIdentity.nickname} '
+            '(${newIdentity.shortFingerprint})'),
+      ),
+    );
+  }
+
 
   void _showNicknameChangeAnimation(
       String oldName, String newName, String peerId) {

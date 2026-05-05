@@ -7,7 +7,7 @@ import 'package:flutter/foundation.dart';
 ///
 /// Format: `[magic(4)] [senderPubkey(32)]` = 36 bytes total.
 ///
-/// The magic bytes identify this as a Bitchat punch packet so receivers
+/// The magic bytes identify this as a Grassroots punch packet so receivers
 /// can distinguish it from UDX traffic or other UDP packets.
 ///
 /// Punch packets serve one purpose: to create a NAT mapping. The receiver

@@ -51,12 +51,13 @@ class BleDeviceConnectedAction extends PeerAction {
   BleDeviceConnectedAction(this.deviceId);
 }
 
-/// Mark a discovered BLE device connection as failed
+/// Mark a discovered BLE device connection as failed.
+/// Errors themselves are events, not state — they're logged via the plugin's
+/// path-changed stream and not retained in Redux.
 class BleDeviceConnectionFailedAction extends PeerAction {
   final String deviceId;
-  final String? error;
 
-  BleDeviceConnectionFailedAction(this.deviceId, {this.error});
+  BleDeviceConnectionFailedAction(this.deviceId);
 }
 
 /// Mark a discovered BLE device as disconnected

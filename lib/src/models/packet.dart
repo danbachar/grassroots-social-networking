@@ -2,7 +2,7 @@ import 'dart:typed_data';
 import 'package:logger/logger.dart' show Logger;
 import 'package:uuid/uuid.dart';
 
-/// Packet types matching Bitchat protocol
+/// Packet types matching Grassroots protocol
 enum PacketType {
   /// Peer identity announcement (sent periodically)
   announce(0x01),
@@ -42,9 +42,9 @@ enum PacketType {
   }
 }
 
-/// A Bitchat packet ready for BLE transmission.
+/// A Grassroots packet ready for BLE transmission.
 /// 
-/// Binary format (Bitchat-compatible):
+/// Binary format (Grassroots-compatible):
 /// ```
 /// [0]      : Packet type (1 byte)
 /// [1]      : TTL (1 byte)
@@ -59,7 +59,7 @@ enum PacketType {
 /// 
 /// Total header size: 152 bytes
 /// Max payload for single packet: ~350 bytes (with 500 byte MTU target)
-class BitchatPacket {
+class GrassrootsPacket {
   static const int headerSize = 152;
   static const int maxPayloadSize = 348; // 500 - 152
   static const int defaultTtl = 7;
@@ -90,7 +90,7 @@ class BitchatPacket {
   /// Ed25519 signature over packet contents
   Uint8List signature;
   
-  BitchatPacket({
+  GrassrootsPacket({
     String? packetId,
     required this.type,
     this.ttl = defaultTtl,
@@ -117,11 +117,11 @@ class BitchatPacket {
       recipientPubkey!.every((b) => b == 0);
   
   /// Create a copy with decremented TTL for relaying
-  BitchatPacket decrementTtl() {
+  GrassrootsPacket decrementTtl() {
     if (ttl <= 0) {
       throw StateError('Cannot decrement TTL below 0');
     }
-    return BitchatPacket(
+    return GrassrootsPacket(
       packetId: packetId,
       type: type,
       ttl: ttl - 1,
@@ -181,7 +181,7 @@ class BitchatPacket {
   }
   
   /// Deserialize from binary format
-  static BitchatPacket deserialize(Uint8List data) {
+  static GrassrootsPacket deserialize(Uint8List data) {
     if (data.length < headerSize) {
       throw FormatException('Packet too small: ${data.length} < $headerSize');
     }
@@ -231,7 +231,7 @@ class BitchatPacket {
     final payload = Uint8List.fromList(data.sublist(offset, offset + payloadLength));
     
     // debugPrint("Serialized packet of type $type with payload length $payloadLength");
-    return BitchatPacket(
+    return GrassrootsPacket(
       packetId: packetId,
       type: type,
       ttl: ttl,
@@ -274,5 +274,5 @@ class BitchatPacket {
   }
   
   @override
-  String toString() => 'BitchatPacket($type, ttl=$ttl, payload=${payload.length}b)';
+  String toString() => 'GrassrootsPacket($type, ttl=$ttl, payload=${payload.length}b)';
 }

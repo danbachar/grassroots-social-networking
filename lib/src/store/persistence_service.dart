@@ -10,10 +10,10 @@ import 'messages_state.dart';
 
 /// Service for persisting Redux state to SharedPreferences
 class PersistenceService {
-  static const String _friendshipsKey = 'bitchat_friendships_v2';
-  static const String _settingsKey = 'bitchat_settings_v2';
-  static const String _conversationsKey = 'bitchat_conversations_v2';
-  static const String _unreadCountsKey = 'bitchat_unread_counts_v2';
+  static const String _friendshipsKey = 'grassroots_friendships_v2';
+  static const String _settingsKey = 'grassroots_settings_v2';
+  static const String _conversationsKey = 'grassroots_conversations_v2';
+  static const String _unreadCountsKey = 'grassroots_unread_counts_v2';
 
   /// Debounce timer for batching writes
   Timer? _debounceTimer;

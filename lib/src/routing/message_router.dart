@@ -23,7 +23,7 @@ import 'package:flutter/foundation.dart';
 ///
 /// All transports feed into [processPacket] — one entry point, one format.
 class MessageRouter {
-  final BitchatIdentity identity;
+  final GrassrootsIdentity identity;
   final Store<AppState> store;
   final ProtocolHandler protocolHandler;
   final FragmentHandler fragmentHandler;
@@ -83,7 +83,7 @@ class MessageRouter {
   /// Invalid signatures are dropped immediately.
   /// ANNOUNCE packets bypass deduplication (always processed).
   Future<void> processPacket(
-    BitchatPacket packet, {
+    GrassrootsPacket packet, {
     required PeerTransport transport,
     String? bleDeviceId,
     BleRole? bleRole,
@@ -167,7 +167,7 @@ class MessageRouter {
   // ===== Handlers =====
 
   void _handleAnnounce(
-    BitchatPacket packet, {
+    GrassrootsPacket packet, {
     required PeerTransport transport,
     String? bleDeviceId,
     BleRole? bleRole,
@@ -190,7 +190,7 @@ class MessageRouter {
       discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
     }
     if (isBleAnnounce && discoveredPeer == null) {
-      final theirServiceUuid = BitchatIdentity.deriveServiceUuid(pubkey);
+      final theirServiceUuid = GrassrootsIdentity.deriveServiceUuid(pubkey);
       discoveredPeer =
           _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
       if (discoveredPeer != null && bleDeviceId == null) {
@@ -262,7 +262,7 @@ class MessageRouter {
   }
 
   void _handleMessage(
-    BitchatPacket packet, {
+    GrassrootsPacket packet, {
     required PeerTransport transport,
     String? peerId,
   }) {
@@ -275,7 +275,7 @@ class MessageRouter {
     onAckRequested?.call(transport, peerId, packet.packetId);
   }
 
-  void _handleFragment(BitchatPacket packet) {
+  void _handleFragment(GrassrootsPacket packet) {
     final reassembled = fragmentHandler.processFragment(packet);
     if (reassembled != null) {
       onMessageReceived?.call(
@@ -283,7 +283,7 @@ class MessageRouter {
     }
   }
 
-  void _handleAck(BitchatPacket packet) {
+  void _handleAck(GrassrootsPacket packet) {
     if (packet.payload.isEmpty) return;
     try {
       final messageId = String.fromCharCodes(packet.payload);
@@ -300,7 +300,7 @@ class MessageRouter {
   }
 
   void _handleSignaling(
-    BitchatPacket packet, {
+    GrassrootsPacket packet, {
     String? observedIp,
     int? observedPort,
   }) {
@@ -312,7 +312,7 @@ class MessageRouter {
     );
   }
 
-  void _handleReadReceipt(BitchatPacket packet) {
+  void _handleReadReceipt(GrassrootsPacket packet) {
     if (packet.payload.isEmpty) return;
     try {
       final messageId = String.fromCharCodes(packet.payload);
@@ -329,7 +329,7 @@ class MessageRouter {
 
   // ===== Helpers =====
 
-  bool _isForUs(BitchatPacket packet) {
+  bool _isForUs(GrassrootsPacket packet) {
     if (packet.isBroadcast) return true;
     return _pubkeysEqual(packet.recipientPubkey!, identity.publicKey);
   }

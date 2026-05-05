@@ -442,9 +442,9 @@ class AnchorServer {
     InternetAddressType? observedFamily,
     String? localPublicAddress,
   }) async {
-    BitchatPacket packet;
+    GrassrootsPacket packet;
     try {
-      packet = BitchatPacket.deserialize(data);
+      packet = GrassrootsPacket.deserialize(data);
     } catch (e) {
       _log('Failed to deserialize packet from $peerId: $e');
       return;
@@ -496,7 +496,7 @@ class AnchorServer {
   }
 
   void _handleAnnounce(
-    BitchatPacket packet, {
+    GrassrootsPacket packet, {
     String? observedIp,
     int? observedPort,
     String? localPublicAddress,
@@ -616,7 +616,7 @@ class AnchorServer {
     }
   }
 
-  bool _sendPacket(String pubkeyHex, BitchatPacket packet) {
+  bool _sendPacket(String pubkeyHex, GrassrootsPacket packet) {
     final conn = _peerConnections[pubkeyHex];
     final packetLabel = packet.type.name;
     final isSignaling = packet.type == PacketType.signaling;

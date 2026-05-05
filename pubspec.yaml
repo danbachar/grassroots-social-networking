@@ -1,5 +1,5 @@
-name: bitchat_transport
-description: BLE mesh transport layer for GSG protocol. Based on Bitchat protocol.
+name: grassroots_networking
+description: BLE mesh transport layer for GSG protocol. Grassroots protocol.
 version: 0.1.0
 publish_to: none
 
@@ -11,11 +11,12 @@ dependencies:
   flutter:
     sdk: flutter
   
-  # BLE - Central mode (scanning, connecting to peripherals)
-  flutter_blue_plus: ^1.31.0
-  
-  # BLE - Peripheral mode (advertising, accepting connections)
-  ble_peripheral_bondless: ^2.5.1
+  # Unified BLE transport (central + peripheral, bondless)
+  grassroots_bluetooth_layer:
+    git:
+      url: git@github.com:danbachar/grassroots-bluetooth-layer.git
+      ref: main
+
   
   # Cryptography (Ed25519 signing, SHA-256 hashing)
   cryptography: ^2.9.0

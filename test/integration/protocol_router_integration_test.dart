@@ -2,17 +2,17 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
-import 'package:bitchat_transport/src/models/packet.dart';
-import 'package:bitchat_transport/src/models/peer.dart';
-import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
-import 'package:bitchat_transport/src/routing/message_router.dart';
-import 'package:bitchat_transport/src/store/store.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
+import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
+import 'package:grassroots_networking/src/routing/message_router.dart';
+import 'package:grassroots_networking/src/store/store.dart';
 
 void main() {
-  late BitchatIdentity aliceIdentity;
-  late BitchatIdentity bobIdentity;
+  late GrassrootsIdentity aliceIdentity;
+  late GrassrootsIdentity bobIdentity;
   late ProtocolHandler aliceProtocol;
   late ProtocolHandler bobProtocol;
   late MessageRouter aliceRouter;
@@ -24,13 +24,13 @@ void main() {
     final algorithm = Ed25519();
 
     final aliceKeyPair = await algorithm.newKeyPair();
-    aliceIdentity = await BitchatIdentity.create(
+    aliceIdentity = await GrassrootsIdentity.create(
       keyPair: aliceKeyPair,
       nickname: 'Alice',
     );
 
     final bobKeyPair = await algorithm.newKeyPair();
-    bobIdentity = await BitchatIdentity.create(
+    bobIdentity = await GrassrootsIdentity.create(
       keyPair: bobKeyPair,
       nickname: 'Bob',
     );
@@ -66,8 +66,8 @@ void main() {
       // Alice creates an ANNOUNCE payload
       final announcePayload = aliceProtocol.createAnnouncePayload();
 
-      // Alice wraps it in a BitchatPacket (as BLE transport does)
-      final packet = BitchatPacket(
+      // Alice wraps it in a GrassrootsPacket (as BLE transport does)
+      final packet = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: announcePayload,
@@ -111,7 +111,7 @@ void main() {
       const address = '[2001:db8::1]:4001';
       final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
 
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: announcePayload,
@@ -256,7 +256,7 @@ void main() {
     test('Alice creates UDP ANNOUNCE, Bob receives and decodes it', () async {
       final announcePayload = aliceProtocol.createAnnouncePayload();
 
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: announcePayload,
@@ -296,7 +296,7 @@ void main() {
       const address = '/ip6/::1/udp/4001/udx';
       final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
 
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: announcePayload,
@@ -435,7 +435,7 @@ void main() {
 
     test('ANNOUNCE is always processed even if seen before', () async {
       final announcePayload = aliceProtocol.createAnnouncePayload();
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: announcePayload,
@@ -468,7 +468,7 @@ void main() {
     test('peer announced via BLE then UDP updates transport info', () async {
       // First: Alice announces via BLE
       final bleAnnouncePayload = aliceProtocol.createAnnouncePayload();
-      final blePacket = BitchatPacket(
+      final blePacket = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: bleAnnouncePayload,
@@ -492,7 +492,7 @@ void main() {
       // Then: Alice announces via UDP with address
       const udpAddr = '[2001:db8::a]:4001';
       final udpAnnouncePayload = aliceProtocol.createAnnouncePayload(address: udpAddr);
-      final udpPacket = BitchatPacket(
+      final udpPacket = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: udpAnnouncePayload,
@@ -517,7 +517,7 @@ void main() {
     test('Alice and Bob exchange announces and messages', () async {
       // Alice announces to Bob
       final aliceAnnouncePayload = aliceProtocol.createAnnouncePayload();
-      final aliceAnnouncePacket = BitchatPacket(
+      final aliceAnnouncePacket = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
         payload: aliceAnnouncePayload,
@@ -534,7 +534,7 @@ void main() {
 
       // Bob announces to Alice
       final bobAnnouncePayload = bobProtocol.createAnnouncePayload();
-      final bobAnnouncePacket = BitchatPacket(
+      final bobAnnouncePacket = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: bobIdentity.publicKey,
         payload: bobAnnouncePayload,

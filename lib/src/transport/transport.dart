@@ -1,4 +1,4 @@
-/// Transport layer abstraction for Bitchat.
+/// Transport layer abstraction for Grassroots.
 ///
 /// This module provides:
 /// - [TransportService]: Abstract interface for transport implementations
@@ -18,6 +18,3 @@ export 'hole_punch_service.dart';
 export 'public_address_discovery.dart';
 export 'address_utils.dart';
 export 'connection_service.dart';
-
-// Re-export BLE types needed for advanced usage
-export '../ble/ble_central_service.dart' show DiscoveredDevice, ConnectedPeer;

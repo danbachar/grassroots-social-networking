@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:bitchat_transport/bitchat_transport.dart';
+import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
@@ -10,7 +10,7 @@ import 'package:uuid/uuid.dart';
 
 /// Chat screen for a conversation with a specific peer
 class ChatScreen extends StatefulWidget {
-  final Bitchat bitchat;
+  final GrassrootsNetwork grassroots;
   final PeerState peer;
   final Uint8List myPubkey;
   final Store<AppState> store;
@@ -21,7 +21,7 @@ class ChatScreen extends StatefulWidget {
 
   const ChatScreen({
     super.key,
-    required this.bitchat,
+    required this.grassroots,
     required this.peer,
     required this.myPubkey,
     required this.store,
@@ -69,7 +69,7 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final message in messages) {
       // Only send read receipts for incoming messages with a messageId
       if (!message.isOutgoing && message.messageId != null) {
-        widget.bitchat.sendReadReceipt(
+        widget.grassroots.sendReadReceipt(
           messageId: message.messageId!,
           senderPubkey: senderPubkey,
         );
@@ -116,10 +116,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
 
     // Send in the background — status updates (sending → sent/delivered/failed)
-    // will be dispatched by Bitchat.send() and reflected via the status icon
+    // will be dispatched by GrassrootsNetwork.send() and reflected via the status icon
     final block = SayBlock(content: text);
     debugPrint("Sending '$text' to peer ${widget.peer.displayName}");
-    widget.bitchat
+    widget.grassroots
         .send(widget.peer.publicKey, block.serialize(), messageId: messageId);
   }
 
@@ -147,7 +147,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   void _forwardMessage(ChatMessageState message) {
     // Show dialog to select a peer to forward to
-    final peers = widget.bitchat.connectedPeers;
+    final peers = widget.grassroots.connectedPeers;
 
     if (peers.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -170,7 +170,7 @@ class _ChatScreenState extends State<ChatScreen> {
         peers: peers,
         onForward: (peer) async {
           Navigator.pop(context);
-          final forwardedMessageId = await widget.bitchat.send(
+          final forwardedMessageId = await widget.grassroots.send(
             peer.publicKey,
             Uint8List.fromList(message.content.codeUnits),
           );
@@ -459,9 +459,9 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    // Send via Bitchat using SayBlock
+    // Send via Grassroots using SayBlock
     final block = SayBlock(content: message.content);
-    final messageId = await widget.bitchat.send(
+    final messageId = await widget.grassroots.send(
       widget.peer.publicKey,
       block.serialize(),
       messageId: existingMessageId,

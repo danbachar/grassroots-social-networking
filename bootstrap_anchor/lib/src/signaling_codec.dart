@@ -225,8 +225,6 @@ class SignalingCodec {
   }
 
   RvListMessage _decodeRvList(Uint8List data) {
-    if (data.length < 2) {
-      throw const FormatException('RvList payload too short');
     }
     final count = _readUint16(data, 0);
     var offset = 2;

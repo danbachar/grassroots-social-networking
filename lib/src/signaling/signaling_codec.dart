@@ -2,8 +2,8 @@ import 'dart:typed_data';
 
 /// Signaling message types for the rendezvous reconnection protocol.
 ///
-/// These ride inside [BitchatPacket] payloads with [PacketType.signaling].
-/// Authentication is handled by the outer BitchatPacket's Ed25519 signature.
+/// These ride inside [GrassrootsPacket] payloads with [PacketType.signaling].
+/// Authentication is handled by the outer GrassrootsPacket's Ed25519 signature.
 ///
 /// Wire byte values are stable; gaps reflect deprecated message types
 /// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the rendezvous

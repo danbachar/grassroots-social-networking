@@ -193,7 +193,7 @@ extension PeerTransportDisplay on PeerTransport {
   }
 }
 
-/// Represents a peer in the Bitchat network.
+/// Represents a peer in the Grassroots network.
 ///
 /// A peer can be:
 /// - Directly connected via BLE
@@ -293,77 +293,6 @@ class Peer {
   /// Get the best transport to use for sending to this peer
   /// Priority: Bluetooth > UDP
   PeerTransport? get bestAvailableTransport => addresses.preferredTransport;
-  
-  /// Update peer state from a received ANNOUNCE
-  void updateFromAnnounce({
-    required String nickname,
-    required int protocolVersion,
-    required DateTime receivedAt,
-    String? udpAddress,
-  }) {
-    this.nickname = nickname;
-    this.protocolVersion = protocolVersion;
-    lastSeen = receivedAt;
-    connectionState = PeerConnectionState.connected;
-
-    // Update UDP address if provided
-    if (udpAddress != null && udpAddress.isNotEmpty) {
-      addresses.updateUdpAddress(udpAddress);
-    }
-  }
-  
-  /// Update the peer's transport addresses
-  void updateAddresses({
-    String? bleDeviceId,
-    String? udpAddress,
-  }) {
-    if (bleDeviceId != null) {
-      addresses.updateBleAddress(bleDeviceId);
-    }
-    if (udpAddress != null) {
-      addresses.updateUdpAddress(udpAddress);
-    }
-
-    // Update current transport to best available
-    final best = addresses.preferredTransport;
-    if (best != null) {
-      transport = best;
-    }
-  }
-  
-  /// Mark peer as disconnected from BLE
-  void markBleDisconnected() {
-    addresses.bleDeviceId = null;
-    addresses.bleLastSeen = null;
-
-    // Update connection state and transport
-    if (addresses.hasUdpAddress) {
-      transport = PeerTransport.udp;
-      // Keep connected state if we have UDP
-    } else {
-      connectionState = PeerConnectionState.disconnected;
-      rssi = -100;
-    }
-  }
-
-  /// Mark peer as disconnected from UDP
-  void markUdpDisconnected() {
-    addresses.udpLastSeen = null;
-
-    // Update transport if we have BLE
-    if (addresses.hasBleAddress) {
-      transport = PeerTransport.bleDirect;
-    } else {
-      connectionState = PeerConnectionState.disconnected;
-    }
-  }
-  
-  /// Mark peer as disconnected
-  void markDisconnected() {
-    connectionState = PeerConnectionState.disconnected;
-    addresses.clear();
-    rssi = -100;
-  }
   
   @override
   bool operator ==(Object other) =>

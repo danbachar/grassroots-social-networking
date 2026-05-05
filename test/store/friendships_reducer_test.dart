@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/src/store/friendships_state.dart';
-import 'package:bitchat_transport/src/store/friendships_actions.dart';
-import 'package:bitchat_transport/src/store/friendships_reducer.dart';
+import 'package:grassroots_networking/src/store/friendships_state.dart';
+import 'package:grassroots_networking/src/store/friendships_actions.dart';
+import 'package:grassroots_networking/src/store/friendships_reducer.dart';
 
 void main() {
   const peerA = 'aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344';

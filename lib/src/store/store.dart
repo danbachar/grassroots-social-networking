@@ -1,4 +1,4 @@
-/// Redux store for Bitchat application state management
+/// Redux store for Grassroots application state management
 library;
 
 export 'app_state.dart';

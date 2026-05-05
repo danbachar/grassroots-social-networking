@@ -1,6 +1,6 @@
-/// Bitchat Transport Layer for GSG Protocol
+/// Grassroots Networking Layer for GSG Protocol
 /// 
-/// This package provides a BLE mesh transport layer based on the Bitchat protocol.
+/// This package provides a BLE mesh transport layer based on the Grassroots protocol.
 /// It handles:
 /// - BLE Central/Peripheral dual-mode operation
 /// - Packet fragmentation and reassembly
@@ -11,41 +11,41 @@
 /// ## Usage
 /// 
 /// ```dart
-/// import 'package:bitchat_transport/bitchat_transport.dart';
+/// import 'package:grassroots_networking/grassroots_networking.dart';
 /// 
 /// // Create identity (provided by GSG layer)
-/// final identity = BitchatIdentity(
+/// final identity = GrassrootsIdentity(
 ///   publicKey: myPubKey,
 ///   privateKey: myPrivKey,
 ///   nickname: 'Alice',
 /// );
 /// 
-/// // Create Bitchat instance
-/// final bitchat = Bitchat(identity: identity);
+/// // Create GrassrootsNetwork instance
+/// final grassroots = GrassrootsNetwork(identity: identity);
 /// 
 /// // Set up callbacks
-/// bitchat.onMessageReceived = (senderPubkey, payload) {
+/// grassroots.onMessageReceived = (senderPubkey, payload) {
 ///   // Handle incoming GSG block
 /// };
 /// 
-/// bitchat.onPeerConnected = (peer) {
+/// grassroots.onPeerConnected = (peer) {
 ///   // New peer available
 /// };
 /// 
 /// // Initialize and start
-/// await bitchat.initialize();
+/// await grassroots.initialize();
 /// 
 /// // Send messages
-/// await bitchat.send(recipientPubkey, gsgBlockData);
-/// await bitchat.broadcast(gsgBlockData);
+/// await grassroots.send(recipientPubkey, gsgBlockData);
+/// await grassroots.broadcast(gsgBlockData);
 /// ```
 /// 
 /// ## Architecture
 /// 
 /// The package is structured as follows:
 /// 
-/// - `Bitchat` - Main API class for GSG integration
-/// - `BitchatIdentity` - Ed25519 identity provided by GSG
+/// - `GrassrootsNetwork` - Main API class for GSG integration
+/// - `GrassrootsIdentity` - Ed25519 identity provided by GSG
 /// - `Peer` - Represents a connected peer
 /// - `MeshRouter` - Handles routing, relay, and fragmentation
 /// - `BleManager` - Manages BLE Central and Peripheral roles
@@ -53,8 +53,8 @@
 /// 
 /// ## Protocol Compatibility
 /// 
-/// This implementation follows the Bitchat protocol specification for
-/// BLE mesh networking, ensuring compatibility with other Bitchat clients.
+/// This implementation follows the Grassroots protocol specification for
+/// BLE mesh networking, ensuring compatibility with other Grassroots clients.
 /// 
 /// ## Transport Abstraction
 /// 
@@ -62,10 +62,10 @@
 /// allowing multiple transport implementations:
 /// - `BleTransportService` - Bluetooth Low Energy mesh (default)
 /// - Future: WebRTC transport (STUN/TURN/TURNS)
-library bitchat_transport;
+library grassroots_networking;
 
 // Main API
-export 'src/bitchat.dart';
+export 'src/grassroots_network.dart';
 
 // Transport abstraction
 export 'src/transport/transport.dart';

@@ -1,16 +1,16 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
-import 'package:bitchat_transport/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
 
-/// Handles Bitchat protocol logic: packet encoding/decoding,
+/// Handles Grassroots protocol logic: packet encoding/decoding,
 /// ANNOUNCE parsing, MESSAGE handling, etc.
 ///
 /// Pure functions - no state, no I/O, fully testable.
 /// Extracted from transport layer to achieve separation of concerns.
 class ProtocolHandler {
-  final BitchatIdentity identity;
+  final GrassrootsIdentity identity;
   static const int protocolVersion = 1;
 
   const ProtocolHandler({required this.identity});
@@ -64,11 +64,11 @@ class ProtocolHandler {
   }
 
   /// Create MESSAGE packet
-  BitchatPacket createMessagePacket({
+  GrassrootsPacket createMessagePacket({
     required Uint8List payload,
     Uint8List? recipientPubkey,
   }) {
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.message,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
@@ -78,12 +78,12 @@ class ProtocolHandler {
   }
 
   /// Create READ_RECEIPT packet
-  BitchatPacket createReadReceiptPacket({
+  GrassrootsPacket createReadReceiptPacket({
     required String messageId,
     required Uint8List recipientPubkey,
   }) {
     final payload = utf8.encode(messageId);
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.readReceipt,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
@@ -167,12 +167,12 @@ class ProtocolHandler {
   }
 
   /// Create ACK packet (for delivery confirmation)
-  BitchatPacket createAckPacket({
+  GrassrootsPacket createAckPacket({
     required String messageId,
     Uint8List? recipientPubkey,
   }) {
     final payload = utf8.encode(messageId);
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.ack,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
@@ -186,7 +186,7 @@ class ProtocolHandler {
   /// Sign a packet with the identity's Ed25519 private key.
   ///
   /// Mutates [packet.signature] in place.
-  Future<void> signPacket(BitchatPacket packet) async {
+  Future<void> signPacket(GrassrootsPacket packet) async {
     final algorithm = Ed25519();
     final signableBytes = packet.getSignableBytes();
     final signature =
@@ -197,7 +197,7 @@ class ProtocolHandler {
   /// Verify a packet's Ed25519 signature against the sender's public key.
   ///
   /// Returns true if the signature is valid.
-  Future<bool> verifyPacket(BitchatPacket packet) async {
+  Future<bool> verifyPacket(GrassrootsPacket packet) async {
     try {
       final algorithm = Ed25519();
       final signableBytes = packet.getSignableBytes();

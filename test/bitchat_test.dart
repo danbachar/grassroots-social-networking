@@ -1,12 +1,12 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/bitchat_transport.dart';
-import 'package:bitchat_transport/src/mesh/bloom_filter.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
+import 'package:grassroots_networking/grassroots_networking.dart';
+import 'package:grassroots_networking/src/mesh/bloom_filter.dart';
+import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:cryptography/cryptography.dart';
 
 void main() {
-  group('BitchatPacket', () {
+  group('GrassrootsPacket', () {
     late Uint8List testPubkey;
     late Uint8List testPayload;
 
@@ -16,7 +16,7 @@ void main() {
     });
 
     test('serializes and deserializes correctly', () {
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 5,
         senderPubkey: testPubkey,
@@ -25,7 +25,7 @@ void main() {
       );
 
       final serialized = packet.serialize();
-      final deserialized = BitchatPacket.deserialize(serialized);
+      final deserialized = GrassrootsPacket.deserialize(serialized);
 
       expect(deserialized.type, equals(packet.type));
       expect(deserialized.ttl, equals(packet.ttl));
@@ -38,7 +38,7 @@ void main() {
     test('serializes with recipient pubkey', () {
       final recipientPubkey = Uint8List.fromList(List.generate(32, (i) => 32 + i));
 
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 7,
         senderPubkey: testPubkey,
@@ -48,14 +48,14 @@ void main() {
       );
 
       final serialized = packet.serialize();
-      final deserialized = BitchatPacket.deserialize(serialized);
+      final deserialized = GrassrootsPacket.deserialize(serialized);
 
       expect(deserialized.isBroadcast, isFalse);
       expect(deserialized.recipientPubkey, equals(recipientPubkey));
     });
 
     test('decrements TTL correctly', () {
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 5,
         senderPubkey: testPubkey,
@@ -69,7 +69,7 @@ void main() {
     });
 
     test('throws on TTL below zero', () {
-      final packet = BitchatPacket(
+      final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 0,
         senderPubkey: testPubkey,
@@ -82,7 +82,7 @@ void main() {
 
     test('throws on invalid pubkey length', () {
       expect(
-        () => BitchatPacket(
+        () => GrassrootsPacket(
           type: PacketType.message,
           senderPubkey: Uint8List(16), // Wrong length
           payload: testPayload,
@@ -213,10 +213,10 @@ void main() {
     });
   });
 
-  group('BitchatIdentity', () {
+  group('GrassrootsIdentity', () {
     test('derives BLE service UUID from public key', () async {
       final keyPair = await Ed25519().newKeyPair();
-      final identity = await BitchatIdentity.create(
+      final identity = await GrassrootsIdentity.create(
         keyPair: keyPair,
         nickname: 'Test',
       );
@@ -236,22 +236,6 @@ void main() {
 
       expect(peer.connectionState, equals(PeerConnectionState.discovered));
       expect(peer.isReachable, isFalse);
-    });
-
-    test('updates from ANNOUNCE correctly', () {
-      final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
-
-      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -70);
-      peer.updateFromAnnounce(
-        nickname: 'Alice',
-        protocolVersion: 1,
-        receivedAt: DateTime.now(),
-      );
-
-      expect(peer.nickname, equals('Alice'));
-      expect(peer.displayName, equals('Alice'));
-      expect(peer.connectionState, equals(PeerConnectionState.connected));
-      expect(peer.isReachable, isTrue);
     });
 
     test('generates correct display name', () {

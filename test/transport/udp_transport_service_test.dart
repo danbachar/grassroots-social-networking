@@ -5,17 +5,17 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:redux/redux.dart';
-import 'package:bitchat_transport/src/transport/udp_transport_service.dart';
-import 'package:bitchat_transport/src/transport/transport_service.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
-import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/store/store.dart';
+import 'package:grassroots_networking/src/transport/udp_transport_service.dart';
+import 'package:grassroots_networking/src/transport/transport_service.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
+import 'package:grassroots_networking/src/store/store.dart';
 
 /// Create a test identity
-Future<BitchatIdentity> _createTestIdentity(String nickname) async {
+Future<GrassrootsIdentity> _createTestIdentity(String nickname) async {
   final algorithm = Ed25519();
   final keyPair = await algorithm.newKeyPair();
-  return BitchatIdentity.create(keyPair: keyPair, nickname: nickname);
+  return GrassrootsIdentity.create(keyPair: keyPair, nickname: nickname);
 }
 
 /// Create a minimal Redux store for testing
@@ -36,7 +36,7 @@ InternetAddress _loopbackFor(UdpTransportService service) =>
 
 void main() {
   group('UdpTransportService', () {
-    late BitchatIdentity identity;
+    late GrassrootsIdentity identity;
     late Store<AppState> store;
     late ProtocolHandler protocolHandler;
 

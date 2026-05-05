@@ -2,47 +2,45 @@ import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
 import '../transport/address_utils.dart';
 
-/// Represents a discovered peer before identity (ANNOUNCE) is exchanged.
-/// Immutable version for Redux state.
+/// A discovered BLE peer before identity (ANNOUNCE) is exchanged.
+///
+/// This is a strict projection of facts emitted by the grassroots_bluetooth_layer plugin:
+/// the path stream tells us whether a path is connecting/ready/disconnected;
+/// the advertisement stream tells us about RSSI and service UUIDs. Reducers
+/// MUST NOT infer state — every field corresponds to a plugin event or to
+/// explicit user intent (the blacklist).
 @immutable
 class DiscoveredPeerState {
-  /// Transport-specific identifier (BLE device ID, etc.)
+  /// PathId from the plugin, e.g. `central:<remote-id>`.
   final String transportId;
 
-  /// Human-readable name (from BLE advertising, etc.)
+  /// Advertised local name (informational only — most Grassroots devices omit it).
   final String? displayName;
 
-  /// Signal strength indicator
+  /// Latest signal strength reported by the plugin's advertisement stream.
   final int rssi;
 
-  /// When this peer was first discovered
+  /// First time we observed an advertisement matching this pathId.
   final DateTime discoveredAt;
 
-  /// When this peer was last seen
+  /// Most recent time we saw any plugin event (advertisement, path change).
   final DateTime lastSeen;
 
-  /// Whether we're currently attempting to connect
+  /// Set during the window between calling `GrassrootsBluetooth.connect()` and the
+  /// plugin emitting `connected`/`ready`/`failed`. Cleared by every other
+  /// path lifecycle event.
   final bool isConnecting;
 
-  /// Whether we're currently connected (transport level)
+  /// True iff the plugin's last path state was `ready` with `canSend=true`.
   final bool isConnected;
 
-  /// Last connection error, if any
-  final String? lastError;
-
-  /// Public key if known (after ANNOUNCE exchange)
-  final Uint8List? publicKey;
-
-  /// Service UUID (for correlation on iOS)
+  /// Service UUID derived from the peer's public key. The Grassroots prefix
+  /// is the first 8 hex bytes; the next 8 are the pubkey tail. Same peer
+  /// across BLE address rotations always advertises the same service UUID.
   final String? serviceUuid;
 
-  /// Number of consecutive failed connection attempts (for backoff)
-  final int consecutiveFailures;
-
-  /// Earliest time we can retry connection (null = can retry now)
-  final DateTime? nextRetryAfter;
-
-  /// Whether this device was manually disconnected and should not auto-connect
+  /// User explicitly opted not to auto-connect to this peer. Persists across
+  /// adapter cycles and is independent of the plugin's path state.
   final bool isBlacklisted;
 
   const DiscoveredPeerState({
@@ -53,27 +51,16 @@ class DiscoveredPeerState {
     required this.lastSeen,
     this.isConnecting = false,
     this.isConnected = false,
-    this.lastError,
-    this.publicKey,
     this.serviceUuid,
-    this.consecutiveFailures = 0,
-    this.nextRetryAfter,
     this.isBlacklisted = false,
   });
 
-  /// Signal quality indicator (0.0 - 1.0), derived from rssi
+  /// Signal quality indicator (0.0 - 1.0), derived from rssi.
   double get signalQuality {
     if (rssi >= -50) return 1.0;
     if (rssi <= -100) return 0.0;
     return (rssi + 100) / 50.0;
   }
-
-  /// Whether we know this peer's identity (received ANNOUNCE)
-  bool get isIdentified => publicKey != null;
-
-  /// Whether this device is currently in backoff period
-  bool get isInBackoff =>
-      nextRetryAfter != null && DateTime.now().isBefore(nextRetryAfter!);
 
   DiscoveredPeerState copyWith({
     String? transportId,
@@ -83,11 +70,7 @@ class DiscoveredPeerState {
     DateTime? lastSeen,
     bool? isConnecting,
     bool? isConnected,
-    String? lastError,
-    Uint8List? publicKey,
     String? serviceUuid,
-    int? consecutiveFailures,
-    DateTime? nextRetryAfter,
     bool? isBlacklisted,
   }) {
     return DiscoveredPeerState(
@@ -98,11 +81,7 @@ class DiscoveredPeerState {
       lastSeen: lastSeen ?? this.lastSeen,
       isConnecting: isConnecting ?? this.isConnecting,
       isConnected: isConnected ?? this.isConnected,
-      lastError: lastError ?? this.lastError,
-      publicKey: publicKey ?? this.publicKey,
       serviceUuid: serviceUuid ?? this.serviceUuid,
-      consecutiveFailures: consecutiveFailures ?? this.consecutiveFailures,
-      nextRetryAfter: nextRetryAfter ?? this.nextRetryAfter,
       isBlacklisted: isBlacklisted ?? this.isBlacklisted,
     );
   }
@@ -116,10 +95,7 @@ class DiscoveredPeerState {
           rssi == other.rssi &&
           isConnecting == other.isConnecting &&
           isConnected == other.isConnected &&
-          lastError == other.lastError &&
           serviceUuid == other.serviceUuid &&
-          consecutiveFailures == other.consecutiveFailures &&
-          nextRetryAfter == other.nextRetryAfter &&
           isBlacklisted == other.isBlacklisted;
 
   @override
@@ -128,19 +104,16 @@ class DiscoveredPeerState {
         rssi,
         isConnecting,
         isConnected,
-        lastError,
         serviceUuid,
-        consecutiveFailures,
-        nextRetryAfter,
         isBlacklisted,
       );
 
   @override
   String toString() =>
-      'DiscoveredPeerState($transportId, rssi: $rssi, connected: $isConnected, failures: $consecutiveFailures)';
+      'DiscoveredPeerState($transportId, rssi: $rssi, connected: $isConnected)';
 }
 
-/// Immutable peer state for identified peers (after ANNOUNCE)
+/// Immutable peer state for identified peers (after ANNOUNCE).
 @immutable
 class PeerState {
   final Uint8List publicKey;
@@ -151,10 +124,14 @@ class PeerState {
   final int protocolVersion;
   final DateTime? lastSeen;
 
-  /// BLE device ID when our device is the central (we scanned and connected to them)
+  /// PathId of our central → their peripheral path, when one is currently
+  /// ready in the plugin. Set on ANNOUNCE receipt over a central path,
+  /// cleared on `disconnected`/`failed` for that path.
   final String? bleCentralDeviceId;
 
-  /// BLE device ID when our device is the peripheral (they connected to us)
+  /// PathId of their central → our peripheral path, when one is currently
+  /// ready in the plugin. Set on ANNOUNCE receipt over a peripheral path,
+  /// cleared on `disconnected`/`failed` for that path.
   final String? blePeripheralDeviceId;
 
   /// When the last BLE ANNOUNCE was received from this peer.
@@ -227,7 +204,14 @@ class PeerState {
   String get displayName =>
       nickname.isNotEmpty ? nickname : '${pubkeyHex.substring(0, 8)}...';
 
-  /// Whether this peer is currently connected
+  /// Whether this peer is currently connected.
+  ///
+  /// "Connected" means: we have received an ANNOUNCE from this peer over a
+  /// transport that is still live AND we have completed our own ANNOUNCE
+  /// exchange with them. Both sides reach this state within one ANNOUNCE
+  /// round-trip of each other; there is no scenario where one side shows
+  /// "connected" while the other shows "not connected" once both ANNOUNCEs
+  /// have been received.
   bool get isConnected => connectionState == PeerConnectionState.connected;
 
   /// Whether this peer has any BLE connection (central or peripheral)
@@ -371,7 +355,7 @@ class PeerState {
 /// Complete peers state for Redux store
 @immutable
 class PeersState {
-  /// Discovered BLE peers (before ANNOUNCE), keyed by device ID
+  /// Discovered BLE peers (before ANNOUNCE), keyed by pathId.
   final Map<String, DiscoveredPeerState> discoveredBlePeers;
 
   /// Identified peers (after ANNOUNCE), keyed by pubkey hex

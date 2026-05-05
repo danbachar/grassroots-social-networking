@@ -27,7 +27,7 @@ const _defaultUdpDisplayInfo = TransportDisplayInfo(
 
 /// UDP transport service using dart_udx for reliable streams over UDP.
 ///
-/// Uses Bitchat's Ed25519 identity directly. Addressing uses simple
+/// Uses Grassroots's Ed25519 identity directly. Addressing uses simple
 /// ip:port strings.
 ///
 /// ## Lifecycle
@@ -46,8 +46,8 @@ const _defaultUdpDisplayInfo = TransportDisplayInfo(
 ///
 /// ## Connection Identity
 ///
-/// The first message on any new UDX stream MUST be a BitchatPacket of type ANNOUNCE.
-/// This allows the receiver to map the UDX connection to a Bitchat public key.
+/// The first message on any new UDX stream MUST be a GrassrootsPacket of type ANNOUNCE.
+/// This allows the receiver to map the UDX connection to a Grassroots public key.
 /// (Future: Noise XX handshake will replace this.)
 ///
 /// ## No Store-and-Forward
@@ -56,8 +56,8 @@ const _defaultUdpDisplayInfo = TransportDisplayInfo(
 class UdpTransportService extends TransportService {
   static const Duration _defaultHandshakeTimeout = Duration(seconds: 10);
 
-  /// Our Bitchat identity (Ed25519 keypair)
-  final BitchatIdentity identity;
+  /// Our Grassroots identity (Ed25519 keypair)
+  final GrassrootsIdentity identity;
 
   /// Redux store for peer state
   final Store<AppState> store;
@@ -114,7 +114,7 @@ class UdpTransportService extends TransportService {
   // --- Public callbacks ---
 
   /// Called when data is received from a UDP peer.
-  /// The coordinator deserializes as BitchatPacket and routes via MessageRouter.
+  /// The coordinator deserializes as GrassrootsPacket and routes via MessageRouter.
   void Function(String pubkeyHex, Uint8List data)? onUdpDataReceived;
 
   /// Timeout for UDX handshake completion.
@@ -685,7 +685,7 @@ class UdpTransportService extends TransportService {
 
   /// Handle an incoming stream on a connection.
   ///
-  /// Any verified BitchatPacket identifies the sender via its header pubkey.
+  /// Any verified GrassrootsPacket identifies the sender via its header pubkey.
   /// The coordinator maps the connection after verifying the first packet.
   void _handleIncomingStream(UDPSocket socket, UDXStream stream) {
     debugPrint('Incoming UDX stream ${stream.id}');
@@ -797,7 +797,7 @@ class UdpTransportService extends TransportService {
 
   /// Handle a non-UDX packet received on the multiplexer socket.
   ///
-  /// This fires for packets that don't parse as valid UDX (e.g. BitchatPackets
+  /// This fires for packets that don't parse as valid UDX (e.g. GrassrootsPackets
   /// sent via [sendRawTo] from a peer where UDX handshake failed).
   /// Skip hole-punch packets (36 bytes with BCPU magic).
   void _handleRawPacket(Uint8List data, InternetAddress address, int port) {

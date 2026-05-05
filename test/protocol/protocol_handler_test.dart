@@ -1,21 +1,21 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/src/protocol/protocol_handler.dart';
-import 'package:bitchat_transport/src/models/identity.dart';
-import 'package:bitchat_transport/src/models/packet.dart';
+import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
+import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:cryptography/cryptography.dart';
 
 void main() {
   group('ProtocolHandler', () {
     late ProtocolHandler handler;
-    late BitchatIdentity testIdentity;
+    late GrassrootsIdentity testIdentity;
 
     setUp(() async {
       // Create a test identity for testing
       final algorithm = Ed25519();
       final keyPair = await algorithm.newKeyPair();
-      testIdentity = await BitchatIdentity.create(
+      testIdentity = await GrassrootsIdentity.create(
         keyPair: keyPair,
         nickname: 'TestUser',
       );
@@ -71,7 +71,7 @@ void main() {
       test('handles empty nickname', () async {
         final algorithm = Ed25519();
         final keyPair = await algorithm.newKeyPair();
-        final emptyNickIdentity = await BitchatIdentity.create(
+        final emptyNickIdentity = await GrassrootsIdentity.create(
           keyPair: keyPair,
           nickname: '',
         );
@@ -361,7 +361,7 @@ void main() {
       test('packet signed by different identity fails verification', () async {
         // Create a different identity
         final otherKeyPair = await Ed25519().newKeyPair();
-        final otherIdentity = await BitchatIdentity.create(
+        final otherIdentity = await GrassrootsIdentity.create(
           keyPair: otherKeyPair,
           nickname: 'Other',
         );
@@ -388,7 +388,7 @@ void main() {
             recipientPubkey: Uint8List(32),
           ),
           handler.createAckPacket(messageId: 'ack-1'),
-          BitchatPacket(
+          GrassrootsPacket(
             type: PacketType.announce,
             senderPubkey: testIdentity.publicKey,
             payload: handler.createAnnouncePayload(),
@@ -413,7 +413,7 @@ void main() {
 
         // Serialize and deserialize
         final bytes = packet.serialize();
-        final restored = BitchatPacket.deserialize(bytes);
+        final restored = GrassrootsPacket.deserialize(bytes);
 
         final isValid = await handler.verifyPacket(restored);
         expect(isValid, isTrue);
@@ -428,7 +428,7 @@ void main() {
         final decoded = handler.decodeAnnounce(originalPayload);
 
         // Re-encode with decoded data
-        final reEncodedIdentity = BitchatIdentity.fromMap({
+        final reEncodedIdentity = GrassrootsIdentity.fromMap({
           'publicKey': decoded.publicKey,
           'privateKey': testIdentity.privateKey,
           'nickname': decoded.nickname,

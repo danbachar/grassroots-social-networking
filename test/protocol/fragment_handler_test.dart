@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/src/protocol/fragment_handler.dart';
-import 'package:bitchat_transport/src/models/packet.dart';
+import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
 
 void main() {
   group('FragmentHandler', () {
@@ -269,7 +269,7 @@ void main() {
       });
 
       test('throws for non-fragment packet', () {
-        final packet = BitchatPacket(
+        final packet = GrassrootsPacket(
           type: PacketType.message,
           senderPubkey: senderPubkey,
           payload: Uint8List(10),

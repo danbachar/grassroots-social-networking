@@ -1,16 +1,16 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:bitchat_transport/src/store/app_state.dart';
-import 'package:bitchat_transport/src/store/reducers.dart';
-import 'package:bitchat_transport/src/store/peers_actions.dart';
-import 'package:bitchat_transport/src/store/messages_actions.dart';
-import 'package:bitchat_transport/src/store/friendships_actions.dart';
-import 'package:bitchat_transport/src/store/settings_actions.dart';
-import 'package:bitchat_transport/src/store/transports_actions.dart';
-import 'package:bitchat_transport/src/store/transports_state.dart';
-import 'package:bitchat_transport/src/store/peers_state.dart';
-import 'package:bitchat_transport/src/transport/transport_service.dart';
+import 'package:grassroots_networking/src/store/app_state.dart';
+import 'package:grassroots_networking/src/store/reducers.dart';
+import 'package:grassroots_networking/src/store/peers_actions.dart';
+import 'package:grassroots_networking/src/store/messages_actions.dart';
+import 'package:grassroots_networking/src/store/friendships_actions.dart';
+import 'package:grassroots_networking/src/store/settings_actions.dart';
+import 'package:grassroots_networking/src/store/transports_actions.dart';
+import 'package:grassroots_networking/src/store/transports_state.dart';
+import 'package:grassroots_networking/src/store/peers_state.dart';
+import 'package:grassroots_networking/src/transport/transport_service.dart';
 
 void main() {
   group('appReducer', () {

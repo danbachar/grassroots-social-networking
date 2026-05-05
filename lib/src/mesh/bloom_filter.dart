@@ -3,7 +3,7 @@ import 'dart:math';
 
 /// Optimized Bloom filter for packet ID deduplication.
 /// 
-/// Bitchat uses this to prevent infinite routing loops in the mesh.
+/// Grassroots uses this to prevent infinite routing loops in the mesh.
 /// 
 /// Properties:
 /// - No false negatives: if we say "not seen", it's definitely not seen

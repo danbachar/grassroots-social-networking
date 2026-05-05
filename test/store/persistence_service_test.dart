@@ -3,11 +3,11 @@ import 'dart:convert';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:bitchat_transport/src/store/persistence_service.dart';
-import 'package:bitchat_transport/src/store/friendships_state.dart';
-import 'package:bitchat_transport/src/store/settings_state.dart';
-import 'package:bitchat_transport/src/store/messages_state.dart';
-import 'package:bitchat_transport/src/store/app_state.dart';
+import 'package:grassroots_networking/src/store/persistence_service.dart';
+import 'package:grassroots_networking/src/store/friendships_state.dart';
+import 'package:grassroots_networking/src/store/settings_state.dart';
+import 'package:grassroots_networking/src/store/messages_state.dart';
+import 'package:grassroots_networking/src/store/app_state.dart';
 
 // ===== Helper builders (top-level to avoid underscore lint warnings) =====
 
@@ -116,7 +116,7 @@ void main() {
       final state = FriendshipsState(friendships: {peerA: friendship});
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_friendships_v2': jsonEncode(state.toJson()),
+        'grassroots_friendships_v2': jsonEncode(state.toJson()),
       });
       service = PersistenceService();
 
@@ -148,7 +148,7 @@ void main() {
       );
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_friendships_v2': jsonEncode(state.toJson()),
+        'grassroots_friendships_v2': jsonEncode(state.toJson()),
       });
       service = PersistenceService();
 
@@ -163,7 +163,7 @@ void main() {
 
     test('returns empty FriendshipsState on corrupt data', () async {
       SharedPreferences.setMockInitialValues({
-        'bitchat_friendships_v2': 'this is not json{{{',
+        'grassroots_friendships_v2': 'this is not json{{{',
       });
       service = PersistenceService();
 
@@ -201,7 +201,7 @@ void main() {
       );
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_settings_v2': jsonEncode(settings.toJson()),
+        'grassroots_settings_v2': jsonEncode(settings.toJson()),
       });
       service = PersistenceService();
 
@@ -219,7 +219,7 @@ void main() {
 
     test('returns default SettingsState on corrupt data', () async {
       SharedPreferences.setMockInitialValues({
-        'bitchat_settings_v2': 'garbage data {{{',
+        'grassroots_settings_v2': 'garbage data {{{',
       });
       service = PersistenceService();
 
@@ -234,7 +234,7 @@ void main() {
       final partialJson = {'bluetoothEnabled': false};
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_settings_v2': jsonEncode(partialJson),
+        'grassroots_settings_v2': jsonEncode(partialJson),
       });
       service = PersistenceService();
 
@@ -263,7 +263,7 @@ void main() {
       };
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_settings_v2': jsonEncode(settingsJson),
+        'grassroots_settings_v2': jsonEncode(settingsJson),
       });
       service = PersistenceService();
 
@@ -309,8 +309,8 @@ void main() {
       final unreadJson = {peerB: 1};
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_conversations_v2': jsonEncode(conversationsJson),
-        'bitchat_unread_counts_v2': jsonEncode(unreadJson),
+        'grassroots_conversations_v2': jsonEncode(conversationsJson),
+        'grassroots_unread_counts_v2': jsonEncode(unreadJson),
       });
       service = PersistenceService();
 
@@ -340,7 +340,7 @@ void main() {
       };
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_conversations_v2': jsonEncode(conversationsJson),
+        'grassroots_conversations_v2': jsonEncode(conversationsJson),
       });
       service = PersistenceService();
 
@@ -354,7 +354,7 @@ void main() {
       final unreadJson = {peerA: 5, peerB: 3};
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_unread_counts_v2': jsonEncode(unreadJson),
+        'grassroots_unread_counts_v2': jsonEncode(unreadJson),
       });
       service = PersistenceService();
 
@@ -368,8 +368,8 @@ void main() {
 
     test('returns empty on corrupt conversations data', () async {
       SharedPreferences.setMockInitialValues({
-        'bitchat_conversations_v2': 'not json!!',
-        'bitchat_unread_counts_v2': jsonEncode({peerA: 2}),
+        'grassroots_conversations_v2': 'not json!!',
+        'grassroots_unread_counts_v2': jsonEncode({peerA: 2}),
       });
       service = PersistenceService();
 
@@ -383,10 +383,10 @@ void main() {
     test('returns empty on corrupt unread counts data', () async {
       final msg = makeMessage(sender: peerA, recipient: peerB, content: 'x');
       SharedPreferences.setMockInitialValues({
-        'bitchat_conversations_v2': jsonEncode({
+        'grassroots_conversations_v2': jsonEncode({
           peerB: [msg.toJson()]
         }),
-        'bitchat_unread_counts_v2': 'broken{{{',
+        'grassroots_unread_counts_v2': 'broken{{{',
       });
       service = PersistenceService();
 
@@ -428,7 +428,7 @@ void main() {
       );
 
       SharedPreferences.setMockInitialValues({
-        'bitchat_conversations_v2': jsonEncode({
+        'grassroots_conversations_v2': jsonEncode({
           peerB: [
             textMsg.toJson(),
             friendReqSent.toJson(),
@@ -491,10 +491,10 @@ void main() {
       await service.flush(state);
 
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bitchat_friendships_v2'), isNotNull);
-      expect(prefs.getString('bitchat_settings_v2'), isNotNull);
-      expect(prefs.getString('bitchat_conversations_v2'), isNotNull);
-      expect(prefs.getString('bitchat_unread_counts_v2'), isNotNull);
+      expect(prefs.getString('grassroots_friendships_v2'), isNotNull);
+      expect(prefs.getString('grassroots_settings_v2'), isNotNull);
+      expect(prefs.getString('grassroots_conversations_v2'), isNotNull);
+      expect(prefs.getString('grassroots_unread_counts_v2'), isNotNull);
     });
 
     test('round-trip: flush then load returns same friendships', () async {
@@ -623,10 +623,10 @@ void main() {
       await service.flush(state);
 
       final prefs = await SharedPreferences.getInstance();
-      final friendshipsData = prefs.getString('bitchat_friendships_v2');
-      final settingsData = prefs.getString('bitchat_settings_v2');
-      final conversationsData = prefs.getString('bitchat_conversations_v2');
-      final unreadData = prefs.getString('bitchat_unread_counts_v2');
+      final friendshipsData = prefs.getString('grassroots_friendships_v2');
+      final settingsData = prefs.getString('grassroots_settings_v2');
+      final conversationsData = prefs.getString('grassroots_conversations_v2');
+      final unreadData = prefs.getString('grassroots_unread_counts_v2');
 
       expect(friendshipsData, isNotNull);
       expect(settingsData, isNotNull);
@@ -666,7 +666,7 @@ void main() {
 
       // Immediately after calling onStateChanged, nothing persisted yet
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bitchat_friendships_v2'), isNull);
+      expect(prefs.getString('grassroots_friendships_v2'), isNull);
     });
 
     test('persists after debounce delay elapses', () {
@@ -726,9 +726,9 @@ void main() {
 
       // Remove non-friendships keys so we can detect if they get re-written
       final prefs = await SharedPreferences.getInstance();
-      await prefs.remove('bitchat_settings_v2');
-      await prefs.remove('bitchat_conversations_v2');
-      await prefs.remove('bitchat_unread_counts_v2');
+      await prefs.remove('grassroots_settings_v2');
+      await prefs.remove('grassroots_conversations_v2');
+      await prefs.remove('grassroots_unread_counts_v2');
 
       // Now change only friendships via onStateChanged (flush already set
       // _lastPersistedState, so only the diff is marked pending)
@@ -746,11 +746,11 @@ void main() {
 
       final prefsAfter = await SharedPreferences.getInstance();
       // Friendships should have been persisted
-      expect(prefsAfter.getString('bitchat_friendships_v2'), isNotNull);
+      expect(prefsAfter.getString('grassroots_friendships_v2'), isNotNull);
       // Settings and conversations should NOT have been re-persisted
-      expect(prefsAfter.getString('bitchat_settings_v2'), isNull);
-      expect(prefsAfter.getString('bitchat_conversations_v2'), isNull);
-      expect(prefsAfter.getString('bitchat_unread_counts_v2'), isNull);
+      expect(prefsAfter.getString('grassroots_settings_v2'), isNull);
+      expect(prefsAfter.getString('grassroots_conversations_v2'), isNull);
+      expect(prefsAfter.getString('grassroots_unread_counts_v2'), isNull);
     });
 
     test('only persists sections that changed - settings only', () async {
@@ -758,9 +758,9 @@ void main() {
       await service.flush(initialState);
 
       final prefs = await SharedPreferences.getInstance();
-      await prefs.remove('bitchat_friendships_v2');
-      await prefs.remove('bitchat_conversations_v2');
-      await prefs.remove('bitchat_unread_counts_v2');
+      await prefs.remove('grassroots_friendships_v2');
+      await prefs.remove('grassroots_conversations_v2');
+      await prefs.remove('grassroots_unread_counts_v2');
 
       fakeAsync((async) {
         final newState = makeAppState(
@@ -773,9 +773,9 @@ void main() {
       });
 
       final prefsAfter = await SharedPreferences.getInstance();
-      expect(prefsAfter.getString('bitchat_settings_v2'), isNotNull);
-      expect(prefsAfter.getString('bitchat_friendships_v2'), isNull);
-      expect(prefsAfter.getString('bitchat_conversations_v2'), isNull);
+      expect(prefsAfter.getString('grassroots_settings_v2'), isNotNull);
+      expect(prefsAfter.getString('grassroots_friendships_v2'), isNull);
+      expect(prefsAfter.getString('grassroots_conversations_v2'), isNull);
     });
 
     test('does not schedule timer when nothing changed', () async {
@@ -795,7 +795,7 @@ void main() {
 
       // Should complete without error; verify data is correct
       final prefs = await SharedPreferences.getInstance();
-      final data = prefs.getString('bitchat_friendships_v2');
+      final data = prefs.getString('grassroots_friendships_v2');
       expect(data, isNotNull);
     });
   });
@@ -820,7 +820,7 @@ void main() {
 
       final prefs = await SharedPreferences.getInstance();
       // Nothing should have been persisted since we disposed before the timer
-      expect(prefs.getString('bitchat_friendships_v2'), isNull);
+      expect(prefs.getString('grassroots_friendships_v2'), isNull);
     });
   });
 
@@ -843,7 +843,7 @@ void main() {
 
       // Data should be persisted immediately
       final prefs = await SharedPreferences.getInstance();
-      final data = prefs.getString('bitchat_friendships_v2');
+      final data = prefs.getString('grassroots_friendships_v2');
       expect(data, isNotNull);
       final loaded =
           FriendshipsState.fromJson(jsonDecode(data!) as Map<String, dynamic>);
@@ -874,18 +874,18 @@ void main() {
       await service.flush(state);
 
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bitchat_friendships_v2'), isNotNull);
-      expect(prefs.getString('bitchat_settings_v2'), isNotNull);
-      expect(prefs.getString('bitchat_conversations_v2'), isNotNull);
-      expect(prefs.getString('bitchat_unread_counts_v2'), isNotNull);
+      expect(prefs.getString('grassroots_friendships_v2'), isNotNull);
+      expect(prefs.getString('grassroots_settings_v2'), isNotNull);
+      expect(prefs.getString('grassroots_conversations_v2'), isNotNull);
+      expect(prefs.getString('grassroots_unread_counts_v2'), isNotNull);
 
       // Verify contents
-      final settingsJson = jsonDecode(prefs.getString('bitchat_settings_v2')!)
+      final settingsJson = jsonDecode(prefs.getString('grassroots_settings_v2')!)
           as Map<String, dynamic>;
       expect(settingsJson['bluetoothEnabled'], isFalse);
 
       final unreadJson =
-          jsonDecode(prefs.getString('bitchat_unread_counts_v2')!)
+          jsonDecode(prefs.getString('grassroots_unread_counts_v2')!)
               as Map<String, dynamic>;
       expect(unreadJson[peerB], equals(3));
     });

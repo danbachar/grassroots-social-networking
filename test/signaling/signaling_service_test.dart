@@ -2,11 +2,11 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
-import 'package:bitchat_transport/src/signaling/signaling_service.dart';
-import 'package:bitchat_transport/src/signaling/signaling_codec.dart';
-import 'package:bitchat_transport/src/signaling/address_table.dart';
-import 'package:bitchat_transport/src/models/peer.dart';
-import 'package:bitchat_transport/src/store/store.dart';
+import 'package:grassroots_networking/src/signaling/signaling_service.dart';
+import 'package:grassroots_networking/src/signaling/signaling_codec.dart';
+import 'package:grassroots_networking/src/signaling/address_table.dart';
+import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/store/store.dart';
 
 // ===== Helpers =====
 
@@ -480,7 +480,7 @@ void main() {
         sentMessages.add((recipient, payload));
         return true;
       };
-      service.onAddrReflected = (ip, port) {
+      service.onAddrReflected = (senderPubkey, ip, port) {
         lastReflectIp = Uint8List.fromList(ip.codeUnits);
       };
     });
@@ -595,7 +595,7 @@ void main() {
     test('fires onAddrReflected with reflected address', () {
       String? gotIp;
       int? gotPort;
-      service.onAddrReflected = (ip, port) {
+      service.onAddrReflected = (senderPubkey, ip, port) {
         gotIp = ip;
         gotPort = port;
       };
@@ -623,7 +623,7 @@ void main() {
       service2.sendSignaling = (recipient, payload) async => true;
 
       String? gotIp;
-      service2.onAddrReflected = (ip, port) => gotIp = ip;
+      service2.onAddrReflected = (senderPubkey, ip, port) => gotIp = ip;
 
       service2.processSignaling(
         anchorKey,

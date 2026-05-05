@@ -17,7 +17,7 @@ class Protocol {
   // ===== Signing & Verification =====
 
   /// Sign a packet with our Ed25519 private key.
-  Future<void> signPacket(BitchatPacket packet) async {
+  Future<void> signPacket(GrassrootsPacket packet) async {
     final algorithm = Ed25519();
     final signableBytes = packet.getSignableBytes();
     final signature =
@@ -26,7 +26,7 @@ class Protocol {
   }
 
   /// Verify a packet's Ed25519 signature against the sender's public key.
-  Future<bool> verifyPacket(BitchatPacket packet) async {
+  Future<bool> verifyPacket(GrassrootsPacket packet) async {
     try {
       final algorithm = Ed25519();
       final signableBytes = packet.getSignableBytes();
@@ -175,9 +175,9 @@ class Protocol {
   }
 
   /// Create an ANNOUNCE packet (broadcast).
-  BitchatPacket createAnnouncePacket({String? address}) {
+  GrassrootsPacket createAnnouncePacket({String? address}) {
     final payload = createAnnouncePayload(address: address);
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.announce,
       senderPubkey: identity.publicKey,
       recipientPubkey: null, // broadcast
@@ -187,12 +187,12 @@ class Protocol {
   }
 
   /// Create ACK packet.
-  BitchatPacket createAckPacket({
+  GrassrootsPacket createAckPacket({
     required String messageId,
     Uint8List? recipientPubkey,
   }) {
     final payload = Uint8List.fromList(messageId.codeUnits);
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.ack,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
@@ -202,11 +202,11 @@ class Protocol {
   }
 
   /// Create a signaling packet targeting a specific peer.
-  BitchatPacket createSignalingPacket({
+  GrassrootsPacket createSignalingPacket({
     required Uint8List recipientPubkey,
     required Uint8List signalingPayload,
   }) {
-    return BitchatPacket(
+    return GrassrootsPacket(
       type: PacketType.signaling,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,

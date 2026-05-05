@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
-/// Block types for the Bitchat protocol
+/// Block types for the Grassroots protocol
 enum BlockType {
   /// Regular text message
   say(0x01),
@@ -31,7 +31,7 @@ enum BlockType {
   }
 }
 
-/// A Block represents a message unit in the Bitchat protocol.
+/// A Block represents a message unit in the Grassroots protocol.
 ///
 /// Block types:
 /// - Say: Regular text message

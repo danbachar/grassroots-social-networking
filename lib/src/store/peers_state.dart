@@ -411,6 +411,24 @@ class PeersState {
       .where((p) => p.isFriend && p.isWellConnected && p.isReachable)
       .toList();
 
+  /// Rendezvous servers advertised by accepted friends via RV_LIST.
+  ///
+  /// Keyed by lowercase rendezvous pubkey hex; value is the advertised
+  /// "ip:port" address. These servers are trusted only as reconnect
+  /// facilitators because a friend explicitly told us to use them.
+  Map<String, String> get friendRvServers {
+    final servers = <String, String>{};
+    for (final friend in friends) {
+      for (final entry in friend.knownRvServers.entries) {
+        final hex = entry.key.toLowerCase();
+        final address = entry.value.trim();
+        if (hex.isEmpty || address.isEmpty) continue;
+        servers[hex] = address;
+      }
+    }
+    return Map.unmodifiable(servers);
+  }
+
   /// Count of connected peers
   int get connectedCount => connectedPeers.length;
 

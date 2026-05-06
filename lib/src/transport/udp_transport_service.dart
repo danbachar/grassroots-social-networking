@@ -92,12 +92,13 @@ class UdpTransportService extends TransportService {
   /// Active UDX connections per peer, keyed by pubkey hex.
   final Map<String, _PeerConnection> _peerConnections = {};
 
-  // Stream IDs: each UDPSocket (connection) has its own ID space.
-  // We use stream ID 1 for our outgoing stream on every connection.
-  // The remote peer also uses stream ID 1 for theirs.
-  // Since stream IDs are scoped to a UDPSocket, there's no collision.
-  static const int _outgoingStreamId = 1;
-  static const int _expectedIncomingStreamId = 1;
+  // Per-multiplexer monotonic stream-id counter. UDX peers refuse new SYNs
+  // for a stream-id whose prior stream just closed (the id is in tear-down
+  // state for some time). If we reused id=1 for every reconnect to the same
+  // remote, the second add of a rendezvous server would be silently dropped
+  // by the server's UDX layer. Bumping the id per connect avoids the
+  // collision entirely.
+  int _nextStreamId = 1;
 
   // --- Stream controllers ---
 
@@ -413,13 +414,14 @@ class UdpTransportService extends TransportService {
       // Create the outgoing stream and wait for handshake inside a guarded
       // zone so low-level async socket send failures are captured as a normal
       // connect failure instead of escaping to Flutter's top-level handler.
+      final streamId = _nextStreamId++;
       runZonedGuarded(() async {
         try {
           final stream = await UDXStream.createOutgoing(
             _udx!,
             socket,
-            _outgoingStreamId,
-            _expectedIncomingStreamId,
+            streamId,
+            streamId,
             remoteHost,
             port,
           );

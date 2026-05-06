@@ -3009,7 +3009,7 @@ class GrassrootsNetwork {
       final pubkeyHex = recipientPubkey
           .map((b) => b.toRadixString(16).padLeft(2, '0'))
           .join();
-      return _sendViaUdp(pubkeyHex, address, bytes);
+      return _sendViaUdp(pubkeyHex, address, bytes, isRendezvous: true);
     };
 
     // Hole-punch initiation: a well-connected friend told us to start punching
@@ -3341,7 +3341,7 @@ class GrassrootsNetwork {
     // may still be reachable via BLE, and BLE/UDP are independent transports.
 
     final facilitatorCount = store.state.peers.wellConnectedFriends.length +
-        _configuredRendezvousServers().length;
+        _configuredRendezvousServers().length + store.state.peers.friendRvServers.length;
     if (facilitatorCount == 0) return;
 
     debugPrint(

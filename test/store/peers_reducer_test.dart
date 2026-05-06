@@ -1438,6 +1438,44 @@ void main() {
     });
   });
 
+  group('PeersState rendezvous server getters', () {
+    test('friendRvServers aggregates rendezvous servers from friends only', () {
+      final friendPubkey = _testPubkey(10);
+      final strangerPubkey = _testPubkey(11);
+      final rvA = _pubkeyHex(_testPubkey(50));
+      final rvB = _pubkeyHex(_testPubkey(51));
+      final state = PeersState(
+        peers: {
+          _pubkeyHex(friendPubkey): PeerState(
+            publicKey: friendPubkey,
+            nickname: 'Friend',
+            isFriend: true,
+            knownRvServers: {
+              rvA: '[2001:db8::50]:9516',
+              rvB.toUpperCase(): '198.51.100.51:9516',
+            },
+          ),
+          _pubkeyHex(strangerPubkey): PeerState(
+            publicKey: strangerPubkey,
+            nickname: 'Stranger',
+            isFriend: false,
+            knownRvServers: {
+              _pubkeyHex(_testPubkey(52)): '198.51.100.52:9516',
+            },
+          ),
+        },
+      );
+
+      expect(
+        state.friendRvServers,
+        equals({
+          rvA: '[2001:db8::50]:9516',
+          rvB: '198.51.100.51:9516',
+        }),
+      );
+    });
+  });
+
   // =========================================================================
   // DiscoveredPeerState backoff getters
   // =========================================================================

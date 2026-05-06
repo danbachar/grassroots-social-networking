@@ -406,10 +406,15 @@ class SignalingService {
       if (entry.address.trim().isEmpty) continue;
       servers[_pubkeyToHex(entry.pubkey)] = entry.address;
     }
+    final senderHex8 = _pubkeyToHex(senderPubkey).substring(0, 8);
     debugPrint(
-      '[rv-list] ${_pubkeyToHex(senderPubkey).substring(0, 8)} advertises '
-      '${servers.length} rendezvous server(s)',
+      '[rv-list] $senderHex8 advertises ${servers.length} rendezvous server(s)',
     );
+    final entries = servers.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    for (final e in entries) {
+      debugPrint('[rv-list]   ${e.key.substring(0, 8)} -> ${e.value}');
+    }
     store.dispatch(PeerRvServersUpdatedAction(
       publicKey: senderPubkey,
       rvServers: servers,
@@ -678,6 +683,10 @@ class SignalingService {
           server.pubkeyHex.toLowerCase() == senderHex) {
         return true;
       }
+    }
+
+    if (store.state.peers.friendRvServers.containsKey(senderHex)) {
+      return true;
     }
 
     return false;

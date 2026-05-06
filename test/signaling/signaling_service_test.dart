@@ -502,6 +502,77 @@ void main() {
       );
       expect(lastReflectIp, isNotNull);
     });
+
+    test("accepts signaling from a friend's advertised rendezvous server", () {
+      final service2 = SignalingService(
+        store: _storeWithPeers({
+          bobHex: PeerState(
+            publicKey: bobKey,
+            nickname: 'Bob',
+            connectionState: PeerConnectionState.connected,
+            isFriend: true,
+            knownRvServers: {anchorHex: anchorAddress},
+          ),
+        }),
+      );
+      Uint8List? gotPeer;
+      String? gotIp;
+      int? gotPort;
+      Uint8List? gotReadyRecipient;
+      service2.onPunchInitiate = (peer, ip, port, readyRecipient) {
+        gotPeer = peer;
+        gotIp = ip;
+        gotPort = port;
+        gotReadyRecipient = readyRecipient;
+      };
+
+      service2.processSignaling(
+        anchorKey,
+        codec.encode(PunchInitiateMessage(
+          peerPubkey: bobKey,
+          ip: directPunchIp,
+          port: 7000,
+        )),
+      );
+
+      expect(_pubkeyHex(gotPeer!), equals(bobHex));
+      expect(gotIp, equals(directPunchIp));
+      expect(gotPort, equals(7000));
+      expect(_pubkeyHex(gotReadyRecipient!), equals(anchorHex));
+
+      service2.dispose();
+    });
+
+    test("does not trust rendezvous servers advertised by non-friends", () {
+      final service2 = SignalingService(
+        store: _storeWithPeers({
+          bobHex: PeerState(
+            publicKey: bobKey,
+            nickname: 'Bob',
+            connectionState: PeerConnectionState.connected,
+            isFriend: false,
+            knownRvServers: {anchorHex: anchorAddress},
+          ),
+        }),
+      );
+      Uint8List? gotPeer;
+      service2.onPunchInitiate = (peer, ip, port, readyRecipient) {
+        gotPeer = peer;
+      };
+
+      service2.processSignaling(
+        anchorKey,
+        codec.encode(PunchInitiateMessage(
+          peerPubkey: bobKey,
+          ip: directPunchIp,
+          port: 7000,
+        )),
+      );
+
+      expect(gotPeer, isNull);
+
+      service2.dispose();
+    });
   });
 
   // ==========================================================================

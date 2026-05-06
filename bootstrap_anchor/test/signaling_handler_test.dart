@@ -138,7 +138,10 @@ void main() {
         // A (whose IP changed) sends RECONNECT first.
         handler.processSignaling(
           aPubkey,
-          codec.encode(ReconnectMessage(peerPubkey: bPubkey)),
+          codec.encode(ReconnectMessage(
+            initiatorPubkey: aPubkey,
+            peerPubkey: bPubkey,
+          )),
           observedIp: '198.51.100.10',
           observedPort: 7000,
         );
@@ -186,7 +189,10 @@ void main() {
 
       handler.processSignaling(
         aPubkey,
-        codec.encode(ReconnectMessage(peerPubkey: bPubkey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aPubkey,
+          peerPubkey: bPubkey,
+        )),
         observedIp: '198.51.100.10',
         observedPort: 7000,
       );
@@ -194,10 +200,34 @@ void main() {
       expect(sentSignals, hasLength(2));
     });
 
+    test('drops RECONNECT when inner initiator differs from signed sender', () {
+      handler.processSignaling(
+        aPubkey,
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: bPubkey,
+          peerPubkey: bPubkey,
+        )),
+        observedIp: '198.51.100.10',
+        observedPort: 7000,
+      );
+
+      handler.processSignaling(
+        bPubkey,
+        codec.encode(AvailableMessage(peerPubkey: aPubkey)),
+        observedIp: '203.0.113.20',
+        observedPort: 9001,
+      );
+
+      expect(sentSignals, isEmpty);
+    });
+
     test('forwards PUNCH_READY to the counterpart after coordination', () {
       handler.processSignaling(
         aPubkey,
-        codec.encode(ReconnectMessage(peerPubkey: bPubkey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aPubkey,
+          peerPubkey: bPubkey,
+        )),
         observedIp: '198.51.100.10',
         observedPort: 7000,
       );
@@ -224,7 +254,10 @@ void main() {
     test('drops requests with sender targeting itself', () {
       handler.processSignaling(
         aPubkey,
-        codec.encode(ReconnectMessage(peerPubkey: aPubkey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aPubkey,
+          peerPubkey: aPubkey,
+        )),
         observedIp: '198.51.100.10',
         observedPort: 7000,
       );
@@ -235,7 +268,10 @@ void main() {
         () {
       handler.processSignaling(
         aPubkey,
-        codec.encode(ReconnectMessage(peerPubkey: bPubkey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aPubkey,
+          peerPubkey: bPubkey,
+        )),
         observedIp: '198.51.100.10',
         observedPort: 7000,
       );
@@ -251,7 +287,10 @@ void main() {
       // Retry immediately — still inside cooldown. Server should drop it.
       handler.processSignaling(
         aPubkey,
-        codec.encode(ReconnectMessage(peerPubkey: bPubkey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aPubkey,
+          peerPubkey: bPubkey,
+        )),
         observedIp: '198.51.100.11',
         observedPort: 7001,
       );

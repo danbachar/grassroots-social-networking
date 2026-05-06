@@ -1347,7 +1347,10 @@ class GrassrootsNetwork {
         '[reconnect] Fanning out RECONNECT for ${friend.displayName} '
         'after IP change',
       );
-      unawaited(_signalingService.fanOutReconnect(friend.publicKey));
+      unawaited(_signalingService.fanOutReconnect(
+        friend.publicKey,
+        initiatorPubkey: identity.publicKey,
+      ));
     }
   }
 
@@ -2627,7 +2630,10 @@ class GrassrootsNetwork {
 
     _beginHolePunchAttempt(pubkeyHex);
 
-    final sent = await _signalingService.fanOutReconnect(pubkeyBytes);
+    final sent = await _signalingService.fanOutReconnect(
+      pubkeyBytes,
+      initiatorPubkey: identity.publicKey,
+    );
     if (sent == 0) {
       debugPrint('[discover] Could not reach any facilitator for $name');
       _failHolePunchAttempt(pubkeyHex, 'Could not reach any facilitator');

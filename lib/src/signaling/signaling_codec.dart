@@ -137,14 +137,23 @@ class ReconnectMessage extends SignalingMessage {
   @override
   SignalingType get type => SignalingType.reconnect;
 
+  /// The public key of the reconnect initiator (32 bytes).
+  ///
+  /// This duplicates the authenticated outer packet sender for protocol
+  /// clarity. Receivers must reject it if it does not match the outer sender.
+  final Uint8List initiatorPubkey;
+
   /// The public key of the peer we want to reconnect to (32 bytes).
   final Uint8List peerPubkey;
 
-  ReconnectMessage({required this.peerPubkey});
+  ReconnectMessage({
+    required this.initiatorPubkey,
+    required this.peerPubkey,
+  });
 
   @override
   String toString() =>
-      'Reconnect(peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
+      'Reconnect(initiator: ${initiatorPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}, peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
 }
 
 /// Agent declares availability to a peer at a rendezvous facilitator.
@@ -179,7 +188,8 @@ class RvServerEntry {
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   @override
-  String toString() => 'RvServerEntry($address, ${pubkeyHex.substring(0, 8)}...)';
+  String toString() =>
+      'RvServerEntry($address, ${pubkeyHex.substring(0, 8)}...)';
 }
 
 /// Agent informs a friend about its configured rendezvous servers.
@@ -210,7 +220,7 @@ class RvListMessage extends SignalingMessage {
 /// PUNCH_INITIATE : type(1) + peerPubkey(32) + ipLen(2) + ipBytes + port(2)
 /// PUNCH_READY    : type(1) + peerPubkey(32)
 /// ADDR_REFLECT   : type(1) + ipLen(2) + ipBytes + port(2)
-/// RECONNECT      : type(1) + peerPubkey(32)
+/// RECONNECT      : type(1) + initiatorPubkey(32) + peerPubkey(32)
 /// AVAILABLE      : type(1) + peerPubkey(32)
 /// RV_LIST        : type(1) + count(2) +
 ///                  repeated(pubkey(32) + addrLen(2) + addrBytes)
@@ -262,6 +272,7 @@ class SignalingCodec {
   Uint8List _encodeReconnect(ReconnectMessage msg) {
     final buffer = BytesBuilder();
     buffer.addByte(SignalingType.reconnect.value);
+    buffer.add(msg.initiatorPubkey);
     buffer.add(msg.peerPubkey);
     return buffer.toBytes();
   }
@@ -348,11 +359,12 @@ class SignalingCodec {
   }
 
   ReconnectMessage _decodeReconnect(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('Reconnect payload too short');
+    if (data.length != 64) {
+      throw const FormatException('Reconnect payload has invalid length');
     }
     return ReconnectMessage(
-      peerPubkey: Uint8List.fromList(data.sublist(0, 32)),
+      initiatorPubkey: Uint8List.fromList(data.sublist(0, 32)),
+      peerPubkey: Uint8List.fromList(data.sublist(32, 64)),
     );
   }
 

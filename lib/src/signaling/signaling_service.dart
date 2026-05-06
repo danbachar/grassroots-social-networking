@@ -16,7 +16,8 @@ import 'signaling_codec.dart';
 ///
 /// When agent A's IP changes, A and B reconnect through a rendezvous
 /// facilitator S as follows:
-/// - A sends RECONNECT(peerPubkey=B) to S. S observes A's source address.
+/// - A sends RECONNECT(initiatorPubkey=A, peerPubkey=B) to S. S observes A's
+///   source address and verifies the initiator matches the signed packet sender.
 /// - B (on detecting A went silent) sends AVAILABLE(peerPubkey=A) to S. S
 ///   observes B's source address.
 /// - S matches the pair and sends each side a PUNCH_INITIATE carrying the
@@ -132,9 +133,18 @@ class SignalingService {
   /// any AVAILABLE the target sends and coordinate a hole-punch.
   ///
   /// Returns the number of facilitators the request was sent to.
-  Future<int> fanOutReconnect(Uint8List targetPubkey) async {
-    return _fanOutCold(targetPubkey, ReconnectMessage(peerPubkey: targetPubkey),
-        intent: 'RECONNECT');
+  Future<int> fanOutReconnect(
+    Uint8List targetPubkey, {
+    required Uint8List initiatorPubkey,
+  }) async {
+    return _fanOutCold(
+      targetPubkey,
+      ReconnectMessage(
+        initiatorPubkey: initiatorPubkey,
+        peerPubkey: targetPubkey,
+      ),
+      intent: 'RECONNECT',
+    );
   }
 
   /// Send AVAILABLE(peerPubkey=target) to the rendezvous facilitators that
@@ -229,7 +239,8 @@ class SignalingService {
     required String intent,
   }) async {
     final targetHex = _pubkeyToHex(targetPubkey);
-    final facilitators = _trustedFacilitatorPubkeys(excludePubkeyHex: targetHex);
+    final facilitators =
+        _trustedFacilitatorPubkeys(excludePubkeyHex: targetHex);
     if (facilitators.isEmpty) {
       debugPrint(
           '[$intent] No trusted facilitators to fan out to for ${targetHex.substring(0, 8)}...');
@@ -377,6 +388,13 @@ class SignalingService {
       case AddrReflectMessage():
         _handleAddrReflect(senderPubkey, msg);
       case ReconnectMessage():
+        if (!listEquals(msg.initiatorPubkey, senderPubkey)) {
+          debugPrint(
+            'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — '
+            'inner initiator does not match signed sender',
+          );
+          return;
+        }
         _handleRendezvous(
           senderPubkey: senderPubkey,
           senderHex: senderHex,

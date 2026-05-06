@@ -59,8 +59,12 @@ class AddrReflectMessage extends SignalingMessage {
 class ReconnectMessage extends SignalingMessage {
   @override
   SignalingType get type => SignalingType.reconnect;
+  final Uint8List initiatorPubkey;
   final Uint8List peerPubkey;
-  ReconnectMessage({required this.peerPubkey});
+  ReconnectMessage({
+    required this.initiatorPubkey,
+    required this.peerPubkey,
+  });
 }
 
 class AvailableMessage extends SignalingMessage {
@@ -150,6 +154,7 @@ class SignalingCodec {
   Uint8List _encodeReconnect(ReconnectMessage msg) {
     final buffer = BytesBuilder();
     buffer.addByte(SignalingType.reconnect.value);
+    buffer.add(msg.initiatorPubkey);
     buffer.add(msg.peerPubkey);
     return buffer.toBytes();
   }
@@ -209,11 +214,12 @@ class SignalingCodec {
   }
 
   ReconnectMessage _decodeReconnect(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('Reconnect payload too short');
+    if (data.length != 64) {
+      throw const FormatException('Reconnect payload has invalid length');
     }
     return ReconnectMessage(
-        peerPubkey: Uint8List.fromList(data.sublist(0, 32)));
+        initiatorPubkey: Uint8List.fromList(data.sublist(0, 32)),
+        peerPubkey: Uint8List.fromList(data.sublist(32, 64)));
   }
 
   AvailableMessage _decodeAvailable(Uint8List data) {

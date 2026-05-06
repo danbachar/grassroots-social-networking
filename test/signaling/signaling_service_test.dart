@@ -109,25 +109,34 @@ void main() {
         return true;
       };
 
-      final sent = await service.fanOutReconnect(bobKey);
+      final sent = await service.fanOutReconnect(
+        bobKey,
+        initiatorPubkey: aliceKey,
+      );
 
       expect(sent, equals(2));
       expect(sentMessages, hasLength(2));
       for (final (recipient, payload) in sentMessages) {
         final decoded = codec.decode(payload) as ReconnectMessage;
+        expect(decoded.initiatorPubkey, equals(aliceKey));
         expect(decoded.peerPubkey, equals(bobKey));
-        expect([friendKey, friend2Key].any((k) => _pubkeyHex(k) == _pubkeyHex(recipient)),
+        expect(
+            [friendKey, friend2Key]
+                .any((k) => _pubkeyHex(k) == _pubkeyHex(recipient)),
             isTrue);
       }
     });
 
-    test('sends RECONNECT to configured rendezvous servers when no friends exist', () async {
+    test(
+        'sends RECONNECT to configured rendezvous servers when no friends exist',
+        () async {
       service = SignalingService(
         store: _storeWithPeers(
           {},
           settings: SettingsState(
             rendezvousServers: [
-              RendezvousServerSettings(pubkeyHex: anchorHex, address: anchorAddress),
+              RendezvousServerSettings(
+                  pubkeyHex: anchorHex, address: anchorAddress),
             ],
           ),
         ),
@@ -137,12 +146,16 @@ void main() {
         return true;
       };
 
-      final sent = await service.fanOutReconnect(bobKey);
+      final sent = await service.fanOutReconnect(
+        bobKey,
+        initiatorPubkey: aliceKey,
+      );
 
       expect(sent, equals(1));
       expect(sentMessages, hasLength(1));
       expect(_pubkeyHex(sentMessages.single.$1), equals(anchorHex));
       final decoded = codec.decode(sentMessages.single.$2) as ReconnectMessage;
+      expect(decoded.initiatorPubkey, equals(aliceKey));
       expect(decoded.peerPubkey, equals(bobKey));
     });
 
@@ -153,7 +166,10 @@ void main() {
         return true;
       };
 
-      final sent = await service.fanOutReconnect(bobKey);
+      final sent = await service.fanOutReconnect(
+        bobKey,
+        initiatorPubkey: aliceKey,
+      );
 
       expect(sent, equals(0));
       expect(sentMessages, isEmpty);
@@ -173,7 +189,10 @@ void main() {
         return true;
       };
 
-      await service.fanOutReconnect(bobKey);
+      await service.fanOutReconnect(
+        bobKey,
+        initiatorPubkey: aliceKey,
+      );
 
       expect(sentMessages, hasLength(1));
       expect(_pubkeyHex(sentMessages.single.$1), equals(friendHex));
@@ -188,8 +207,10 @@ void main() {
           settings: SettingsState(
             rendezvousServers: [
               // intentionally listed in reverse lexicographic order
-              RendezvousServerSettings(pubkeyHex: anchor2Hex, address: anchor2Address),
-              RendezvousServerSettings(pubkeyHex: anchorHex, address: anchorAddress),
+              RendezvousServerSettings(
+                  pubkeyHex: anchor2Hex, address: anchor2Address),
+              RendezvousServerSettings(
+                  pubkeyHex: anchorHex, address: anchorAddress),
             ],
           ),
         ),
@@ -199,7 +220,10 @@ void main() {
         return true;
       };
 
-      await service.fanOutReconnect(bobKey);
+      await service.fanOutReconnect(
+        bobKey,
+        initiatorPubkey: aliceKey,
+      );
 
       expect(sentMessages, hasLength(2));
       expect(
@@ -240,8 +264,7 @@ void main() {
         sentMessages.add((recipient, payload));
         return true;
       };
-      service.sendSignalingToAddress =
-          (recipient, address, payload) async {
+      service.sendSignalingToAddress = (recipient, address, payload) async {
         addressSends.add((recipient, address, payload));
         return true;
       };
@@ -252,8 +275,7 @@ void main() {
       expect(addressSends, hasLength(1));
       expect(_pubkeyHex(addressSends.single.$1), equals(anchorHex));
       expect(addressSends.single.$2, equals(anchorAddress));
-      final decoded =
-          codec.decode(addressSends.single.$3) as AvailableMessage;
+      final decoded = codec.decode(addressSends.single.$3) as AvailableMessage;
       expect(decoded.peerPubkey, equals(bobKey));
     });
 
@@ -297,8 +319,7 @@ void main() {
         sentMessages.add((recipient, payload));
         return true;
       };
-      service.sendSignalingToAddress =
-          (recipient, address, payload) async {
+      service.sendSignalingToAddress = (recipient, address, payload) async {
         addressSends.add((recipient, address, payload));
         return true;
       };
@@ -368,7 +389,8 @@ void main() {
       expect(ok, isTrue);
       expect(sentMessages, hasLength(1));
       expect(_pubkeyHex(sentMessages.single.$1), equals(bobHex));
-      final decoded = codec.decode(sentMessages.single.$2) as PunchInitiateMessage;
+      final decoded =
+          codec.decode(sentMessages.single.$2) as PunchInitiateMessage;
       expect(decoded.peerPubkey, equals(aliceKey));
       expect(decoded.ip, equals(directPunchIp));
       expect(decoded.port, equals(7000));
@@ -443,7 +465,8 @@ void main() {
 
       expect(sentMessages, hasLength(1));
       expect(_pubkeyHex(sentMessages.single.$1), equals(bobHex));
-      final decoded = codec.decode(sentMessages.single.$2) as AddrReflectMessage;
+      final decoded =
+          codec.decode(sentMessages.single.$2) as AddrReflectMessage;
       expect(decoded.ip, equals(reflectedIp));
       expect(decoded.port, equals(7000));
     });
@@ -686,7 +709,8 @@ void main() {
           {},
           settings: SettingsState(
             rendezvousServers: [
-              RendezvousServerSettings(pubkeyHex: anchorHex, address: anchorAddress),
+              RendezvousServerSettings(
+                  pubkeyHex: anchorHex, address: anchorAddress),
             ],
           ),
         ),
@@ -737,7 +761,10 @@ void main() {
         () {
       service.processSignaling(
         aliceKey,
-        codec.encode(ReconnectMessage(peerPubkey: bobKey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aliceKey,
+          peerPubkey: bobKey,
+        )),
         observedIp: '198.51.100.10',
         observedPort: 7000,
       );
@@ -753,8 +780,7 @@ void main() {
 
       expect(sentMessages, hasLength(2));
       final toAlice = sentMessages.firstWhere((m) => m.$1 == aliceKey);
-      final initiateToAlice =
-          codec.decode(toAlice.$2) as PunchInitiateMessage;
+      final initiateToAlice = codec.decode(toAlice.$2) as PunchInitiateMessage;
       expect(initiateToAlice.peerPubkey, equals(bobKey));
       expect(initiateToAlice.ip, equals('203.0.113.20'));
       expect(initiateToAlice.port, equals(9001));
@@ -770,9 +796,33 @@ void main() {
         () {
       service.processSignaling(
         aliceKey,
-        codec.encode(ReconnectMessage(peerPubkey: bobKey)),
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: aliceKey,
+          peerPubkey: bobKey,
+        )),
         // observedIp/observedPort omitted — like a BLE delivery
       );
+      expect(sentMessages, isEmpty);
+    });
+
+    test('drops RECONNECT when inner initiator differs from signed sender', () {
+      service.processSignaling(
+        aliceKey,
+        codec.encode(ReconnectMessage(
+          initiatorPubkey: bobKey,
+          peerPubkey: bobKey,
+        )),
+        observedIp: '198.51.100.10',
+        observedPort: 7000,
+      );
+
+      service.processSignaling(
+        bobKey,
+        codec.encode(AvailableMessage(peerPubkey: aliceKey)),
+        observedIp: '203.0.113.20',
+        observedPort: 9001,
+      );
+
       expect(sentMessages, isEmpty);
     });
   });
@@ -816,8 +866,7 @@ void main() {
       final service = SignalingService(store: store);
       final addressSends = <(Uint8List, String, Uint8List)>[];
       service.sendSignaling = (recipient, payload) async => true;
-      service.sendSignalingToAddress =
-          (recipient, address, payload) async {
+      service.sendSignalingToAddress = (recipient, address, payload) async {
         addressSends.add((recipient, address, payload));
         return true;
       };

@@ -762,7 +762,8 @@ class AnchorServer {
         AddrReflectMessage() =>
           'addrReflect addr=${message.ip}:${message.port}',
         ReconnectMessage() =>
-          'reconnect peer=${_shortHex(_pubkeyToHex(message.peerPubkey))}',
+          'reconnect initiator=${_shortHex(_pubkeyToHex(message.initiatorPubkey))} '
+              'peer=${_shortHex(_pubkeyToHex(message.peerPubkey))}',
         AvailableMessage() =>
           'available peer=${_shortHex(_pubkeyToHex(message.peerPubkey))}',
         RvListMessage() => 'rvList count=${message.entries.length}',

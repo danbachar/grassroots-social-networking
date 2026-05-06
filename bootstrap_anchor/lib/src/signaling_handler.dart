@@ -119,6 +119,11 @@ class SignalingHandler {
 
     switch (msg) {
       case ReconnectMessage():
+        if (!_pubkeysEqual(msg.initiatorPubkey, senderPubkey)) {
+          _log('Dropping RECONNECT from ${senderHex.substring(0, 8)}...: '
+              'inner initiator does not match signed sender');
+          return;
+        }
         _handleRendezvous(
           senderPubkey: senderPubkey,
           senderHex: senderHex,
@@ -236,7 +241,8 @@ class SignalingHandler {
       ip: observedIp,
       port: observedPort,
     );
-    sendSignaling?.call(counterpart.senderPubkey, codec.encode(initiateToCounterpart));
+    sendSignaling?.call(
+        counterpart.senderPubkey, codec.encode(initiateToCounterpart));
   }
 
   void _handlePunchReady(Uint8List senderPubkey, PunchReadyMessage msg) {
@@ -263,6 +269,14 @@ class SignalingHandler {
   /// Canonical (order-independent) key for a punch session between two peers.
   static String _punchSessionKey(String a, String b) =>
       a.compareTo(b) <= 0 ? '$a|$b' : '$b|$a';
+
+  static bool _pubkeysEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
 
   void _pruneExpiredPending(DateTime now) {
     _pending.removeWhere(

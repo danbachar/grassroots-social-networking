@@ -229,8 +229,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
       // (it was bound to the previous address/network path).
       final preserveReach = newUdpAddress == existing.udpAddress &&
           setEquals(newUdpAddressCandidates, existing.udpAddressCandidates);
-      final updated = PeerState(
-        publicKey: existing.publicKey,
+      final updated = existing.copyWith(
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
         transport: action.transport,
@@ -247,9 +246,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         udpAddress: newUdpAddress,
         linkLocalAddress: action.linkLocalAddress ?? existing.linkLocalAddress,
         udpAddressCandidates: newUdpAddressCandidates,
-        isFriend: existing.isFriend,
-        lastDirectReachAt: preserveReach ? existing.lastDirectReachAt : null,
-        hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        clearLastDirectReachAt: !preserveReach,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -311,6 +308,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -377,6 +375,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: false,
+        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -482,6 +481,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: preserveReach ? existing.lastDirectReachAt : null,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,

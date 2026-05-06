@@ -255,7 +255,6 @@ void main() {
       expect(peer.isConnecting, false);
       expect(peer.isConnected, false);
     });
-
   });
 
   // =========================================================================
@@ -486,6 +485,56 @@ void main() {
       expect(peer.connectionState, PeerConnectionState.connected);
     });
 
+    test('merges ANNOUNCE fields without dropping non-ANNOUNCE peer state', () {
+      final pubkey = _testPubkey(6);
+      final rvPubkey = _testPubkey(60);
+      final hex = _pubkeyHex(pubkey);
+      final rvHex = _pubkeyHex(rvPubkey);
+      final directReachAt = DateTime.now().subtract(const Duration(minutes: 2));
+      const udpAddress = '[2001:db8::6]:4006';
+      const rvAddress = '[2600:1901:8130:98a:0:1::]:9516';
+      final initial = PeersState(
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'OldNick',
+            connectionState: PeerConnectionState.disconnected,
+            transport: PeerTransport.udp,
+            rssi: -90,
+            protocolVersion: 1,
+            udpAddress: udpAddress,
+            udpAddressCandidates: const {udpAddress},
+            isFriend: true,
+            lastDirectReachAt: directReachAt,
+            hasLiveUdpConnection: true,
+            knownRvServers: {rvHex: rvAddress},
+          ),
+        },
+      );
+
+      final result = peersReducer(
+        initial,
+        PeerAnnounceReceivedAction(
+          publicKey: pubkey,
+          nickname: 'NewNick',
+          protocolVersion: 3,
+          rssi: -40,
+          transport: PeerTransport.udp,
+          udpAddress: udpAddress,
+        ),
+      );
+
+      final peer = result.peers[hex]!;
+      expect(peer.nickname, 'NewNick');
+      expect(peer.protocolVersion, 3);
+      expect(peer.rssi, -40);
+      expect(peer.connectionState, PeerConnectionState.connected);
+      expect(peer.isFriend, isTrue);
+      expect(peer.hasLiveUdpConnection, isTrue);
+      expect(peer.lastDirectReachAt, directReachAt);
+      expect(peer.knownRvServers, equals({rvHex: rvAddress}));
+    });
+
     test('sets connectionState to connected', () {
       final pubkey = _testPubkey(2);
       final action = PeerAnnounceReceivedAction(
@@ -578,6 +627,48 @@ void main() {
       final result = peersReducer(initial, action);
 
       expect(result.peers[hex]!.lastUdpSeen, equals(udpSeenAt));
+    });
+
+    test('preserves advertised RV servers across later ANNOUNCE updates', () {
+      final pubkey = _testPubkey(5);
+      final rvPubkey = _testPubkey(50);
+      final hex = _pubkeyHex(pubkey);
+      final rvHex = _pubkeyHex(rvPubkey);
+      const rvAddress = '[2600:1901:8130:98a:0:1::]:9516';
+
+      var state = peersReducer(
+        PeersState.initial,
+        PeerAnnounceReceivedAction(
+          publicKey: pubkey,
+          nickname: 'Dan',
+          protocolVersion: 1,
+          rssi: -48,
+          transport: PeerTransport.udp,
+          udpAddress: '[2a00:a041:e567:f100:4c38:ab70:6484:6f45]:61785',
+        ),
+      );
+
+      state = peersReducer(
+        state,
+        PeerRvServersUpdatedAction(
+          publicKey: pubkey,
+          rvServers: {rvHex: rvAddress},
+        ),
+      );
+
+      state = peersReducer(
+        state,
+        PeerAnnounceReceivedAction(
+          publicKey: pubkey,
+          nickname: 'Dan',
+          protocolVersion: 1,
+          rssi: -45,
+          transport: PeerTransport.bleDirect,
+          bleCentralDeviceId: 'central-dan',
+        ),
+      );
+
+      expect(state.peers[hex]!.knownRvServers, equals({rvHex: rvAddress}));
     });
   });
 

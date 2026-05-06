@@ -286,6 +286,7 @@ class PeerState {
     Set<String>? udpAddressCandidates,
     bool? isFriend,
     DateTime? lastDirectReachAt,
+    bool clearLastDirectReachAt = false,
     bool? hasLiveUdpConnection,
     Map<String, String>? knownRvServers,
   }) {
@@ -306,7 +307,9 @@ class PeerState {
       linkLocalAddress: linkLocalAddress ?? this.linkLocalAddress,
       udpAddressCandidates: udpAddressCandidates ?? this.udpAddressCandidates,
       isFriend: isFriend ?? this.isFriend,
-      lastDirectReachAt: lastDirectReachAt ?? this.lastDirectReachAt,
+      lastDirectReachAt: clearLastDirectReachAt
+          ? null
+          : lastDirectReachAt ?? this.lastDirectReachAt,
       hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
       knownRvServers: knownRvServers ?? this.knownRvServers,
     );
@@ -347,8 +350,8 @@ class PeerState {
         isFriend,
         lastDirectReachAt,
         hasLiveUdpConnection,
-        Object.hashAll(knownRvServers.entries
-            .map((e) => Object.hash(e.key, e.value))),
+        Object.hashAll(
+            knownRvServers.entries.map((e) => Object.hash(e.key, e.value))),
       );
 }
 

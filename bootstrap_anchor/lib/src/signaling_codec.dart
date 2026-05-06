@@ -225,7 +225,6 @@ class SignalingCodec {
   }
 
   RvListMessage _decodeRvList(Uint8List data) {
-    }
     final count = _readUint16(data, 0);
     var offset = 2;
     final entries = <RvServerEntry>[];

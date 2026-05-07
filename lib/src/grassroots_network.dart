@@ -1264,17 +1264,6 @@ class GrassrootsNetwork {
     if (!_isUdpEnabledInSettings) return;
     if (!_started) return;
 
-    // Remember friends with UDP addresses so we can re-establish UDP sessions.
-    final udpFriends = _peersState.friends
-        .where(
-          (peer) => _udpCandidatesForPeer(peer).isNotEmpty,
-        )
-        .toList()
-      ..sort((a, b) {
-        if (a.isWellConnected == b.isWellConnected) return 0;
-        return a.isWellConnected ? -1 : 1;
-      });
-
     for (final completer in _holePunchCompleters.values) {
       if (!completer.isCompleted) {
         completer.complete(false);
@@ -1322,8 +1311,28 @@ class GrassrootsNetwork {
 
     await _waitForPublicUdpAddress();
 
+    await _reconnectUdpFriends(reason: 'connectivity-changed');
+  }
+
+  /// Walk every UDP-eligible friend and bring them back online.
+  /// Direct-dial known addresses; fan out RECONNECT to facilitators for
+  /// friends we couldn't reach directly. Idempotent — already-connected
+  /// friends are skipped by [_connectToFriendViaUdp] and by the second-pass
+  /// [getPeerIdForPubkey] guard.
+  Future<void> _reconnectUdpFriends({required String reason}) async {
+    if (!_udpAvailable) return;
+
+    final udpFriends = _peersState.friends
+        .where((peer) => _udpCandidatesForPeer(peer).isNotEmpty)
+        .toList()
+      ..sort((a, b) {
+        if (a.isWellConnected == b.isWellConnected) return 0;
+        return a.isWellConnected ? -1 : 1;
+      });
+    if (udpFriends.isEmpty) return;
+
     debugPrint(
-      'UDP restarted after network change, re-connecting to ${udpFriends.length} friends',
+      '[reconnect] Sweeping ${udpFriends.length} UDP friends ($reason)',
     );
 
     for (final friend in udpFriends) {
@@ -1338,7 +1347,8 @@ class GrassrootsNetwork {
     // will pair this with the friend's AVAILABLE (which the friend sends
     // when its keepalive for us expires) and coordinate a hole-punch.
     final facilitatorCount = store.state.peers.wellConnectedFriends.length +
-        _configuredRendezvousServers().length;
+        _configuredRendezvousServers().length +
+        store.state.peers.friendRvServers.length;
     if (facilitatorCount == 0) return;
 
     for (final friend in udpFriends) {
@@ -1352,6 +1362,16 @@ class GrassrootsNetwork {
         initiatorPubkey: identity.publicKey,
       ));
     }
+  }
+
+  /// Public entry point for triggering a UDP friend-reconnection sweep.
+  /// Chains on the transport update lock so it cannot overlap with a
+  /// connectivity-driven or settings-driven restart.
+  Future<void> reconnectUdpFriends({required String reason}) {
+    final previous = _transportUpdateLock ?? Future.value();
+    final next = previous.then((_) => _reconnectUdpFriends(reason: reason));
+    _transportUpdateLock = next;
+    return next;
   }
 
   /// Check if two connectivity result lists are equivalent.
@@ -1423,6 +1443,7 @@ class GrassrootsNetwork {
       await _initializeUdp();
       if (wasStarted && _udpAvailable) {
         await _udpService!.start();
+        await _reconnectUdpFriends(reason: 'settings-enabled');
       }
     } else if (!_isUdpEnabledInSettings && _udpAvailable) {
       // UDP was disabled, dispose service and clean up

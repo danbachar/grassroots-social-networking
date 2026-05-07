@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:redux/redux.dart';
 import 'package:flutter/foundation.dart';
@@ -30,11 +31,10 @@ import 'signaling_codec.dart';
 /// - **Rendezvous server** (bootstrap_anchor): runs the RECONNECT/AVAILABLE
 ///   matcher. The canonical facilitator implementation lives in
 ///   `bootstrap_anchor/lib/src/signaling_handler.dart`.
-/// - **Well-connected friend** (this client, when reachable directly): can
-///   relay direct PUNCH_INITIATE for an already-known friend
-///   ([requestDirectPunch]). Acting as a full RECONNECT/AVAILABLE matcher
-///   inside the client requires plumbing observed source addresses through
-///   the message router — left as a follow-up.
+/// - **Friend mediator** (this client, when connected to both peers): handles
+///   an explicit RECONNECT-style mediation request by looking up both friends'
+///   addresses and sending each side a PUNCH_INITIATE. This matches the
+///   friends-based rendezvous step in the GLP spec.
 ///
 /// ## Integration
 ///
@@ -54,11 +54,6 @@ class SignalingService {
   /// Timer for periodic stale-entry cleanup in the address table.
   Timer? _staleCleanupTimer;
 
-  /// Pending RECONNECT/AVAILABLE awaiting a counterpart, keyed by
-  /// `senderHex|targetHex`. Mirrors the rendezvous server's matcher so a
-  /// well-connected client can act as a friends-based rendezvous mediator.
-  final Map<String, _PendingRendezvous> _pendingRendezvous = {};
-
   /// Counterpart map for forwarding PUNCH_READY between peers we coordinated.
   final Map<String, Uint8List> _pendingPunchCounterparts = {};
 
@@ -66,7 +61,6 @@ class SignalingService {
   /// pair, to drop duplicate matches inside the cooldown window.
   final Map<String, DateTime> _recentPunchCoordinations = {};
 
-  static const _pendingRendezvousExpiry = Duration(seconds: 30);
   static const _punchCoordinationCooldown = Duration(seconds: 15);
 
   // ===== Callbacks (set by coordinator) =====
@@ -75,13 +69,13 @@ class SignalingService {
   /// The coordinator wraps the payload in a GrassrootsPacket(type: signaling),
   /// signs it, and sends it via the best available transport.
   Future<bool> Function(Uint8List recipientPubkey, Uint8List signalingPayload)?
-      sendSignaling;
+  sendSignaling;
 
   /// Send a signaling payload only over an already-live direct control path.
   /// Used for peer-to-peer punch coordination where falling back to UDP would
   /// re-enter the very path we are trying to establish.
   Future<bool> Function(Uint8List recipientPubkey, Uint8List signalingPayload)?
-      sendDirectSignaling;
+  sendDirectSignaling;
 
   /// Send a signaling payload to a specific UDP address — used when fanning
   /// out RECONNECT/AVAILABLE to rendezvous servers we've learned about from
@@ -91,7 +85,8 @@ class SignalingService {
     Uint8List recipientPubkey,
     String address,
     Uint8List signalingPayload,
-  )? sendSignalingToAddress;
+  )?
+  sendSignalingToAddress;
 
   /// Fired when a rendezvous facilitator (or direct peer) tells us to start
   /// hole-punching. [readyRecipientPubkey] is where we should send PUNCH_READY
@@ -101,7 +96,8 @@ class SignalingService {
     String ip,
     int port,
     Uint8List readyRecipientPubkey,
-  )? onPunchInitiate;
+  )?
+  onPunchInitiate;
 
   /// Fired when a hole-punch completes and we should connect to the peer.
   /// (Triggered by PUNCH_READY from the other side via the facilitator.)
@@ -113,10 +109,7 @@ class SignalingService {
   /// registration round-trip (the GLP spec response to a client ANNOUNCE).
   void Function(Uint8List senderPubkey, String ip, int port)? onAddrReflected;
 
-  SignalingService({
-    required this.store,
-    this.codec = const SignalingCodec(),
-  }) {
+  SignalingService({required this.store, this.codec = const SignalingCodec()}) {
     // Clean up stale address table entries every 60 seconds.
     _staleCleanupTimer = Timer.periodic(
       const Duration(seconds: 60),
@@ -129,8 +122,9 @@ class SignalingService {
   /// Send RECONNECT(peerPubkey=target) to every trusted facilitator.
   ///
   /// Called when this agent's connectivity changed (new public IP) and it
-  /// wants to reach [targetPubkey]. The facilitators will match this against
-  /// any AVAILABLE the target sends and coordinate a hole-punch.
+  /// wants to reach [targetPubkey]. Rendezvous servers match this against
+  /// the target's AVAILABLE. Friend mediators handle it only when they are
+  /// already connected to the target and can look up both addresses.
   ///
   /// Returns the number of facilitators the request was sent to.
   Future<int> fanOutReconnect(
@@ -147,14 +141,45 @@ class SignalingService {
     );
   }
 
+  /// Ask one connected friend to mediate reconnection to [targetPubkey].
+  Future<bool> requestFriendMediation({
+    required Uint8List mediatorPubkey,
+    required Uint8List targetPubkey,
+    required Uint8List initiatorPubkey,
+  }) async {
+    final msg = ReconnectMessage(
+      initiatorPubkey: initiatorPubkey,
+      peerPubkey: targetPubkey,
+    );
+    return await sendSignaling?.call(mediatorPubkey, codec.encode(msg)) ??
+        false;
+  }
+
+  /// Proactively mediate two connected friends from the local address table.
+  void mediateFriends({
+    required Uint8List requesterPubkey,
+    required Uint8List targetPubkey,
+  }) {
+    final requesterHex = _pubkeyToHex(requesterPubkey);
+    _handleRendezvous(
+      senderPubkey: requesterPubkey,
+      senderHex: requesterHex,
+      targetPubkey: targetPubkey,
+      observedIp: null,
+      observedPort: null,
+      intent: 'RECONNECT',
+    );
+  }
+
   /// Send AVAILABLE(peerPubkey=target) to the rendezvous facilitators that
   /// the target is known to use.
   ///
   /// Spec §3.5: when B detects A went silent, B contacts *A's* known
   /// rendezvous agents — not B's own. We learn the target's RV list (pubkey
   /// + address) via the RV_LIST signaling exchange. If the target hasn't
-  /// told us their list yet, fall back to common well-connected friends as
-  /// a friends-based rendezvous mediator.
+  /// told us their list yet, there is no rendezvous-server AVAILABLE target.
+  /// Friends-based mediation is driven by RECONNECT-style mediation requests,
+  /// not by the rendezvous server's two-sided AVAILABLE matcher.
   ///
   /// Returns the number of facilitators the message was sent to.
   Future<int> fanOutAvailable(Uint8List targetPubkey) async {
@@ -183,11 +208,8 @@ class SignalingService {
         } catch (_) {
           continue;
         }
-        final ok = await sendSignalingToAddress?.call(
-              rvPubkey,
-              address,
-              payload,
-            ) ??
+        final ok =
+            await sendSignalingToAddress?.call(rvPubkey, address, payload) ??
             false;
         if (ok) {
           sent++;
@@ -200,34 +222,15 @@ class SignalingService {
       }
     }
 
-    // Fallback: well-connected friends (friends-based rendezvous mediators).
-    final wcFriends = <String, Uint8List>{};
-    for (final friend in store.state.peers.wellConnectedFriends) {
-      final friendHex = _pubkeyToHex(friend.publicKey);
-      if (friendHex == targetHex) continue;
-      wcFriends.putIfAbsent(friendHex, () => friend.publicKey);
-    }
-    final wcHexes = wcFriends.keys.toList()..sort();
-    for (final hex in wcHexes) {
-      final ok = await sendSignaling?.call(wcFriends[hex]!, payload) ?? false;
-      if (ok) {
-        sent++;
-      } else {
-        debugPrint(
-          '[AVAILABLE] Could not reach WC friend ${hex.substring(0, 8)}...',
-        );
-      }
-    }
-
     if (sent == 0) {
       debugPrint(
         '[AVAILABLE] No facilitators reached for ${targetHex.substring(0, 8)}'
-        ' (RV count=${rvHexes.length}, WC friends=${wcHexes.length})',
+        ' (target RV count=${rvHexes.length})',
       );
     } else {
       debugPrint(
         '[AVAILABLE] Sent for ${targetHex.substring(0, 8)} to '
-        '${rvHexes.length} target RV(s) + ${wcHexes.length} WC friend(s)',
+        '${rvHexes.length} target RV(s)',
       );
     }
     return sent;
@@ -239,11 +242,14 @@ class SignalingService {
     required String intent,
   }) async {
     final targetHex = _pubkeyToHex(targetPubkey);
-    final facilitators =
-        _trustedFacilitatorPubkeys(excludePubkeyHex: targetHex);
+    final facilitators = _trustedFacilitatorPubkeys(
+      targetPubkeyHex: targetHex,
+      excludePubkeyHex: targetHex,
+    );
     if (facilitators.isEmpty) {
       debugPrint(
-          '[$intent] No trusted facilitators to fan out to for ${targetHex.substring(0, 8)}...');
+        '[$intent] No trusted facilitators to fan out to for ${targetHex.substring(0, 8)}...',
+      );
       return 0;
     }
 
@@ -275,6 +281,19 @@ class SignalingService {
     List<RvServerEntry> ownRvServers,
   ) async {
     final msg = RvListMessage(entries: ownRvServers);
+    return await sendSignaling?.call(recipientPubkey, codec.encode(msg)) ??
+        false;
+  }
+
+  /// Send our current accepted friend set to a friend.
+  ///
+  /// Recipients maintain this as their friends-of-friends map, which lets
+  /// them choose common-friend mediators for friends-based rendezvous.
+  Future<bool> sendFriendList(
+    Uint8List recipientPubkey,
+    List<Uint8List> friendPubkeys,
+  ) async {
+    final msg = FriendListMessage(friendPubkeys: friendPubkeys);
     return await sendSignaling?.call(recipientPubkey, codec.encode(msg)) ??
         false;
   }
@@ -350,8 +369,7 @@ class SignalingService {
   /// [senderPubkey] is the authenticated sender from the outer GrassrootsPacket.
   /// [payload] is the raw signaling payload (type byte + message data).
   /// [observedIp] / [observedPort] carry the UDP source address observed by
-  /// the transport layer — used by the client's friends-based rendezvous
-  /// matcher when this agent is acting as a facilitator for two friends.
+  /// the transport layer — used when this client acts as a friend mediator.
   void processSignaling(
     Uint8List senderPubkey,
     Uint8List payload, {
@@ -376,7 +394,8 @@ class SignalingService {
       return;
     }
 
-    final senderLabel = senderPeer?.displayName ??
+    final senderLabel =
+        senderPeer?.displayName ??
         'facilitator ${senderHex.substring(0, 8)}...';
     debugPrint('Received signaling from $senderLabel: $msg');
 
@@ -414,6 +433,8 @@ class SignalingService {
         );
       case RvListMessage():
         _handleRvList(senderPubkey, msg);
+      case FriendListMessage():
+        _handleFriendList(senderPubkey, msg);
     }
   }
 
@@ -433,15 +454,36 @@ class SignalingService {
     for (final e in entries) {
       debugPrint('[rv-list]   ${e.key.substring(0, 8)} -> ${e.value}');
     }
-    store.dispatch(PeerRvServersUpdatedAction(
-      publicKey: senderPubkey,
-      rvServers: servers,
-    ));
+    store.dispatch(
+      PeerRvServersUpdatedAction(publicKey: senderPubkey, rvServers: servers),
+    );
   }
 
-  /// Match RECONNECT(A→B) with AVAILABLE(B→A) and dispatch PUNCH_INITIATE
-  /// to both sides — same logic as the rendezvous server, run on a client
-  /// acting as a friends-based rendezvous mediator.
+  void _handleFriendList(Uint8List senderPubkey, FriendListMessage msg) {
+    final friends = <String>{};
+    for (final pubkey in msg.friendPubkeys) {
+      if (pubkey.length != 32) continue;
+      friends.add(_pubkeyToHex(pubkey));
+    }
+    final senderHex8 = _pubkeyToHex(senderPubkey).substring(0, 8);
+    debugPrint(
+      '[fof] $senderHex8 advertises ${friends.length} accepted friend(s)',
+    );
+    store.dispatch(
+      PeerFriendListUpdatedAction(
+        publicKey: senderPubkey,
+        friendPubkeyHexes: friends,
+      ),
+    );
+  }
+
+  /// Handle a RECONNECT-style friend mediation request by looking up both
+  /// friends' addresses and dispatching PUNCH_INITIATE to both sides.
+  ///
+  /// The two-sided RECONNECT/AVAILABLE matcher belongs to rendezvous servers.
+  /// A friend mediator follows the GLP friends-based rendezvous step: it must
+  /// already be connected to the target friend, and it uses its friend address
+  /// table rather than waiting for an AVAILABLE counterpart.
   void _handleRendezvous({
     required Uint8List senderPubkey,
     required String senderHex,
@@ -452,105 +494,166 @@ class SignalingService {
   }) {
     final targetHex = _pubkeyToHex(targetPubkey);
 
-    if (observedIp == null || observedPort == null) {
-      // TODO(ble-mediator): support BLE-arrived RECONNECT/AVAILABLE for the
-      // edge case where an internet-down but BLE-adjacent peer asks us to
-      // mediate. Replace this drop with a stored-address fallback:
-      //   1. Look up the sender's UDP address — first in `addressTable`
-      //      (populated by `processAnnounceFromFriend`), then in
-      //      `PeerState.udpAddress` / `udpAddressCandidates`.
-      //   2. If found, use that as the synthetic observed source for matching
-      //      and continue. Mirrors the spec's friends-based mediation model
-      //      (§3.5.2 `punch_to`), where the mediator looks up addresses in
-      //      its friends list rather than observing them from the packet.
-      //   3. If not found, drop — we have nothing to punch toward.
-      // Until then, BLE-arrived signaling is dropped here; the typical UDP
-      // path covers RV servers and well-connected friends.
+    if (intent != 'RECONNECT') {
       debugPrint(
-        'Dropping $intent from ${senderHex.substring(0, 8)}... — no observed '
-        'source (likely arrived over BLE; mediator role requires UDP)',
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — friend '
+        'mediators do not run the rendezvous-server matcher',
       );
       return;
     }
+
     if (senderHex == targetHex) {
-      debugPrint('Dropping $intent from ${senderHex.substring(0, 8)}... — '
-          'sender targeting itself');
+      debugPrint(
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — '
+        'sender targeting itself',
+      );
+      return;
+    }
+
+    final targetPeer = store.state.peers.getPeerByPubkeyHex(targetHex);
+    if (targetPeer == null || !targetPeer.isFriend) {
+      debugPrint(
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — target '
+        '${targetHex.substring(0, 8)} is not a friend of this mediator',
+      );
+      return;
+    }
+
+    final senderAddress = _addressForMediation(
+      senderHex,
+      observedIp: observedIp,
+      observedPort: observedPort,
+    );
+    if (senderAddress == null) {
+      debugPrint(
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — no UDP '
+        'address available for friends-based mediation',
+      );
       return;
     }
 
     final now = DateTime.now();
-    _pruneExpiredPendingRendezvous(now);
     _pruneRecentPunchCoordinations(now);
 
     final sessionKey = _punchSessionKey(senderHex, targetHex);
     final lastCoordinated = _recentPunchCoordinations[sessionKey];
     if (lastCoordinated != null &&
         now.difference(lastCoordinated) < _punchCoordinationCooldown) {
-      debugPrint('Dropping duplicate $intent ${senderHex.substring(0, 8)}'
-          ' ↔ ${targetHex.substring(0, 8)} — already coordinated '
-          '${now.difference(lastCoordinated).inMilliseconds}ms ago');
+      debugPrint(
+        'Dropping duplicate $intent ${senderHex.substring(0, 8)}'
+        ' ↔ ${targetHex.substring(0, 8)} — already coordinated '
+        '${now.difference(lastCoordinated).inMilliseconds}ms ago',
+      );
       return;
     }
 
-    final counterpartKey = _pendingKey(targetHex, senderHex);
-    final counterpart = _pendingRendezvous.remove(counterpartKey);
-
-    if (counterpart == null) {
-      _pendingRendezvous[_pendingKey(senderHex, targetHex)] =
-          _PendingRendezvous(
-        senderPubkey: senderPubkey,
-        ip: observedIp,
-        port: observedPort,
-        intent: intent,
-        timestamp: now,
-      );
+    if (!targetPeer.isLiveReachable) {
       debugPrint(
-        '[mediate] Stored $intent: ${senderHex.substring(0, 8)}'
-        '($observedIp:$observedPort) → ${targetHex.substring(0, 8)}, '
-        'awaiting counterpart',
+        'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — target '
+        '${targetHex.substring(0, 8)} is not live on this mediator',
+      );
+      return;
+    }
+
+    final targetAddress = _addressForMediation(
+      targetHex,
+      observedIp: null,
+      observedPort: null,
+    );
+    if (targetAddress == null) {
+      debugPrint(
+        'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — no UDP '
+        'address available for target ${targetHex.substring(0, 8)}',
       );
       return;
     }
 
     _recentPunchCoordinations[sessionKey] = now;
-    _pendingPunchCounterparts[senderHex] = counterpart.senderPubkey;
+    _pendingPunchCounterparts[senderHex] = targetPubkey;
     _pendingPunchCounterparts[targetHex] = senderPubkey;
 
     debugPrint(
-      '[mediate] Coordinating hole-punch (${counterpart.intent} × $intent): '
-      '${targetHex.substring(0, 8)}(${counterpart.ip}:${counterpart.port}) <-> '
-      '${senderHex.substring(0, 8)}($observedIp:$observedPort)',
+      '[mediate] Coordinating single-step friend mediation: '
+      '${senderHex.substring(0, 8)}'
+      '(${senderAddress.ip}:${senderAddress.port}) <-> '
+      '${targetHex.substring(0, 8)}(${targetAddress.ip}:${targetAddress.port})',
     );
 
     final initiateToSender = PunchInitiateMessage(
-      peerPubkey: counterpart.senderPubkey,
-      ip: counterpart.ip,
-      port: counterpart.port,
+      peerPubkey: targetPubkey,
+      ip: targetAddress.ip,
+      port: targetAddress.port,
     );
     sendSignaling?.call(senderPubkey, codec.encode(initiateToSender));
 
-    final initiateToCounterpart = PunchInitiateMessage(
+    final initiateToTarget = PunchInitiateMessage(
       peerPubkey: senderPubkey,
-      ip: observedIp,
-      port: observedPort,
+      ip: senderAddress.ip,
+      port: senderAddress.port,
     );
-    sendSignaling?.call(
-      counterpart.senderPubkey,
-      codec.encode(initiateToCounterpart),
-    );
+    sendSignaling?.call(targetPubkey, codec.encode(initiateToTarget));
   }
 
-  static String _pendingKey(String senderHex, String targetHex) =>
-      '$senderHex|$targetHex';
+  ({String ip, int port})? _addressForMediation(
+    String pubkeyHex, {
+    required String? observedIp,
+    required int? observedPort,
+  }) {
+    if (observedIp != null && observedPort != null) {
+      return (ip: observedIp, port: observedPort);
+    }
+
+    final registeredAddresses = addressTable.lookupAll(pubkeyHex);
+    for (final registered in registeredAddresses) {
+      final normalized = _normalizeMediationAddress(
+        registered.ip,
+        registered.port,
+      );
+      if (normalized == null || !isGloballyRoutableAddress(normalized)) {
+        continue;
+      }
+      return (ip: registered.ip, port: registered.port);
+    }
+
+    for (final registered in registeredAddresses) {
+      final normalized = _normalizeMediationAddress(
+        registered.ip,
+        registered.port,
+      );
+      if (normalized != null) {
+        return (ip: registered.ip, port: registered.port);
+      }
+    }
+
+    final peer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
+    if (peer == null) return null;
+
+    for (final candidate in peer.allUdpAddressCandidates) {
+      if (!isGloballyRoutableAddress(candidate)) continue;
+      final parsed = parseAddressString(candidate);
+      if (parsed != null) {
+        return (ip: parsed.ip.address, port: parsed.port);
+      }
+    }
+
+    for (final candidate in peer.allUdpAddressCandidates) {
+      final parsed = parseAddressString(candidate);
+      if (parsed != null) {
+        return (ip: parsed.ip.address, port: parsed.port);
+      }
+    }
+
+    return null;
+  }
+
+  String? _normalizeMediationAddress(String ip, int port) {
+    final parsedIp = InternetAddress.tryParse(ip);
+    if (parsedIp == null) return null;
+    return AddressInfo(parsedIp, port).toAddressString();
+  }
 
   static String _punchSessionKey(String a, String b) =>
       a.compareTo(b) <= 0 ? '$a|$b' : '$b|$a';
-
-  void _pruneExpiredPendingRendezvous(DateTime now) {
-    _pendingRendezvous.removeWhere(
-      (_, entry) => now.difference(entry.timestamp) >= _pendingRendezvousExpiry,
-    );
-  }
 
   void _pruneRecentPunchCoordinations(DateTime now) {
     _recentPunchCoordinations.removeWhere(
@@ -679,7 +782,6 @@ class SignalingService {
   void dispose() {
     _staleCleanupTimer?.cancel();
     _staleCleanupTimer = null;
-    _pendingRendezvous.clear();
     _pendingPunchCounterparts.clear();
     _recentPunchCoordinations.clear();
     addressTable.clear();
@@ -713,14 +815,23 @@ class SignalingService {
   /// Trusted facilitators in deterministic lexicographic order by pubkey hex.
   ///
   /// Both well-connected friends and configured rendezvous servers count as
-  /// facilitators. Both sides of a reconnection compute the same ordered
-  /// list, so they converge on the same facilitator on retry.
-  List<Uint8List> _trustedFacilitatorPubkeys({String? excludePubkeyHex}) {
+  /// facilitators. Rendezvous servers run the two-sided matcher; friends run
+  /// only the single-step friend mediation path when connected to the target.
+  List<Uint8List> _trustedFacilitatorPubkeys({
+    required String targetPubkeyHex,
+    String? excludePubkeyHex,
+  }) {
     final facilitators = <String, Uint8List>{};
 
     for (final friend in store.state.peers.wellConnectedFriends) {
       final friendHex = _pubkeyToHex(friend.publicKey);
       if (friendHex == excludePubkeyHex) continue;
+      if (store.state.peers.friendsOfFriends[friendHex]?.contains(
+            targetPubkeyHex,
+          ) !=
+          true) {
+        continue;
+      }
       facilitators[friendHex] = friend.publicKey;
     }
 
@@ -743,20 +854,4 @@ class SignalingService {
     final orderedHexes = facilitators.keys.toList()..sort();
     return [for (final hex in orderedHexes) facilitators[hex]!];
   }
-}
-
-class _PendingRendezvous {
-  final Uint8List senderPubkey;
-  final String ip;
-  final int port;
-  final String intent;
-  final DateTime timestamp;
-
-  _PendingRendezvous({
-    required this.senderPubkey,
-    required this.ip,
-    required this.port,
-    required this.intent,
-    required this.timestamp,
-  });
 }

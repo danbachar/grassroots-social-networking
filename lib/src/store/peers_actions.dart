@@ -31,10 +31,7 @@ class BleDeviceRssiUpdatedAction extends PeerAction {
   final String deviceId;
   final int rssi;
 
-  BleDeviceRssiUpdatedAction({
-    required this.deviceId,
-    required this.rssi,
-  });
+  BleDeviceRssiUpdatedAction({required this.deviceId, required this.rssi});
 }
 
 /// Mark a discovered BLE device as connecting
@@ -140,10 +137,7 @@ class PeerRssiUpdatedAction extends PeerAction {
   final Uint8List publicKey;
   final int rssi;
 
-  PeerRssiUpdatedAction({
-    required this.publicKey,
-    required this.rssi,
-  });
+  PeerRssiUpdatedAction({required this.publicKey, required this.rssi});
 }
 
 /// Mark peer as disconnected from BLE.
@@ -229,10 +223,7 @@ class AssociateUdpAddressAction extends PeerAction {
   final Uint8List publicKey;
   final String address;
 
-  AssociateUdpAddressAction({
-    required this.publicKey,
-    required this.address,
-  });
+  AssociateUdpAddressAction({required this.publicKey, required this.address});
 }
 
 /// Update the set of rendezvous servers a peer reaches its peers through.
@@ -248,6 +239,20 @@ class PeerRvServersUpdatedAction extends PeerAction {
   });
 }
 
+/// Update the friends-of-friends set advertised by a direct friend.
+///
+/// [friendPubkeyHexes] are lowercase public-key hex strings for the sender's
+/// currently accepted friends.
+class PeerFriendListUpdatedAction extends PeerAction {
+  final Uint8List publicKey;
+  final Set<String> friendPubkeyHexes;
+
+  PeerFriendListUpdatedAction({
+    required this.publicKey,
+    required this.friendPubkeyHexes,
+  });
+}
+
 // ===== Friendship Actions =====
 
 /// A friendship has been established - mark peer as friend
@@ -255,10 +260,7 @@ class FriendEstablishedAction extends PeerAction {
   final Uint8List publicKey;
   final String? nickname;
 
-  FriendEstablishedAction({
-    required this.publicKey,
-    this.nickname,
-  });
+  FriendEstablishedAction({required this.publicKey, this.nickname});
 }
 
 /// A friendship has been removed
@@ -271,13 +273,11 @@ class FriendRemovedAction extends PeerAction {
 // ===== Reachability Verification Actions =====
 
 /// We successfully reached a peer at their UDP address without coordinating
-/// a hole-punch — empirical proof that they accept unsolicited inbound.
-/// Promotes the peer from "candidate" (publicly routable address) to
-/// "verified well-connected".
+/// a hole-punch — empirical evidence that they accept unsolicited inbound.
 class PeerDirectReachObservedAction extends PeerAction {
   final Uint8List publicKey;
   final DateTime observedAt;
 
   PeerDirectReachObservedAction(this.publicKey, {DateTime? observedAt})
-      : observedAt = observedAt ?? DateTime.now();
+    : observedAt = observedAt ?? DateTime.now();
 }

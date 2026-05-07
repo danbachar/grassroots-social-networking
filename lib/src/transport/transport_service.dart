@@ -99,8 +99,7 @@ class TransportConnectionEvent {
   /// True if this connection was initiated by the remote peer (we accepted),
   /// false if we initiated. Always false for disconnect events.
   ///
-  /// Used to detect unsolicited inbound traffic, which is empirical proof
-  /// that our address accepts unsolicited inbound (i.e. we are well-connected).
+  /// Used to record unsolicited inbound traffic at our advertised address.
   final bool isIncoming;
 
   TransportConnectionEvent({
@@ -213,6 +212,6 @@ abstract class TransportService {
 /// Convenience extension on TransportState
 extension TransportStateX on TransportState {
   /// Whether this state represents a usable (initialized) transport
-  bool get isUsable => this == TransportState.ready || this == TransportState.active;
+  bool get isUsable =>
+      this == TransportState.ready || this == TransportState.active;
 }
-

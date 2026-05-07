@@ -79,10 +79,7 @@ void main() {
 
         // The friendships state should have changed (pending request added)
         expect(result.friendships, isNot(equals(initial.friendships)));
-        expect(
-          result.friendships.friendships.containsKey('abc123'),
-          isTrue,
-        );
+        expect(result.friendships.friendships.containsKey('abc123'), isTrue);
 
         // Other state sections remain unchanged
         expect(result.peers, equals(initial.peers));
@@ -111,8 +108,9 @@ void main() {
 
       test('TransportAction routes to transportsReducer', () {
         const initial = AppState.initial;
-        final action =
-            BleTransportStateChangedAction(TransportState.initializing);
+        final action = BleTransportStateChangedAction(
+          TransportState.initializing,
+        );
 
         final result = appReducer(initial, action);
 
@@ -156,19 +154,23 @@ void main() {
         expect(result.transports.bleState, TransportState.uninitialized);
       });
 
-      test('BleTransportStateChangedAction with error stores error message',
-          () {
-        const initial = AppState.initial;
+      test(
+        'BleTransportStateChangedAction with error stores error message',
+        () {
+          const initial = AppState.initial;
 
-        final result = appReducer(
-          initial,
-          BleTransportStateChangedAction(TransportState.error,
-              error: 'BLE unavailable'),
-        );
+          final result = appReducer(
+            initial,
+            BleTransportStateChangedAction(
+              TransportState.error,
+              error: 'BLE unavailable',
+            ),
+          );
 
-        expect(result.transports.bleState, TransportState.error);
-        expect(result.transports.bleError, 'BLE unavailable');
-      });
+          expect(result.transports.bleState, TransportState.error);
+          expect(result.transports.bleError, 'BLE unavailable');
+        },
+      );
 
       test('BleScanningChangedAction updates scanning flag', () {
         final state = AppState.initial.copyWith(
@@ -197,31 +199,49 @@ void main() {
           NetworkConnectionType.wifi,
         );
         expect(
-            result.transports.publicAddress, initial.transports.publicAddress);
+          result.transports.publicAddress,
+          initial.transports.publicAddress,
+        );
         expect(result.transports.publicIp, initial.transports.publicIp);
       });
 
-      test('ClearPublicConnectivityAction clears stale public network info',
-          () {
-        final state = AppState.initial.copyWith(
-          transports: const TransportsState(
-            udpState: TransportState.active,
-            publicAddress: '203.0.113.10:4242',
-            publicIp: '203.0.113.10',
-            networkConnectionType: NetworkConnectionType.cellular,
-          ),
-        );
+      test(
+        'ClearPublicConnectivityAction clears stale public network info',
+        () {
+          final state = AppState.initial.copyWith(
+            transports: const TransportsState(
+              udpState: TransportState.active,
+              publicAddress: '203.0.113.10:4242',
+              publicIp: '203.0.113.10',
+              networkConnectionType: NetworkConnectionType.cellular,
+            ),
+          );
 
-        final result = appReducer(state, ClearPublicConnectivityAction());
+          final result = appReducer(state, ClearPublicConnectivityAction());
 
-        expect(result.transports.publicAddress, isNull);
-        expect(result.transports.publicIp, isNull);
-        expect(
-          result.transports.networkConnectionType,
-          NetworkConnectionType.cellular,
-        );
-        expect(result.transports.udpState, TransportState.active);
-      });
+          expect(result.transports.publicAddress, isNull);
+          expect(result.transports.publicIp, isNull);
+          expect(
+            result.transports.networkConnectionType,
+            NetworkConnectionType.cellular,
+          );
+          expect(result.transports.udpState, TransportState.active);
+        },
+      );
+
+      test(
+        'well-connected only requires a globally routable public address',
+        () {
+          const publicState = TransportsState(
+            publicAddress: '[2606:4700::1]:4242',
+          );
+          const privateState = TransportsState(publicAddress: '10.0.0.4:4242');
+
+          expect(publicState.lastUnsolicitedInboundAt, isNull);
+          expect(publicState.isWellConnected, isTrue);
+          expect(privateState.isWellConnected, isFalse);
+        },
+      );
     });
 
     // =========================================================
@@ -296,52 +316,47 @@ void main() {
     // =========================================================
     group('actions preserve unrelated state sections', () {
       test(
-          'BleTransportStateChangedAction preserves peers, messages, friendships, settings',
-          () {
-        final now = DateTime.now();
-        final stateWithData = AppState(
-          peers: PeersState(
-            discoveredBlePeers: {
-              'dev1': DiscoveredPeerState(
-                transportId: 'dev1',
-                rssi: -60,
-                discoveredAt: now,
-                lastSeen: now,
-              ),
-            },
-          ),
-        );
+        'BleTransportStateChangedAction preserves peers, messages, friendships, settings',
+        () {
+          final now = DateTime.now();
+          final stateWithData = AppState(
+            peers: PeersState(
+              discoveredBlePeers: {
+                'dev1': DiscoveredPeerState(
+                  transportId: 'dev1',
+                  rssi: -60,
+                  discoveredAt: now,
+                  lastSeen: now,
+                ),
+              },
+            ),
+          );
 
-        final result = appReducer(
-          stateWithData,
-          BleTransportStateChangedAction(TransportState.active),
-        );
+          final result = appReducer(
+            stateWithData,
+            BleTransportStateChangedAction(TransportState.active),
+          );
 
-        // Transports changed
-        expect(result.transports.bleState, TransportState.active);
+          // Transports changed
+          expect(result.transports.bleState, TransportState.active);
 
-        // Peers preserved exactly
-        expect(result.peers, equals(stateWithData.peers));
-        expect(
-          result.peers.discoveredBlePeers.containsKey('dev1'),
-          isTrue,
-        );
+          // Peers preserved exactly
+          expect(result.peers, equals(stateWithData.peers));
+          expect(result.peers.discoveredBlePeers.containsKey('dev1'), isTrue);
 
-        // Messages, friendships, settings preserved
-        expect(result.messages, equals(stateWithData.messages));
-        expect(result.friendships, equals(stateWithData.friendships));
-        expect(result.settings, equals(stateWithData.settings));
-      });
+          // Messages, friendships, settings preserved
+          expect(result.messages, equals(stateWithData.messages));
+          expect(result.friendships, equals(stateWithData.friendships));
+          expect(result.settings, equals(stateWithData.settings));
+        },
+      );
 
       test('PeerAction preserves transports and other sub-states', () {
         final state = AppState.initial.copyWith(
           transports: const TransportsState(bleState: TransportState.active),
         );
 
-        final action = BleDeviceDiscoveredAction(
-          deviceId: 'dev2',
-          rssi: -70,
-        );
+        final action = BleDeviceDiscoveredAction(deviceId: 'dev2', rssi: -70);
         final result = appReducer(state, action);
 
         // Peers changed

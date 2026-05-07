@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
 import '../transport/address_utils.dart';
@@ -100,13 +102,13 @@ class DiscoveredPeerState {
 
   @override
   int get hashCode => Object.hash(
-        transportId,
-        rssi,
-        isConnecting,
-        isConnected,
-        serviceUuid,
-        isBlacklisted,
-      );
+    transportId,
+    rssi,
+    isConnecting,
+    isConnected,
+    serviceUuid,
+    isBlacklisted,
+  );
 
   @override
   String toString() =>
@@ -156,11 +158,11 @@ class PeerState {
   final bool isFriend;
 
   /// When we last successfully reached this peer at [udpAddress] over UDP
-  /// without a prior hole-punch coordination — i.e. the address accepts
-  /// unsolicited inbound. This is the proof that the peer is well-connected.
+  /// without a prior hole-punch coordination — i.e. the address accepted
+  /// unsolicited inbound.
   ///
   /// Bound to [udpAddress]: cleared whenever the UDP address changes, since
-  /// any prior proof was for a different network path.
+  /// any prior observation was for a different network path.
   final DateTime? lastDirectReachAt;
 
   /// Whether there is a live UDX connection to this peer.
@@ -230,25 +232,18 @@ class PeerState {
 
   /// UDP candidates in first-seen order, including legacy fields.
   Set<String> get allUdpAddressCandidates => normalizeAddressStrings([
-        linkLocalAddress,
-        udpAddress,
-        ...udpAddressCandidates,
-      ]);
+    linkLocalAddress,
+    udpAddress,
+    ...udpAddressCandidates,
+  ]);
 
-  /// Whether this peer's [udpAddress] is a publicly routable candidate.
-  /// A candidate may not actually accept unsolicited inbound — see
-  /// [isWellConnected] for the verified version.
+  /// Whether this peer has any publicly routable UDP candidate.
   bool get hasPublicUdpAddress =>
       allUdpAddressCandidates.any(isGloballyRoutableAddress);
 
-  /// Whether this peer is verified well-connected: claims a public UDP
-  /// address AND we have proof that they accept unsolicited inbound at
-  /// that address (we successfully reached them without hole-punching, or
-  /// they reached us via an unsolicited path).
-  ///
-  /// Only verified well-connected peers should be used as signaling
-  /// facilitators or trusted to skip hole-punching on outbound sends.
-  bool get isWellConnected => hasPublicUdpAddress && lastDirectReachAt != null;
+  /// Whether this peer can act as a well-connected friend: it advertises at
+  /// least one globally routable UDP address.
+  bool get isWellConnected => hasPublicUdpAddress;
 
   /// Whether this peer has a live, active connection right now.
   /// Use this for UI "online" status — not for signaling/discovery.
@@ -337,22 +332,24 @@ class PeerState {
 
   @override
   int get hashCode => Object.hash(
-        pubkeyHex,
-        nickname,
-        connectionState,
-        transport,
-        rssi,
-        bleCentralDeviceId,
-        blePeripheralDeviceId,
-        udpAddress,
-        linkLocalAddress,
-        Object.hashAll(udpAddressCandidates),
-        isFriend,
-        lastDirectReachAt,
-        hasLiveUdpConnection,
-        Object.hashAll(
-            knownRvServers.entries.map((e) => Object.hash(e.key, e.value))),
-      );
+    pubkeyHex,
+    nickname,
+    connectionState,
+    transport,
+    rssi,
+    bleCentralDeviceId,
+    blePeripheralDeviceId,
+    udpAddress,
+    linkLocalAddress,
+    Object.hashAll(udpAddressCandidates.toList()..sort()),
+    isFriend,
+    lastDirectReachAt,
+    hasLiveUdpConnection,
+    Object.hashAll(
+      (knownRvServers.entries.toList()..sort((a, b) => a.key.compareTo(b.key)))
+          .map((e) => Object.hash(e.key, e.value)),
+    ),
+  );
 }
 
 /// Complete peers state for Redux store
@@ -364,9 +361,16 @@ class PeersState {
   /// Identified peers (after ANNOUNCE), keyed by pubkey hex
   final Map<String, PeerState> peers;
 
+  /// Friends-of-friends map, keyed by a direct friend's pubkey hex.
+  ///
+  /// Each value is the set of accepted friends that direct friend last
+  /// advertised. This is synced by FRIEND_LIST signaling messages.
+  final Map<String, Set<String>> friendsOfFriends;
+
   const PeersState({
     this.discoveredBlePeers = const {},
     this.peers = const {},
+    this.friendsOfFriends = const {},
   });
 
   static const PeersState initial = PeersState();
@@ -429,6 +433,34 @@ class PeersState {
     return Map.unmodifiable(servers);
   }
 
+  /// Direct accepted friend public keys.
+  Set<String> get friendPubkeyHexes =>
+      friends.map((friend) => friend.pubkeyHex).toSet();
+
+  /// Common friends between us and [friendPubkeyHex], based on the last
+  /// FRIEND_LIST received from that direct friend.
+  Set<String> commonFriendHexesWith(String friendPubkeyHex) {
+    final advertised = friendsOfFriends[friendPubkeyHex.toLowerCase()];
+    if (advertised == null || advertised.isEmpty) return const {};
+    return advertised.intersection(friendPubkeyHexes);
+  }
+
+  /// Connected direct friends that can mediate to [targetPubkeyHex] because
+  /// their advertised friend list contains the target.
+  List<PeerState> mediatorsForFriend(String targetPubkeyHex) {
+    final targetHex = targetPubkeyHex.toLowerCase();
+    final mediators = <PeerState>[];
+    for (final friend in friends) {
+      if (!friend.isLiveReachable) continue;
+      if (friend.pubkeyHex == targetHex) continue;
+      if (friendsOfFriends[friend.pubkeyHex]?.contains(targetHex) == true) {
+        mediators.add(friend);
+      }
+    }
+    mediators.sort((a, b) => a.pubkeyHex.compareTo(b.pubkeyHex));
+    return mediators;
+  }
+
   /// Count of connected peers
   int get connectedCount => connectedPeers.length;
 
@@ -470,10 +502,12 @@ class PeersState {
   PeersState copyWith({
     Map<String, DiscoveredPeerState>? discoveredBlePeers,
     Map<String, PeerState>? peers,
+    Map<String, Set<String>>? friendsOfFriends,
   }) {
     return PeersState(
       discoveredBlePeers: discoveredBlePeers ?? this.discoveredBlePeers,
       peers: peers ?? this.peers,
+      friendsOfFriends: friendsOfFriends ?? this.friendsOfFriends,
     );
   }
 
@@ -483,11 +517,42 @@ class PeersState {
       other is PeersState &&
           runtimeType == other.runtimeType &&
           mapEquals(discoveredBlePeers, other.discoveredBlePeers) &&
-          mapEquals(peers, other.peers);
+          mapEquals(peers, other.peers) &&
+          _setMapEquals(friendsOfFriends, other.friendsOfFriends);
 
   @override
   int get hashCode => Object.hash(
-        discoveredBlePeers.length,
-        peers.length,
-      );
+    _hashStringKeyedMap(discoveredBlePeers),
+    _hashStringKeyedMap(peers),
+    _hashStringSetMap(friendsOfFriends),
+  );
+}
+
+int _hashStringKeyedMap<T>(Map<String, T> map) {
+  return Object.hashAll(
+    (map.entries.toList()..sort((a, b) => a.key.compareTo(b.key))).map(
+      (entry) => Object.hash(entry.key, entry.value),
+    ),
+  );
+}
+
+int _hashStringSetMap(Map<String, Set<String>> map) {
+  return Object.hashAll(
+    (map.entries.toList()..sort((a, b) => a.key.compareTo(b.key))).map(
+      (entry) => Object.hash(
+        entry.key,
+        Object.hashAll(entry.value.toList()..sort()),
+      ),
+    ),
+  );
+}
+
+bool _setMapEquals(Map<String, Set<String>> a, Map<String, Set<String>> b) {
+  if (identical(a, b)) return true;
+  if (a.length != b.length) return false;
+  for (final entry in a.entries) {
+    final other = b[entry.key];
+    if (other == null || !setEquals(entry.value, other)) return false;
+  }
+  return true;
 }

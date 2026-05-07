@@ -43,7 +43,13 @@ enum SignalingType {
   /// list per-friend so that on detecting the friend went silent, it fans
   /// out AVAILABLE to those exact servers (per the spec: B contacts A's
   /// known rendezvous agents).
-  rvList(0x0a);
+  rvList(0x0a),
+
+  /// "Here is my current accepted friend set" — agent → friend.
+  ///
+  /// Used to maintain the friends-of-friends map that drives friend-mediated
+  /// rendezvous.
+  friendList(0x0b);
 
   final int value;
   const SignalingType(this.value);
@@ -146,10 +152,7 @@ class ReconnectMessage extends SignalingMessage {
   /// The public key of the peer we want to reconnect to (32 bytes).
   final Uint8List peerPubkey;
 
-  ReconnectMessage({
-    required this.initiatorPubkey,
-    required this.peerPubkey,
-  });
+  ReconnectMessage({required this.initiatorPubkey, required this.peerPubkey});
 
   @override
   String toString() =>
@@ -210,6 +213,20 @@ class RvListMessage extends SignalingMessage {
   String toString() => 'RvList(count: ${entries.length})';
 }
 
+/// Agent informs a friend about its current accepted friends.
+class FriendListMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.friendList;
+
+  /// Friend public keys (32 bytes each).
+  final List<Uint8List> friendPubkeys;
+
+  FriendListMessage({required this.friendPubkeys});
+
+  @override
+  String toString() => 'FriendList(count: ${friendPubkeys.length})';
+}
+
 // ===== Codec =====
 
 /// Binary encoder/decoder for signaling messages.
@@ -224,6 +241,7 @@ class RvListMessage extends SignalingMessage {
 /// AVAILABLE      : type(1) + peerPubkey(32)
 /// RV_LIST        : type(1) + count(2) +
 ///                  repeated(pubkey(32) + addrLen(2) + addrBytes)
+/// FRIEND_LIST    : type(1) + count(2) + repeated(pubkey(32))
 /// ```
 class SignalingCodec {
   const SignalingCodec();
@@ -238,6 +256,7 @@ class SignalingCodec {
       ReconnectMessage() => _encodeReconnect(msg),
       AvailableMessage() => _encodeAvailable(msg),
       RvListMessage() => _encodeRvList(msg),
+      FriendListMessage() => _encodeFriendList(msg),
     };
   }
 
@@ -297,6 +316,19 @@ class SignalingCodec {
     return buffer.toBytes();
   }
 
+  Uint8List _encodeFriendList(FriendListMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.friendList.value);
+    _writeUint16(buffer, msg.friendPubkeys.length);
+    for (final pubkey in msg.friendPubkeys) {
+      if (pubkey.length != 32) {
+        throw ArgumentError('FriendList pubkey must be 32 bytes');
+      }
+      buffer.add(pubkey);
+    }
+    return buffer.toBytes();
+  }
+
   // ===== Decoding =====
 
   /// Decode a signaling payload into a [SignalingMessage].
@@ -317,6 +349,7 @@ class SignalingCodec {
       SignalingType.reconnect => _decodeReconnect(payload),
       SignalingType.available => _decodeAvailable(payload),
       SignalingType.rvList => _decodeRvList(payload),
+      SignalingType.friendList => _decodeFriendList(payload),
     };
   }
 
@@ -332,11 +365,7 @@ class SignalingCodec {
     offset += ipLen;
     final port = _readUint16(data, offset);
 
-    return PunchInitiateMessage(
-      peerPubkey: peerPubkey,
-      ip: ip,
-      port: port,
-    );
+    return PunchInitiateMessage(peerPubkey: peerPubkey, ip: ip, port: port);
   }
 
   PunchReadyMessage _decodePunchReady(Uint8List data) {
@@ -395,12 +424,33 @@ class SignalingCodec {
       if (offset + addrLen > data.length) {
         throw const FormatException('RvList address truncated');
       }
-      final address =
-          String.fromCharCodes(data.sublist(offset, offset + addrLen));
+      final address = String.fromCharCodes(
+        data.sublist(offset, offset + addrLen),
+      );
       offset += addrLen;
       entries.add(RvServerEntry(pubkey: pubkey, address: address));
     }
     return RvListMessage(entries: entries);
+  }
+
+  FriendListMessage _decodeFriendList(Uint8List data) {
+    if (data.length < 2) {
+      throw const FormatException('FriendList payload too short');
+    }
+    final count = _readUint16(data, 0);
+    var offset = 2;
+    final friendPubkeys = <Uint8List>[];
+    for (var i = 0; i < count; i++) {
+      if (offset + 32 > data.length) {
+        throw const FormatException('FriendList entry truncated');
+      }
+      friendPubkeys.add(Uint8List.fromList(data.sublist(offset, offset + 32)));
+      offset += 32;
+    }
+    if (offset != data.length) {
+      throw const FormatException('FriendList payload has trailing bytes');
+    }
+    return FriendListMessage(friendPubkeys: friendPubkeys);
   }
 
   // ===== Helpers =====

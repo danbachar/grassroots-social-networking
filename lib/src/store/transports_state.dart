@@ -2,14 +2,7 @@ import 'package:flutter/foundation.dart';
 import '../transport/transport_service.dart';
 import '../transport/address_utils.dart';
 
-enum NetworkConnectionType {
-  wifi,
-  cellular,
-  ethernet,
-  vpn,
-  other,
-  offline,
-}
+enum NetworkConnectionType { wifi, cellular, ethernet, vpn, other, offline }
 
 extension NetworkConnectionTypeX on NetworkConnectionType {
   String get displayName {
@@ -64,11 +57,10 @@ class TransportsState {
 
   /// When we last observed unsolicited inbound traffic at [publicAddress]
   /// — i.e. a peer connected to us via UDP without us first coordinating
-  /// a hole-punch. This is empirical proof that our firewall and NAT path
-  /// allow inbound packets at the claimed address.
+  /// a hole-punch.
   ///
   /// Bound to [publicAddress]: cleared whenever the address changes, since
-  /// any prior proof was for a different network path.
+  /// any prior observation was for a different network path.
   final DateTime? lastUnsolicitedInboundAt;
 
   const TransportsState({
@@ -92,24 +84,13 @@ class TransportsState {
   /// Whether the system is in a healthy state (any transport active)
   bool get isHealthy => isAnyActive;
 
-  /// Whether this device has a publicly routable address candidate.
-  ///
-  /// This means the address *looks* reachable, but we have no proof yet
-  /// that unsolicited inbound actually works. Use [isWellConnected] for
-  /// decisions where reachability matters.
+  /// Whether this device has a publicly routable address.
   bool get hasPublicAddress =>
       publicAddress != null && isGloballyRoutableAddress(publicAddress!);
 
-  /// Whether this device is verified well-connected: has a public address
-  /// AND we have observed unsolicited inbound at that address.
-  ///
-  /// Only verified well-connected devices should advertise themselves as
-  /// signaling facilitators. A device with a public address but no proof
-  /// of inbound reachability may sit behind a stateful firewall that
-  /// silently drops unsolicited packets — picking it as facilitator
-  /// causes silent hole-punch failures.
-  bool get isWellConnected =>
-      hasPublicAddress && lastUnsolicitedInboundAt != null;
+  /// Whether this device is well-connected: it has a globally routable UDP
+  /// address and can advertise itself as a signaling facilitator.
+  bool get isWellConnected => hasPublicAddress;
 
   /// Overall status display string derived from per-transport states
   String get statusDisplayString {
@@ -158,7 +139,7 @@ class TransportsState {
 
   /// Create a copy with publicAddress explicitly cleared (set to null).
   /// Keeps publicIp — the IP is still valid even if the full address isn't.
-  /// Also clears lastUnsolicitedInboundAt — the proof was bound to the address.
+  /// Also clears lastUnsolicitedInboundAt because it was bound to the address.
   TransportsState clearPublicAddress() {
     return TransportsState(
       bleState: bleState,
@@ -174,7 +155,7 @@ class TransportsState {
   }
 
   /// Create a copy with both publicAddress and publicIp cleared.
-  /// Also clears lastUnsolicitedInboundAt — the proof was bound to the address.
+  /// Also clears lastUnsolicitedInboundAt because it was bound to the address.
   TransportsState clearPublicConnectivity() {
     return TransportsState(
       bleState: bleState,
@@ -190,7 +171,7 @@ class TransportsState {
   }
 
   /// Create a copy with publicAddress changed to a new value, clearing the
-  /// reachability proof (since the proof was bound to the previous address).
+  /// reachability observation because it was bound to the previous address.
   TransportsState withNewPublicAddress(String address) {
     return TransportsState(
       bleState: bleState,
@@ -222,16 +203,16 @@ class TransportsState {
 
   @override
   int get hashCode => Object.hash(
-        bleState,
-        udpState,
-        bleError,
-        udpError,
-        bleScanning,
-        publicAddress,
-        publicIp,
-        networkConnectionType,
-        lastUnsolicitedInboundAt,
-      );
+    bleState,
+    udpState,
+    bleError,
+    udpError,
+    bleScanning,
+    publicAddress,
+    publicIp,
+    networkConnectionType,
+    lastUnsolicitedInboundAt,
+  );
 
   @override
   String toString() =>

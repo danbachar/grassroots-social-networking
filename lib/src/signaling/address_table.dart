@@ -1,9 +1,8 @@
 /// In-memory address table for well-connected friends.
 ///
-/// When this device is well-connected, it maintains a table of friend
-/// addresses received via ADDR_REGISTER signaling messages. Other friends
-/// can query this table via ADDR_QUERY to discover each other's addresses
-/// for hole-punching.
+/// When this device can act as a friend mediator, it maintains a table of
+/// friend addresses learned from ANNOUNCE traffic. The mediation path uses
+/// this table to tell two friends which UDP addresses to punch toward.
 ///
 /// The table is volatile — entries are lost on restart. Friends re-register
 /// their addresses on startup, so this is fine.

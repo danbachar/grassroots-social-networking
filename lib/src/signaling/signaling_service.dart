@@ -397,7 +397,7 @@ class SignalingService {
     final senderLabel =
         senderPeer?.displayName ??
         'facilitator ${senderHex.substring(0, 8)}...';
-    debugPrint('Received signaling from $senderLabel: $msg');
+    // debugPrint('Received signaling from $senderLabel: $msg');
 
     switch (msg) {
       case PunchInitiateMessage():
@@ -555,15 +555,25 @@ class SignalingService {
       return;
     }
 
+    // Hole punching requires both peers to share an IP address family —
+    // a UDP socket bound to IPv4 cannot reach an IPv6 destination, and vice
+    // versa. Pick the target's address constrained to the sender's family
+    // and bail out if no compatible candidate exists; coordinating a punch
+    // across families produces 9 packets sent into the void on each side
+    // and a 10s UDX handshake timeout for the user.
+    final senderFamily = InternetAddress.tryParse(senderAddress.ip)?.type;
     final targetAddress = _addressForMediation(
       targetHex,
       observedIp: null,
       observedPort: null,
+      requireFamily: senderFamily,
     );
     if (targetAddress == null) {
       debugPrint(
         'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — no UDP '
-        'address available for target ${targetHex.substring(0, 8)}',
+        'address for target ${targetHex.substring(0, 8)} in the same '
+        'address family ($senderFamily) as the sender '
+        '(${senderAddress.ip})',
       );
       return;
     }
@@ -594,17 +604,32 @@ class SignalingService {
     sendSignaling?.call(targetPubkey, codec.encode(initiateToTarget));
   }
 
+  /// Pick a UDP address suitable for use as a hole-punch target.
+  ///
+  /// When [requireFamily] is non-null, only candidates whose IP belongs to
+  /// that family (IPv4 or IPv6) are considered. The mediator uses this to
+  /// pair compatible families across the two punching peers.
   ({String ip, int port})? _addressForMediation(
     String pubkeyHex, {
     required String? observedIp,
     required int? observedPort,
+    InternetAddressType? requireFamily,
   }) {
-    if (observedIp != null && observedPort != null) {
+    bool matchesFamily(String ip) {
+      if (requireFamily == null) return true;
+      final parsed = InternetAddress.tryParse(ip);
+      return parsed != null && parsed.type == requireFamily;
+    }
+
+    if (observedIp != null &&
+        observedPort != null &&
+        matchesFamily(observedIp)) {
       return (ip: observedIp, port: observedPort);
     }
 
     final registeredAddresses = addressTable.lookupAll(pubkeyHex);
     for (final registered in registeredAddresses) {
+      if (!matchesFamily(registered.ip)) continue;
       final normalized = _normalizeMediationAddress(
         registered.ip,
         registered.port,
@@ -616,6 +641,7 @@ class SignalingService {
     }
 
     for (final registered in registeredAddresses) {
+      if (!matchesFamily(registered.ip)) continue;
       final normalized = _normalizeMediationAddress(
         registered.ip,
         registered.port,
@@ -631,16 +657,16 @@ class SignalingService {
     for (final candidate in peer.allUdpAddressCandidates) {
       if (!isGloballyRoutableAddress(candidate)) continue;
       final parsed = parseAddressString(candidate);
-      if (parsed != null) {
-        return (ip: parsed.ip.address, port: parsed.port);
-      }
+      if (parsed == null) continue;
+      if (!matchesFamily(parsed.ip.address)) continue;
+      return (ip: parsed.ip.address, port: parsed.port);
     }
 
     for (final candidate in peer.allUdpAddressCandidates) {
       final parsed = parseAddressString(candidate);
-      if (parsed != null) {
-        return (ip: parsed.ip.address, port: parsed.port);
-      }
+      if (parsed == null) continue;
+      if (!matchesFamily(parsed.ip.address)) continue;
+      return (ip: parsed.ip.address, port: parsed.port);
     }
 
     return null;
@@ -773,7 +799,7 @@ class SignalingService {
   /// it back. We update our public address with this value — it has the
   /// correct external port, unlike our local-port-based guess.
   void _handleAddrReflect(Uint8List senderPubkey, AddrReflectMessage msg) {
-    debugPrint('Address reflected by facilitator: ${msg.ip}:${msg.port}');
+    // debugPrint('Address reflected by facilitator: ${msg.ip}:${msg.port}');
     onAddrReflected?.call(senderPubkey, msg.ip, msg.port);
   }
 

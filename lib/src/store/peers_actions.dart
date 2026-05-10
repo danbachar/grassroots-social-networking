@@ -91,7 +91,12 @@ class PeerAnnounceReceivedAction extends PeerAction {
   final Uint8List publicKey;
   final String nickname;
   final int protocolVersion;
-  final int rssi;
+
+  /// BLE signal strength in dBm. Non-null only when the ANNOUNCE arrived over
+  /// BLE (carries `payload.rssi` from the plugin). Null for UDP ANNOUNCEs —
+  /// the reducer keeps any existing RSSI in that case rather than clobbering.
+  final int? rssi;
+
   final PeerTransport transport;
 
   /// BLE device ID from our central role (we connected to them)
@@ -108,7 +113,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
     required this.publicKey,
     required this.nickname,
     required this.protocolVersion,
-    required this.rssi,
+    this.rssi,
     this.transport = PeerTransport.bleDirect,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,

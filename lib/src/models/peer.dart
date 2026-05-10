@@ -234,7 +234,7 @@ class Peer {
   DateTime? lastSentTo;
   
   /// Signal strength (RSSI) if available, for BLE connections
-  int rssi;
+  int? rssi;
   
   /// Protocol version from ANNOUNCE
   int protocolVersion;
@@ -260,7 +260,7 @@ class Peer {
     PeerAddresses? addresses,
     this.lastSeen,
     this.lastSentTo,
-    required this.rssi,
+    this.rssi,
     this.protocolVersion = 1,
   }) : addresses = addresses ?? PeerAddresses(
           bleDeviceId: bleDeviceId,

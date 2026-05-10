@@ -199,6 +199,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final preserveReach =
           newUdpAddress == existing.udpAddress &&
           setEquals(newUdpAddressCandidates, existing.udpAddressCandidates);
+      // RSSI: copyWith already treats null as "no update" (rssi ?? this.rssi),
+      // so a UDP ANNOUNCE (action.rssi == null) keeps any existing BLE-derived
+      // RSSI. A BLE ANNOUNCE carries the per-packet payload.rssi and overwrites.
       final updated = existing.copyWith(
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
@@ -261,13 +264,15 @@ PeersState peersReducer(PeersState state, dynamic action) {
           ? existing.connectionState
           : PeerConnectionState.disconnected;
 
-      // Construct directly to allow clearing nullable fields
+      // Construct directly to allow clearing nullable fields.
+      // RSSI is meaningful only while a BLE link exists; clear it when the
+      // last BLE path drops so the peer doesn't carry a stale dBm value.
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
         connectionState: newConnectionState,
         transport: existing.transport,
-        rssi: existing.rssi,
+        rssi: hasAnyBle ? existing.rssi : null,
         protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
         bleCentralDeviceId: newCentralId,

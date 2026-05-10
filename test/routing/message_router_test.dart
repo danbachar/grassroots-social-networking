@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 import 'package:cryptography/cryptography.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
@@ -49,6 +50,13 @@ Uint8List buildAnnouncePayload({
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Sodium sodium;
+  setUpAll(() async {
+    sodium = await SodiumInit.init();
+  });
+
   group('MessageRouter', () {
     late MessageRouter router;
     late Store<AppState> store;
@@ -78,8 +86,9 @@ void main() {
         initialState: const AppState(),
       );
 
-      protocolHandler = ProtocolHandler(identity: identity);
-      otherProtocolHandler = ProtocolHandler(identity: otherIdentity);
+      protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
+      otherProtocolHandler =
+          ProtocolHandler(identity: otherIdentity, sodium: sodium);
       fragmentHandler = FragmentHandler();
 
       router = MessageRouter(
@@ -222,6 +231,10 @@ void main() {
       });
 
       test('resolves BLE announce from scan-discovered service UUID', () async {
+        // The peripheral receives the ANNOUNCE with the per-packet RSSI from
+        // the BLE plugin (-58). The scan-discovered entry (-48) is only used
+        // to resolve the BLE device ID/role — RSSI now comes from the live
+        // packet, not the older advertisement cache.
         store.dispatch(BleDeviceDiscoveredAction(
           deviceId: 'scan-device-1',
           serviceUuid: GrassrootsIdentity.deriveServiceUuid(otherPubkey),
@@ -237,12 +250,13 @@ void main() {
         await router.processPacket(
           p,
           transport: PeerTransport.bleDirect,
+          rssi: -58,
         );
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
         expect(peer!.bleDeviceId, equals('scan-device-1'));
-        expect(peer.rssi, equals(-48));
+        expect(peer.rssi, equals(-58));
       });
 
       test('includes udpAddress from ANNOUNCE payload', () async {
@@ -705,7 +719,8 @@ void main() {
         expect(peer, isNotNull);
         expect(peer!.hasBleConnection, isFalse);
         expect(peer.bleDeviceId, isNull);
-        expect(peer.rssi, equals(-100));
+        // UDP-only peer has no BLE link, so rssi is null (no -100 sentinel).
+        expect(peer.rssi, isNull);
         expect(store.state.peers.nearbyBlePeers, isEmpty);
       });
 

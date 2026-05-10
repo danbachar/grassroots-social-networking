@@ -20,7 +20,9 @@ class DiscoveredPeerState {
   final String? displayName;
 
   /// Latest signal strength reported by the plugin's advertisement stream.
+  /// Always populated for `DiscoveredPeerState` because every advertisement carries RSSI.
   final int rssi;
+
 
   /// First time we observed an advertisement matching this pathId.
   final DateTime discoveredAt;
@@ -113,7 +115,16 @@ class PeerState {
   final String nickname;
   final PeerConnectionState connectionState;
   final PeerTransport transport;
-  final int rssi;
+
+  /// Latest BLE signal strength in dBm.
+  ///
+  /// Null when the peer has no live BLE link (UDP-only friends, or peers we
+  /// last saw via BLE that have since disconnected). Non-null exactly when at
+  /// least one BLE packet has been received from this peer and BLE is still
+  /// the live transport. Cleared by `PeerBleDisconnectedAction` when the last
+  /// BLE path drops.
+  final int? rssi;
+
   final int protocolVersion;
   final DateTime? lastSeen;
 
@@ -173,7 +184,7 @@ class PeerState {
     required this.nickname,
     this.connectionState = PeerConnectionState.discovered,
     this.transport = PeerTransport.bleDirect,
-    this.rssi = -100,
+    this.rssi,
     this.protocolVersion = 1,
     this.lastSeen,
     this.bleCentralDeviceId,
@@ -248,11 +259,15 @@ class PeerState {
     return transport;
   }
 
-  /// Signal quality (0.0 - 1.0)
-  double get signalQuality {
-    if (rssi >= -50) return 1.0;
-    if (rssi <= -100) return 0.0;
-    return (rssi + 100) / 50.0;
+  /// Signal quality (0.0 - 1.0). Returns null when no RSSI is known
+  /// (UDP-only or BLE-disconnected peers). Callers in BLE-only contexts
+  /// (e.g. the Nearby panel) can safely use `signalQuality!`.
+  double? get signalQuality {
+    final r = rssi;
+    if (r == null) return null;
+    if (r >= -50) return 1.0;
+    if (r <= -100) return 0.0;
+    return (r + 100) / 50.0;
   }
 
   PeerState copyWith({

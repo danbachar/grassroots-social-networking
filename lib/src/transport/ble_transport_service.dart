@@ -85,8 +85,11 @@ class BleTransportService extends TransportService {
   // ===== Public callbacks =====
 
   /// Called when a BLE packet is deserialized and ready for routing.
+  /// `rssi` is the per-packet signal strength reported by the BLE plugin
+  /// for every received packet, regardless of role; nullable only because
+  /// the typedef matches `MessageRouter.processPacket`'s shared signature.
   void Function(GrassrootsPacket packet,
-      {String? bleDeviceId, int rssi, BleRole? bleRole})? onBlePacketReceived;
+      {String? bleDeviceId, int? rssi, BleRole? bleRole})? onBlePacketReceived;
 
   /// Called when a peer disconnects at the BLE level.
   void Function(Peer peer)? onPeerDisconnected;
@@ -164,7 +167,7 @@ class BleTransportService extends TransportService {
 
     try {
       _adapterSub = _ble.adapterStateChanges.listen((s) {
-        debugPrint('[grassroots_bluetooth_layer] adapter → $s');
+        // debugPrint('[grassroots_bluetooth_layer] adapter → $s');
         _onAdapterStateChanged(s);
       });
       _advertisementSub = _ble.advertisements.listen(_onAdvertisement);
@@ -172,7 +175,8 @@ class BleTransportService extends TransportService {
       _payloadSub = _ble.payloads.listen(_onPayload);
       // Surface plugin diagnostic logs in the Dart console too — on iOS
       // they're already going to NSLog, but we want them in `flutter run`.
-      _logSub = _ble.logs.listen((msg) => debugPrint('[grassroots_bluetooth_layer] $msg'));
+      // _logSub = _ble.logs.listen((msg) => debugPrint('[grassroots_bluetooth_layer] $msg'));
+      _logSub = _ble.logs.listen((msg) => {});
 
       // `restoreState: true` opts the iOS plugin into CoreBluetooth's
       // state-preservation. With this on, when iOS suspends and later

@@ -88,12 +88,22 @@ class MessageRouter {
     String? bleDeviceId,
     BleRole? bleRole,
     String? udpPeerId,
-    int rssi = -100,
+    int? rssi,
     String? observedIp,
     int? observedPort,
   }) async {
-    // Verify signature — drop invalid packets
+    // Verify signature — drop invalid packets.
+    // Ed25519 verify is CPU-bound on the main isolate (cryptography package
+    // pure-Dart implementation). For fragmented payloads (~315 fragments per
+    // 100 KB picture), this dominates receive latency. Log per-packet timing
+    // so the cost is visible.
+    final verifyStart = DateTime.now();
     final isValid = await protocolHandler.verifyPacket(packet);
+    final verifyMs = DateTime.now().difference(verifyStart).inMilliseconds;
+    if (verifyMs > 50) {
+      debugPrint(
+          '[verify] ${packet.type.name} from ${_pubkeyToHex(packet.senderPubkey).substring(0, 8)} took ${verifyMs}ms');
+    }
     if (!isValid) {
       debugPrint(
           'Dropping packet with invalid signature (type: ${packet.type})');
@@ -114,6 +124,24 @@ class MessageRouter {
     // for that peer, even if it is an ACK, read receipt, or retransmission.
     if (transport == PeerTransport.udp && packet.type != PacketType.announce) {
       store.dispatch(PeerUdpSeenAction(packet.senderPubkey));
+    }
+
+    // Refresh per-packet RSSI on every verified BLE packet from a known peer.
+    // The plugin reports `payload.rssi` for every received BLE packet
+    // regardless of role, so this keeps the indicator current during
+    // conversation traffic (not just on the next advertisement). For ANNOUNCE
+    // packets, _handleAnnounce already covers the RSSI update via
+    // PeerAnnounceReceivedAction.
+    if (transport == PeerTransport.bleDirect &&
+        rssi != null &&
+        packet.type != PacketType.announce) {
+      final peer = _peersState.getPeerByPubkey(packet.senderPubkey);
+      if (peer != null) {
+        store.dispatch(PeerRssiUpdatedAction(
+          publicKey: packet.senderPubkey,
+          rssi: rssi,
+        ));
+      }
     }
 
     // ANNOUNCE always processed (peer may have updated info)
@@ -147,7 +175,11 @@ class MessageRouter {
       case PacketType.fragmentStart:
       case PacketType.fragmentContinue:
       case PacketType.fragmentEnd:
-        _handleFragment(packet);
+        _handleFragment(
+          packet,
+          transport: transport,
+          peerId: effectiveUdpPeerId ?? bleDeviceId,
+        );
       case PacketType.ack:
         _handleAck(packet);
       case PacketType.nack:
@@ -172,12 +204,16 @@ class MessageRouter {
     String? bleDeviceId,
     BleRole? bleRole,
     String? udpPeerId,
-    int rssi = -100,
+    int? rssi,
   }) {
     final data = protocolHandler.decodeAnnounce(packet.payload);
     final pubkey = data.publicKey;
 
-    int effectiveRssi = rssi;
+    // Use the per-packet RSSI from the BLE plugin (passed in via `rssi` for BLE
+    // ANNOUNCEs; null for UDP ANNOUNCEs). This is always more current than the
+    // advertisement RSSI cached on `DiscoveredPeerState`, especially on the
+    // peripheral side where our scanner may not have seen the central yet.
+    final int? effectiveRssi = transport == PeerTransport.bleDirect ? rssi : null;
 
     // Resolve BLE metadata only for packets that actually arrived over BLE.
     // UDP ANNOUNCEs can coincide with stale scan results; treating those as a
@@ -185,25 +221,18 @@ class MessageRouter {
     final isBleAnnounce = transport == PeerTransport.bleDirect;
     String? resolvedBleDeviceId = isBleAnnounce ? bleDeviceId : null;
     BleRole? resolvedBleRole = isBleAnnounce ? bleRole : null;
-    DiscoveredPeerState? discoveredPeer;
-    if (isBleAnnounce && bleDeviceId != null) {
-      discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
-    }
-    if (isBleAnnounce && discoveredPeer == null) {
+    if (isBleAnnounce && bleDeviceId == null) {
+      // No transport-provided device ID — try to find one from our scan results
+      // by matching on the service UUID derived from their pubkey. (We do NOT
+      // use this lookup to source RSSI; the per-packet value above is fresher.)
       final theirServiceUuid = GrassrootsIdentity.deriveServiceUuid(pubkey);
-      discoveredPeer =
+      final discoveredPeer =
           _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
-      if (discoveredPeer != null && bleDeviceId == null) {
-        // Only use scan-discovered device ID when no transport-provided ID exists.
-        // When bleDeviceId IS provided, keep it because Android MAC randomization
-        // means the scan-discovered MAC may differ from the actual connected MAC.
+      if (discoveredPeer != null) {
         resolvedBleDeviceId = discoveredPeer.transportId;
-        // If we found via scan, that means our central discovered them
+        // If we found via scan, that means our central discovered them.
         resolvedBleRole ??= BleRole.central;
       }
-    }
-    if (isBleAnnounce && discoveredPeer != null) {
-      effectiveRssi = discoveredPeer.rssi;
     }
 
     final isNew = _peersState.getPeerByPubkey(pubkey) == null;
@@ -275,12 +304,35 @@ class MessageRouter {
     onAckRequested?.call(transport, peerId, packet.packetId);
   }
 
-  void _handleFragment(GrassrootsPacket packet) {
+  void _handleFragment(
+    GrassrootsPacket packet, {
+    required PeerTransport transport,
+    String? peerId,
+  }) {
     final reassembled = fragmentHandler.processFragment(packet);
-    if (reassembled != null) {
-      onMessageReceived?.call(
-          packet.packetId, packet.senderPubkey, reassembled);
-    }
+    if (reassembled == null) return;
+
+    // Reassembly produced the original message's payload bytes. Synthesize
+    // a logical MESSAGE packet and route it through `_handleMessage` so the
+    // single-packet and fragmented paths share one delivery pipeline:
+    //   - `_isForUs` recipient check
+    //   - `onMessageReceived` dispatch
+    //   - `onAckRequested` round-trip
+    //
+    // The signature field is zeroed because per-fragment signatures have
+    // already been verified upstream in `processPacket`; nothing downstream
+    // re-checks the synthetic packet's signature.
+    final logical = GrassrootsPacket(
+      type: PacketType.message,
+      ttl: packet.ttl,
+      timestamp: packet.timestamp,
+      senderPubkey: packet.senderPubkey,
+      recipientPubkey: packet.recipientPubkey,
+      payload: reassembled.payload,
+      signature: Uint8List(64),
+      packetId: reassembled.messageId,
+    );
+    _handleMessage(logical, transport: transport, peerId: peerId);
   }
 
   void _handleAck(GrassrootsPacket packet) {

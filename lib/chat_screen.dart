@@ -163,7 +163,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _messageController.clear();
 
     // Generate message ID upfront so we can show the message immediately
-    final messageId = _uuid.v4().substring(0, 8);
+    // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
+// and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
+// would corrupt either format.
+final messageId = _uuid.v4();
 
     // Save to conversation immediately so the message appears in the UI
     widget.store.dispatch(SaveChatMessageAction(

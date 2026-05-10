@@ -189,14 +189,14 @@ void main() {
       expect(fragmented.fragments.last.type, equals(PacketType.fragmentEnd));
 
       // Process all fragments
-      Uint8List? result;
+      ReassembledMessage? result;
       for (final fragment in fragmented.fragments) {
         result = handler.processFragment(fragment);
       }
 
       // Last fragment should trigger reassembly
       expect(result, isNotNull);
-      expect(result, equals(payload));
+      expect(result!.payload, equals(payload));
     });
 
     test('returns null for incomplete fragments', () {

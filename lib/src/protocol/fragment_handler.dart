@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../models/packet.dart';
 
@@ -7,11 +8,22 @@ import '../models/packet.dart';
 class FragmentedMessage {
   final String messageId;
   final List<GrassrootsPacket> fragments;
-  
+
   FragmentedMessage({
     required this.messageId,
     required this.fragments,
   });
+}
+
+/// Result of reassembling a fragmented message: the final payload bytes plus
+/// the originating message id (carried in `FRAGMENT_START` and matching the
+/// sender's `MessageSendingAction.messageId`, so the receiver's ACK can be
+/// addressed to the same id the sender is tracking).
+class ReassembledMessage {
+  final String messageId;
+  final Uint8List payload;
+
+  ReassembledMessage({required this.messageId, required this.payload});
 }
 
 /// State of a message being reassembled
@@ -73,8 +85,12 @@ class FragmentHandler {
   /// Inter-fragment delay
   static const Duration fragmentDelay = Duration(milliseconds: 20);
   
-  /// Timeout for incomplete reassembly
-  static const Duration reassemblyTimeout = Duration(seconds: 30);
+  /// Timeout for incomplete reassembly. Sized to cover slow Android receivers
+  /// where Ed25519 verification of every fragment runs in series on a worker
+  /// isolate at ~150-200ms each — a 100 KB picture (~315 fragments) needs
+  /// roughly a minute end-to-end. The worker keeps the main isolate
+  /// responsive; this timeout just has to outlast the verify queue draining.
+  static const Duration reassemblyTimeout = Duration(minutes: 2);
   
   /// Messages currently being reassembled, keyed by messageId
   final Map<String, _ReassemblyState> _reassemblyBuffer = {};
@@ -90,20 +106,26 @@ class FragmentHandler {
   bool needsFragmentation(Uint8List payload) => payload.length > fragmentThreshold;
   
   /// Fragment a large payload into multiple packets.
-  /// 
+  ///
   /// Returns a [FragmentedMessage] containing all the packets to send.
   /// Caller should send them with [fragmentDelay] between each.
+  ///
+  /// [messageId] is the application-level id under which the sender tracks
+  /// delivery (`MessageSendingAction.messageId`). It travels in the
+  /// `FRAGMENT_START` payload and is echoed back in the receiver's ACK so
+  /// `MessageDeliveredAction` can find the right outgoing-message slot.
   FragmentedMessage fragment({
     required Uint8List payload,
     required Uint8List senderPubkey,
     Uint8List? recipientPubkey,
     int ttl = GrassrootsPacket.defaultTtl,
+    String? messageId,
   }) {
     if (!needsFragmentation(payload)) {
       throw ArgumentError('Payload does not need fragmentation');
     }
-    
-    final messageId = _uuid.v4();
+
+    final id = messageId ?? _uuid.v4();
     final fragments = <GrassrootsPacket>[];
     
     // Calculate number of fragments needed
@@ -121,7 +143,7 @@ class FragmentHandler {
         // First fragment: include metadata
         type = PacketType.fragmentStart;
         fragmentPayload = _encodeFragmentStart(
-          messageId: messageId,
+          messageId: id,
           totalFragments: totalFragments,
           totalSize: payload.length,
           chunk: chunk,
@@ -130,7 +152,7 @@ class FragmentHandler {
         // Last fragment
         type = PacketType.fragmentEnd;
         fragmentPayload = _encodeFragmentEnd(
-          messageId: messageId,
+          messageId: id,
           fragmentIndex: i,
           chunk: chunk,
         );
@@ -138,12 +160,12 @@ class FragmentHandler {
         // Middle fragments
         type = PacketType.fragmentContinue;
         fragmentPayload = _encodeFragmentContinue(
-          messageId: messageId,
+          messageId: id,
           fragmentIndex: i,
           chunk: chunk,
         );
       }
-      
+
       fragments.add(GrassrootsPacket(
         type: type,
         ttl: ttl,
@@ -153,15 +175,16 @@ class FragmentHandler {
         signature: Uint8List(64), // Placeholder - will be signed by caller
       ));
     }
-    
-    return FragmentedMessage(messageId: messageId, fragments: fragments);
+
+    return FragmentedMessage(messageId: id, fragments: fragments);
   }
   
   /// Process an incoming fragment packet.
-  /// 
-  /// Returns the reassembled payload if this was the final fragment
-  /// and all fragments have been received. Otherwise returns null.
-  Uint8List? processFragment(GrassrootsPacket packet) {
+  ///
+  /// Returns the reassembled message (payload + originating messageId) if
+  /// this was the final fragment and all fragments have been received.
+  /// Otherwise returns null.
+  ReassembledMessage? processFragment(GrassrootsPacket packet) {
     switch (packet.type) {
       case PacketType.fragmentStart:
         return _processFragmentStart(packet);
@@ -173,11 +196,16 @@ class FragmentHandler {
         throw ArgumentError('Not a fragment packet: ${packet.type}');
     }
   }
-  
-  Uint8List? _processFragmentStart(GrassrootsPacket packet) {
-    final (messageId, totalFragments, totalSize, chunk) = 
+
+  ReassembledMessage? _processFragmentStart(GrassrootsPacket packet) {
+    final (messageId, totalFragments, totalSize, chunk) =
         _decodeFragmentStart(packet.payload);
-    
+
+    debugPrint(
+        '[fragment] START msgId=${messageId.substring(0, 8)} '
+        'totalFragments=$totalFragments totalSize=${totalSize}B '
+        'firstChunk=${chunk.length}B');
+
     // Create reassembly state
     _reassemblyBuffer[messageId] = _ReassemblyState(
       messageId: messageId,
@@ -185,49 +213,75 @@ class FragmentHandler {
       totalSize: totalSize,
       senderPubkey: packet.senderPubkey,
     )..addChunk(0, chunk);
-    
+
     // Check if single-fragment message
     if (totalFragments == 1) {
       final state = _reassemblyBuffer.remove(messageId)!;
-      return state.reassemble();
+      debugPrint(
+          '[fragment] reassembled single-fragment msgId=${messageId.substring(0, 8)}');
+      final payload = state.reassemble();
+      if (payload == null) return null;
+      return ReassembledMessage(messageId: messageId, payload: payload);
     }
-    
+
     return null;
   }
-  
-  Uint8List? _processFragmentContinue(GrassrootsPacket packet) {
-    final (messageId, fragmentIndex, chunk) = 
+
+  ReassembledMessage? _processFragmentContinue(GrassrootsPacket packet) {
+    final (messageId, fragmentIndex, chunk) =
         _decodeFragmentContinue(packet.payload);
-    
+
     final state = _reassemblyBuffer[messageId];
     if (state == null) {
-      // Missing start fragment, can't reassemble
+      // Missing start fragment (or buffer was GC'd by reassembly timeout
+      // before this fragment landed). Drop with a log so the gap is visible.
+      debugPrint(
+          '[fragment] CONTINUE msgId=${messageId.substring(0, 8)} '
+          'index=$fragmentIndex DROPPED — no reassembly buffer '
+          '(timeout or missing start)');
       return null;
     }
-    
+
     state.addChunk(fragmentIndex, chunk);
+    // Log every 25th to avoid spamming for big payloads.
+    if (fragmentIndex % 25 == 0) {
+      debugPrint(
+          '[fragment] CONTINUE msgId=${messageId.substring(0, 8)} '
+          'index=$fragmentIndex received=${state.receivedChunks.length}/${state.totalFragments}');
+    }
     return null;
   }
-  
-  Uint8List? _processFragmentEnd(GrassrootsPacket packet) {
-    final (messageId, fragmentIndex, chunk) = 
+
+  ReassembledMessage? _processFragmentEnd(GrassrootsPacket packet) {
+    final (messageId, fragmentIndex, chunk) =
         _decodeFragmentEnd(packet.payload);
-    
+
     final state = _reassemblyBuffer[messageId];
     if (state == null) {
-      // Missing start fragment, can't reassemble
+      debugPrint(
+          '[fragment] END msgId=${messageId.substring(0, 8)} '
+          'index=$fragmentIndex DROPPED — no reassembly buffer '
+          '(timeout or missing start)');
       return null;
     }
-    
+
     state.addChunk(fragmentIndex, chunk);
-    
+
     // Attempt reassembly
     final result = state.reassemble();
     if (result != null) {
       _reassemblyBuffer.remove(messageId);
+      debugPrint(
+          '[fragment] END msgId=${messageId.substring(0, 8)} reassembled '
+          '${result.length}B from ${state.totalFragments} fragments');
+      return ReassembledMessage(messageId: messageId, payload: result);
     }
-    
-    return result;
+
+    debugPrint(
+        '[fragment] END msgId=${messageId.substring(0, 8)} INCOMPLETE: '
+        'have ${state.receivedChunks.length}/${state.totalFragments} fragments — '
+        'missing fragments will never arrive, dropping at next cleanup');
+    return null;
   }
   
   // ===== Encoding helpers =====
@@ -315,7 +369,15 @@ class FragmentHandler {
   void _cleanupStaleReassemblies() {
     final now = DateTime.now();
     _reassemblyBuffer.removeWhere((id, state) {
-      return now.difference(state.startedAt) > reassemblyTimeout;
+      final age = now.difference(state.startedAt);
+      if (age > reassemblyTimeout) {
+        debugPrint(
+            '[fragment] DROPPING stale reassembly msgId=${id.substring(0, 8)} '
+            'received=${state.receivedChunks.length}/${state.totalFragments} '
+            'age=${age.inSeconds}s — fragments arrived too slowly to reassemble');
+        return true;
+      }
+      return false;
     });
   }
   

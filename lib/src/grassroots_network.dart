@@ -1532,8 +1532,10 @@ class GrassrootsNetwork {
       return null;
     }
 
-    // Use provided message ID or generate one
-    messageId ??= _uuid.v4().substring(0, 8);
+    // Use provided message ID or generate one. Full UUID required —
+    // packet.packetId is wire-encoded as 16 bytes, so a short prefix would
+    // be corrupted on serialization.
+    messageId ??= _uuid.v4();
 
     // Dispatch sending action (clock icon)
     store.dispatch(
@@ -1545,10 +1547,15 @@ class GrassrootsNetwork {
       ),
     );
 
-    // Create the message packet and sign it once
+    // Create the message packet and sign it once.
+    // packetId == messageId so the recipient's ACK (which echoes the
+    // packetId back) matches the entry we just stored under `messageId`
+    // in `MessageSendingAction`. Otherwise `MessageDeliveredAction` would
+    // look up an unrelated UUID and never flip ✓ → ✓✓.
     final packet = _protocolHandler.createMessagePacket(
       payload: payload,
       recipientPubkey: recipientPubkey,
+      packetId: messageId,
     );
     if (!_fragmentHandler.needsFragmentation(payload)) {
       await _protocolHandler.signPacket(packet);
@@ -1570,6 +1577,7 @@ class GrassrootsNetwork {
           payload: payload,
           recipientPubkey: recipientPubkey,
           bleDeviceId: bleDeviceId,
+          messageId: messageId,
         );
       } else {
         success = await _bleService!.sendToPeer(bleDeviceId, bytes);
@@ -1597,9 +1605,9 @@ class GrassrootsNetwork {
 
       // Try existing UDX connection first
       if (await _udpService!.sendToPeer(resolvedPeer.pubkeyHex, bytes)) {
-        debugPrint(
-          'Sent via existing UDP connection to ${resolvedPeer.displayName}',
-        );
+        // debugPrint(
+        //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
+        // );
         store.dispatch(
           MessageSentAction(
             messageId: messageId,
@@ -3109,6 +3117,7 @@ class GrassrootsNetwork {
     // The corrected address will be broadcast to all friends on the next
     // periodic ANNOUNCE cycle.
     _signalingService.onAddrReflected = (senderPubkey, ip, port) {
+      // TODO: why is server ANONUNNCE needed? why need to block verifyRendezvousServerResponds?
       // The GLP-spec response to a registration ANNOUNCE is an addrReflect.
       // If the sender is a configured (or in-flight) rendezvous server,
       // treat it as authoritative proof of the round-trip and unblock
@@ -3181,15 +3190,15 @@ class GrassrootsNetwork {
 
     // Forward BLE packets to the MessageRouter for processing
     _bleService!.onBlePacketReceived =
-        (packet, {String? bleDeviceId, int rssi = -100, BleRole? bleRole}) {
-          _messageRouter.processPacket(
-            packet,
-            transport: PeerTransport.bleDirect,
-            bleDeviceId: bleDeviceId,
-            bleRole: bleRole,
-            rssi: rssi,
-          );
-        };
+        (packet, {String? bleDeviceId, int? rssi, BleRole? bleRole}) {
+      _messageRouter.processPacket(
+        packet,
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: bleDeviceId,
+        bleRole: bleRole,
+        rssi: rssi,
+      );
+    };
 
     // Peer disconnected at BLE level
     _bleService!.onPeerDisconnected = (peer) {
@@ -3825,11 +3834,13 @@ class GrassrootsNetwork {
     required Uint8List payload,
     required Uint8List recipientPubkey,
     required String bleDeviceId,
+    required String messageId,
   }) async {
     final fragmented = _fragmentHandler.fragment(
       payload: payload,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
+      messageId: messageId,
     );
 
     for (final fragment in fragmented.fragments) {

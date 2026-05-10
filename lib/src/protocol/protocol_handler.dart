@@ -67,10 +67,16 @@ class ProtocolHandler {
     return buffer.toBytes();
   }
 
-  /// Create MESSAGE packet
+  /// Create MESSAGE packet.
+  ///
+  /// [packetId] is used as the wire-level identifier the recipient echoes
+  /// back in its ACK. Pass the same id you stored in `MessageSendingAction`
+  /// so `MessageDeliveredAction` (dispatched on ACK receipt) can match the
+  /// outgoing message in the Redux store and flip ✓ → ✓✓.
   GrassrootsPacket createMessagePacket({
     required Uint8List payload,
     Uint8List? recipientPubkey,
+    String? packetId,
   }) {
     return GrassrootsPacket(
       type: PacketType.message,
@@ -78,6 +84,7 @@ class ProtocolHandler {
       recipientPubkey: recipientPubkey,
       payload: payload,
       signature: Uint8List(64), // Caller must sign before sending
+      packetId: packetId,
     );
   }
 

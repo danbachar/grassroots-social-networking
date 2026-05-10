@@ -153,13 +153,13 @@ void main() {
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
-        Uint8List? result;
+        ReassembledMessage? result;
         for (final fragment in fragmented.fragments) {
           result = receiver.processFragment(fragment);
         }
 
         expect(result, isNotNull);
-        expect(result, equals(payload));
+        expect(result!.payload, equals(payload));
       });
 
       test('reassembles complete message from out-of-order fragments', () {
@@ -191,7 +191,7 @@ void main() {
         // Send end last - should trigger reassembly
         final result = receiver.processFragment(lastFragment);
         expect(result, isNotNull);
-        expect(result, equals(payload));
+        expect(result!.payload, equals(payload));
       });
 
       test('handles duplicate fragments idempotently', () {
@@ -213,13 +213,13 @@ void main() {
         receiver.processFragment(fragmented.fragments.first);
 
         // Send remaining fragments
-        Uint8List? result;
+        ReassembledMessage? result;
         for (var i = 1; i < fragmented.fragments.length; i++) {
           result = receiver.processFragment(fragmented.fragments[i]);
         }
 
         expect(result, isNotNull);
-        expect(result, equals(payload));
+        expect(result!.payload, equals(payload));
       });
 
       test('returns null for incomplete fragments', () {
@@ -298,16 +298,16 @@ void main() {
           );
 
           final receiver = FragmentHandler();
-          Uint8List? result;
+          ReassembledMessage? result;
           for (final fragment in fragmented.fragments) {
             result = receiver.processFragment(fragment);
           }
           receiver.dispose();
 
           expect(result, isNotNull, reason: 'Failed for size=$size');
-          expect(result!.length, equals(size),
+          expect(result!.payload.length, equals(size),
               reason: 'Length mismatch for size=$size');
-          expect(result, equals(payload),
+          expect(result.payload, equals(payload),
               reason: 'Content mismatch for size=$size');
         }
       });

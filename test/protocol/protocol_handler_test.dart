@@ -5,8 +5,16 @@ import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:cryptography/cryptography.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Sodium sodium;
+  setUpAll(() async {
+    sodium = await SodiumInit.init();
+  });
+
   group('ProtocolHandler', () {
     late ProtocolHandler handler;
     late GrassrootsIdentity testIdentity;
@@ -19,7 +27,7 @@ void main() {
         keyPair: keyPair,
         nickname: 'TestUser',
       );
-      handler = ProtocolHandler(identity: testIdentity);
+      handler = ProtocolHandler(identity: testIdentity, sodium: sodium);
     });
 
     group('createAnnouncePayload', () {
@@ -75,7 +83,8 @@ void main() {
           keyPair: keyPair,
           nickname: '',
         );
-        final emptyHandler = ProtocolHandler(identity: emptyNickIdentity);
+        final emptyHandler =
+            ProtocolHandler(identity: emptyNickIdentity, sodium: sodium);
 
         final payload = emptyHandler.createAnnouncePayload();
 
@@ -365,7 +374,8 @@ void main() {
           keyPair: otherKeyPair,
           nickname: 'Other',
         );
-        final otherHandler = ProtocolHandler(identity: otherIdentity);
+        final otherHandler =
+            ProtocolHandler(identity: otherIdentity, sodium: sodium);
 
         // Create packet claiming to be from testIdentity
         final packet = handler.createMessagePacket(
@@ -433,7 +443,8 @@ void main() {
           'privateKey': testIdentity.privateKey,
           'nickname': decoded.nickname,
         });
-        final reEncodedHandler = ProtocolHandler(identity: reEncodedIdentity);
+        final reEncodedHandler =
+            ProtocolHandler(identity: reEncodedIdentity, sodium: sodium);
         final reEncodedPayload = reEncodedHandler.createAnnouncePayload(
           address: decoded.udpAddress,
         );

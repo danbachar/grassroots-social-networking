@@ -81,3 +81,6 @@ export 'src/store/store.dart';
 
 // BLE (for advanced usage)
 export 'src/ble/permission_handler.dart' show PermissionHandler, PermissionResult;
+
+// Media (used by the chat UI for picture compression / file storage)
+export 'src/services/media_service.dart';

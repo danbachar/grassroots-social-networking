@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:redux/redux.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 import 'package:grassroots_networking/src/transport/udp_transport_service.dart';
 import 'package:grassroots_networking/src/transport/transport_service.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
@@ -35,6 +36,13 @@ InternetAddress _loopbackFor(UdpTransportService service) =>
     _loopbackForFamily(service.activeAddressType ?? InternetAddressType.IPv6);
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Sodium sodium;
+  setUpAll(() async {
+    sodium = await SodiumInit.init();
+  });
+
   group('UdpTransportService', () {
     late GrassrootsIdentity identity;
     late Store<AppState> store;
@@ -43,7 +51,7 @@ void main() {
     setUp(() async {
       identity = await _createTestIdentity('TestPeer');
       store = _createTestStore();
-      protocolHandler = ProtocolHandler(identity: identity);
+      protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
     });
 
     // =========================================================================
@@ -358,8 +366,8 @@ void main() {
         final bobIdentity = await _createTestIdentity('Bob');
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
-        final aliceProto = ProtocolHandler(identity: aliceIdentity);
-        final bobProto = ProtocolHandler(identity: bobIdentity);
+        final aliceProto = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -428,8 +436,8 @@ void main() {
         final bobIdentity = await _createTestIdentity('Bob');
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
-        final aliceProto = ProtocolHandler(identity: aliceIdentity);
-        final bobProto = ProtocolHandler(identity: bobIdentity);
+        final aliceProto = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -481,8 +489,8 @@ void main() {
         final bobIdentity = await _createTestIdentity('Bob');
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
-        final aliceProto = ProtocolHandler(identity: aliceIdentity);
-        final bobProto = ProtocolHandler(identity: bobIdentity);
+        final aliceProto = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -542,8 +550,8 @@ void main() {
         final bobIdentity = await _createTestIdentity('Bob');
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
-        final aliceProto = ProtocolHandler(identity: aliceIdentity);
-        final bobProto = ProtocolHandler(identity: bobIdentity);
+        final aliceProto = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,

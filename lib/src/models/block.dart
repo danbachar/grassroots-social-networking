@@ -92,27 +92,137 @@ abstract class Block {
   }
 }
 
-/// A regular text message block
-class SayBlock extends Block {
+/// User-authored content sent in a chat. The umbrella type covers any kind
+/// of "thing the user said" — text, picture, future audio/video — and the
+/// concrete subclass is determined by a one-byte subtype tag.
+///
+/// Wire format: [0x01] + [subtype: 1 byte] + <subtype-specific payload>
+abstract class SayBlock extends Block {
+  /// Generative default constructor so concrete subtypes (TextSayBlock,
+  /// PictureSayBlock) can extend this class. The factory `fromPayload`
+  /// handles inbound parsing.
+  SayBlock();
+
   @override
   BlockType get type => BlockType.say;
 
-  /// The text content of the message
-  final String content;
+  /// One-byte tag distinguishing the kind of "say" content.
+  SaySubtype get subtype;
 
-  SayBlock({required this.content});
+  /// Subtype-specific bytes (excluding the [type] and [subtype] header bytes).
+  Uint8List serializeSubtypePayload();
 
   @override
   Uint8List serialize() {
-    final contentBytes = utf8.encode(content);
-    final data = Uint8List(1 + contentBytes.length);
+    final body = serializeSubtypePayload();
+    final data = Uint8List(2 + body.length);
     data[0] = type.value;
-    data.setRange(1, data.length, contentBytes);
+    data[1] = subtype.value;
+    data.setRange(2, data.length, body);
     return data;
   }
 
+  /// Parse the SayBlock body (everything after the [type] byte) and dispatch
+  /// to the right concrete subtype.
   factory SayBlock.fromPayload(Uint8List payload) {
-    return SayBlock(content: utf8.decode(payload));
+    if (payload.isEmpty) {
+      throw FormatException('SayBlock payload missing subtype byte');
+    }
+    final subtype = SaySubtype.fromValue(payload[0]);
+    final body = payload.sublist(1);
+    switch (subtype) {
+      case SaySubtype.text:
+        return TextSayBlock.fromBody(body);
+      case SaySubtype.picture:
+        return PictureSayBlock.fromBody(body);
+    }
+  }
+}
+
+/// SayBlock subtypes. New media kinds extend this without claiming a new
+/// top-level [BlockType].
+enum SaySubtype {
+  text(0x00),
+  picture(0x01);
+
+  final int value;
+  const SaySubtype(this.value);
+
+  static SaySubtype fromValue(int value) {
+    return SaySubtype.values.firstWhere(
+      (s) => s.value == value,
+      orElse: () => throw ArgumentError('Unknown say subtype: $value'),
+    );
+  }
+}
+
+/// Plain text message — the historical SayBlock content.
+class TextSayBlock extends SayBlock {
+  @override
+  SaySubtype get subtype => SaySubtype.text;
+
+  /// The text content of the message.
+  final String content;
+
+  TextSayBlock({required this.content});
+
+  @override
+  Uint8List serializeSubtypePayload() => utf8.encode(content);
+
+  factory TextSayBlock.fromBody(Uint8List body) {
+    return TextSayBlock(content: utf8.decode(body));
+  }
+}
+
+/// Picture message. Wire body:
+///   [viewOnce: 1 byte, 0/1] +
+///   [mimeLen: 1 byte] +
+///   [mime: utf8] +
+///   [imageBytes: rest of payload]
+///
+/// `viewOnce == true` flags the recipient bubble to render a blurred preview
+/// and delete the file on first view; the sender's local copy is deleted when
+/// the message reaches MessageStatus.delivered.
+class PictureSayBlock extends SayBlock {
+  @override
+  SaySubtype get subtype => SaySubtype.picture;
+
+  final bool viewOnce;
+  final String mime;
+  final Uint8List imageBytes;
+
+  PictureSayBlock({
+    required this.viewOnce,
+    required this.mime,
+    required this.imageBytes,
+  });
+
+  @override
+  Uint8List serializeSubtypePayload() {
+    final mimeBytes = utf8.encode(mime);
+    if (mimeBytes.length > 255) {
+      throw ArgumentError('mime too long (max 255 bytes): $mime');
+    }
+    final out = Uint8List(2 + mimeBytes.length + imageBytes.length);
+    out[0] = viewOnce ? 1 : 0;
+    out[1] = mimeBytes.length;
+    out.setRange(2, 2 + mimeBytes.length, mimeBytes);
+    out.setRange(2 + mimeBytes.length, out.length, imageBytes);
+    return out;
+  }
+
+  factory PictureSayBlock.fromBody(Uint8List body) {
+    if (body.length < 2) {
+      throw const FormatException('PictureSayBlock body too short');
+    }
+    final viewOnce = body[0] != 0;
+    final mimeLen = body[1];
+    if (body.length < 2 + mimeLen) {
+      throw const FormatException('PictureSayBlock body truncated in mime');
+    }
+    final mime = utf8.decode(body.sublist(2, 2 + mimeLen));
+    final image = Uint8List.fromList(body.sublist(2 + mimeLen));
+    return PictureSayBlock(viewOnce: viewOnce, mime: mime, imageBytes: image);
   }
 }
 

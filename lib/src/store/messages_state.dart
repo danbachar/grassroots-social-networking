@@ -17,6 +17,11 @@ enum ChatMessageType {
 
   /// Friend request accepted by us
   friendRequestAcceptedByUs,
+
+  /// Picture message — the file lives on disk at `mediaPath`. May be a
+  /// "1-time view" picture if `viewOnce` is true; the recipient deletes
+  /// the file after viewing, the sender deletes when delivery confirms.
+  picture,
 }
 
 /// Record of an outgoing message with delivery status
@@ -120,6 +125,25 @@ class ChatMessageState {
   /// Message ID for tracking delivery/read status (outgoing messages only)
   final String? messageId;
 
+  /// Absolute path to the on-disk media file for picture messages. Null for
+  /// text/friendship messages, and also null after a view-once picture has
+  /// been viewed (recipient) or delivered (sender).
+  final String? mediaPath;
+
+  /// MIME type of the media file (e.g. `image/jpeg`). Set whenever
+  /// `mediaPath` is set; used to choose the right decoder/extension.
+  final String? mediaMime;
+
+  /// Whether this is a "1-time view" picture. The recipient bubble shows
+  /// a blurred preview until the user taps; on dismiss the file is deleted.
+  /// On the sender side, the file is deleted on `MessageStatus.delivered`.
+  final bool viewOnce;
+
+  /// Whether the view-once picture has been viewed (recipient) or expired
+  /// (sender, post-delivery). Once true, `mediaPath` is null and the bubble
+  /// renders the "expired" placeholder.
+  final bool viewed;
+
   const ChatMessageState({
     required this.senderPubkeyHex,
     required this.recipientPubkeyHex,
@@ -129,13 +153,29 @@ class ChatMessageState {
     this.messageType = ChatMessageType.text,
     this.udpAddress,
     this.messageId,
+    this.mediaPath,
+    this.mediaMime,
+    this.viewOnce = false,
+    this.viewed = false,
   });
+
+  /// Whether this message carries an on-disk picture that hasn't expired.
+  bool get hasMedia => mediaPath != null;
+
+  /// Whether this is a picture message.
+  bool get isPicture => messageType == ChatMessageType.picture;
 
   /// The peer's pubkey hex (the other party in the conversation)
   String get peerHex => isOutgoing ? recipientPubkeyHex : senderPubkeyHex;
 
-  /// Whether this is a friendship-related message
-  bool get isFriendshipMessage => messageType != ChatMessageType.text;
+  /// Whether this is a friendship-related message (request/accept).
+  /// Picture and text messages are user content and should render as regular
+  /// chat bubbles, not as the centered system-message style.
+  bool get isFriendshipMessage =>
+      messageType == ChatMessageType.friendRequestSent ||
+      messageType == ChatMessageType.friendRequestReceived ||
+      messageType == ChatMessageType.friendRequestAccepted ||
+      messageType == ChatMessageType.friendRequestAcceptedByUs;
 
   /// Whether this is a pending friend request that can be accepted
   bool get canAccept => messageType == ChatMessageType.friendRequestReceived;
@@ -213,6 +253,10 @@ class ChatMessageState {
         'messageType': messageType.index,
         'udpAddress': udpAddress,
         'messageId': messageId,
+        'mediaPath': mediaPath,
+        'mediaMime': mediaMime,
+        'viewOnce': viewOnce,
+        'viewed': viewed,
       };
 
   factory ChatMessageState.fromJson(Map<String, dynamic> json) {
@@ -225,6 +269,35 @@ class ChatMessageState {
       messageType: ChatMessageType.values[json['messageType'] as int],
       udpAddress: json['udpAddress'] as String?,
       messageId: json['messageId'] as String?,
+      mediaPath: json['mediaPath'] as String?,
+      mediaMime: json['mediaMime'] as String?,
+      viewOnce: (json['viewOnce'] as bool?) ?? false,
+      viewed: (json['viewed'] as bool?) ?? false,
+    );
+  }
+
+  /// Copy with optional field overrides. `clearMediaPath: true` is used after
+  /// a view-once picture is consumed (recipient view, or sender delivery) to
+  /// drop the path while keeping the rest of the message intact.
+  ChatMessageState copyWith({
+    String? content,
+    bool? viewed,
+    String? mediaPath,
+    bool clearMediaPath = false,
+  }) {
+    return ChatMessageState(
+      senderPubkeyHex: senderPubkeyHex,
+      recipientPubkeyHex: recipientPubkeyHex,
+      content: content ?? this.content,
+      timestamp: timestamp,
+      isOutgoing: isOutgoing,
+      messageType: messageType,
+      udpAddress: udpAddress,
+      messageId: messageId,
+      mediaPath: clearMediaPath ? null : (mediaPath ?? this.mediaPath),
+      mediaMime: mediaMime,
+      viewOnce: viewOnce,
+      viewed: viewed ?? this.viewed,
     );
   }
 
@@ -236,7 +309,9 @@ class ChatMessageState {
           senderPubkeyHex == other.senderPubkeyHex &&
           recipientPubkeyHex == other.recipientPubkeyHex &&
           timestamp == other.timestamp &&
-          messageType == other.messageType;
+          messageType == other.messageType &&
+          mediaPath == other.mediaPath &&
+          viewed == other.viewed;
 
   @override
   int get hashCode => Object.hash(
@@ -244,6 +319,8 @@ class ChatMessageState {
         recipientPubkeyHex,
         timestamp,
         messageType,
+        mediaPath,
+        viewed,
       );
 }
 

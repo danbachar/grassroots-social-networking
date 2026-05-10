@@ -27,8 +27,15 @@
     <!-- Notifications (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Required features -->
+    <!-- Required features.
+         Camera is invoked via image_picker → ACTION_IMAGE_CAPTURE intent,
+         which runs in the system camera app's own process, so we do NOT
+         declare android.permission.CAMERA — that would force a runtime
+         permission grant we don't actually need. The `uses-feature` line
+         below just signals the device has a camera if available; it isn't
+         a runtime permission. -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application
         android:label="grassroots_networking"
         android:name="${applicationName}"

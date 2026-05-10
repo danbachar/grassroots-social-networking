@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
@@ -11,6 +12,13 @@ import 'package:grassroots_networking/src/routing/message_router.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Sodium sodium;
+  setUpAll(() async {
+    sodium = await SodiumInit.init();
+  });
+
   late GrassrootsIdentity aliceIdentity;
   late GrassrootsIdentity bobIdentity;
   late ProtocolHandler aliceProtocol;
@@ -38,8 +46,8 @@ void main() {
     aliceStore = Store<AppState>(appReducer, initialState: const AppState());
     bobStore = Store<AppState>(appReducer, initialState: const AppState());
 
-    aliceProtocol = ProtocolHandler(identity: aliceIdentity);
-    bobProtocol = ProtocolHandler(identity: bobIdentity);
+    aliceProtocol = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+    bobProtocol = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
     aliceRouter = MessageRouter(
       identity: aliceIdentity,

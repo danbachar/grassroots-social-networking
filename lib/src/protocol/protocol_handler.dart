@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:cryptography/cryptography.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 
 /// Handles Grassroots protocol logic: packet encoding/decoding,
 /// ANNOUNCE parsing, MESSAGE handling, etc.
@@ -11,9 +11,13 @@ import 'package:grassroots_networking/src/models/packet.dart';
 /// Extracted from transport layer to achieve separation of concerns.
 class ProtocolHandler {
   final GrassrootsIdentity identity;
+  final Sodium _sodium;
   static const int protocolVersion = 1;
 
-  const ProtocolHandler({required this.identity});
+  ProtocolHandler({
+    required this.identity,
+    required Sodium sodium,
+  }) : _sodium = sodium;
 
   // ===== Encoding =====
 
@@ -185,32 +189,45 @@ class ProtocolHandler {
 
   /// Sign a packet with the identity's Ed25519 private key.
   ///
-  /// Mutates [packet.signature] in place.
+  /// Mutates [packet.signature] in place. Uses libsodium's native Ed25519
+  /// (~5-10ms on Android, ~1-3ms on iOS) instead of the pure-Dart
+  /// `cryptography` implementation (~150-200ms on Android) — relevant when
+  /// signing fragmented payloads where the sender signs every fragment in
+  /// a tight loop.
   Future<void> signPacket(GrassrootsPacket packet) async {
-    final algorithm = Ed25519();
     final signableBytes = packet.getSignableBytes();
-    final signature =
-        await algorithm.sign(signableBytes, keyPair: identity.keyPair);
-    packet.signature = Uint8List.fromList(signature.bytes);
+    // The identity's `privateKey` is the standard 64-byte Ed25519 secret
+    // key (32-byte seed concatenated with the 32-byte public key) — exactly
+    // what libsodium's `crypto_sign_detached` expects.
+    final secretKey = SecureKey.fromList(_sodium, identity.privateKey);
+    try {
+      final signature = _sodium.crypto.sign.detached(
+        message: signableBytes,
+        secretKey: secretKey,
+      );
+      packet.signature = signature;
+    } finally {
+      secretKey.dispose();
+    }
   }
 
   /// Verify a packet's Ed25519 signature against the sender's public key.
   ///
-  /// Returns true if the signature is valid.
+  /// Native libsodium verify (~5-10ms on Android) is fast enough that we run
+  /// on the main isolate — even a fully fragmented 100 KB picture (~315
+  /// individually signed BitchatPackets) totals ~2-3s of CPU spread across
+  /// the BLE arrival window, comfortably interleaved with the event loop's
+  /// other work.
+  ///
+  /// Returns true if the signature is valid; false on any error.
   Future<bool> verifyPacket(GrassrootsPacket packet) async {
     try {
-      final algorithm = Ed25519();
-      final signableBytes = packet.getSignableBytes();
-      final publicKey = SimplePublicKey(
-        packet.senderPubkey,
-        type: KeyPairType.ed25519,
+      return _sodium.crypto.sign.verifyDetached(
+        signature: packet.signature,
+        message: packet.getSignableBytes(),
+        publicKey: packet.senderPubkey,
       );
-      final signature = Signature(
-        packet.signature,
-        publicKey: publicKey,
-      );
-      return await algorithm.verify(signableBytes, signature: signature);
-    } catch (e) {
+    } catch (_) {
       return false;
     }
   }

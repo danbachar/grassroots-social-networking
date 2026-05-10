@@ -145,6 +145,11 @@ class SaveChatMessageAction extends MessageAction {
   /// For friendship messages: the UDP address involved
   final String? udpAddress;
 
+  /// Picture-message fields. All null/false for text messages.
+  final String? mediaPath;
+  final String? mediaMime;
+  final bool viewOnce;
+
   SaveChatMessageAction({
     required this.senderPubkeyHex,
     required this.recipientPubkeyHex,
@@ -154,7 +159,32 @@ class SaveChatMessageAction extends MessageAction {
     this.messageId,
     this.messageType = 0, // ChatMessageType.text
     this.udpAddress,
+    this.mediaPath,
+    this.mediaMime,
+    this.viewOnce = false,
   }) : timestamp = timestamp ?? DateTime.now();
+}
+
+/// Mark a view-once picture as viewed and clear its on-disk path. The caller
+/// is responsible for the actual file deletion via
+/// `MediaService.deleteMediaFile` — this action only updates Redux state.
+class MarkPictureViewedAction extends MessageAction {
+  final String peerHex;
+  final String messageId;
+
+  MarkPictureViewedAction({
+    required this.peerHex,
+    required this.messageId,
+  });
+}
+
+/// Delete the entire conversation with [peerHex] — drops the message history
+/// and the unread count. Media files attached to messages in the conversation
+/// are deleted out-of-band by the middleware that observes this action.
+class DeleteConversationAction extends MessageAction {
+  final String peerHex;
+
+  DeleteConversationAction(this.peerHex);
 }
 
 /// Mark all messages from a peer as read

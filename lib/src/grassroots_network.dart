@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:redux/redux.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 import 'package:uuid/uuid.dart';
 import 'ble/permission_handler.dart';
 import 'signaling/signaling_codec.dart';
@@ -156,6 +157,11 @@ class GrassrootsNetwork {
 
   /// Redux store for app state
   final Store<AppState> store;
+
+  /// Initialized libsodium instance for native Ed25519 sign/verify.
+  /// The caller (typically `main()`) is responsible for `await SodiumInit.init()`
+  /// once at app startup and passing the result here.
+  final Sodium sodium;
 
   /// Subscription for listening to store changes
   StreamSubscription<AppState>? _storeSubscription;
@@ -315,8 +321,9 @@ class GrassrootsNetwork {
     required this.identity,
     this.config = const GrassrootsNetworkConfig(),
     required this.store,
+    required this.sodium,
   }) {
-    _protocolHandler = ProtocolHandler(identity: identity);
+    _protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
     _fragmentHandler = FragmentHandler();
     _messageRouter = MessageRouter(
       identity: identity,

@@ -143,6 +143,9 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
       messageType: ChatMessageType.values[action.messageType],
       udpAddress: action.udpAddress,
       messageId: action.messageId,
+      mediaPath: action.mediaPath,
+      mediaMime: action.mediaMime,
+      viewOnce: action.viewOnce,
     );
 
     // Get existing conversation or create new
@@ -171,10 +174,60 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
     );
   }
 
+  if (action is MarkPictureViewedAction) {
+    final conv = state.conversations[action.peerHex];
+    if (conv == null) return state;
+
+    final idx = conv.indexWhere((m) => m.messageId == action.messageId);
+    if (idx < 0) return state;
+
+    final updatedMessage = conv[idx].copyWith(
+      viewed: true,
+      clearMediaPath: true,
+    );
+    final newConv = List<ChatMessageState>.from(conv)..[idx] = updatedMessage;
+
+    final updatedConversations = Map<String, List<ChatMessageState>>.from(
+      state.conversations,
+    )..[action.peerHex] = newConv;
+
+    return state.copyWith(conversations: updatedConversations);
+  }
+
   if (action is MarkMessagesReadAction) {
     final updatedUnreadCounts = Map<String, int>.from(state.unreadCounts);
     updatedUnreadCounts.remove(action.peerHex);
     return state.copyWith(unreadCounts: updatedUnreadCounts);
+  }
+
+  if (action is DeleteConversationAction) {
+    // Drop the message thread + unread count. Outgoing/incoming delivery-status
+    // records get pruned here too: with the chat history gone there is nothing
+    // for those records to bind to, and they would otherwise leak forever.
+    final messageIdsToDrop = <String>{
+      for (final m
+          in (state.conversations[action.peerHex] ?? const <ChatMessageState>[]))
+        if (m.messageId != null) m.messageId!,
+    };
+
+    final newConversations = Map<String, List<ChatMessageState>>.from(
+      state.conversations,
+    )..remove(action.peerHex);
+
+    final newUnreadCounts = Map<String, int>.from(state.unreadCounts)
+      ..remove(action.peerHex);
+
+    final newOutgoing = Map<String, OutgoingMessage>.from(state.outgoingMessages)
+      ..removeWhere((id, _) => messageIdsToDrop.contains(id));
+    final newIncoming = Map<String, IncomingMessage>.from(state.incomingMessages)
+      ..removeWhere((id, _) => messageIdsToDrop.contains(id));
+
+    return state.copyWith(
+      conversations: newConversations,
+      unreadCounts: newUnreadCounts,
+      outgoingMessages: newOutgoing,
+      incomingMessages: newIncoming,
+    );
   }
 
   if (action is HydrateConversationsAction) {

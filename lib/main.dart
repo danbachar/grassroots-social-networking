@@ -10,6 +10,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:sodium_libs/sodium_libs.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'package:cryptography/cryptography.dart';
@@ -34,6 +35,11 @@ late final Store<AppState> appStore;
 
 // Global persistence service
 late final PersistenceService persistenceService;
+
+// Global libsodium handle, initialized at app startup. Used by ProtocolHandler
+// for native Ed25519 sign on the main isolate; verifier worker isolates
+// initialize their own Sodium handles independently.
+late final Sodium appSodium;
 
 Future<GrassrootsIdentity> _initIdentity() async {
   const storage = FlutterSecureStorage();
@@ -187,12 +193,77 @@ LogEntry? _parseLogLine(String line) {
   );
 }
 
+/// Redux middleware that handles two file-system side effects:
+///
+/// 1. **View-once cleanup on delivery**: when an outgoing view-once picture
+///    transitions to `MessageStatus.delivered`, delete the sender's local
+///    copy and dispatch `MarkPictureViewedAction` to drop the path from state.
+///    The recipient's copy is deleted separately when they tap to view.
+///
+/// 2. **Conversation deletion cleanup**: when a `DeleteConversationAction`
+///    fires, snapshot the media paths in that conversation BEFORE the reducer
+///    runs (the conversation is gone after `next(action)`), then delete those
+///    files asynchronously.
+void _mediaCleanupMiddleware(
+    Store<AppState> store, dynamic action, NextDispatcher next) {
+  // Snapshot before reducing — we need the conversation's media paths before
+  // it disappears.
+  List<String>? pathsToDeleteOnConversationDrop;
+  if (action is DeleteConversationAction) {
+    final conv = store.state.messages.conversations[action.peerHex];
+    if (conv != null) {
+      pathsToDeleteOnConversationDrop = [
+        for (final m in conv)
+          if (m.mediaPath != null) m.mediaPath!,
+      ];
+    }
+  }
+
+  next(action);
+
+  if (pathsToDeleteOnConversationDrop != null) {
+    for (final p in pathsToDeleteOnConversationDrop) {
+      unawaited(deleteMediaFile(p));
+    }
+    return;
+  }
+
+  if (action is MessageDeliveredAction) {
+    // Find the matching outgoing chat message by messageId across all
+    // conversations. Pictures are infrequent; this scan is cheap relative to
+    // the actual message arrival.
+    final messageId = action.messageId;
+    for (final entry in store.state.messages.conversations.entries) {
+      final peerHex = entry.key;
+      for (final msg in entry.value) {
+        if (msg.messageId == messageId &&
+            msg.isOutgoing &&
+            msg.viewOnce &&
+            msg.mediaPath != null) {
+          final pathToDelete = msg.mediaPath!;
+          unawaited(deleteMediaFile(pathToDelete));
+          store.dispatch(MarkPictureViewedAction(
+            peerHex: peerHex,
+            messageId: messageId,
+          ));
+          return;
+        }
+      }
+    }
+  }
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Capture all Flutter print output (including Logger) into the debug log buffer.
   // This feeds the Debug Logs screen in Settings.
   _setupDebugLogCapture();
+
+  // Initialize libsodium once for the main isolate. Verifier worker isolates
+  // each call SodiumInit.init() themselves — the native binary loads once per
+  // process, but each isolate needs its own Dart-side FFI handle.
+  appSodium = await SodiumInit.init();
 
   // Create persistence service and load persisted state
   persistenceService = PersistenceService();
@@ -212,6 +283,7 @@ void main() async {
         unreadCounts: unreadCounts,
       ),
     ),
+    middleware: [_mediaCleanupMiddleware],
   );
 
   // Subscribe to persist changes (debounced)
@@ -295,21 +367,21 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     return {for (var p in peersState.nearbyBlePeers) p.pubkeyHex: p};
   }
 
-  /// Get discovered but unconnected nearby devices
-  List<DiscoveredPeerState> get _unconnectedDevices {
-    final peersState = appStore.state.peers;
-    // Map of currently connected device IDs
-    final connectedDeviceIds = peersState.peersList
-        .where((p) => p.hasBleConnection)
-        .expand((p) => [p.bleCentralDeviceId, p.blePeripheralDeviceId])
-        .where((id) => id != null)
-        .toSet();
+  // /// Get discovered but unconnected nearby devices
+  // List<DiscoveredPeerState> get _unconnectedDevices {
+  //   final peersState = appStore.state.peers;
+  //   // Map of currently connected device IDs
+  //   final connectedDeviceIds = peersState.peersList
+  //       .where((p) => p.hasBleConnection)
+  //       .expand((p) => [p.bleCentralDeviceId, p.blePeripheralDeviceId])
+  //       .where((id) => id != null)
+  //       .toSet();
 
-    return peersState.discoveredBlePeersList
-        .where((d) =>
-            !connectedDeviceIds.contains(d.transportId) && !d.isConnected)
-        .toList();
-  }
+  //   return peersState.discoveredBlePeersList
+  //       .where((d) =>
+  //           !connectedDeviceIds.contains(d.transportId) && !d.isConnected)
+  //       .toList();
+  // }
 
   @override
   void initState() {
@@ -369,6 +441,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       final grassroots = GrassrootsNetwork(
         identity: identity,
         store: appStore,
+        sodium: appSodium,
       );
 
       grassroots.onMessageReceived =
@@ -473,10 +546,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     switch (block.type) {
       case BlockType.say:
         final sayBlock = block as SayBlock;
-        debugPrint(
-            '💬 [$transportName] Message from $senderName: "${sayBlock.content}"');
-        await _handleTextMessage(
-            senderHex, myHex, sayBlock.content, messageId, senderPubkey);
+        if (sayBlock is TextSayBlock) {
+          debugPrint(
+              '💬 [$transportName] Message from $senderName: "${sayBlock.content}"');
+          await _handleTextMessage(
+              senderHex, myHex, sayBlock.content, messageId, senderPubkey);
+        } else if (sayBlock is PictureSayBlock) {
+          debugPrint(
+              '📷 [$transportName] Picture from $senderName (${sayBlock.imageBytes.length} bytes, viewOnce=${sayBlock.viewOnce})');
+          await _handlePictureMessage(
+              senderHex, myHex, sayBlock, messageId, senderPubkey);
+        }
 
       case BlockType.friendshipOffer:
         debugPrint(
@@ -518,6 +598,41 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
     // Show notification
     await _showMessageNotification(senderHex, senderName, content);
+  }
+
+  Future<void> _handlePictureMessage(
+      String senderHex,
+      String myHex,
+      PictureSayBlock block,
+      String messageId,
+      Uint8List senderPubkey) async {
+    // Persist the image bytes to disk under a SHA-256-named file. dedupes
+    // identical images naturally.
+    final file = await writeMediaFile(block.imageBytes, block.mime);
+
+    appStore.dispatch(SaveChatMessageAction(
+      senderPubkeyHex: senderHex,
+      recipientPubkeyHex: myHex,
+      // No caption support in v1; keep content empty so chat-list previews
+      // can still render a short subtitle.
+      content: '',
+      isOutgoing: false,
+      messageId: messageId,
+      messageType: ChatMessageType.picture.index,
+      mediaPath: file.path,
+      mediaMime: block.mime,
+      viewOnce: block.viewOnce,
+    ));
+
+    final peer = _peers.values
+        .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == senderHex)
+        .firstOrNull;
+    final senderName = peer?.displayName ?? 'Unknown';
+    await _showMessageNotification(
+      senderHex,
+      senderName,
+      block.viewOnce ? '🔥 Sent a 1-time photo' : '📷 Sent a photo',
+    );
   }
 
   Future<void> _handleFriendshipOffer(
@@ -1152,26 +1267,32 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   List<_ChatPreview> _getChatsWithMessages() {
     final chats = <_ChatPreview>[];
-    final myHex =
-        _identity != null ? ChatMessage.pubkeyToHex(_identity!.publicKey) : '';
 
-    // Get all conversation partners from Redux store
-    final conversations = appStore.state.messages.conversationPeers;
+    // Walk every conversation that has messages — friends, BT peers, UDP-only
+    // peers, or any peer we've ever exchanged a message with. The keys are
+    // Ed25519 pubkey hexes, so a peer who is BOTH a friend and a BT peer
+    // appears once.
+    final messagesState = appStore.state.messages;
+    final peersMap = appStore.state.peers.peers;
+    final friendshipsState = appStore.state.friendships;
 
-    for (final peerHex in conversations) {
-      final messages = appStore.state.messages.getConversation(peerHex);
+    for (final peerHex in messagesState.conversationPeers) {
+      final messages = messagesState.getConversation(peerHex);
       if (messages.isEmpty) continue;
 
       final lastMessage = messages.last;
-      final peer = _peers.values
-          .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == peerHex)
-          .firstOrNull;
+      // Prefer the full peer record (carries connection state + nickname),
+      // fall back to the friendship record for offline friends so the chat
+      // list shows the right name even when the peer isn't currently seen.
+      final peer = peersMap[peerHex];
+      final friendship = friendshipsState.getFriendship(peerHex);
 
       chats.add(_ChatPreview(
         peerHex: peerHex,
         peer: peer,
+        friendship: friendship,
         lastMessage: lastMessage,
-        unreadCount: appStore.state.messages.getUnreadCount(peerHex),
+        unreadCount: messagesState.getUnreadCount(peerHex),
       ));
     }
 
@@ -1182,16 +1303,47 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   }
 
   Widget _buildChatListItem(_ChatPreview chat) {
-    final displayName =
-        chat.peer?.displayName ?? 'Peer ${chat.peerHex.substring(0, 8)}...';
-    final isOnline = chat.peer != null &&
-        chat.peer!.connectionState == PeerConnectionState.connected;
+    final displayName = chat.displayName;
+    final isFriend = chat.isFriend;
+    final isOnline = chat.peer?.isLiveReachable ?? false;
 
-    return ListTile(
+    return Dismissible(
+      key: ValueKey('chat-${chat.peerHex}'),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        color: Colors.red,
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: const Row(
+          mainAxisAlignment: MainAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.delete, color: Colors.white),
+            SizedBox(width: 8),
+            Text(
+              'Delete',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+      ),
+      confirmDismiss: (_) => _confirmDeleteChat(chat),
+      onDismissed: (_) {
+        appStore.dispatch(DeleteConversationAction(chat.peerHex));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Deleted chat with $displayName'),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      },
+      child: ListTile(
       leading: Stack(
         children: [
           CircleAvatar(
-            backgroundColor: Colors.blueGrey,
+            backgroundColor: isFriend ? Colors.blue : Colors.blueGrey,
             child: Text(
               displayName.isNotEmpty ? displayName[0].toUpperCase() : '?',
               style: const TextStyle(color: Colors.white),
@@ -1215,7 +1367,19 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       ),
       title: Row(
         children: [
-          Expanded(child: Text(displayName)),
+          Expanded(
+            child: Row(
+              children: [
+                Flexible(
+                  child: Text(displayName, overflow: TextOverflow.ellipsis),
+                ),
+                if (isFriend) ...[
+                  const SizedBox(width: 4),
+                  const Icon(Icons.people, size: 14, color: Colors.blue),
+                ],
+              ],
+            ),
+          ),
           if (chat.unreadCount > 0)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -1231,7 +1395,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         ],
       ),
       subtitle: Text(
-        chat.lastMessage.content,
+        _chatPreviewText(chat.lastMessage),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: TextStyle(
@@ -1245,10 +1409,78 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         style: const TextStyle(color: Colors.grey, fontSize: 12),
       ),
       onTap: () {
-        if (chat.peer != null) {
-          _openChat(chat.peer!);
+        // Live peer wins; otherwise synthesize a stub from the friendship so
+        // the chat opens for offline friends. ChatScreen + grassroots.send
+        // only need the pubkey + nickname; if no transport is live, the send
+        // path emits MessageFailedAction as usual.
+        final peer = chat.peer ?? _stubPeerFromChatPreview(chat);
+        if (peer != null) {
+          _openChat(peer);
         }
       },
+      ),
+    );
+  }
+
+  /// Confirm chat deletion. Returns true if the user accepted; the dispatch
+  /// happens in `onDismissed` so the snackbar fires after the list animates.
+  Future<bool> _confirmDeleteChat(_ChatPreview chat) async {
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Delete chat?'),
+        content: Text(
+          'Delete the entire chat with ${chat.displayName}? '
+          'Messages and any photos in this chat will be removed from this device.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    return accepted ?? false;
+  }
+
+  /// Build a synthetic [PeerState] for opening a chat from the chat list when
+  /// no live peer record exists (e.g. an offline friend on app startup).
+  /// Returns null only when neither a peer record nor a friendship is on file
+  /// — in that case there's nothing to talk to.
+  PeerState? _stubPeerFromChatPreview(_ChatPreview chat) {
+    final friendship = chat.friendship;
+    if (friendship == null) return null;
+    return PeerState(
+      publicKey: _hexStringToBytes(chat.peerHex),
+      nickname: friendship.nickname ?? '',
+      isFriend: friendship.isAccepted,
+      udpAddress: friendship.udpAddress,
+    );
+  }
+
+  /// One-line preview text for the chat list. Substitutes a short label for
+  /// picture messages instead of trying to show the empty `content` field.
+  String _chatPreviewText(ChatMessageState m) {
+    if (m.messageType == ChatMessageType.picture) {
+      if (m.viewOnce) return '🔥 1-time photo';
+      return '📷 Photo';
+    }
+    return m.content;
+  }
+
+  /// Decode a 64-char hex pubkey into 32 bytes.
+  Uint8List _hexStringToBytes(String hex) {
+    return Uint8List.fromList(
+      List.generate(
+        hex.length ~/ 2,
+        (i) => int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16),
+      ),
     );
   }
 
@@ -1370,7 +1602,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               const Icon(Icons.bluetooth, size: 18, color: Colors.blueGrey),
               const SizedBox(width: 8),
               Text(
-                'Nearby (${_peers.length + _unconnectedDevices.length})',
+                'Nearby (${_peers.length})',
                 style: const TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
@@ -1383,7 +1615,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         const SizedBox(height: 8),
 
         Expanded(
-          child: (_peers.isEmpty && _unconnectedDevices.isEmpty)
+          child: (_peers.isEmpty)
               ? const Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -1416,24 +1648,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                                 fontSize: 12)),
                       ),
                       ...(_peers.values.toList()
-                            ..sort((a, b) => b.rssi.compareTo(a.rssi)))
+                            ..sort((a, b) => (b.rssi ?? -100)
+                                .compareTo(a.rssi ?? -100)))
                           .map((peer) => _buildPeerListItem(peer)),
                     ],
-                    if (_unconnectedDevices.isNotEmpty) ...[
-                      const Padding(
-                        padding:
-                            EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        child: Text('Discovered Grassroots Devices',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.grey,
-                                fontSize: 12)),
-                      ),
-                      ...(_unconnectedDevices
-                            ..sort((a, b) => b.rssi.compareTo(a.rssi)))
-                          .map((device) =>
-                              _buildUnconnectedDeviceListItem(device)),
-                    ]
                   ],
                 ),
         ),
@@ -1504,13 +1722,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     final hasPendingRequest =
         appStore.state.friendships.hasPendingRequest(peerHex);
 
-    // RSSI signal strength indicator
-    IconData signalIcon;
-    Color signalColor;
-    if (peer.rssi < -80) {
+    // RSSI signal strength indicator. Peers in this list come from
+    // `nearbyBlePeers`, which is filtered by `hasBleConnection`, and any peer
+    // with a live BLE link has received at least one BLE packet — so `rssi`
+    // is always non-null here. The `!` reflects that invariant.
+    final rssiDbm = peer.rssi!;
+    final IconData signalIcon;
+    final Color signalColor;
+    if (rssiDbm < -80) {
       signalIcon = Icons.signal_cellular_alt_1_bar;
       signalColor = Colors.red;
-    } else if (peer.rssi < -60) {
+    } else if (rssiDbm < -60) {
       signalIcon = Icons.signal_cellular_alt_2_bar;
       signalColor = Colors.orange;
     } else {
@@ -1642,7 +1864,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                 children: [
                   Icon(signalIcon, color: signalColor, size: 20),
                   Text(
-                    '${peer.rssi} dBm',
+                    '$rssiDbm dBm',
                     style: TextStyle(fontSize: 10, color: signalColor),
                   ),
                 ],
@@ -1670,63 +1892,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             ],
           ),
           onTap: () => _openChat(peer),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildUnconnectedDeviceListItem(DiscoveredPeerState device) {
-    // RSSI signal strength indicator
-    IconData signalIcon;
-    Color signalColor;
-    if (device.rssi < -80) {
-      signalIcon = Icons.signal_cellular_alt_1_bar;
-      signalColor = Colors.red;
-    } else if (device.rssi < -60) {
-      signalIcon = Icons.signal_cellular_alt_2_bar;
-      signalColor = Colors.orange;
-    } else {
-      signalIcon = Icons.signal_cellular_alt;
-      signalColor = Colors.green;
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: Card(
-        margin: EdgeInsets.zero,
-        elevation: 1,
-        color: Colors.grey.withOpacity(0.05),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: Colors.grey.withOpacity(0.2)),
-        ),
-        child: ListTile(
-          leading: const CircleAvatar(
-            backgroundColor: Colors.grey,
-            child: Icon(Icons.bluetooth, color: Colors.white),
-          ),
-          title: Text(
-            device.displayName ?? 'Unknown Grassroots Device',
-            style: const TextStyle(
-                fontWeight: FontWeight.normal, color: Colors.grey),
-          ),
-          subtitle: Row(
-            children: [
-              Icon(signalIcon, color: signalColor, size: 14),
-              const SizedBox(width: 4),
-              Text(
-                '${device.rssi} dBm · Discovered: ${_formatSecondsAgo(device.discoveredAt)}',
-                style: const TextStyle(fontSize: 12),
-              ),
-            ],
-          ),
-          trailing: device.isConnecting
-              ? const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : null,
         ),
       ),
     );
@@ -1801,7 +1966,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               if (peer != null) ...[
                 Text('Nickname: ${peer.displayName}'),
                 Text('Status: ${peer.connectionState.name}'),
-                Text('Signal: ${peer.rssi} dBm'),
+                if (peer.rssi != null) Text('Signal: ${peer.rssi} dBm'),
                 if (peer.lastSeen != null)
                   Text('Last seen: ${_formatSecondsAgo(peer.lastSeen!)}'),
               ] else
@@ -2276,6 +2441,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     final newGrassroots = GrassrootsNetwork(
       identity: newIdentity,
       store: appStore,
+      sodium: appSodium,
     );
     newGrassroots.onMessageReceived =
         (messageId, senderPubkey, payload, transport) {
@@ -2385,14 +2551,35 @@ class _NicknameChange {
 /// Helper class for chat list preview
 class _ChatPreview {
   final String peerHex;
+
+  /// Full peer record, when one exists. Null for an offline friend whose
+  /// `PeerState` hasn't been re-hydrated yet (e.g. fresh app start, no live
+  /// connection, but the conversation history is loaded from disk).
   final PeerState? peer;
+
+  /// Friendship record, when this peer is on our friends list. Used as the
+  /// nickname source when [peer] is null.
+  final FriendshipState? friendship;
+
   final ChatMessageState lastMessage;
   final int unreadCount;
 
   _ChatPreview({
     required this.peerHex,
     required this.peer,
+    required this.friendship,
     required this.lastMessage,
     required this.unreadCount,
   });
+
+  /// Display name from peer (live), then friendship (offline friend),
+  /// then a truncated pubkey as last resort.
+  String get displayName {
+    if (peer != null && peer!.displayName.isNotEmpty) return peer!.displayName;
+    final fNick = friendship?.nickname;
+    if (fNick != null && fNick.isNotEmpty) return fNick;
+    return 'Peer ${peerHex.substring(0, 8)}...';
+  }
+
+  bool get isFriend => friendship?.isAccepted ?? false;
 }

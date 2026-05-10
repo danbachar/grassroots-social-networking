@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
@@ -41,6 +44,12 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   StreamSubscription<AppState>? _storeSubscription;
+  final ImagePicker _imagePicker = ImagePicker();
+
+  /// True while a picture is being compressed and queued for send. Drives the
+  /// indeterminate progress bar above the composer (BLE fragmentation can
+  /// take seconds per image).
+  bool _sendingMedia = false;
 
   String get _peerHex => ChatMessage.pubkeyToHex(widget.peer.publicKey);
   String get _myHex => ChatMessage.pubkeyToHex(widget.myPubkey);
@@ -59,6 +68,58 @@ class _ChatScreenState extends State<ChatScreen> {
     // Mark messages as read and send read receipts when opening chat
     widget.store.dispatch(MarkMessagesReadAction(_peerHex));
     _sendReadReceipts();
+    // Android can kill the Flutter Activity while the camera app is in the
+    // foreground (memory pressure). When we come back, the original
+    // pickImage future is dead but the captured file is recoverable here.
+    unawaited(_recoverLostPickedMedia());
+  }
+
+  /// Android-only: recover a picked image whose pickImage future was killed
+  /// when the Flutter Activity was reclaimed during camera capture. iOS does
+  /// not need this — the UIImagePickerController is hosted in our process.
+  Future<void> _recoverLostPickedMedia() async {
+    if (!Platform.isAndroid) return;
+    final LostDataResponse lost;
+    try {
+      lost = await _imagePicker.retrieveLostData();
+    } catch (e) {
+      debugPrint('[picture-send] retrieveLostData failed: $e');
+      return;
+    }
+    if (lost.isEmpty) return;
+    if (lost.exception != null) {
+      debugPrint('[picture-send] lost data exception: ${lost.exception}');
+      return;
+    }
+    final file = lost.file;
+    if (file == null) return;
+    debugPrint('[picture-send] recovered lost file: ${file.path}');
+    if (!mounted) return;
+    // The viewOnce flag was lost when the Activity died. Confirm with the
+    // user before sending so a recovery doesn't silently downgrade privacy.
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Recovered photo'),
+        content: const Text(
+          'Your last photo capture was interrupted. Send it now? '
+          '(1-time view will not be applied to the recovered photo.)',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Discard'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Send'),
+          ),
+        ],
+      ),
+    );
+    if (proceed == true) {
+      await _sendPicture(file, viewOnce: false);
+    }
   }
 
   /// Send read receipts for all unread incoming messages
@@ -117,10 +178,171 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Send in the background — status updates (sending → sent/delivered/failed)
     // will be dispatched by GrassrootsNetwork.send() and reflected via the status icon
-    final block = SayBlock(content: text);
+    final block = TextSayBlock(content: text);
     debugPrint("Sending '$text' to peer ${widget.peer.displayName}");
     widget.grassroots
         .send(widget.peer.publicKey, block.serialize(), messageId: messageId);
+  }
+
+  /// Open a small bottom sheet to pick an image source (camera or gallery)
+  /// and an optional 1-time view toggle, then send the chosen photo.
+  Future<void> _openAttachmentSheet() async {
+    bool viewOnce = false;
+    final source = await showModalBottomSheet<ImageSource>(
+      context: context,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: StatefulBuilder(
+            builder: (sbContext, setSheet) => Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.camera_alt),
+                  title: const Text('Camera'),
+                  onTap: () => Navigator.pop(sheetContext, ImageSource.camera),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.photo_library),
+                  title: const Text('Photo library'),
+                  onTap: () => Navigator.pop(sheetContext, ImageSource.gallery),
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  secondary: const Icon(Icons.local_fire_department),
+                  title: const Text('Send as 1-time view'),
+                  subtitle:
+                      const Text('Recipient sees a blurred preview; deletes after one view'),
+                  value: viewOnce,
+                  onChanged: (v) => setSheet(() => viewOnce = v),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (source == null) {
+      debugPrint('[picture-send] attachment sheet dismissed without choice');
+      return;
+    }
+    debugPrint('[picture-send] source chosen: $source, viewOnce=$viewOnce');
+
+    // No app-level permission request: image_picker handles camera permission
+    // natively on both platforms.
+    //  - iOS: UIImagePickerController triggers the OS prompt the first time;
+    //    if the user denied previously, iOS shows its standard
+    //    "Camera access is denied — Settings" alert.
+    //  - Android: ACTION_IMAGE_CAPTURE runs in the system camera app's own
+    //    process, so the calling app doesn't need a runtime CAMERA grant.
+
+    XFile? picked;
+    try {
+      picked = await _imagePicker.pickImage(source: source);
+    } catch (e, st) {
+      _log.e('[picture-send] pickImage threw', error: e, stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Image picker failed: $e')),
+        );
+      }
+      return;
+    }
+    if (picked == null) {
+      debugPrint(
+          '[picture-send] pickImage returned null — user cancelled, OR '
+          'Activity was killed while in $source. Will retry retrieveLostData on next entry.');
+      return;
+    }
+    debugPrint('[picture-send] picker returned: ${picked.path}');
+
+    await _sendPicture(picked, viewOnce: viewOnce);
+  }
+
+
+  Future<void> _sendPicture(XFile picked, {required bool viewOnce}) async {
+    if (_sendingMedia) return;
+    setState(() => _sendingMedia = true);
+    try {
+      debugPrint('[picture-send] reading bytes from ${picked.path}');
+      final raw = await picked.readAsBytes();
+      debugPrint('[picture-send] raw bytes: ${raw.length}');
+
+      // Aggressive compression: BLE moves ~15 KB/s with 20ms inter-fragment
+      // delays, so unconstrained photos take minutes. Target ~100 KB.
+      final compressed = await compressForBle(raw);
+      debugPrint(
+          '[picture-send] compressed: ${compressed.length} bytes (was ${raw.length})');
+
+      final mime =
+          picked.mimeType ?? 'image/jpeg'; // imagePicker may omit on some platforms
+      final mediaFile = await writeMediaFile(compressed, mime);
+      debugPrint('[picture-send] wrote ${mediaFile.path}');
+
+      // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
+// and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
+// would corrupt either format.
+final messageId = _uuid.v4();
+
+      widget.store.dispatch(SaveChatMessageAction(
+        senderPubkeyHex: _myHex,
+        recipientPubkeyHex: _peerHex,
+        content: '',
+        isOutgoing: true,
+        messageId: messageId,
+        messageType: ChatMessageType.picture.index,
+        mediaPath: mediaFile.path,
+        mediaMime: mime,
+        viewOnce: viewOnce,
+      ));
+      _scrollToBottom();
+
+      final block = PictureSayBlock(
+        viewOnce: viewOnce,
+        mime: mime,
+        imageBytes: compressed,
+      );
+      final wireBytes = block.serialize();
+      debugPrint(
+          '[picture-send] block serialized: ${wireBytes.length} bytes; '
+          'dispatching to grassroots.send for peer ${widget.peer.displayName}');
+
+      final sentMessageId = await widget.grassroots
+          .send(widget.peer.publicKey, wireBytes, messageId: messageId);
+
+      if (sentMessageId == null) {
+        // send() returns null when the peer isn't reachable on any transport
+        // (no BLE link, no UDP address, no friend-discovery candidate). Mark
+        // the bubble as failed so the user sees a red "!" instead of an
+        // ambiguous "still sending".
+        debugPrint(
+            '[picture-send] grassroots.send returned null — no transport for ${widget.peer.displayName}');
+        widget.store.dispatch(MessageFailedAction(messageId: messageId));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Could not reach ${widget.peer.displayName} — no BLE or UDP transport available.',
+              ),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      } else {
+        debugPrint('[picture-send] sent ok, messageId=$sentMessageId');
+      }
+    } catch (e, st) {
+      _log.e('Failed to send picture', error: e, stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to send picture: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
+    }
   }
 
   void _scrollToBottom() {
@@ -440,6 +662,7 @@ class _ChatScreenState extends State<ChatScreen> {
       onLongPress: (position) => _showMessageOptions(message, position),
       messagesState: widget.store.state.messages,
       onResend: message.isOutgoing ? () => _resendMessage(message) : null,
+      store: widget.store,
     );
   }
 
@@ -459,8 +682,11 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
-    // Send via Grassroots using SayBlock
-    final block = SayBlock(content: message.content);
+    // Send via Grassroots using SayBlock. Picture resend is not yet wired —
+    // for now resend treats the message as text. (The bubble's resend affordance
+    // is only shown for failed messages, and pictures over BLE rarely fail
+    // partway because fragmentation is in-process.)
+    final block = TextSayBlock(content: message.content);
     final messageId = await widget.grassroots.send(
       widget.peer.publicKey,
       block.serialize(),
@@ -654,7 +880,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildMessageInput() {
     return Container(
-      padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
         boxShadow: [
@@ -665,24 +890,38 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         ],
       ),
-      child: Row(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Expanded(
-            child: TextField(
-              controller: _messageController,
-              decoration: const InputDecoration(
-                hintText: 'Type a message...',
-                border: OutlineInputBorder(),
-                contentPadding:
-                    EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-              ),
-              onSubmitted: (_) => _sendMessage(),
+          if (_sendingMedia) const LinearProgressIndicator(minHeight: 2),
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.add_photo_alternate_outlined),
+                  tooltip: 'Send a picture',
+                  onPressed: _sendingMedia ? null : _openAttachmentSheet,
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    decoration: const InputDecoration(
+                      hintText: 'Type a message...',
+                      border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    ),
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send),
+                  onPressed: _sendMessage,
+                ),
+              ],
             ),
-          ),
-          const SizedBox(width: 8),
-          IconButton(
-            icon: const Icon(Icons.send),
-            onPressed: _sendMessage,
           ),
         ],
       ),
@@ -695,12 +934,14 @@ class _MessageBubble extends StatelessWidget {
   final void Function(Offset position)? onLongPress;
   final MessagesState? messagesState;
   final VoidCallback? onResend;
+  final Store<AppState>? store;
 
   const _MessageBubble({
     required this.message,
     this.onLongPress,
     this.messagesState,
     this.onResend,
+    this.store,
   });
 
   @override
@@ -714,7 +955,9 @@ class _MessageBubble extends StatelessWidget {
         },
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: message.isPicture
+              ? const EdgeInsets.all(6)
+              : const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           constraints: BoxConstraints(
             maxWidth: MediaQuery.of(context).size.width * 0.75,
           ),
@@ -727,39 +970,175 @@ class _MessageBubble extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Text(
-                message.content,
-                style: TextStyle(
-                  color: message.isOutgoing ? Colors.white : null,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _formatTime(message.timestamp),
-                    style: TextStyle(
-                      fontSize: 10,
-                      color: message.isOutgoing
-                          ? Colors.white70
-                          : Theme.of(context)
-                              .colorScheme
-                              .onSurface
-                              .withValues(alpha: 0.5),
-                    ),
+              if (message.isPicture)
+                _buildPictureContent(context)
+              else
+                Text(
+                  message.content,
+                  style: TextStyle(
+                    color: message.isOutgoing ? Colors.white : null,
                   ),
-                  if (message.isOutgoing) ...[
-                    const SizedBox(width: 4),
-                    _buildStatusIcon(context),
+                ),
+              const SizedBox(height: 4),
+              Padding(
+                padding: message.isPicture
+                    ? const EdgeInsets.symmetric(horizontal: 6)
+                    : EdgeInsets.zero,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _formatTime(message.timestamp),
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: message.isOutgoing
+                            ? Colors.white70
+                            : Theme.of(context)
+                                .colorScheme
+                                .onSurface
+                                .withValues(alpha: 0.5),
+                      ),
+                    ),
+                    if (message.isOutgoing) ...[
+                      const SizedBox(width: 4),
+                      _buildStatusIcon(context),
+                    ],
                   ],
-                ],
+                ),
               ),
             ],
           ),
         ),
       ),
     );
+  }
+
+  Widget _buildPictureContent(BuildContext context) {
+    final mediaPath = message.mediaPath;
+
+    // Expired view-once (recipient already viewed, or sender's copy was
+    // deleted on delivery).
+    if (mediaPath == null || message.viewed) {
+      return _buildExpiredPlaceholder(context);
+    }
+
+    if (message.viewOnce && !message.isOutgoing) {
+      return _buildViewOncePreview(context, mediaPath);
+    }
+
+    return _buildInlinePicture(context, mediaPath);
+  }
+
+  Widget _buildInlinePicture(BuildContext context, String mediaPath) {
+    return GestureDetector(
+      onTap: () => _openFullscreen(context, mediaPath, viewOnce: false),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Image.file(
+          File(mediaPath),
+          width: 240,
+          fit: BoxFit.cover,
+          cacheWidth: 600,
+          errorBuilder: (_, __, ___) => _buildExpiredPlaceholder(context),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildViewOncePreview(BuildContext context, String mediaPath) {
+    return GestureDetector(
+      onTap: () => _openFullscreen(context, mediaPath, viewOnce: true),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Image.file(
+              File(mediaPath),
+              width: 240,
+              height: 240,
+              fit: BoxFit.cover,
+              cacheWidth: 600,
+              errorBuilder: (_, __, ___) => _buildExpiredPlaceholder(context),
+            ),
+            BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+              child: Container(
+                width: 240,
+                height: 240,
+                color: Colors.black.withValues(alpha: 0.15),
+                alignment: Alignment.center,
+                child: const Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.local_fire_department,
+                        color: Colors.white, size: 36),
+                    SizedBox(height: 8),
+                    Text(
+                      'Tap to view once',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExpiredPlaceholder(BuildContext context) {
+    return Container(
+      width: 240,
+      height: 120,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: Colors.black26,
+      ),
+      alignment: Alignment.center,
+      child: const Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.visibility_off, color: Colors.white70),
+          SizedBox(height: 4),
+          Text(
+            'View-once photo expired',
+            style: TextStyle(color: Colors.white70, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openFullscreen(
+    BuildContext context,
+    String mediaPath, {
+    required bool viewOnce,
+  }) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => _FullscreenImageView(path: mediaPath),
+      ),
+    );
+
+    // After the viewer dismisses, if this was an incoming view-once photo,
+    // mark it consumed and delete the local file. The middleware in main.dart
+    // handles the outgoing-side deletion separately on delivery.
+    if (viewOnce && !message.isOutgoing && message.messageId != null) {
+      final s = store;
+      if (s != null) {
+        unawaited(deleteMediaFile(mediaPath));
+        s.dispatch(MarkPictureViewedAction(
+          peerHex: message.senderPubkeyHex,
+          messageId: message.messageId!,
+        ));
+      }
+    }
   }
 
   Widget _buildStatusIcon(BuildContext context) {
@@ -816,6 +1195,40 @@ class _MessageBubble extends StatelessWidget {
     final hour = time.hour.toString().padLeft(2, '0');
     final minute = time.minute.toString().padLeft(2, '0');
     return '$hour:$minute';
+  }
+}
+
+/// Fullscreen viewer for picture messages: pinch-zoom, drag, dismiss with
+/// the back button or the close icon. Used for both regular and view-once
+/// pictures; the caller decides what to do on dismiss.
+class _FullscreenImageView extends StatelessWidget {
+  final String path;
+  const _FullscreenImageView({required this.path});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 0.5,
+          maxScale: 4,
+          child: Image.file(
+            File(path),
+            errorBuilder: (_, __, ___) => const Center(
+              child: Text(
+                'Image unavailable',
+                style: TextStyle(color: Colors.white70),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 

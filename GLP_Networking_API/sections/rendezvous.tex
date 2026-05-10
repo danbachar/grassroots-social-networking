@@ -96,11 +96,27 @@ Agent~$A$ detects the IP change via \func{onConnectivityStatus} (Section~\ref{se
 
 \item $B$ detects that~$A$ disconnected.  $B$ sends a UDP packet to each of~$A$'s known rendezvous agents, opening a NAT hole so that the rendezvous agent can reach~$B$.  $B$ sends a cold-call message: $\mathit{available}(B_{\mathit{pk}}, A_{\mathit{pk}}, \mathit{Reply})$.
 
-\item $S$ verifies~$A$'s friendship proof, observes~$A$'s public address via \code{peer\_address/2} (Section~\ref{sec:rv-predicates}), matches~$A$'s reconnect request with~$B$'s availability message, and sends~$B$ a $\mathit{punch}(\mathit{Addr}_A)$ message via~$B$'s reply variable.  If the proof is invalid, $S$ binds~$A$'s reply to $\mathit{rejected}$ and does not store the request.
+\item $S$ verifies~$A$'s friendship proof, observes~$A$'s public address via
+\code{peer\_address/2} (Section~\ref{sec:rv-predicates}), observes~$B$'s
+public address from~$B$'s availability message, and matches~$A$'s reconnect
+request with~$B$'s availability message. If the proof is invalid, $S$
+binds~$A$'s reply to $\mathit{rejected}$ and does not store the request. When the match succeeds, $S$ sends~$B$ a
+$\mathit{punch}(\mathit{Addr}_A)$ message via~$B$'s reply variable, and sends~$A$ a $\mathit{punch}(\mathit{Addr}_B)$ message via~$A$'s reply variable.
 
-\item $B$ receives $\mathit{punch}(\mathit{Addr}_A)$ and calls \code{punch\_udp/1} (Section~\ref{sec:rv-predicates}) to send UDP packets to~$A$'s new address.  Since~$A$ already has an open mapping to~$S$ (and~$B$'s NAT now has a mapping for~$A$), the packets traverse the NAT.  A direct UDP path is established.
+\dan{New: the punch is two-sided. The rendezvous agent tells both endpoints
+to send UDP punch traffic toward the other endpoint, because an outbound
+mapping from $A$ to $S$ does not in general allow packets from $B$ to reach
+$A$ through NAT.}
 
-\item The networking layer opens a UDX stream over the new UDP path and authenticates via Noise~XX (Section~\ref{sec:ip-connection}).  \func{onPeerConnected} fires at both agents.
+\item $A$ and~$B$ each receive their $\mathit{punch}(\cdot)$ message and call
+\code{punch\_udp/1} toward the other's observed public address. Each endpoint
+sends a short burst of UDP packets, opening the corresponding NAT mappings on
+both sides. Once the punch packets overlap, a direct UDP path is established.
+
+\item The networking layer chooses a deterministic UDX initiator: the endpoint with the lexicographically
+smaller public key. The initiator opens a UDX stream over the new UDP path, and the other endpoint accepts it. The stream authenticates via Noise~XX
+(Section~\ref{sec:ip-connection}). \func{onPeerConnected} fires at both agents. \dan{Added clarification about who starts the UDX connection to avoid simultaneous-open ambiguity when both sides start a connection: we need one side to listen, and one side to open}
+
 \end{enumerate}
 
 If the first rendezvous agent is unreachable or does not respond within a timeout,~$A$ and~$B$ proceed to the next rendezvous agent on their shared list, ordered deterministically (e.g., lexicographically by public key).  Since both sides compute the same ordered list, they converge on the same~$S$.

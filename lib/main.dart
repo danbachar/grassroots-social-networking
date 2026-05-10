@@ -1648,20 +1648,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                 ],
               ),
               const SizedBox(width: 8),
-              if (peer.hasBleConnection)
-                IconButton(
-                  icon: const Icon(Icons.bluetooth_disabled, size: 20),
-                  color: Colors.redAccent,
-                  tooltip: 'Disconnect BLE',
-                  onPressed: () {
-                    _grassroots?.disconnectBlePeer(peer.pubkeyHex);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                          content:
-                              Text('Disconnecting from ${peer.displayName}')),
-                    );
-                  },
-                ),
               // Friend request / Chat button
               if (!isFriend && !hasPendingRequest)
                 IconButton(
@@ -1740,19 +1726,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   height: 24,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 )
-              : IconButton(
-                  icon: const Icon(Icons.bluetooth_connected),
-                  color: Colors.blue,
-                  tooltip: 'Connect manually',
-                  onPressed: () {
-                    _grassroots?.connectBleDevice(device.transportId);
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                          content: Text(
-                              'Connecting to ${device.displayName ?? 'device'}...')),
-                    );
-                  },
-                ),
+              : null,
         ),
       ),
     );

@@ -64,20 +64,6 @@ class BleDeviceDisconnectedAction extends PeerAction {
   BleDeviceDisconnectedAction(this.deviceId);
 }
 
-/// Blacklist a discovered BLE device to prevent auto-reconnection
-class BleDeviceBlacklistedAction extends PeerAction {
-  final String deviceId;
-
-  BleDeviceBlacklistedAction(this.deviceId);
-}
-
-/// Unblacklist a discovered BLE device so it can be reconnected
-class BleDeviceUnblacklistedAction extends PeerAction {
-  final String deviceId;
-
-  BleDeviceUnblacklistedAction(this.deviceId);
-}
-
 /// Remove a discovered BLE device
 class BleDeviceRemovedAction extends PeerAction {
   final String deviceId;

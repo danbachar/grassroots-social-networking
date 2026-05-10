@@ -114,30 +114,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
     return state;
   }
 
-  if (action is BleDeviceBlacklistedAction) {
-    final existing = state.discoveredBlePeers[action.deviceId];
-    if (existing != null) {
-      final updated = existing.copyWith(isBlacklisted: true);
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = updated,
-      );
-    }
-    return state;
-  }
-
-  if (action is BleDeviceUnblacklistedAction) {
-    final existing = state.discoveredBlePeers[action.deviceId];
-    if (existing != null) {
-      final updated = existing.copyWith(isBlacklisted: false);
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = updated,
-      );
-    }
-    return state;
-  }
-
   if (action is BleDeviceRemovedAction) {
     final newMap = Map<String, DiscoveredPeerState>.from(
       state.discoveredBlePeers,

@@ -419,7 +419,7 @@ class BleTransportService extends TransportService {
   /// the existing path (Android). We do not duplicate that guard here.
   /// Path-state updates flow through `_onPathChanged`, which is the only
   /// dispatcher of `BleDeviceConnectingAction` / `Connected` / `Failed`.
-  Future<bool> connectToDevice(String pathId, {bool isManual = true}) async {
+  Future<bool> connectToDevice(String pathId) async {
     if (!pathId.startsWith('central:')) {
       // Peripheral-side paths are inbound — we don't dial them.
       return false;
@@ -457,13 +457,6 @@ class BleTransportService extends TransportService {
     }
   }
 
-  Future<void> disconnectFromDevice(String pathId) async {
-    try {
-      await _ble.disconnect(pathId);
-    } catch (e) {
-      debugPrint('disconnect() failed for $pathId: $e');
-    }
-  }
 
   /// Process an incoming raw BLE packet. Deserializes and forwards to the
   /// MessageRouter via [onBlePacketReceived].
@@ -556,9 +549,6 @@ class BleTransportService extends TransportService {
     if (existing != null && (existing.isConnected || existing.isConnecting)) {
       return;
     }
-    if (existing != null && existing.isBlacklisted) {
-      return;
-    }
     // BLE address rotation produces a fresh pathId every ~30s for the same
     // peer. With a single shared discovery UUID we can't tell pre-connect
     // whether this is a new peer or a known one wearing a new MAC. Cap
@@ -569,7 +559,7 @@ class BleTransportService extends TransportService {
       return;
     }
 
-    unawaited(connectToDevice(pathId, isManual: false));
+    unawaited(connectToDevice(pathId));
   }
 
   /// Cap on simultaneous `connecting` central paths.

@@ -238,7 +238,6 @@ void main() {
       final disc = state.discoveredBlePeers[pathId]!;
       expect(disc.isConnecting, false);
       expect(disc.isConnected, false);
-      expect(disc.isBlacklisted, false);
     });
   });
 }

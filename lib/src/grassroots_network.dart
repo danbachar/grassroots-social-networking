@@ -444,29 +444,6 @@ class GrassrootsNetwork {
     );
   }
 
-  /// Explicitly disconnect from a BLE peer
-  Future<void> disconnectBlePeer(String pubkeyHex) async {
-    final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
-    if (peer != null && _bleService != null) {
-      if (peer.bleCentralDeviceId != null) {
-        store.dispatch(BleDeviceBlacklistedAction(peer.bleCentralDeviceId!));
-        await _bleService!.disconnectFromDevice(peer.bleCentralDeviceId!);
-      }
-      if (peer.blePeripheralDeviceId != null) {
-        store.dispatch(BleDeviceBlacklistedAction(peer.blePeripheralDeviceId!));
-        await _bleService!.disconnectFromDevice(peer.blePeripheralDeviceId!);
-      }
-    }
-  }
-
-  /// Explicitly connect to a discovered BLE device
-  Future<bool> connectBleDevice(String deviceId) async {
-    store.dispatch(BleDeviceUnblacklistedAction(deviceId));
-    if (_bleService != null) {
-      return await _bleService!.connectToDevice(deviceId, isManual: true);
-    }
-    return false;
-  }
 
   // ===== Lifecycle =====
 

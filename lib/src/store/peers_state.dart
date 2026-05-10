@@ -41,10 +41,6 @@ class DiscoveredPeerState {
   /// across BLE address rotations always advertises the same service UUID.
   final String? serviceUuid;
 
-  /// User explicitly opted not to auto-connect to this peer. Persists across
-  /// adapter cycles and is independent of the plugin's path state.
-  final bool isBlacklisted;
-
   const DiscoveredPeerState({
     required this.transportId,
     this.displayName,
@@ -54,7 +50,6 @@ class DiscoveredPeerState {
     this.isConnecting = false,
     this.isConnected = false,
     this.serviceUuid,
-    this.isBlacklisted = false,
   });
 
   /// Signal quality indicator (0.0 - 1.0), derived from rssi.
@@ -73,7 +68,6 @@ class DiscoveredPeerState {
     bool? isConnecting,
     bool? isConnected,
     String? serviceUuid,
-    bool? isBlacklisted,
   }) {
     return DiscoveredPeerState(
       transportId: transportId ?? this.transportId,
@@ -84,7 +78,6 @@ class DiscoveredPeerState {
       isConnecting: isConnecting ?? this.isConnecting,
       isConnected: isConnected ?? this.isConnected,
       serviceUuid: serviceUuid ?? this.serviceUuid,
-      isBlacklisted: isBlacklisted ?? this.isBlacklisted,
     );
   }
 
@@ -97,8 +90,7 @@ class DiscoveredPeerState {
           rssi == other.rssi &&
           isConnecting == other.isConnecting &&
           isConnected == other.isConnected &&
-          serviceUuid == other.serviceUuid &&
-          isBlacklisted == other.isBlacklisted;
+          serviceUuid == other.serviceUuid;
 
   @override
   int get hashCode => Object.hash(
@@ -107,7 +99,6 @@ class DiscoveredPeerState {
     isConnecting,
     isConnected,
     serviceUuid,
-    isBlacklisted,
   );
 
   @override

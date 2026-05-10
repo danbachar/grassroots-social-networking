@@ -13,7 +13,7 @@ rm -rf dart-udx
 cp -r ../dart-udx ./dart-udx
 
 echo "Building Docker image..."
-docker build -f Dockerfile.standalone -t rendezvous-server .
+docker build -t rendezvous-server .
 
 echo "Cleaning up..."
 rm -rf dart-udx

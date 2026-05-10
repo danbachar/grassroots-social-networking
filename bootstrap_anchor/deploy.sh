@@ -87,13 +87,20 @@ gcloud compute firewall-rules create "${NETWORK}-allow-ssh" \
   --quiet 2>/dev/null || echo "SSH firewall rule already exists"
 
 # 2. Build Docker image
+# Build from within bootstrap_anchor/ so the build context is self-contained.
+# Copy dart-udx into the context first because it normally lives one directory
+# up (and may be a symlink at the repo root in git worktrees, which BuildKit
+# refuses to follow out of context).
 echo "--- Building Docker image ---"
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
+DART_UDX_COPY="$(pwd)/dart-udx"
+rm -rf "$DART_UDX_COPY"
+cp -r ../dart-udx "$DART_UDX_COPY"
+trap 'rm -rf "$DART_UDX_COPY"' EXIT
 # --platform linux/amd64 ensures the binary works on x86_64 GCE VMs even
 # when building on Apple Silicon (which would otherwise produce arm64).
 docker build \
   --platform linux/amd64 \
-  -f bootstrap_anchor/Dockerfile \
   -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:latest" \
   .
 

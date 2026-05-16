@@ -191,22 +191,30 @@ extension PacketTypeSessionSecurity on PacketType {
 ///
 /// Binary format (Grassroots-compatible):
 /// ```
-/// [0]      : Packet type (1 byte)
-/// [1]      : TTL (1 byte)
-/// [2-5]    : Timestamp (4 bytes, seconds since epoch, big-endian)
-/// [6-37]   : Sender public key (32 bytes)
-/// [38-69]  : Recipient public key (32 bytes, zeros for broadcast)
-/// [70-71]  : Payload length (2 bytes, big-endian)
-/// [72-87]  : Packet ID (16 bytes, UUID)
-/// [88-151] : Signature (64 bytes, Ed25519)
-/// [152-N]  : Payload (variable length)
+/// [0]       : Packet type (1 byte)
+/// [1]       : TTL (1 byte)
+/// [2-5]     : Timestamp (4 bytes, seconds since epoch, big-endian)
+/// [6-37]    : Sender public key (32 bytes)
+/// [38-69]   : Recipient public key (32 bytes, zeros for broadcast)
+/// [70-73]   : Payload length (4 bytes, big-endian)
+/// [74-89]   : Packet ID (16 bytes, UUID)
+/// [90-153]  : Signature (64 bytes, Ed25519)
+/// [154-N]   : Payload (variable length)
 /// ```
 ///
-/// Total header size: 152 bytes
-/// Max payload for single packet: ~350 bytes (with 500 byte MTU target)
+/// Total header size: 154 bytes. The 4-byte payload length is the on-wire
+/// framer: stream transports (UDP/UDX) accumulate bytes until
+/// `headerSize + payloadLength` are available before treating a buffer as
+/// one packet.
 class GrassrootsPacket {
-  static const int headerSize = 152;
-  static const int maxPayloadSize = 348; // 500 - 152
+  static const int headerSize = 154;
+  static const int payloadLengthOffset = 70; // byte index of length field
+  static const int signatureOffset = 90; // byte index of signature start
+  static const int signatureLength = 64;
+
+  /// Soft target for fragmented payloads — chosen to keep a single
+  /// encrypted+signed packet under ~500 byte MTU on BLE.
+  static const int maxPayloadSize = 346; // 500 - 154
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();
@@ -328,9 +336,9 @@ class GrassrootsPacket {
     }
     offset += 32;
 
-    // Payload length (2 bytes, big-endian)
-    buffer.setUint16(offset, payload.length, Endian.big);
-    offset += 2;
+    // Payload length (4 bytes, big-endian)
+    buffer.setUint32(offset, payload.length, Endian.big);
+    offset += 4;
 
     // Packet ID (16 bytes - UUID as bytes)
     final idBytes = _uuidToBytes(packetId);
@@ -378,8 +386,8 @@ class GrassrootsPacket {
     offset += 32;
 
     // Payload length
-    final payloadLength = buffer.getUint16(offset, Endian.big);
-    offset += 2;
+    final payloadLength = buffer.getUint32(offset, Endian.big);
+    offset += 4;
 
     // Packet ID
     final idBytes = data.sublist(offset, offset + 16);
@@ -415,10 +423,21 @@ class GrassrootsPacket {
   /// Get bytes that should be signed (everything except signature)
   Uint8List getSignableBytes() {
     final serialized = serialize();
-    // Zero out the signature portion (bytes 88-151)
+    // Zero out the signature portion.
     final signable = Uint8List.fromList(serialized);
-    signable.fillRange(88, 152, 0);
+    signable.fillRange(signatureOffset, signatureOffset + signatureLength, 0);
     return signable;
+  }
+
+  /// Peek the payload length from a serialized buffer without parsing the
+  /// rest of the header. Used by stream-transport receive paths (UDP) to
+  /// know when enough bytes have been accumulated to slice out one packet.
+  /// Returns null when the buffer is shorter than the header.
+  static int? peekPayloadLength(Uint8List data, [int offset = 0]) {
+    if (data.length - offset < headerSize) return null;
+    final view = ByteData.view(data.buffer, data.offsetInBytes + offset,
+        data.length - offset);
+    return view.getUint32(payloadLengthOffset, Endian.big);
   }
 
   /// Convert UUID string to 16 bytes

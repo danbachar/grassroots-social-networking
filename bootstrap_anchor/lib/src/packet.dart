@@ -155,21 +155,24 @@ enum PacketType {
 
 /// A Grassroots packet — wire-compatible with the Flutter client.
 ///
-/// Binary format (152-byte header + variable payload):
+/// Binary format (154-byte header + variable payload):
 /// ```
-/// [0]      : Packet type (1 byte)
-/// [1]      : TTL (1 byte)
-/// [2-5]    : Timestamp (4 bytes, seconds since epoch, big-endian)
-/// [6-37]   : Sender public key (32 bytes)
-/// [38-69]  : Recipient public key (32 bytes, zeros for broadcast)
-/// [70-71]  : Payload length (2 bytes, big-endian)
-/// [72-87]  : Packet ID (16 bytes, UUID)
-/// [88-151] : Signature (64 bytes, Ed25519)
-/// [152-N]  : Payload (variable length)
+/// [0]       : Packet type (1 byte)
+/// [1]       : TTL (1 byte)
+/// [2-5]     : Timestamp (4 bytes, seconds since epoch, big-endian)
+/// [6-37]    : Sender public key (32 bytes)
+/// [38-69]   : Recipient public key (32 bytes, zeros for broadcast)
+/// [70-73]   : Payload length (4 bytes, big-endian)
+/// [74-89]   : Packet ID (16 bytes, UUID)
+/// [90-153]  : Signature (64 bytes, Ed25519)
+/// [154-N]   : Payload (variable length)
 /// ```
 class GrassrootsPacket {
-  static const int headerSize = 152;
-  static const int maxPayloadSize = 348;
+  static const int headerSize = 154;
+  static const int payloadLengthOffset = 70;
+  static const int signatureOffset = 90;
+  static const int signatureLength = 64;
+  static const int maxPayloadSize = 346;
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();
@@ -229,8 +232,8 @@ class GrassrootsPacket {
     }
     offset += 32;
 
-    buffer.setUint16(offset, payload.length, Endian.big);
-    offset += 2;
+    buffer.setUint32(offset, payload.length, Endian.big);
+    offset += 4;
 
     final idBytes = _uuidToBytes(packetId);
     bytes.setRange(offset, offset + 16, idBytes);
@@ -266,8 +269,8 @@ class GrassrootsPacket {
         : Uint8List.fromList(recipientBytes);
     offset += 32;
 
-    final payloadLength = buffer.getUint16(offset, Endian.big);
-    offset += 2;
+    final payloadLength = buffer.getUint32(offset, Endian.big);
+    offset += 4;
 
     final idBytes = data.sublist(offset, offset + 16);
     final packetId = _bytesToUuid(idBytes);
@@ -324,7 +327,7 @@ class GrassrootsPacket {
   Uint8List getSignableBytes() {
     final serialized = serialize();
     final signable = Uint8List.fromList(serialized);
-    signable.fillRange(88, 152, 0);
+    signable.fillRange(signatureOffset, signatureOffset + signatureLength, 0);
     return signable;
   }
 

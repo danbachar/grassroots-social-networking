@@ -415,13 +415,21 @@ void main() {
         expect(connected, isTrue);
         expect(alice.connectedCount, equals(1));
 
-        // Alice sends data to Bob
-        final testData = Uint8List.fromList(
-            List.generate(100, (i) => i)); // 100 bytes of test data
+        // Alice sends data to Bob. The UDP transport's receive path now
+        // frames by GrassrootsPacket boundary (using the header's
+        // payload-length field), so we send a real serialized packet
+        // instead of an arbitrary byte buffer.
+        final testPayload = Uint8List.fromList(List.generate(100, (i) => i));
+        final packet = aliceProto.createMessagePacket(
+          payload: testPayload,
+          recipientPubkey: bobIdentity.publicKey,
+        );
+        await aliceProto.signPacket(packet);
+        final testData = packet.serialize();
         final sent = await alice.sendToPeer(bobPubkeyHex, testData);
         expect(sent, isTrue);
 
-        // Bob should receive the data
+        // Bob should receive the framed packet.
         final received = await bobReceived.future.timeout(
           const Duration(seconds: 5),
           onTimeout: () => throw TimeoutException('Bob did not receive data'),
@@ -477,7 +485,16 @@ void main() {
         );
 
         expect(connected, isTrue);
-        final testData = Uint8List.fromList([4, 3, 2, 1]);
+        // Send a real serialized packet so the receive-side framer can
+        // slice it cleanly (the transport now frames the UDX byte
+        // stream into GrassrootsPacket boundaries via the header's
+        // payload-length field).
+        final packet = aliceProto.createMessagePacket(
+          payload: Uint8List.fromList([4, 3, 2, 1]),
+          recipientPubkey: bobIdentity.publicKey,
+        );
+        await aliceProto.signPacket(packet);
+        final testData = packet.serialize();
         expect(await alice.sendToPeer(bobPubkeyHex, testData), isTrue);
         expect(
           await bobReceived.future.timeout(const Duration(seconds: 5)),
@@ -611,8 +628,15 @@ void main() {
         );
         expect(connected, isTrue);
 
-        // Phase 5: Send data over the UDX stream
-        final testData = Uint8List.fromList([1, 2, 3, 4, 5]);
+        // Phase 5: Send a real serialized packet so the receive-side
+        // framer (which slices by GrassrootsPacket header length) can
+        // emit it cleanly.
+        final packet = aliceProto.createMessagePacket(
+          payload: Uint8List.fromList([1, 2, 3, 4, 5]),
+          recipientPubkey: bobIdentity.publicKey,
+        );
+        await aliceProto.signPacket(packet);
+        final testData = packet.serialize();
         await alice.sendToPeer(bobPubkeyHex, testData);
 
         final received = await bobReceived.future.timeout(

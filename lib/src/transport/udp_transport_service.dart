@@ -8,6 +8,7 @@ import 'package:grassroots_dart_udx/grassroots_dart_udx.dart';
 import '../transport/transport_service.dart';
 import '../transport/address_utils.dart';
 import '../models/identity.dart';
+import '../models/packet.dart';
 import '../protocol/protocol_handler.dart';
 import '../store/store.dart';
 
@@ -706,6 +707,7 @@ class UdpTransportService extends TransportService {
       port: socket.remotePort,
     );
 
+    final framer = _PacketFramer();
     stream.data.listen(
       (Uint8List data) {
         if (data.isEmpty) return;
@@ -715,26 +717,24 @@ class UdpTransportService extends TransportService {
         // that matches _peerConnections.
         final effectiveId = _tempKeyToPubkey[tempKey] ?? tempKey;
 
-        // debugPrint(
-        //     'Received ${data.length} bytes from ${socket.remoteAddress}:${socket.remotePort} (id: $effectiveId)');
-
-        // Emit on data stream
-        _dataController.add(TransportDataEvent(
-          peerId: effectiveId,
-          transport: TransportType.udp,
-          data: data,
-        ));
-
-        // Forward to coordinator for deserialization and routing.
-        // The coordinator will call back with the pubkey after ANNOUNCE processing,
-        // and we'll remap the connection.
-        onUdpDataReceived?.call(effectiveId, data);
+        for (final packetBytes in framer.ingest(data)) {
+          _dataController.add(TransportDataEvent(
+            peerId: effectiveId,
+            transport: TransportType.udp,
+            data: packetBytes,
+          ));
+          // Forward to coordinator for deserialization and routing. The
+          // coordinator may call back with the pubkey after ANNOUNCE
+          // processing, and we'll remap the connection.
+          onUdpDataReceived?.call(effectiveId, packetBytes);
+        }
       },
       onError: (e) {
         debugPrint('⚠️ UDX stream error from $tempKey: $e');
       },
       onDone: () {
         debugPrint('⚠️ UDX stream closed from $tempKey');
+        framer.reset();
         // If we have a peer mapped to this temp key, clean up
         final pubkeyHex = _tempKeyToPubkey.remove(tempKey);
         if (pubkeyHex != null) {
@@ -882,25 +882,26 @@ class UdpTransportService extends TransportService {
 
   /// Listen for data on an outgoing stream (peer we connected to).
   void _listenToStream(String pubkeyHex, UDXStream stream) {
+    final framer = _PacketFramer();
     stream.data.listen(
       (Uint8List data) {
         if (data.isEmpty) return;
 
-        // debugPrint('Received ${data.length} bytes from peer $pubkeyHex');
-
-        _dataController.add(TransportDataEvent(
-          peerId: pubkeyHex,
-          transport: TransportType.udp,
-          data: data,
-        ));
-
-        onUdpDataReceived?.call(pubkeyHex, data);
+        for (final packetBytes in framer.ingest(data)) {
+          _dataController.add(TransportDataEvent(
+            peerId: pubkeyHex,
+            transport: TransportType.udp,
+            data: packetBytes,
+          ));
+          onUdpDataReceived?.call(pubkeyHex, packetBytes);
+        }
       },
       onError: (e) {
         debugPrint('⚠️ UDX stream error from $pubkeyHex: $e');
       },
       onDone: () {
         debugPrint('⚠️ UDX stream closed from $pubkeyHex');
+        framer.reset();
         _peerConnections.remove(pubkeyHex);
 
         if (!_connectionController.isClosed) {
@@ -997,4 +998,59 @@ class _PeerConnection {
     required this.addr,
     required this.port,
   });
+}
+
+/// Per-UDX-stream byte accumulator that slices the byte stream into
+/// complete GrassrootsPackets using the on-wire payload-length field as
+/// the frame delimiter.
+///
+/// UDX is a reliable byte stream (a `stream.add(N bytes)` is fragmented
+/// into MTU-sized stream-frames and delivered to the receiver as several
+/// `_dataController.add(chunk)` events). Without framing, the receiver
+/// can't tell where one application packet ends and the next begins.
+/// GrassrootsPacket already carries its own length at
+/// `payloadLengthOffset`, so all the receiver has to do is buffer until
+/// `headerSize + payloadLength` bytes are available, slice that out as
+/// one packet, and keep any trailing bytes for the next iteration.
+class _PacketFramer {
+  Uint8List _buffer = Uint8List(0);
+
+  /// Append a UDX stream chunk and yield all complete packets it
+  /// completes. Returned packets are independent copies; the framer
+  /// retains any partial trailing bytes for the next call.
+  List<Uint8List> ingest(Uint8List chunk) {
+    if (chunk.isEmpty) return const [];
+    _append(chunk);
+    final packets = <Uint8List>[];
+    while (true) {
+      if (_buffer.length < GrassrootsPacket.headerSize) break;
+      final payloadLength = GrassrootsPacket.peekPayloadLength(_buffer);
+      if (payloadLength == null) break;
+      final total = GrassrootsPacket.headerSize + payloadLength;
+      if (_buffer.length < total) break;
+      packets.add(Uint8List.fromList(_buffer.sublist(0, total)));
+      _buffer = _buffer.length == total
+          ? Uint8List(0)
+          : Uint8List.fromList(_buffer.sublist(total));
+    }
+    return packets;
+  }
+
+  /// Drop any partial-packet bytes — call when the stream closes so a
+  /// future stream id collision (rare, but possible) can't get a stale
+  /// header prefix from the previous session.
+  void reset() {
+    _buffer = Uint8List(0);
+  }
+
+  void _append(Uint8List chunk) {
+    if (_buffer.isEmpty) {
+      _buffer = Uint8List.fromList(chunk);
+      return;
+    }
+    final combined = Uint8List(_buffer.length + chunk.length)
+      ..setRange(0, _buffer.length, _buffer)
+      ..setRange(_buffer.length, _buffer.length + chunk.length, chunk);
+    _buffer = combined;
+  }
 }

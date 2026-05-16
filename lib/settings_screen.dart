@@ -806,11 +806,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<_FriendSharedRendezvousRow> _friendSharedRendezvousRows() {
     final byServer = <String, _MutableFriendSharedRendezvousRow>{};
 
-    for (final friend in widget.store.state.peers.friends) {
-      final friendName = friend.displayName.trim().isEmpty
-          ? friend.pubkeyHex.substring(0, 8)
-          : friend.displayName;
-      for (final entry in friend.knownRvServers.entries) {
+    // `knownRvServers` now lives on the friendship record (friendship-scoped
+    // and persisted). Iterate accepted friendships and pull each friend's
+    // human-readable name from the live PeerState when available so the UI
+    // matches the rest of the Friends list (which uses PeerState nicknames).
+    for (final friendship in widget.store.state.friendships.friends) {
+      final hex = friendship.peerPubkeyHex;
+      final peer = widget.store.state.peers.getPeerByPubkeyHex(hex);
+      final friendName = peer?.displayName.trim().isNotEmpty == true
+          ? peer!.displayName
+          : (friendship.nickname?.trim().isNotEmpty == true
+              ? friendship.nickname!
+              : hex.substring(0, 8));
+
+      for (final entry in friendship.knownRvServers.entries) {
         final pubkeyHex = entry.key.toLowerCase();
         final address = entry.value.trim();
         if (pubkeyHex.isEmpty || address.isEmpty) continue;

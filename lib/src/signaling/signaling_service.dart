@@ -6,6 +6,7 @@ import 'package:redux/redux.dart';
 import 'package:flutter/foundation.dart';
 
 import '../store/app_state.dart';
+import '../store/friendships_actions.dart';
 import '../store/peers_actions.dart';
 import '../transport/address_utils.dart';
 import 'address_table.dart';
@@ -184,7 +185,10 @@ class SignalingService {
   /// Returns the number of facilitators the message was sent to.
   Future<int> fanOutAvailable(Uint8List targetPubkey) async {
     final targetHex = _pubkeyToHex(targetPubkey);
-    final targetPeer = store.state.peers.getPeerByPubkeyHex(targetHex);
+    // RV lists are friendship-scoped (we only ever receive an RV_LIST from a
+    // friend) and persisted with the friendship record, so they survive app
+    // restart and are available before the friend's first reconnect.
+    final friendship = store.state.friendships.getFriendship(targetHex);
 
     final payload = codec.encode(AvailableMessage(peerPubkey: targetPubkey));
     var sent = 0;
@@ -193,15 +197,15 @@ class SignalingService {
     // the address the friend told us — needed for RVs we don't ourselves
     // have configured.
     final rvHexes = <String>[];
-    if (targetPeer != null) {
-      for (final entry in targetPeer.knownRvServers.entries) {
+    if (friendship != null) {
+      for (final entry in friendship.knownRvServers.entries) {
         final hex = entry.key.toLowerCase();
         if (hex.isEmpty || hex == targetHex) continue;
         rvHexes.add(hex);
       }
       rvHexes.sort();
       for (final hex in rvHexes) {
-        final address = targetPeer.knownRvServers[hex]!;
+        final address = friendship.knownRvServers[hex]!;
         Uint8List rvPubkey;
         try {
           rvPubkey = _hexToBytes(hex);
@@ -455,7 +459,10 @@ class SignalingService {
       debugPrint('[rv-list]   ${e.key.substring(0, 8)} -> ${e.value}');
     }
     store.dispatch(
-      PeerRvServersUpdatedAction(publicKey: senderPubkey, rvServers: servers),
+      FriendKnownRvServersUpdatedAction(
+        publicKey: senderPubkey,
+        rvServers: servers,
+      ),
     );
   }
 
@@ -831,7 +838,7 @@ class SignalingService {
       }
     }
 
-    if (store.state.peers.friendRvServers.containsKey(senderHex)) {
+    if (store.state.friendships.friendRvServers.containsKey(senderHex)) {
       return true;
     }
 

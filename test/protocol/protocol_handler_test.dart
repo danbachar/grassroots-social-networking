@@ -7,12 +7,14 @@ import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:sodium_libs/sodium_libs.dart';
 
+import '../helpers/sodium_test_bootstrap.dart';
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late Sodium sodium;
   setUpAll(() async {
-    sodium = await SodiumInit.init();
+    sodium = await initTestSodium();
   });
 
   group('ProtocolHandler', () {

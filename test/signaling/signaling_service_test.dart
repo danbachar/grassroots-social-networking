@@ -25,12 +25,31 @@ Store<AppState> _storeWithPeers(
   Map<String, PeerState> peers, {
   Map<String, Set<String>> friendsOfFriends = const {},
   SettingsState settings = const SettingsState(),
+  Map<String, Map<String, String>> friendRvServers = const {},
 }) {
+  // Synthesize accepted FriendshipState entries for any PeerState marked
+  // isFriend, attaching RV-list data from [friendRvServers] when provided.
+  // RV-list data lives on the friendship record (friendship-scoped + persisted).
+  final now = DateTime.now();
+  final friendships = <String, FriendshipState>{};
+  for (final entry in peers.entries) {
+    final peer = entry.value;
+    if (!peer.isFriend) continue;
+    friendships[entry.key] = FriendshipState(
+      peerPubkeyHex: entry.key,
+      nickname: peer.nickname,
+      status: FriendshipStatus.accepted,
+      createdAt: now,
+      updatedAt: now,
+      knownRvServers: friendRvServers[entry.key] ?? const {},
+    );
+  }
   return Store<AppState>(
     appReducer,
     initialState: AppState(
       peers: PeersState(peers: peers, friendsOfFriends: friendsOfFriends),
       settings: settings,
+      friendships: FriendshipsState(friendships: friendships),
     ),
   );
 }
@@ -293,15 +312,19 @@ void main() {
         // Bob has previously told us he uses anchor as his RV at anchorAddress.
         // AVAILABLE should target Bob's RV at exactly that address.
         service = SignalingService(
-          store: _storeWithPeers({
-            bobHex: PeerState(
-              publicKey: bobKey,
-              nickname: 'Bob',
-              connectionState: PeerConnectionState.connected,
-              isFriend: true,
-              knownRvServers: {anchorHex: anchorAddress},
-            ),
-          }),
+          store: _storeWithPeers(
+            {
+              bobHex: PeerState(
+                publicKey: bobKey,
+                nickname: 'Bob',
+                connectionState: PeerConnectionState.connected,
+                isFriend: true,
+              ),
+            },
+            friendRvServers: {
+              bobHex: {anchorHex: anchorAddress},
+            },
+          ),
         );
         final addressSends = <(Uint8List, String, Uint8List)>[];
         service.sendSignaling = (recipient, payload) async {
@@ -347,19 +370,23 @@ void main() {
       'targets only the target RVs, even with WC friends available',
       () async {
         service = SignalingService(
-          store: _storeWithPeers({
-            friendHex: _wellConnectedFriend(friendKey),
-            bobHex: PeerState(
-              publicKey: bobKey,
-              nickname: 'Bob',
-              connectionState: PeerConnectionState.connected,
-              isFriend: true,
-              knownRvServers: {
+          store: _storeWithPeers(
+            {
+              friendHex: _wellConnectedFriend(friendKey),
+              bobHex: PeerState(
+                publicKey: bobKey,
+                nickname: 'Bob',
+                connectionState: PeerConnectionState.connected,
+                isFriend: true,
+              ),
+            },
+            friendRvServers: {
+              bobHex: {
                 anchorHex: anchorAddress,
                 anchor2Hex: anchor2Address,
               },
-            ),
-          }),
+            },
+          ),
         );
         final addressSends = <(Uint8List, String, Uint8List)>[];
         service.sendSignaling = (recipient, payload) async {
@@ -566,15 +593,19 @@ void main() {
 
     test("accepts signaling from a friend's advertised rendezvous server", () {
       final service2 = SignalingService(
-        store: _storeWithPeers({
-          bobHex: PeerState(
-            publicKey: bobKey,
-            nickname: 'Bob',
-            connectionState: PeerConnectionState.connected,
-            isFriend: true,
-            knownRvServers: {anchorHex: anchorAddress},
-          ),
-        }),
+        store: _storeWithPeers(
+          {
+            bobHex: PeerState(
+              publicKey: bobKey,
+              nickname: 'Bob',
+              connectionState: PeerConnectionState.connected,
+              isFriend: true,
+            ),
+          },
+          friendRvServers: {
+            bobHex: {anchorHex: anchorAddress},
+          },
+        ),
       );
       Uint8List? gotPeer;
       String? gotIp;
@@ -607,6 +638,11 @@ void main() {
     });
 
     test("does not trust rendezvous servers advertised by non-friends", () {
+      // Non-friends can't even have a known-RV record under the
+      // friendship-scoped model (RV_LIST is only ever processed for
+      // accepted friends in the reducer). The setup below intentionally
+      // omits friendRvServers so the trust gate has no friend-vouched RV
+      // for anchorKey — anchorKey should still be rejected.
       final service2 = SignalingService(
         store: _storeWithPeers({
           bobHex: PeerState(
@@ -614,7 +650,6 @@ void main() {
             nickname: 'Bob',
             connectionState: PeerConnectionState.connected,
             isFriend: false,
-            knownRvServers: {anchorHex: anchorAddress},
           ),
         }),
       );
@@ -847,16 +882,18 @@ void main() {
         );
 
         expect(sentMessages, hasLength(2));
-        final toAlice = sentMessages.firstWhere((m) => m.$1 == aliceKey);
+        final toAlice = sentMessages
+            .firstWhere((m) => _pubkeyHex(m.$1) == aliceHex);
         final initiateToAlice =
             codec.decode(toAlice.$2) as PunchInitiateMessage;
-        expect(initiateToAlice.peerPubkey, equals(bobKey));
+        expect(_pubkeyHex(initiateToAlice.peerPubkey), equals(bobHex));
         expect(initiateToAlice.ip, equals('2606:4700::20'));
         expect(initiateToAlice.port, equals(9001));
 
-        final toBob = sentMessages.firstWhere((m) => m.$1 == bobKey);
+        final toBob = sentMessages
+            .firstWhere((m) => _pubkeyHex(m.$1) == bobHex);
         final initiateToBob = codec.decode(toBob.$2) as PunchInitiateMessage;
-        expect(initiateToBob.peerPubkey, equals(aliceKey));
+        expect(_pubkeyHex(initiateToBob.peerPubkey), equals(aliceHex));
         expect(initiateToBob.ip, equals('2606:4700::10'));
         expect(initiateToBob.port, equals(7000));
       },
@@ -894,15 +931,17 @@ void main() {
       );
 
       expect(sentMessages, hasLength(2));
-      final toAlice = sentMessages.firstWhere((m) => m.$1 == aliceKey);
+      final toAlice = sentMessages
+          .firstWhere((m) => _pubkeyHex(m.$1) == aliceHex);
       final initiateToAlice = codec.decode(toAlice.$2) as PunchInitiateMessage;
-      expect(initiateToAlice.peerPubkey, equals(bobKey));
+      expect(_pubkeyHex(initiateToAlice.peerPubkey), equals(bobHex));
       expect(initiateToAlice.ip, equals('2606:4700::20'));
       expect(initiateToAlice.port, equals(9001));
 
-      final toBob = sentMessages.firstWhere((m) => m.$1 == bobKey);
+      final toBob = sentMessages
+          .firstWhere((m) => _pubkeyHex(m.$1) == bobHex);
       final initiateToBob = codec.decode(toBob.$2) as PunchInitiateMessage;
-      expect(initiateToBob.peerPubkey, equals(aliceKey));
+      expect(_pubkeyHex(initiateToBob.peerPubkey), equals(aliceHex));
       expect(initiateToBob.ip, equals('2606:4700::10'));
       expect(initiateToBob.port, equals(7000));
     });
@@ -961,7 +1000,9 @@ void main() {
         ),
       );
 
-      final updated = store.state.peers.getPeerByPubkeyHex(bobHex);
+      // knownRvServers moved to the friendship record (friendship-scoped,
+      // persisted). PeerState no longer owns it.
+      final updated = store.state.friendships.getFriendship(bobHex);
       expect(updated, isNotNull);
       expect(
         updated!.knownRvServers,

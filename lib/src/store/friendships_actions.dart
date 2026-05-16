@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'friendships_state.dart';
 
 /// Base class for friendship-related actions
@@ -83,5 +85,22 @@ class UpdateFriendshipUdpAddressAction extends FriendshipAction {
   UpdateFriendshipUdpAddressAction({
     required this.peerPubkeyHex,
     this.udpAddress,
+  });
+}
+
+/// Replace a friend's known rendezvous servers (learned via the RV_LIST
+/// signaling exchange). Only friends ever receive an RV_LIST — strangers
+/// don't — so this action is friendship-scoped by construction and the data
+/// lives alongside the rest of the persisted friendship record.
+class FriendKnownRvServersUpdatedAction extends FriendshipAction {
+  /// Friend's pubkey (Ed25519 32-byte raw bytes).
+  final Uint8List publicKey;
+
+  /// Lowercase RV pubkey hex → "ip:port".
+  final Map<String, String> rvServers;
+
+  FriendKnownRvServersUpdatedAction({
+    required this.publicKey,
+    required this.rvServers,
   });
 }

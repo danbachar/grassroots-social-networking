@@ -130,15 +130,19 @@ Map<String, dynamic> _serializeAppState(AppState state) {
 
 /// Set up debug log capture by intercepting debugPrint.
 ///
-/// The logger package outputs via print/debugPrint. We intercept this to
-/// also feed the in-memory LogBuffer, which drives the Debug Logs screen.
+/// Adds a `[HH:MM:SS.fff]` timestamp to every console line (matching the
+/// rendezvous-server format so client/server logs can be cross-referenced),
+/// and feeds the in-memory LogBuffer that drives the Debug Logs screen.
 void _setupDebugLogCapture() {
   final originalDebugPrint = debugPrint;
   debugPrint = (String? message, {int? wrapWidth}) {
-    // Forward to original console output
-    originalDebugPrint(message, wrapWidth: wrapWidth);
+    // Prepend a wall-clock timestamp so console output is correlatable with
+    // the rendezvous-server logs. The LogBuffer entry below uses its own
+    // structured timestamp; only the console line gets the prefix.
+    final stamped = message == null ? null : '[${_logTimestamp()}] $message';
+    originalDebugPrint(stamped, wrapWidth: wrapWidth);
 
-    // Parse the log line to extract level and feed the buffer
+    // Parse the (untimestamped) log line to extract level and feed the buffer
     if (message != null && message.isNotEmpty) {
       final entry = _parseLogLine(message);
       if (entry != null) {
@@ -146,6 +150,13 @@ void _setupDebugLogCapture() {
       }
     }
   };
+}
+
+String _logTimestamp() {
+  final now = DateTime.now();
+  String two(int v) => v.toString().padLeft(2, '0');
+  String three(int v) => v.toString().padLeft(3, '0');
+  return '${two(now.hour)}:${two(now.minute)}:${two(now.second)}.${three(now.millisecond)}';
 }
 
 /// Parse a logger output line to extract the level and clean message.

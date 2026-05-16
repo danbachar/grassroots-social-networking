@@ -65,6 +65,21 @@ class MessageRouter {
   /// identification that previously required ANNOUNCE as the first message).
   void Function(Uint8List senderPubkey, String udpPeerId)? onUdpPeerIdentified;
 
+  /// Called when a signed Noise handshake packet arrives. The coordinator owns
+  /// session state and sends any handshake response over the same medium.
+  Future<void> Function(
+    GrassrootsPacket packet,
+    PeerTransport transport, {
+    String? peerId,
+  })? onNoiseHandshakeReceived;
+
+  /// Decrypts a signed session-encrypted packet before normal routing.
+  Future<GrassrootsPacket?> Function(
+    GrassrootsPacket packet,
+    PeerTransport transport, {
+    String? peerId,
+  })? decryptSessionPacket;
+
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
 
@@ -118,6 +133,28 @@ class MessageRouter {
     if (transport == PeerTransport.udp && udpPeerId != null) {
       onUdpPeerIdentified?.call(packet.senderPubkey, udpPeerId);
       effectiveUdpPeerId = _pubkeyToHex(packet.senderPubkey);
+    }
+
+    if (packet.type == PacketType.noiseHandshake) {
+      await onNoiseHandshakeReceived?.call(
+        packet,
+        transport,
+        peerId: effectiveUdpPeerId ?? bleDeviceId,
+      );
+      return;
+    }
+
+    if (packet.type.isSessionEncrypted) {
+      final decrypted = await decryptSessionPacket?.call(
+        packet,
+        transport,
+        peerId: effectiveUdpPeerId ?? bleDeviceId,
+      );
+      if (decrypted == null) {
+        debugPrint('Dropping encrypted packet without session');
+        return;
+      }
+      packet = decrypted;
     }
 
     // Any verified non-ANNOUNCE packet over UDP counts as liveness traffic
@@ -193,6 +230,16 @@ class MessageRouter {
           observedIp: observedIp,
           observedPort: observedPort,
         );
+      case PacketType.noiseHandshake:
+      case PacketType.secureMessage:
+      case PacketType.secureFragmentStart:
+      case PacketType.secureFragmentContinue:
+      case PacketType.secureFragmentEnd:
+      case PacketType.secureAck:
+      case PacketType.secureNack:
+      case PacketType.secureReadReceipt:
+      case PacketType.secureSignaling:
+        return;
     }
   }
 
@@ -213,7 +260,8 @@ class MessageRouter {
     // ANNOUNCEs; null for UDP ANNOUNCEs). This is always more current than the
     // advertisement RSSI cached on `DiscoveredPeerState`, especially on the
     // peripheral side where our scanner may not have seen the central yet.
-    final int? effectiveRssi = transport == PeerTransport.bleDirect ? rssi : null;
+    final int? effectiveRssi =
+        transport == PeerTransport.bleDirect ? rssi : null;
 
     // Resolve BLE metadata only for packets that actually arrived over BLE.
     // UDP ANNOUNCEs can coincide with stale scan results; treating those as a

@@ -173,12 +173,6 @@ class PeerState {
   /// the actual transport-level connection state right now.
   final bool hasLiveUdpConnection;
 
-  /// Rendezvous servers this peer uses, learned via the RV_LIST signaling
-  /// exchange. Keyed by lowercase pubkey hex; value is the "ip:port" address.
-  /// Used to target AVAILABLE fan-out at exactly the servers the peer is
-  /// reaching for reconnect (per spec §3.5).
-  final Map<String, String> knownRvServers;
-
   const PeerState({
     required this.publicKey,
     required this.nickname,
@@ -197,7 +191,6 @@ class PeerState {
     this.isFriend = false,
     this.lastDirectReachAt,
     this.hasLiveUdpConnection = false,
-    this.knownRvServers = const {},
   });
 
   /// Hex representation of public key (for map keys)
@@ -289,7 +282,6 @@ class PeerState {
     DateTime? lastDirectReachAt,
     bool clearLastDirectReachAt = false,
     bool? hasLiveUdpConnection,
-    Map<String, String>? knownRvServers,
   }) {
     return PeerState(
       publicKey: publicKey ?? this.publicKey,
@@ -312,7 +304,6 @@ class PeerState {
           ? null
           : lastDirectReachAt ?? this.lastDirectReachAt,
       hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
-      knownRvServers: knownRvServers ?? this.knownRvServers,
     );
   }
 
@@ -333,8 +324,7 @@ class PeerState {
           setEquals(udpAddressCandidates, other.udpAddressCandidates) &&
           isFriend == other.isFriend &&
           lastDirectReachAt == other.lastDirectReachAt &&
-          hasLiveUdpConnection == other.hasLiveUdpConnection &&
-          mapEquals(knownRvServers, other.knownRvServers);
+          hasLiveUdpConnection == other.hasLiveUdpConnection;
 
   @override
   int get hashCode => Object.hash(
@@ -351,10 +341,6 @@ class PeerState {
     isFriend,
     lastDirectReachAt,
     hasLiveUdpConnection,
-    Object.hashAll(
-      (knownRvServers.entries.toList()..sort((a, b) => a.key.compareTo(b.key)))
-          .map((e) => Object.hash(e.key, e.value)),
-    ),
   );
 }
 
@@ -420,24 +406,6 @@ class PeersState {
   List<PeerState> get wellConnectedFriends => peers.values
       .where((p) => p.isFriend && p.isWellConnected && p.isReachable)
       .toList();
-
-  /// Rendezvous servers advertised by accepted friends via RV_LIST.
-  ///
-  /// Keyed by lowercase rendezvous pubkey hex; value is the advertised
-  /// "ip:port" address. These servers are trusted only as reconnect
-  /// facilitators because a friend explicitly told us to use them.
-  Map<String, String> get friendRvServers {
-    final servers = <String, String>{};
-    for (final friend in friends) {
-      for (final entry in friend.knownRvServers.entries) {
-        final hex = entry.key.toLowerCase();
-        final address = entry.value.trim();
-        if (hex.isEmpty || address.isEmpty) continue;
-        servers[hex] = address;
-      }
-    }
-    return Map.unmodifiable(servers);
-  }
 
   /// Direct accepted friend public keys.
   Set<String> get friendPubkeyHexes =>

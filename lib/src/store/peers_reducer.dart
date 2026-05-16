@@ -285,7 +285,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
-        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -347,7 +346,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: false,
-        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -454,30 +452,12 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: preserveReach ? existing.lastDirectReachAt : null,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
-        knownRvServers: existing.knownRvServers,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
       );
     }
     return state;
-  }
-
-  if (action is PeerRvServersUpdatedAction) {
-    final pubkeyHex = _pubkeyToHex(action.publicKey);
-    final existing = state.peers[pubkeyHex];
-    if (existing == null) return state;
-    final normalized = <String, String>{};
-    for (final entry in action.rvServers.entries) {
-      final hex = entry.key.toLowerCase();
-      if (hex.isEmpty || entry.value.trim().isEmpty) continue;
-      normalized[hex] = entry.value;
-    }
-    if (mapEquals(existing.knownRvServers, normalized)) {
-      return state;
-    }
-    final updated = existing.copyWith(knownRvServers: normalized);
-    return state.copyWith(peers: Map.from(state.peers)..[pubkeyHex] = updated);
   }
 
   if (action is PeerFriendListUpdatedAction) {

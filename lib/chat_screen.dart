@@ -717,12 +717,15 @@ final messageId = _uuid.v4();
   }
 
   void _showPeerInfo() {
-    // Refresh from store so the dialog reflects the latest knownRvServers /
-    // udpAddress / connection state, not just the snapshot widget.peer was
-    // built with.
+    // Refresh from store so the dialog reflects the latest udpAddress /
+    // connection state, not just the snapshot widget.peer was built with.
+    // RV-list lives on the friendship record (persisted, friendship-scoped).
     final peer = widget.store.state.peers.getPeerByPubkeyHex(_peerHex) ??
         widget.peer;
-    final rvEntries = peer.knownRvServers.entries.toList()
+    final friendship = widget.store.state.friendships.getFriendship(_peerHex);
+    final knownRvServers =
+        friendship?.knownRvServers ?? const <String, String>{};
+    final rvEntries = knownRvServers.entries.toList()
       ..sort((a, b) => a.key.compareTo(b.key));
 
     showDialog(

@@ -11,12 +11,14 @@ import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
+import '../helpers/sodium_test_bootstrap.dart';
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late Sodium sodium;
   setUpAll(() async {
-    sodium = await SodiumInit.init();
+    sodium = await initTestSodium();
   });
 
   late GrassrootsIdentity aliceIdentity;
@@ -88,7 +90,8 @@ void main() {
       // Bob's router processes the BLE packet
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? udpPeerId}) {
+      bobRouter.onPeerAnnounced =
+          (data, transport, {bool isNew = false, String? udpPeerId}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -108,7 +111,8 @@ void main() {
       expect(receivedTransport, equals(PeerTransport.bleDirect));
 
       // Verify Bob's Redux store was updated
-      final peerState = bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
+      final peerState =
+          bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
       expect(peerState, isNotNull);
       expect(peerState!.nickname, equals('Alice'));
       expect(peerState.transport, equals(PeerTransport.bleDirect));
@@ -117,7 +121,8 @@ void main() {
 
     test('ANNOUNCE with UDP address roundtrips correctly', () async {
       const address = '[2001:db8::1]:4001';
-      final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
+      final announcePayload =
+          aliceProtocol.createAnnouncePayload(address: address);
 
       final packet = GrassrootsPacket(
         type: PacketType.announce,
@@ -129,7 +134,8 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       AnnounceData? receivedAnnounce;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? udpPeerId}) {
+      bobRouter.onPeerAnnounced =
+          (data, transport, {bool isNew = false, String? udpPeerId}) {
         receivedAnnounce = data;
       };
 
@@ -144,7 +150,8 @@ void main() {
       expect(receivedAnnounce!.udpAddress, equals(address));
 
       // Verify UDP address stored in Redux
-      final peerState = bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
+      final peerState =
+          bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
       expect(peerState!.udpAddress, equals(address));
     });
   });
@@ -276,7 +283,8 @@ void main() {
       // Bob's router processes it
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? udpPeerId}) {
+      bobRouter.onPeerAnnounced =
+          (data, transport, {bool isNew = false, String? udpPeerId}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -294,7 +302,8 @@ void main() {
       expect(receivedTransport, equals(PeerTransport.udp));
 
       // Verify Bob's Redux store was updated
-      final peerState = bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
+      final peerState =
+          bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
       expect(peerState, isNotNull);
       expect(peerState!.nickname, equals('Alice'));
       expect(peerState.transport, equals(PeerTransport.udp));
@@ -302,7 +311,8 @@ void main() {
 
     test('UDP ANNOUNCE with address roundtrips correctly', () async {
       const address = '/ip6/::1/udp/4001/udx';
-      final announcePayload = aliceProtocol.createAnnouncePayload(address: address);
+      final announcePayload =
+          aliceProtocol.createAnnouncePayload(address: address);
 
       final packet = GrassrootsPacket(
         type: PacketType.announce,
@@ -314,7 +324,8 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       AnnounceData? receivedAnnounce;
-      bobRouter.onPeerAnnounced = (data, transport, {bool isNew = false, String? udpPeerId}) {
+      bobRouter.onPeerAnnounced =
+          (data, transport, {bool isNew = false, String? udpPeerId}) {
         receivedAnnounce = data;
       };
 
@@ -453,7 +464,8 @@ void main() {
       await aliceProtocol.signPacket(packet);
 
       int announceCount = 0;
-      bobRouter.onPeerAnnounced = (_, __, {bool isNew = false, String? udpPeerId}) {
+      bobRouter.onPeerAnnounced =
+          (_, __, {bool isNew = false, String? udpPeerId}) {
         announceCount++;
       };
 
@@ -499,7 +511,8 @@ void main() {
 
       // Then: Alice announces via UDP with address
       const udpAddr = '[2001:db8::a]:4001';
-      final udpAnnouncePayload = aliceProtocol.createAnnouncePayload(address: udpAddr);
+      final udpAnnouncePayload =
+          aliceProtocol.createAnnouncePayload(address: udpAddr);
       final udpPacket = GrassrootsPacket(
         type: PacketType.announce,
         senderPubkey: aliceIdentity.publicKey,
@@ -558,8 +571,10 @@ void main() {
       );
 
       // Both stores should know about each other
-      final bobInAliceStore = aliceStore.state.peers.getPeerByPubkey(bobIdentity.publicKey);
-      final aliceInBobStore = bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
+      final bobInAliceStore =
+          aliceStore.state.peers.getPeerByPubkey(bobIdentity.publicKey);
+      final aliceInBobStore =
+          bobStore.state.peers.getPeerByPubkey(aliceIdentity.publicKey);
       expect(bobInAliceStore, isNotNull);
       expect(aliceInBobStore, isNotNull);
       expect(bobInAliceStore!.nickname, equals('Bob'));

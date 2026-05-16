@@ -20,6 +20,7 @@ import 'models/packet.dart';
 import 'protocol/protocol_handler.dart';
 import 'protocol/fragment_handler.dart';
 import 'routing/message_router.dart';
+import 'session/noise_session_manager.dart';
 import 'store/store.dart';
 import 'transport/transport_service.dart';
 
@@ -232,6 +233,9 @@ class GrassrootsNetwork {
   /// Message router for incoming packet processing
   late final MessageRouter _messageRouter;
 
+  /// Per-peer, per-transport Noise XX sessions for payload encryption.
+  late final NoiseSessionManager _noiseSessions;
+
   /// Pending hole-punch completers: pubkeyHex → completer that resolves
   /// to true (connected) or false (failed) when the punch finishes.
   final Map<String, Completer<bool>> _holePunchCompleters = {};
@@ -267,6 +271,17 @@ class GrassrootsNetwork {
   /// Minimum interval between discovery attempts for the same peer.
   static const _discoveryRetryInterval = Duration(seconds: 60);
 
+  /// When we last fan-ed out an AVAILABLE for each unreachable friend.
+  /// Used to periodically re-fire AVAILABLE on the next announce tick so the
+  /// pairing window at the friend's RV stays open while the friend is mid-
+  /// reconnect (their stale-cache may stall their RECONNECT for tens of
+  /// seconds). Cleared when the friend becomes UDP-reachable again.
+  final Map<String, DateTime> _availableFanOutLastFiredAt = {};
+
+  /// Minimum interval between AVAILABLE re-fires for the same friend while
+  /// they remain UDP-unreachable.
+  static const _availableRefireInterval = Duration(minutes: 5);
+
   /// Back off briefly after a failed proactive UDP attempt so repeated BLE
   /// ANNOUNCEs don't start a fresh UDX handshake every few seconds.
   static const _autoUdpRetryBackoff = Duration(seconds: 15);
@@ -298,8 +313,7 @@ class GrassrootsNetwork {
     Uint8List senderPubkey,
     Uint8List payload,
     MessageTransport transport,
-  )?
-  onMessageReceived;
+  )? onMessageReceived;
 
   /// Called when a new peer connects and exchanges ANNOUNCE
   void Function(Peer peer)? onPeerConnected;
@@ -325,6 +339,7 @@ class GrassrootsNetwork {
   }) {
     _protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
     _fragmentHandler = FragmentHandler();
+    _noiseSessions = NoiseSessionManager(identity: identity);
     _messageRouter = MessageRouter(
       identity: identity,
       store: store,
@@ -337,8 +352,8 @@ class GrassrootsNetwork {
 
     // Listen to network connectivity changes (WiFi ↔ cellular, etc.)
     _connectivitySubscription = Connectivity().onConnectivityChanged.listen(
-      _onConnectivityChanged,
-    );
+          _onConnectivityChanged,
+        );
     _seedConnectivityState();
 
     // Listen to Redux store changes for settings and friendship updates
@@ -402,8 +417,8 @@ class GrassrootsNetwork {
 
   /// UDP address candidates to share with trusted peers.
   Set<String> get udpAddressCandidates => Set.unmodifiable(
-    _candidateAddresses(includeLinkLocal: _linkLocalAddress != null),
-  );
+        _candidateAddresses(includeLinkLocal: _linkLocalAddress != null),
+      );
 
   /// Whether currently scanning for BLE devices
   bool get isScanning => _bleService?.isScanning ?? false;
@@ -681,6 +696,7 @@ class GrassrootsNetwork {
       } catch (e) {
         debugPrint('Error stopping BLE: $e');
       }
+      _noiseSessions.resetTransport(PeerTransport.bleDirect);
     }
 
     if (_udpService != null) {
@@ -689,6 +705,7 @@ class GrassrootsNetwork {
       } catch (e) {
         debugPrint('Error stopping UDP: $e');
       }
+      _noiseSessions.resetTransport(PeerTransport.udp);
     }
   }
 
@@ -963,86 +980,85 @@ class GrassrootsNetwork {
       }
 
       late final Future<bool> syncFuture;
-      syncFuture =
-          _enqueueRendezvousTask(() async {
-            if (_udpService == null || !_udpAvailable) {
-              debugPrint('[rendezvous] Cannot $reason — UDP unavailable');
-              return false;
-            }
+      syncFuture = _enqueueRendezvousTask(() async {
+        if (_udpService == null || !_udpAvailable) {
+          debugPrint('[rendezvous] Cannot $reason — UDP unavailable');
+          return false;
+        }
 
-            final rendezvousAddress = _parseSupportedUdpAddress(
-              rendezvous.address,
-              context: 'rendezvous',
-            );
-            if (rendezvousAddress == null) {
-              return false;
-            }
+        final rendezvousAddress = _parseSupportedUdpAddress(
+          rendezvous.address,
+          context: 'rendezvous',
+        );
+        if (rendezvousAddress == null) {
+          return false;
+        }
 
-            if (!_canDialUdpAddress(rendezvousAddress)) {
-              _logRendezvousSuppression(
-                configKey,
-                'no-route:${rendezvousAddress.ip.type.name}',
-                '[rendezvous] Skipping $reason for '
-                    '${rendezvous.pubkeyHex.substring(0, 8)}... — no usable '
-                    '${rendezvousAddress.ip.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4"} route',
-              );
-              return false;
-            }
+        if (!_canDialUdpAddress(rendezvousAddress)) {
+          _logRendezvousSuppression(
+            configKey,
+            'no-route:${rendezvousAddress.ip.type.name}',
+            '[rendezvous] Skipping $reason for '
+                '${rendezvous.pubkeyHex.substring(0, 8)}... — no usable '
+                '${rendezvousAddress.ip.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4"} route',
+          );
+          return false;
+        }
 
-            if (_isRendezvousBackoffActive(rendezvous, reason)) {
-              return false;
-            }
+        if (_isRendezvousBackoffActive(rendezvous, reason)) {
+          return false;
+        }
 
-            _lastRendezvousSuppressionLogKey.remove(configKey);
+        _lastRendezvousSuppressionLogKey.remove(configKey);
 
-            final announce = await _createSignedAnnounce(address: udpAddress);
-            if (await _udpService!.sendToPeer(rendezvous.pubkeyHex, announce)) {
-              _resetRendezvousBackoff(configKey);
-              debugPrint(
-                '[rendezvous] Re-announced via existing session '
-                '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
-              );
-              return true;
-            }
+        final announce = await _createSignedAnnounce(address: udpAddress);
+        if (await _udpService!.sendToPeer(rendezvous.pubkeyHex, announce)) {
+          _resetRendezvousBackoff(configKey);
+          debugPrint(
+            '[rendezvous] Re-announced via existing session '
+            '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
+          );
+          return true;
+        }
 
-            final success = await _sendViaUdp(
-              rendezvous.pubkeyHex,
-              rendezvous.address,
-              announce,
-              isRendezvous: true,
-            );
-            if (success) {
-              _resetRendezvousBackoff(configKey);
-              debugPrint(
-                '[rendezvous] Connected and announced '
-                '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
-              );
-              return true;
-            }
+        final success = await _sendViaUdp(
+          rendezvous.pubkeyHex,
+          rendezvous.address,
+          announce,
+          isRendezvous: true,
+        );
+        if (success) {
+          _resetRendezvousBackoff(configKey);
+          debugPrint(
+            '[rendezvous] Connected and announced '
+            '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
+          );
+          return true;
+        }
 
-            final failureKind = _udpService!.lastConnectFailureKind;
-            _rendezvousLastFailureKind[configKey] = failureKind;
-            final backoff = _rendezvousBackoffForFailure(failureKind);
-            if (backoff != null) {
-              _rendezvousRetryAfter[configKey] = DateTime.now().add(backoff);
-              debugPrint(
-                '[rendezvous] Failed to connect '
-                '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason): '
-                '${_describeRendezvousFailure(failureKind)}; '
-                'backing off for ${backoff.inSeconds}s',
-              );
-            } else {
-              debugPrint(
-                '[rendezvous] Failed to connect '
-                '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
-              );
-            }
-            return false;
-          }).whenComplete(() {
-            if (identical(_rendezvousSyncInFlight[configKey], syncFuture)) {
-              _rendezvousSyncInFlight.remove(configKey);
-            }
-          });
+        final failureKind = _udpService!.lastConnectFailureKind;
+        _rendezvousLastFailureKind[configKey] = failureKind;
+        final backoff = _rendezvousBackoffForFailure(failureKind);
+        if (backoff != null) {
+          _rendezvousRetryAfter[configKey] = DateTime.now().add(backoff);
+          debugPrint(
+            '[rendezvous] Failed to connect '
+            '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason): '
+            '${_describeRendezvousFailure(failureKind)}; '
+            'backing off for ${backoff.inSeconds}s',
+          );
+        } else {
+          debugPrint(
+            '[rendezvous] Failed to connect '
+            '(${rendezvous.pubkeyHex.substring(0, 8)}..., $reason)',
+          );
+        }
+        return false;
+      }).whenComplete(() {
+        if (identical(_rendezvousSyncInFlight[configKey], syncFuture)) {
+          _rendezvousSyncInFlight.remove(configKey);
+        }
+      });
 
       _rendezvousSyncInFlight[configKey] = syncFuture;
       results.add(await syncFuture);
@@ -1158,9 +1174,8 @@ class GrassrootsNetwork {
   List<ConnectivityResult> _normalizeConnectivityResults(
     List<ConnectivityResult> results,
   ) {
-    final ipResults = results
-        .where((r) => r != ConnectivityResult.bluetooth)
-        .toList();
+    final ipResults =
+        results.where((r) => r != ConnectivityResult.bluetooth).toList();
     if (ipResults.isEmpty) {
       return [ConnectivityResult.none];
     }
@@ -1278,6 +1293,7 @@ class GrassrootsNetwork {
     _holePunchServices.clear();
 
     if (_udpService != null) {
+      _noiseSessions.resetTransport(PeerTransport.udp);
       await _udpService!.dispose();
       _udpService = null;
     }
@@ -1318,14 +1334,13 @@ class GrassrootsNetwork {
   Future<void> _reconnectUdpFriends({required String reason}) async {
     if (!_udpAvailable) return;
 
-    final udpFriends =
-        _peersState.friends
-            .where((peer) => _udpCandidatesForPeer(peer).isNotEmpty)
-            .toList()
-          ..sort((a, b) {
-            if (a.isWellConnected == b.isWellConnected) return 0;
-            return a.isWellConnected ? -1 : 1;
-          });
+    final udpFriends = _peersState.friends
+        .where((peer) => _udpCandidatesForPeer(peer).isNotEmpty)
+        .toList()
+      ..sort((a, b) {
+        if (a.isWellConnected == b.isWellConnected) return 0;
+        return a.isWellConnected ? -1 : 1;
+      });
     if (udpFriends.isEmpty) return;
 
     debugPrint(
@@ -1334,8 +1349,7 @@ class GrassrootsNetwork {
 
     for (final friend in udpFriends) {
       final candidates = _udpCandidatesForPeer(friend);
-      final friendAddress =
-          friend.udpAddress ??
+      final friendAddress = friend.udpAddress ??
           (candidates.isNotEmpty ? candidates.first : null);
       if (friendAddress == null) continue;
       await _connectToFriendViaUdp(friend.pubkeyHex, friendAddress);
@@ -1344,10 +1358,9 @@ class GrassrootsNetwork {
     // Fan out RECONNECT for friends still unreachable. Rendezvous servers pair
     // this with the friend's AVAILABLE; eligible friend mediators are selected
     // through the friends-of-friends map and coordinate directly.
-    final facilitatorCount =
-        store.state.peers.wellConnectedFriends.length +
+    final facilitatorCount = store.state.peers.wellConnectedFriends.length +
         _configuredRendezvousServers().length +
-        store.state.peers.friendRvServers.length;
+        store.state.friendships.friendRvServers.length;
     if (facilitatorCount == 0) return;
 
     for (final friend in udpFriends) {
@@ -1404,6 +1417,7 @@ class GrassrootsNetwork {
       // Dispose old service first to clean up native state (GATT server, subscriptions)
       if (_bleService != null) {
         debugPrint('Disposing old BLE service before re-initialization');
+        _noiseSessions.resetTransport(PeerTransport.bleDirect);
         await _bleService!.dispose();
         _bleService = null;
       }
@@ -1419,6 +1433,7 @@ class GrassrootsNetwork {
         await _bleService!.dispose();
         _bleService = null;
       }
+      _noiseSessions.resetTransport(PeerTransport.bleDirect);
 
       // Reset Redux state so _bleAvailable returns false
       store.dispatch(
@@ -1456,6 +1471,7 @@ class GrassrootsNetwork {
       _holePunchServices.clear();
 
       if (_udpService != null) {
+        _noiseSessions.resetTransport(PeerTransport.udp);
         await _udpService!.dispose();
         _udpService = null;
       }
@@ -1547,7 +1563,8 @@ class GrassrootsNetwork {
       ),
     );
 
-    // Create the message packet and sign it once.
+    // Create the message packet. It is signed after optional session
+    // encryption because the signature covers the final wire payload.
     // packetId == messageId so the recipient's ACK (which echoes the
     // packetId back) matches the entry we just stored under `messageId`
     // in `MessageSendingAction`. Otherwise `MessageDeliveredAction` would
@@ -1557,11 +1574,6 @@ class GrassrootsNetwork {
       recipientPubkey: recipientPubkey,
       packetId: messageId,
     );
-    if (!_fragmentHandler.needsFragmentation(payload)) {
-      await _protocolHandler.signPacket(packet);
-    }
-
-    final bytes = packet.serialize();
 
     // --- Try BLE first (preferred for nearby peers) ---
     final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
@@ -1580,7 +1592,17 @@ class GrassrootsNetwork {
           messageId: messageId,
         );
       } else {
-        success = await _bleService!.sendToPeer(bleDeviceId, bytes);
+        final bytes = await _signedPacketBytesForTransport(
+          packet: packet,
+          transport: PeerTransport.bleDirect,
+          recipientPubkey: recipientPubkey,
+          peerId: bleDeviceId,
+        );
+        if (bytes == null) {
+          success = false;
+        } else {
+          success = await _bleService!.sendToPeer(bleDeviceId, bytes);
+        }
       }
 
       if (success) {
@@ -1604,19 +1626,28 @@ class GrassrootsNetwork {
       final resolvedPeer = _peersState.getPeerByPubkey(recipientPubkey) ?? peer;
 
       // Try existing UDX connection first
-      if (await _udpService!.sendToPeer(resolvedPeer.pubkeyHex, bytes)) {
-        // debugPrint(
-        //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
-        // );
-        store.dispatch(
-          MessageSentAction(
-            messageId: messageId,
-            transport: MessageTransport.udp,
-            recipientPubkey: recipientPubkey,
-            payloadSize: payload.length,
-          ),
+      if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
+        final bytes = await _signedPacketBytesForTransport(
+          packet: packet,
+          transport: PeerTransport.udp,
+          recipientPubkey: recipientPubkey,
+          peerId: resolvedPeer.pubkeyHex,
         );
-        return messageId;
+        if (bytes != null &&
+            await _udpService!.sendToPeer(resolvedPeer.pubkeyHex, bytes)) {
+          // debugPrint(
+          //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
+          // );
+          store.dispatch(
+            MessageSentAction(
+              messageId: messageId,
+              transport: MessageTransport.udp,
+              recipientPubkey: recipientPubkey,
+              payloadSize: payload.length,
+            ),
+          );
+          return messageId;
+        }
       }
 
       // No existing connection — try connect-on-demand if we have an address
@@ -1626,7 +1657,12 @@ class GrassrootsNetwork {
         debugPrint(
           'Sending via UDP to ${resolvedPeer.displayName} at $udpCandidates',
         );
-        if (await _sendViaUdp(resolvedPeer.pubkeyHex, udpAddr, bytes)) {
+        if (await _sendPacketViaUdp(
+          pubkeyHex: resolvedPeer.pubkeyHex,
+          udpAddress: udpAddr,
+          packet: packet,
+          recipientPubkey: recipientPubkey,
+        )) {
           store.dispatch(
             MessageSentAction(
               messageId: messageId,
@@ -1652,10 +1688,11 @@ class GrassrootsNetwork {
           final freshCandidates = _udpCandidatesForPeer(freshPeer);
           if (freshPeer != null && freshCandidates.isNotEmpty) {
             debugPrint('[send] Discovery succeeded, sending via UDP');
-            if (await _sendViaUdp(
-              freshPeer.pubkeyHex,
-              freshPeer.udpAddress ?? freshCandidates.first,
-              bytes,
+            if (await _sendPacketViaUdp(
+              pubkeyHex: freshPeer.pubkeyHex,
+              udpAddress: freshPeer.udpAddress ?? freshCandidates.first,
+              packet: packet,
+              recipientPubkey: recipientPubkey,
             )) {
               store.dispatch(
                 MessageSentAction(
@@ -1688,19 +1725,27 @@ class GrassrootsNetwork {
   }) async {
     final peer = _peersState.getPeerByPubkey(senderPubkey);
 
-    // Create and sign read receipt packet at coordinator level
+    // Create read receipt packet at coordinator level. Signing happens after
+    // session encryption, if available.
     final packet = _protocolHandler.createReadReceiptPacket(
       messageId: messageId,
       recipientPubkey: senderPubkey,
     );
-    await _protocolHandler.signPacket(packet);
-    final bytes = packet.serialize();
 
     // Try BLE first
     if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
       final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
       if (peer != null && bleDeviceId != null) {
-        if (await _bleService!.sendToPeer(bleDeviceId, bytes)) return true;
+        final bytes = await _signedPacketBytesForTransport(
+          packet: packet,
+          transport: PeerTransport.bleDirect,
+          recipientPubkey: senderPubkey,
+          peerId: bleDeviceId,
+        );
+        if (bytes != null &&
+            await _bleService!.sendToPeer(bleDeviceId, bytes)) {
+          return true;
+        }
       }
     }
 
@@ -1708,10 +1753,11 @@ class GrassrootsNetwork {
     if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
       final udpCandidates = _udpCandidatesForPeer(peer);
       if (peer != null && udpCandidates.isNotEmpty) {
-        if (await _sendViaUdp(
-          peer.pubkeyHex,
-          peer.udpAddress ?? udpCandidates.first,
-          bytes,
+        if (await _sendPacketViaUdp(
+          pubkeyHex: peer.pubkeyHex,
+          udpAddress: peer.udpAddress ?? udpCandidates.first,
+          packet: packet,
+          recipientPubkey: senderPubkey,
         )) {
           return true;
         }
@@ -1724,28 +1770,61 @@ class GrassrootsNetwork {
 
   /// Broadcast a message to all peers on all enabled transports.
   Future<void> broadcast(Uint8List payload) async {
-    // Create and sign the packet at coordinator level
-    final packet = _protocolHandler.createMessagePacket(payload: payload);
-    await _protocolHandler.signPacket(packet);
-    final bytes = packet.serialize();
-
-    // Broadcast via BLE (handle fragmentation)
+    // Broadcast as individually encrypted unicast packets, one Noise session
+    // per peer per transport medium.
     if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
       try {
-        if (_fragmentHandler.needsFragmentation(payload)) {
-          await _broadcastFragmentedViaBle(payload: payload);
-        } else {
-          await _bleService!.broadcast(bytes);
+        for (final peerId in _bleService!.connectedPeerIds) {
+          final pubkey = _bleService!.getPubkeyForPeerId(peerId);
+          if (pubkey == null) continue;
+          if (_fragmentHandler.needsFragmentation(payload)) {
+            await _sendFragmentedViaBle(
+              payload: payload,
+              recipientPubkey: pubkey,
+              bleDeviceId: peerId,
+              messageId: _uuid.v4(),
+            );
+          } else {
+            final packet = _protocolHandler.createMessagePacket(
+              payload: payload,
+              recipientPubkey: pubkey,
+            );
+            final bytes = await _signedPacketBytesForTransport(
+              packet: packet,
+              transport: PeerTransport.bleDirect,
+              recipientPubkey: pubkey,
+              peerId: peerId,
+            );
+            if (bytes != null) {
+              await _bleService!.sendToPeer(peerId, bytes);
+            }
+          }
         }
       } catch (e) {
         debugPrint('BLE broadcast failed: $e');
       }
     }
 
-    // Broadcast via UDP (no size limit)
     if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
       try {
-        await _udpService!.broadcast(bytes);
+        for (final peer in _peersState.peersList) {
+          if (_udpService!.getPeerIdForPubkey(peer.publicKey) == null) {
+            continue;
+          }
+          final packet = _protocolHandler.createMessagePacket(
+            payload: payload,
+            recipientPubkey: peer.publicKey,
+          );
+          final bytes = await _signedPacketBytesForTransport(
+            packet: packet,
+            transport: PeerTransport.udp,
+            recipientPubkey: peer.publicKey,
+            peerId: peer.pubkeyHex,
+          );
+          if (bytes != null) {
+            await _udpService!.sendToPeer(peer.pubkeyHex, bytes);
+          }
+        }
       } catch (e) {
         debugPrint('UDP broadcast failed: $e');
       }
@@ -1921,6 +2000,117 @@ class GrassrootsNetwork {
   bool _hasLiveBlePath(PeerState? peer) =>
       _connectedBleDeviceIdForPeer(peer) != null;
 
+  static String _pubkeyToHex(Uint8List pubkey) =>
+      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  Future<void> _startNoiseHandshakeForPeer({
+    required PeerTransport transport,
+    required PeerState peer,
+    String? peerId,
+  }) async {
+    if (transport == PeerTransport.bleDirect) {
+      peerId ??= _connectedBleDeviceIdForPeer(peer);
+      if (peerId == null) return;
+    } else if (transport == PeerTransport.udp) {
+      if (_udpService?.getPeerIdForPubkey(peer.publicKey) == null) return;
+      peerId ??= peer.pubkeyHex;
+    } else {
+      return;
+    }
+
+    await _ensureNoiseSession(
+      transport: transport,
+      recipientPubkey: peer.publicKey,
+      peerId: peerId,
+    );
+  }
+
+  Future<bool> _ensureNoiseSession({
+    required PeerTransport transport,
+    required Uint8List recipientPubkey,
+    String? peerId,
+  }) async {
+    if (_noiseSessions.hasSession(transport, recipientPubkey)) return true;
+
+    final payload = await _noiseSessions.startHandshake(
+      transport,
+      recipientPubkey,
+    );
+    if (payload != null) {
+      final sent = await _sendNoiseHandshakePacket(
+        transport: transport,
+        recipientPubkey: recipientPubkey,
+        peerId: peerId,
+        payload: payload,
+      );
+      if (!sent) {
+        _noiseSessions.reset(transport, recipientPubkey);
+        return false;
+      }
+    }
+
+    return _noiseSessions.waitForSession(transport, recipientPubkey);
+  }
+
+  Future<bool> _sendNoiseHandshakePacket({
+    required PeerTransport transport,
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    String? peerId,
+  }) async {
+    final packet = GrassrootsPacket(
+      type: PacketType.noiseHandshake,
+      ttl: 0,
+      senderPubkey: identity.publicKey,
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      signature: Uint8List(64),
+    );
+    await _protocolHandler.signPacket(packet);
+    final bytes = packet.serialize();
+
+    if (transport == PeerTransport.bleDirect) {
+      final id = peerId ?? _bleService?.getPeerIdForPubkey(recipientPubkey);
+      if (id == null) return false;
+      final service = _bleService;
+      if (service == null) return false;
+      return service.sendToPeer(id, bytes);
+    }
+
+    if (transport == PeerTransport.udp) {
+      final id = peerId ?? _pubkeyToHex(recipientPubkey);
+      final service = _udpService;
+      if (service == null) return false;
+      return service.sendToPeer(id, bytes);
+    }
+
+    return false;
+  }
+
+  Future<Uint8List?> _signedPacketBytesForTransport({
+    required GrassrootsPacket packet,
+    required PeerTransport transport,
+    required Uint8List recipientPubkey,
+    String? peerId,
+  }) async {
+    var outgoing = packet;
+    if (packet.type.usesSessionSecurity) {
+      final ready = await _ensureNoiseSession(
+        transport: transport,
+        recipientPubkey: recipientPubkey,
+        peerId: peerId,
+      );
+      if (!ready) return null;
+      outgoing = await _noiseSessions.encryptPacket(
+        packet,
+        transport: transport,
+        remotePubkey: recipientPubkey,
+      );
+    }
+    await _protocolHandler.signPacket(outgoing);
+    return outgoing.serialize();
+  }
+
   HolePunchService? _holePunchServiceFor(InternetAddress address) =>
       _holePunchServices[address.type];
 
@@ -1957,12 +2147,13 @@ class GrassrootsNetwork {
   Set<String> _udpCandidatesForPeer(
     PeerState? peer, {
     String? fallbackAddress,
-  }) => normalizeAddressStrings([
-    peer?.linkLocalAddress,
-    peer?.udpAddress,
-    if (peer != null) ...peer.udpAddressCandidates,
-    fallbackAddress,
-  ]);
+  }) =>
+      normalizeAddressStrings([
+        peer?.linkLocalAddress,
+        peer?.udpAddress,
+        if (peer != null) ...peer.udpAddressCandidates,
+        fallbackAddress,
+      ]);
 
   AddressInfo? _selectUdpRemoteCandidate(
     Set<String> remoteCandidates, {
@@ -1987,19 +2178,17 @@ class GrassrootsNetwork {
     return pair.remote;
   }
 
-  Future<Uint8List> _createSignedSignalingPacket(
+  GrassrootsPacket _createSignalingPacket(
     Uint8List recipientPubkey,
     Uint8List signalingPayload,
-  ) async {
-    final packet = GrassrootsPacket(
+  ) {
+    return GrassrootsPacket(
       type: PacketType.signaling,
       senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: signalingPayload,
       signature: Uint8List(64),
     );
-    await _protocolHandler.signPacket(packet);
-    return packet.serialize();
   }
 
   Future<bool> _sendDirectSignalingOverLiveBle(
@@ -2010,19 +2199,22 @@ class GrassrootsNetwork {
       return false;
     }
 
-    final pubkeyHex = recipientPubkey
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join();
+    final pubkeyHex =
+        recipientPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     final peer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
     final deviceId = _connectedBleDeviceIdForPeer(peer);
     if (deviceId == null) {
       return false;
     }
 
-    final bytes = await _createSignedSignalingPacket(
-      recipientPubkey,
-      signalingPayload,
+    final packet = _createSignalingPacket(recipientPubkey, signalingPayload);
+    final bytes = await _signedPacketBytesForTransport(
+      packet: packet,
+      transport: PeerTransport.bleDirect,
+      recipientPubkey: recipientPubkey,
+      peerId: deviceId,
     );
+    if (bytes == null) return false;
     return _bleService!.sendToPeer(deviceId, bytes);
   }
 
@@ -2175,6 +2367,65 @@ class GrassrootsNetwork {
       return true;
     }
 
+    final connected = await _ensureUdpConnection(
+      pubkeyHex,
+      udpAddress,
+      isRendezvous: isRendezvous,
+      allowBleAssistedFallback: allowBleAssistedFallback,
+      performPreConnectPunch: performPreConnectPunch,
+    );
+    if (!connected) return false;
+
+    debugPrint('[udp-send] Connected, sending data to $peerShort');
+    return _udpService!.sendToPeer(pubkeyHex, data);
+  }
+
+  Future<bool> _sendPacketViaUdp({
+    required String pubkeyHex,
+    required String udpAddress,
+    required GrassrootsPacket packet,
+    required Uint8List recipientPubkey,
+    bool isRendezvous = false,
+    bool allowBleAssistedFallback = true,
+    bool performPreConnectPunch = true,
+  }) async {
+    if (_udpService == null) return false;
+
+    final connected =
+        _udpService!.getPeerIdForPubkey(recipientPubkey) != null ||
+            await _ensureUdpConnection(
+              pubkeyHex,
+              udpAddress,
+              isRendezvous: isRendezvous,
+              allowBleAssistedFallback: allowBleAssistedFallback,
+              performPreConnectPunch: performPreConnectPunch,
+            );
+    if (!connected) return false;
+
+    final bytes = await _signedPacketBytesForTransport(
+      packet: packet,
+      transport: PeerTransport.udp,
+      recipientPubkey: recipientPubkey,
+      peerId: pubkeyHex,
+    );
+    if (bytes == null) return false;
+
+    return _udpService!.sendToPeer(pubkeyHex, bytes);
+  }
+
+  Future<bool> _ensureUdpConnection(
+    String pubkeyHex,
+    String udpAddress, {
+    bool isRendezvous = false,
+    bool allowBleAssistedFallback = true,
+    bool performPreConnectPunch = true,
+  }) async {
+    if (_udpService == null) return false;
+    if (_udpService!.getPeerIdForPubkey(_hexToBytes(pubkeyHex)) != null) {
+      return true;
+    }
+    final peerShort = pubkeyHex.substring(0, 8);
+
     // Not connected — check if we should initiate or wait.
     // Only one side should call connectToPeer to avoid UDX simultaneous-open
     // (two independent socket pairs where data flows in only one direction).
@@ -2206,9 +2457,9 @@ class GrassrootsNetwork {
       );
       for (var i = 0; i < 10; i++) {
         await Future.delayed(const Duration(milliseconds: 500));
-        if (await _udpService!.sendToPeer(pubkeyHex, data)) {
+        if (_udpService!.getPeerIdForPubkey(_hexToBytes(pubkeyHex)) != null) {
           debugPrint(
-            '[udp-send] Incoming connection arrived, sent to $peerShort',
+            '[udp-send] Incoming connection arrived for $peerShort',
           );
           return true;
         }
@@ -2222,9 +2473,7 @@ class GrassrootsNetwork {
     final inFlight = _udpConnectInFlight[pubkeyHex];
     if (inFlight != null) {
       debugPrint('[udp-send] Reusing in-flight UDX connect to $peerShort...');
-      final connected = await inFlight;
-      if (!connected) return false;
-      return _udpService!.sendToPeer(pubkeyHex, data);
+      return inFlight;
     }
 
     late final Future<bool> udxConnectFuture;
@@ -2258,11 +2507,7 @@ class GrassrootsNetwork {
       }
     }
 
-    if (connected) {
-      debugPrint('[udp-send] Connected, sending data to $peerShort');
-      // Send the data — the periodic ANNOUNCE cycle handles identity exchange
-      return _udpService!.sendToPeer(pubkeyHex, data);
-    }
+    if (connected) return true;
 
     debugPrint(
       '[udp-send] UDX connect failed to $peerShort at $selectedAddress',
@@ -2296,7 +2541,7 @@ class GrassrootsNetwork {
   ) async {
     final normalizedAddress =
         _normalizeAnnouncedUdpAddress(udpAddress, context: 'auto-udp') ??
-        udpAddress;
+            udpAddress;
     final peerShort = pubkeyHex.substring(0, 8);
 
     final retryAfter = _autoUdpRetryAfter[pubkeyHex];
@@ -2530,9 +2775,8 @@ class GrassrootsNetwork {
     int port, {
     Uint8List? readyRecipientPubkey,
   }) async {
-    final peerHex = peerPubkey
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join();
+    final peerHex =
+        peerPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     final peerShort = peerHex.substring(0, 8);
     final hasPendingSend = _holePunchCompleters.containsKey(peerHex);
 
@@ -2650,9 +2894,8 @@ class GrassrootsNetwork {
     final pubkeyHex = peer.pubkeyHex;
     final name = peer.displayName;
     final mediators = store.state.peers.mediatorsForFriend(pubkeyHex);
-    final directMediatorCount = mediators
-        .where((mediator) => !mediator.isWellConnected)
-        .length;
+    final directMediatorCount =
+        mediators.where((mediator) => !mediator.isWellConnected).length;
     final trustedFriendCount = store.state.peers.wellConnectedFriends
         .where(
           (friend) =>
@@ -2769,12 +3012,10 @@ class GrassrootsNetwork {
         continue;
       }
 
-      final mediators = store.state.peers
-          .mediatorsForFriend(friend.pubkeyHex)
-          .toList();
-      final directMediatorCount = mediators
-          .where((mediator) => !mediator.isWellConnected)
-          .length;
+      final mediators =
+          store.state.peers.mediatorsForFriend(friend.pubkeyHex).toList();
+      final directMediatorCount =
+          mediators.where((mediator) => !mediator.isWellConnected).length;
       final wellConnectedCount = store.state.peers.wellConnectedFriends
           .where(
             (wc) =>
@@ -2858,18 +3099,50 @@ class GrassrootsNetwork {
     // Previously required ANNOUNCE as the first message on a stream; now any
     // verified packet identifies the sender via its header.
     _messageRouter.onUdpPeerIdentified = (senderPubkey, udpPeerId) {
-      final pubkeyHex = senderPubkey
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join();
+      final pubkeyHex =
+          senderPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
       _udpService?.mapIncomingConnectionToPubkey(udpPeerId, pubkeyHex);
     };
 
+    _messageRouter.onNoiseHandshakeReceived =
+        (packet, transport, {String? peerId}) async {
+      try {
+        final result = await _noiseSessions.handleHandshakePacket(
+          packet,
+          transport: transport,
+        );
+        final response = result.responsePayload;
+        if (response != null) {
+          await _sendNoiseHandshakePacket(
+            transport: transport,
+            recipientPubkey: packet.senderPubkey,
+            peerId: peerId,
+            payload: response,
+          );
+        }
+      } catch (e) {
+        debugPrint('[noise] Dropping handshake packet: $e');
+      }
+    };
+
+    _messageRouter.decryptSessionPacket =
+        (packet, transport, {String? peerId}) async {
+      try {
+        return await _noiseSessions.decryptPacket(
+          packet,
+          transport: transport,
+        );
+      } catch (e) {
+        debugPrint('[noise] Failed to decrypt session packet: $e');
+        return null;
+      }
+    };
+
     // Peer ANNOUNCE processed
-    _messageRouter
-        .onPeerAnnounced = (data, transport, {bool isNew = false, String? udpPeerId}) {
-      final pubkeyHex = data.publicKey
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join();
+    _messageRouter.onPeerAnnounced =
+        (data, transport, {bool isNew = false, String? udpPeerId}) {
+      final pubkeyHex =
+          data.publicKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
       // debugPrint('Announce inc');
       if (_isRendezvousPubkeyHex(pubkeyHex)) {
         _completeRendezvousResponseWaiters(pubkeyHex);
@@ -2923,6 +3196,15 @@ class GrassrootsNetwork {
         if (senderPeer != null && senderPeer.isFriend) {
           _sendFriendAnnounceToConnectedBlePaths(senderPeer);
         }
+      }
+
+      final announcedPeer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
+      if (announcedPeer != null && !_isRendezvousPubkeyHex(pubkeyHex)) {
+        unawaited(_startNoiseHandshakeForPeer(
+          transport: transport,
+          peer: announcedPeer,
+          peerId: udpPeerId,
+        ));
       }
 
       // Proactive UDP connect: when a friend's ANNOUNCE arrives with a UDP
@@ -2990,9 +3272,29 @@ class GrassrootsNetwork {
         debugPrint('Cannot send ACK for $messageId: no peerId');
         return;
       }
-      final ackPacket = _protocolHandler.createAckPacket(messageId: messageId);
-      await _protocolHandler.signPacket(ackPacket);
-      final bytes = ackPacket.serialize();
+      Uint8List? recipientPubkey;
+      if (transport == PeerTransport.udp) {
+        recipientPubkey = _hexToBytes(peerId);
+      } else if (transport == PeerTransport.bleDirect) {
+        recipientPubkey = _bleService?.getPubkeyForPeerId(peerId);
+      }
+      if (recipientPubkey == null) {
+        debugPrint('Cannot send ACK for $messageId: unknown recipient pubkey');
+        return;
+      }
+
+      final ackPacket = _protocolHandler.createAckPacket(
+        messageId: messageId,
+        recipientPubkey: recipientPubkey,
+      );
+      final bytes = await _signedPacketBytesForTransport(
+        packet: ackPacket,
+        transport: transport,
+        recipientPubkey: recipientPubkey,
+        peerId: peerId,
+      );
+      if (bytes == null) return;
+
       if (transport == PeerTransport.udp) {
         await _udpService?.sendToPeer(peerId, bytes);
       } else if (transport == PeerTransport.bleDirect) {
@@ -3003,13 +3305,13 @@ class GrassrootsNetwork {
     // Signaling packet received — delegate to SignalingService.
     _messageRouter.onSignalingReceived =
         (senderPubkey, payload, {observedIp, observedPort}) {
-          _signalingService.processSignaling(
-            senderPubkey,
-            payload,
-            observedIp: observedIp,
-            observedPort: observedPort,
-          );
-        };
+      _signalingService.processSignaling(
+        senderPubkey,
+        payload,
+        observedIp: observedIp,
+        observedPort: observedPort,
+      );
+    };
   }
 
   /// Set up SignalingService callbacks
@@ -3017,96 +3319,130 @@ class GrassrootsNetwork {
     // SignalingService sends signaling payloads through us (wrapped in GrassrootsPacket)
     _signalingService.sendSignaling =
         (recipientPubkey, signalingPayload) async {
-          final bytes = await _createSignedSignalingPacket(
-            recipientPubkey,
-            signalingPayload,
+      final packet = _createSignalingPacket(
+        recipientPubkey,
+        signalingPayload,
+      );
+
+      final pubkeyHex = _pubkeyToHex(recipientPubkey);
+      final isRendezvous = _isRendezvousPubkeyHex(pubkeyHex);
+      final rendezvousConfig =
+          isRendezvous ? _configuredRendezvousForPubkeyHex(pubkeyHex) : null;
+
+      // Rendezvous anchors are UDP-only and reached via a configured address.
+      // They share the wire encryption (Noise-wrapped `secureSignaling`) with
+      // peer-to-peer signaling — the only specialisation here is the
+      // RV-aware connection-management path (`_syncConfiguredRendezvous`),
+      // which knows about per-RV backoff and the ANNOUNCE primer.
+      if (isRendezvous) {
+        if (_udpService == null || !_udpAvailable) return false;
+        final synced = await _syncConfiguredRendezvous(
+          config: rendezvousConfig,
+          reason: 'signaling-primer',
+        );
+        if (!synced) return false;
+        final udpAddr = rendezvousConfig?.address;
+        if (udpAddr == null || udpAddr.isEmpty) return false;
+        return _sendPacketViaUdp(
+          pubkeyHex: pubkeyHex,
+          udpAddress: udpAddr,
+          packet: packet,
+          recipientPubkey: recipientPubkey,
+          isRendezvous: true,
+        );
+      }
+
+      // Try BLE first
+      if (_bleService != null && _bleAvailable) {
+        final peerId = _bleService!.getPeerIdForPubkey(recipientPubkey);
+        if (peerId != null) {
+          final bytes = await _signedPacketBytesForTransport(
+            packet: packet,
+            transport: PeerTransport.bleDirect,
+            recipientPubkey: recipientPubkey,
+            peerId: peerId,
           );
-
-          final pubkeyHex = recipientPubkey
-              .map((b) => b.toRadixString(16).padLeft(2, '0'))
-              .join();
-          final isRendezvous = _isRendezvousPubkeyHex(pubkeyHex);
-          final rendezvousConfig = isRendezvous
-              ? _configuredRendezvousForPubkeyHex(pubkeyHex)
-              : null;
-
-          // Try BLE first
-          if (_bleService != null && _bleAvailable) {
-            final peerId = _bleService!.getPeerIdForPubkey(recipientPubkey);
-            if (peerId != null) {
-              if (await _bleService!.sendToPeer(peerId, bytes)) return true;
-            }
+          if (bytes != null && await _bleService!.sendToPeer(peerId, bytes)) {
+            return true;
           }
+        }
+      }
 
-          // Fall back to UDP
-          if (_udpService != null && _udpAvailable) {
-            if (isRendezvous) {
-              final synced = await _syncConfiguredRendezvous(
-                config: rendezvousConfig,
-                reason: 'signaling-primer',
-              );
-              if (!synced) {
-                return false;
-              }
-            }
-
-            if (await _udpService!.sendToPeer(pubkeyHex, bytes)) return true;
-
-            // Not connected via UDP yet — try connect-on-demand
-            final peer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
-            final candidates = _udpCandidatesForPeer(
-              peer,
-              fallbackAddress: rendezvousConfig?.address,
-            );
-            final udpAddr =
-                peer?.udpAddress ??
-                rendezvousConfig?.address ??
-                (candidates.isNotEmpty ? candidates.first : null);
-            if (udpAddr != null && udpAddr.isNotEmpty) {
-              return _sendViaUdp(
-                pubkeyHex,
-                udpAddr,
-                bytes,
-                isRendezvous: isRendezvous,
-              );
-            }
+      // Fall back to UDP
+      if (_udpService != null && _udpAvailable) {
+        if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
+          final bytes = await _signedPacketBytesForTransport(
+            packet: packet,
+            transport: PeerTransport.udp,
+            recipientPubkey: recipientPubkey,
+            peerId: pubkeyHex,
+          );
+          if (bytes != null &&
+              await _udpService!.sendToPeer(pubkeyHex, bytes)) {
+            return true;
           }
+        }
 
-          return false;
-        };
+        // Not connected via UDP yet — try connect-on-demand
+        final peer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
+        final candidates = _udpCandidatesForPeer(
+          peer,
+          fallbackAddress: rendezvousConfig?.address,
+        );
+        final udpAddr = peer?.udpAddress ??
+            rendezvousConfig?.address ??
+            (candidates.isNotEmpty ? candidates.first : null);
+        if (udpAddr != null && udpAddr.isNotEmpty) {
+          return _sendPacketViaUdp(
+            pubkeyHex: pubkeyHex,
+            udpAddress: udpAddr,
+            packet: packet,
+            recipientPubkey: recipientPubkey,
+            isRendezvous: isRendezvous,
+          );
+        }
+      }
+
+      return false;
+    };
     _signalingService.sendDirectSignaling = _sendDirectSignalingOverLiveBle;
 
     // Address-aware send: target an RV at an explicit ip:port even if we
     // haven't otherwise registered or connected to it. Used by AVAILABLE
-    // fan-out for RVs we learned about from a friend (RV_LIST).
+    // fan-out for RVs we learned about from a friend (RV_LIST). The recipient
+    // is always an RV here — always go through the Noise-encrypted
+    // `_sendPacketViaUdp` path; the anchor only accepts secureSignaling.
     _signalingService.sendSignalingToAddress =
         (recipientPubkey, address, signalingPayload) async {
-          final bytes = await _createSignedSignalingPacket(
-            recipientPubkey,
-            signalingPayload,
-          );
-          if (_udpService == null || !_udpAvailable) return false;
-          final pubkeyHex = recipientPubkey
-              .map((b) => b.toRadixString(16).padLeft(2, '0'))
-              .join();
-          return _sendViaUdp(pubkeyHex, address, bytes, isRendezvous: true);
-        };
+      if (_udpService == null || !_udpAvailable) return false;
+      final packet = _createSignalingPacket(
+        recipientPubkey,
+        signalingPayload,
+      );
+      final pubkeyHex = _pubkeyToHex(recipientPubkey);
+      return _sendPacketViaUdp(
+        pubkeyHex: pubkeyHex,
+        udpAddress: address,
+        packet: packet,
+        recipientPubkey: recipientPubkey,
+        isRendezvous: true,
+      );
+    };
 
     // Hole-punch initiation: a well-connected friend told us to start punching
     _signalingService.onPunchInitiate =
         (peerPubkey, ip, port, readyRecipientPubkey) async {
-          await _executePunchInitiate(
-            peerPubkey,
-            ip,
-            port,
-            readyRecipientPubkey: readyRecipientPubkey,
-          );
-        };
+      await _executePunchInitiate(
+        peerPubkey,
+        ip,
+        port,
+        readyRecipientPubkey: readyRecipientPubkey,
+      );
+    };
 
     _signalingService.onPunchReady = (peerPubkey) async {
-      final peerHex = peerPubkey
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join();
+      final peerHex =
+          peerPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
       _holePunchRemoteReady.add(peerHex);
       await _maybeEstablishPunchConnection(peerHex);
     };
@@ -3124,9 +3460,8 @@ class GrassrootsNetwork {
       // _verifyRendezvousServerResponds. The server's separate ANNOUNCE-back
       // is informational — relying on it is fragile because that send path
       // is fire-and-forget and can be dropped on stream tear-down.
-      final senderHex = senderPubkey
-          .map((b) => b.toRadixString(16).padLeft(2, '0'))
-          .join();
+      final senderHex =
+          senderPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
       if (_isRendezvousPubkeyHex(senderHex)) {
         debugPrint(
           '[rendezvous] Server ${senderHex.substring(0, 8)}... acknowledged '
@@ -3203,6 +3538,7 @@ class GrassrootsNetwork {
     // Peer disconnected at BLE level
     _bleService!.onPeerDisconnected = (peer) {
       debugPrint('BLE Peer disconnected: ${peer.displayName}');
+      _noiseSessions.reset(PeerTransport.bleDirect, peer.publicKey);
       onPeerDisconnected?.call(peer);
     };
 
@@ -3248,12 +3584,15 @@ class GrassrootsNetwork {
       if (event.connected) {
         debugPrint('UDP peer connected: ${event.peerId}');
         store.dispatch(PeerUdpSeenAction(_hexToBytes(event.peerId)));
+        // The friend is reachable again — reset the AVAILABLE re-fire clock so
+        // the next disconnect triggers a fresh fan-out immediately rather than
+        // waiting out the previous-cycle backoff.
+        _availableFanOutLastFiredAt.remove(event.peerId);
         _sendRvListToFriendIfEligible(event.peerId);
         _sendFriendListToFriendIfEligible(event.peerId);
         _mediateCommonFriendsFor(event.peerId);
 
-        final wasPunching =
-            _holePunchTargets.containsKey(event.peerId) ||
+        final wasPunching = _holePunchTargets.containsKey(event.peerId) ||
             _holePunchLocalReady.contains(event.peerId) ||
             _holePunchRemoteReady.contains(event.peerId);
         final completer = _holePunchCompleters.remove(event.peerId);
@@ -3295,8 +3634,7 @@ class GrassrootsNetwork {
           final peer = _peersState.getPeerByPubkeyHex(event.peerId);
           final observedRemote = _udpService!.getRemoteAddress(event.peerId);
           final peerCandidates = _udpCandidatesForPeer(peer);
-          final matchedAdvertisedAddress =
-              observedRemote != null &&
+          final matchedAdvertisedAddress = observedRemote != null &&
               peerCandidates.any((candidate) {
                 final parsed = parseAddressString(candidate);
                 return parsed != null &&
@@ -3321,8 +3659,7 @@ class GrassrootsNetwork {
             // that succeeded, not just any direct path.
             if (peer.hasPublicUdpAddress && matchedAdvertisedAddress) {
               final remote = _udpService!.getRemoteAddress(event.peerId);
-              final reachedAdvertisedAddress =
-                  remote != null &&
+              final reachedAdvertisedAddress = remote != null &&
                   peerCandidates.any((candidate) {
                     final advertised = parseAddressString(candidate);
                     return advertised != null &&
@@ -3354,9 +3691,9 @@ class GrassrootsNetwork {
         debugPrint('UDP peer disconnected: ${event.peerId}');
         final hadPendingPunch =
             _holePunchCompleters.containsKey(event.peerId) ||
-            _holePunchTargets.containsKey(event.peerId) ||
-            _holePunchLocalReady.contains(event.peerId) ||
-            _holePunchRemoteReady.contains(event.peerId);
+                _holePunchTargets.containsKey(event.peerId) ||
+                _holePunchLocalReady.contains(event.peerId) ||
+                _holePunchRemoteReady.contains(event.peerId);
         if (hadPendingPunch) {
           _failHolePunchAttempt(
             event.peerId,
@@ -3457,9 +3794,10 @@ class GrassrootsNetwork {
     final requester = _peersState.getPeerByPubkeyHex(reconnectedFriendHex);
     if (requester == null || !requester.isFriend) return;
 
-    final commonFriendHexes =
-        _peersState.commonFriendHexesWith(reconnectedFriendHex).toList()
-          ..sort();
+    final commonFriendHexes = _peersState
+        .commonFriendHexesWith(reconnectedFriendHex)
+        .toList()
+      ..sort();
     for (final commonHex in commonFriendHexes) {
       if (commonHex == reconnectedFriendHex) continue;
       final common = _peersState.getPeerByPubkeyHex(commonHex);
@@ -3485,22 +3823,51 @@ class GrassrootsNetwork {
   }
 
   void _onUdpPeerDisconnected(String pubkeyHex) {
+    _noiseSessions.resetByPubkeyHex(PeerTransport.udp, pubkeyHex);
     final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
     if (peer == null || !peer.isFriend) return;
 
     // Don't fire the application-level onPeerDisconnected here — the peer
     // may still be reachable via BLE, and BLE/UDP are independent transports.
 
-    final facilitatorCount =
-        store.state.peers.wellConnectedFriends.length +
+    final facilitatorCount = store.state.peers.wellConnectedFriends.length +
         _configuredRendezvousServers().length +
-        store.state.peers.friendRvServers.length;
+        store.state.friendships.friendRvServers.length;
     if (facilitatorCount == 0) return;
 
     debugPrint(
       '[reconnect] UDP path to ${peer.displayName} dropped — fanning out AVAILABLE',
     );
+    _availableFanOutLastFiredAt[pubkeyHex] = DateTime.now();
     unawaited(_signalingService.fanOutAvailable(peer.publicKey));
+  }
+
+  /// Periodically re-fire AVAILABLE for friends that remain UDP-unreachable.
+  ///
+  /// The friend's RV holds AVAILABLE entries for a finite expiry window
+  /// (~5 minutes). If the friend takes longer than that window to deliver
+  /// their matching RECONNECT (e.g. their client is stalled on a stale-cache
+  /// false-positive direct dial), the RV will have dropped our AVAILABLE and
+  /// no pairing can complete. Re-firing every cycle keeps the pairing window
+  /// open until the friend is reachable or we give up the path.
+  void _refireAvailableForUnreachableFriends() {
+    if (_udpService == null || !_udpAvailable) return;
+    final now = DateTime.now();
+    for (final friend in _peersState.friends) {
+      // Skip friends we already have a live UDP connection to.
+      if (_udpService!.getPeerIdForPubkey(friend.publicKey) != null) continue;
+
+      final last = _availableFanOutLastFiredAt[friend.pubkeyHex];
+      if (last != null && now.difference(last) < _availableRefireInterval) {
+        continue;
+      }
+      debugPrint(
+        '[reconnect] Re-firing AVAILABLE for ${friend.displayName} '
+        '(UDP-unreachable for ${last == null ? "unknown" : "${now.difference(last).inSeconds}s"})',
+      );
+      _availableFanOutLastFiredAt[friend.pubkeyHex] = now;
+      unawaited(_signalingService.fanOutAvailable(friend.publicKey));
+    }
   }
 
   /// Clean up resources
@@ -3529,9 +3896,11 @@ class GrassrootsNetwork {
     _holePunchLocalReady.clear();
     _holePunchRemoteReady.clear();
     _holePunchConnectionInProgress.clear();
+    _availableFanOutLastFiredAt.clear();
 
     _messageRouter.dispose();
     _signalingService.dispose();
+    _noiseSessions.dispose();
 
     if (_bleService != null) {
       await _bleService!.dispose();
@@ -3555,6 +3924,7 @@ class GrassrootsNetwork {
       _broadcastAnnounceViaUdp();
       _removeStalePeers();
       _discoverUnreachableFriends();
+      _refireAvailableForUnreachableFriends();
     });
   }
 
@@ -3688,8 +4058,7 @@ class GrassrootsNetwork {
       linkLocalAddress,
       context: 'announce',
     );
-    final includeKnownCandidates =
-        normalizedAddress != null ||
+    final includeKnownCandidates = normalizedAddress != null ||
         normalizedLinkLocal != null ||
         addressCandidates.isNotEmpty;
     final normalizedCandidates = normalizeAddressStrings([
@@ -3726,9 +4095,8 @@ class GrassrootsNetwork {
     String? myAddress,
   }) async {
     var sent = false;
-    final friendPubkeyHex = friendPubkey
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join();
+    final friendPubkeyHex =
+        friendPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
     // Create signed ANNOUNCE packet with our address
     final normalizedAddress = _normalizeAnnouncedUdpAddress(
@@ -3767,8 +4135,7 @@ class GrassrootsNetwork {
       } else {
         final peer = _peersState.getPeerByPubkeyHex(friendPubkeyHex);
         final candidates = _udpCandidatesForPeer(peer);
-        final friendAddress =
-            peer?.udpAddress ??
+        final friendAddress = peer?.udpAddress ??
             (candidates.isNotEmpty ? candidates.first : null);
         if (friendAddress != null && friendAddress.isNotEmpty) {
           final udpSent = await _sendViaUdp(
@@ -3829,7 +4196,7 @@ class GrassrootsNetwork {
   // ===== BLE Fragmentation Helpers =====
 
   /// Send a large payload via BLE using fragmentation.
-  /// Each fragment is individually signed.
+  /// Each fragment is individually encrypted and signed.
   Future<bool> _sendFragmentedViaBle({
     required Uint8List payload,
     required Uint8List recipientPubkey,
@@ -3844,29 +4211,17 @@ class GrassrootsNetwork {
     );
 
     for (final fragment in fragmented.fragments) {
-      await _protocolHandler.signPacket(fragment);
-      final sent = await _bleService!.sendToPeer(
-        bleDeviceId,
-        fragment.serialize(),
+      final bytes = await _signedPacketBytesForTransport(
+        packet: fragment,
+        transport: PeerTransport.bleDirect,
+        recipientPubkey: recipientPubkey,
+        peerId: bleDeviceId,
       );
+      if (bytes == null) return false;
+      final sent = await _bleService!.sendToPeer(bleDeviceId, bytes);
       if (!sent) return false;
       await Future.delayed(FragmentHandler.fragmentDelay);
     }
     return true;
-  }
-
-  /// Broadcast a large payload via BLE using fragmentation.
-  /// Each fragment is individually signed.
-  Future<void> _broadcastFragmentedViaBle({required Uint8List payload}) async {
-    final fragmented = _fragmentHandler.fragment(
-      payload: payload,
-      senderPubkey: identity.publicKey,
-    );
-
-    for (final fragment in fragmented.fragments) {
-      await _protocolHandler.signPacket(fragment);
-      await _bleService!.broadcast(fragment.serialize());
-      await Future.delayed(FragmentHandler.fragmentDelay);
-    }
   }
 }

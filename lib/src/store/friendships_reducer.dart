@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import 'friendships_state.dart';
 import 'friendships_actions.dart';
 
@@ -140,6 +142,31 @@ FriendshipsState friendshipsReducer(FriendshipsState state, FriendshipAction act
     );
     return state.copyWith(
       friendships: Map.from(state.friendships)..[action.peerPubkeyHex] = friendship,
+    );
+  }
+
+  if (action is FriendKnownRvServersUpdatedAction) {
+    final pubkeyHex = action.publicKey
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+    final existing = state.friendships[pubkeyHex];
+    // We only ever receive an RV_LIST from an accepted friend, so a missing
+    // friendship record means the sender isn't (or no longer is) one of our
+    // friends; drop the update silently.
+    if (existing == null || !existing.isAccepted) return state;
+
+    final normalized = <String, String>{
+      for (final entry in action.rvServers.entries)
+        entry.key.toLowerCase(): entry.value,
+    };
+    if (mapEquals(existing.knownRvServers, normalized)) return state;
+
+    final friendship = existing.copyWith(
+      knownRvServers: normalized,
+      updatedAt: DateTime.now(),
+    );
+    return state.copyWith(
+      friendships: Map.from(state.friendships)..[pubkeyHex] = friendship,
     );
   }
 

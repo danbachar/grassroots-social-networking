@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
-import 'package:dart_udx/dart_udx.dart';
+import 'package:grassroots_dart_udx/grassroots_dart_udx.dart';
 
 import 'address_table.dart';
 import 'identity.dart';
+import 'noise_session_manager.dart';
 import 'packet.dart';
 import 'peer_table.dart';
 import 'protocol.dart';
@@ -39,6 +40,7 @@ class AnchorServer {
   late AddressTable _addressTable;
   late SignalingHandler _signalingHandler;
   late SignalingCodec _codec;
+  late NoiseSessionManager _noiseSessions;
 
   final List<_AnchorListener> _listeners = [];
 
@@ -79,6 +81,7 @@ class AnchorServer {
     _peerTable = PeerTable();
     _addressTable = AddressTable();
     _codec = const SignalingCodec();
+    _noiseSessions = NoiseSessionManager(identity: _identity);
 
     _signalingHandler = SignalingHandler(
       protocol: _protocol,
@@ -474,25 +477,115 @@ class AnchorServer {
             observedIp: observedIp,
             observedPort: observedPort,
             localPublicAddress: localPublicAddress);
+      case PacketType.noiseHandshake:
+        await _handleNoiseHandshake(packet);
+      case PacketType.secureSignaling:
+        await _handleSecureSignaling(packet,
+            observedIp: observedIp, observedPort: observedPort);
       case PacketType.signaling:
-        _signalingHandler.processSignaling(
-          packet.senderPubkey,
-          packet.payload,
-          observedIp: observedIp,
-          observedPort: observedPort,
-        );
+        // Plaintext signaling is no longer accepted — clients must wrap
+        // signaling in Noise (secureSignaling). Dropping silently is the
+        // intended behaviour after the legacy cutover.
+        _log('Dropping plaintext signaling from '
+            '${senderHex.substring(0, 8)}... '
+            '(anchor requires Noise-encrypted secureSignaling)');
       case PacketType.message:
       case PacketType.fragmentStart:
       case PacketType.fragmentContinue:
       case PacketType.fragmentEnd:
-        // The rendezvous server never relays message content.
         _log('Dropping ${packet.type} from ${senderHex.substring(0, 8)}... '
             '(rendezvous server does not relay messages)');
       case PacketType.ack:
       case PacketType.nack:
       case PacketType.readReceipt:
+      case PacketType.secureMessage:
+      case PacketType.secureFragmentStart:
+      case PacketType.secureFragmentContinue:
+      case PacketType.secureFragmentEnd:
+      case PacketType.secureAck:
+      case PacketType.secureNack:
+      case PacketType.secureReadReceipt:
         break;
     }
+  }
+
+  /// Process an inbound Noise XX handshake packet from a peer. The anchor is
+  /// always responder — it never initiates a session. If the handshake
+  /// completes (message 3), we send a fresh addrReflect over the freshly
+  /// established session so the peer learns its public address without having
+  /// to wait for another ANNOUNCE cycle.
+  Future<void> _handleNoiseHandshake(GrassrootsPacket packet) async {
+    final senderHex = _pubkeyToHex(packet.senderPubkey);
+    try {
+      final result = await _noiseSessions.handleHandshakePacket(packet);
+      final responsePayload = result.responsePayload;
+      if (responsePayload != null) {
+        final responsePacket = GrassrootsPacket(
+          type: PacketType.noiseHandshake,
+          senderPubkey: _identity.publicKey,
+          recipientPubkey: packet.senderPubkey,
+          payload: responsePayload,
+          signature: Uint8List(64),
+        );
+        await _protocol.signPacket(responsePacket);
+        _sendPacket(senderHex, responsePacket);
+      }
+      if (result.sessionEstablished) {
+        _log('Noise session established with ${senderHex.substring(0, 8)}...');
+        _sendAddrReflectFor(senderHex);
+      }
+    } catch (e) {
+      _log('Failed to process Noise handshake from '
+          '${senderHex.substring(0, 8)}...: $e');
+      _noiseSessions.reset(senderHex);
+    }
+  }
+
+  /// Decrypt an inbound `secureSignaling` packet and feed the plaintext into
+  /// the signaling handler. Drops the packet if no session exists.
+  Future<void> _handleSecureSignaling(
+    GrassrootsPacket packet, {
+    String? observedIp,
+    int? observedPort,
+  }) async {
+    final senderHex = _pubkeyToHex(packet.senderPubkey);
+    if (!_noiseSessions.hasSession(senderHex)) {
+      _log('Dropping secureSignaling from ${senderHex.substring(0, 8)}... '
+          '(no Noise session)');
+      return;
+    }
+    try {
+      final clear = await _noiseSessions.decryptPacket(packet);
+      _signalingHandler.processSignaling(
+        clear.senderPubkey,
+        clear.payload,
+        observedIp: observedIp,
+        observedPort: observedPort,
+      );
+    } catch (e) {
+      _log('Failed to decrypt secureSignaling from '
+          '${senderHex.substring(0, 8)}...: $e');
+      _noiseSessions.reset(senderHex);
+    }
+  }
+
+  /// Send a fresh addrReflect to [pubkeyHex] using the currently-tracked
+  /// observed address. Called right after a Noise session establishes so the
+  /// peer learns its public address promptly rather than waiting for its next
+  /// ANNOUNCE cycle.
+  void _sendAddrReflectFor(String pubkeyHex) {
+    final conn = _peerConnections[pubkeyHex];
+    if (conn == null) return;
+    final reflect = AddrReflectMessage(
+      ip: conn.addr.address,
+      port: conn.port,
+    );
+    final peer = _peerTable.lookupVerified(pubkeyHex);
+    if (peer == null) return;
+    _signalingHandler.sendSignaling?.call(
+      peer.publicKey,
+      _codec.encode(reflect),
+    );
   }
 
   void _handleAnnounce(
@@ -570,21 +663,45 @@ class AnchorServer {
     final senderHex = _identity.pubkeyHex;
     final recipientHex = _pubkeyToHex(recipientPubkey);
     final signalingSummary = _describeSignalingPayload(signalingPayload);
+
+    // The anchor only ships signaling as Noise-encrypted `secureSignaling`. If
+    // no session exists yet, drop silently — the client initiates Noise on its
+    // first signaling attempt, and subsequent anchor-side replies (e.g. the
+    // next addrReflect on the next ANNOUNCE cycle) will land once the session
+    // is up.
+    if (!_noiseSessions.hasSession(recipientHex)) {
+      _log('Skipping signaling reply to ${recipientHex.substring(0, 8)}...: '
+          'no Noise session yet ($signalingSummary)');
+      return false;
+    }
+
     _log('Preparing signaling reply $signalingSummary from '
         '${senderHex.substring(0, 8)}... to ${recipientHex.substring(0, 8)}... '
         '(payload=${signalingPayload.length}B)');
 
-    final packet = _protocol.createSignalingPacket(
+    final clearPacket = _protocol.createSignalingPacket(
       recipientPubkey: recipientPubkey,
       signalingPayload: signalingPayload,
     );
-    await _protocol.signPacket(packet);
-    final serializedLength = packet.serialize().length;
+
+    GrassrootsPacket securePacket;
+    try {
+      securePacket = await _noiseSessions.encryptPacket(
+        clearPacket,
+        remotePubkeyHex: recipientHex,
+      );
+    } catch (e) {
+      _log('Failed to encrypt signaling reply for '
+          '${recipientHex.substring(0, 8)}...: $e');
+      return false;
+    }
+    await _protocol.signPacket(securePacket);
+    final serializedLength = securePacket.serialize().length;
     _log('Signed signaling reply $signalingSummary from '
         '${senderHex.substring(0, 8)}... to ${recipientHex.substring(0, 8)}... '
         '(wire=$serializedLength B)');
 
-    final sent = _sendPacket(recipientHex, packet);
+    final sent = _sendPacket(recipientHex, securePacket);
     _log('Signaling send path for ${recipientHex.substring(0, 8)}... '
         '${sent ? "accepted" : "rejected"} '
         '($signalingSummary)');
@@ -619,6 +736,9 @@ class AnchorServer {
   bool _sendPacket(String pubkeyHex, GrassrootsPacket packet) {
     final conn = _peerConnections[pubkeyHex];
     final packetLabel = packet.type.name;
+    // `secureSignaling` carries an encrypted payload, so we only have a useful
+    // summary while the packet is still in its clear form. The encrypted
+    // branch falls back to a generic label.
     final isSignaling = packet.type == PacketType.signaling;
     final signalingSummary =
         isSignaling ? _describeSignalingPayload(packet.payload) : null;
@@ -727,6 +847,9 @@ class AnchorServer {
     _peerConnections.remove(pubkeyHex);
     _addressToPubkey.remove('${released.addr.address}:${released.port}');
     _addressTable.remove(pubkeyHex);
+    // Once the UDX stream is gone we can't reuse the Noise session — a fresh
+    // session will be negotiated on the next reconnect.
+    _noiseSessions.reset(pubkeyHex);
     _log('Peer disconnected: ${pubkeyHex.substring(0, 8)}... '
         '(address table entry cleared)');
   }

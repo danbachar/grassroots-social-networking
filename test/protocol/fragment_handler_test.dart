@@ -318,10 +318,14 @@ void main() {
 
         // Fragment two different messages
         final payload1 = Uint8List(1000);
-        for (var i = 0; i < 1000; i++) payload1[i] = i % 256;
+        for (var i = 0; i < 1000; i++) {
+          payload1[i] = i % 256;
+        }
 
         final payload2 = Uint8List(1200);
-        for (var i = 0; i < 1200; i++) payload2[i] = (i * 7) % 256;
+        for (var i = 0; i < 1200; i++) {
+          payload2[i] = (i * 7) % 256;
+        }
 
         final fragmented1 = handler.fragment(
           payload: payload1,
@@ -345,13 +349,11 @@ void main() {
         }
 
         // End fragments
-        final result1 =
-            receiver.processFragment(fragmented1.fragments.last);
-        final result2 =
-            receiver.processFragment(fragmented2.fragments.last);
+        final result1 = receiver.processFragment(fragmented1.fragments.last);
+        final result2 = receiver.processFragment(fragmented2.fragments.last);
 
-        expect(result1, equals(payload1));
-        expect(result2, equals(payload2));
+        expect(result1?.payload, equals(payload1));
+        expect(result2?.payload, equals(payload2));
       });
     });
 

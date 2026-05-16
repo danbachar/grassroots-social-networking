@@ -11,6 +11,8 @@ import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
+import '../helpers/sodium_test_bootstrap.dart';
+
 /// Helper to create an ANNOUNCE payload:
 /// [pubkey(32) + version(2) + nickLen(1) + nick + candidateCount(2) + candidates]
 Uint8List buildAnnouncePayload({
@@ -54,7 +56,7 @@ void main() {
 
   late Sodium sodium;
   setUpAll(() async {
-    sodium = await SodiumInit.init();
+    sodium = await initTestSodium();
   });
 
   group('MessageRouter', () {

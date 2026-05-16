@@ -490,12 +490,9 @@ void main() {
 
     test('merges ANNOUNCE fields without dropping non-ANNOUNCE peer state', () {
       final pubkey = _testPubkey(6);
-      final rvPubkey = _testPubkey(60);
       final hex = _pubkeyHex(pubkey);
-      final rvHex = _pubkeyHex(rvPubkey);
       final directReachAt = DateTime.now().subtract(const Duration(minutes: 2));
       const udpAddress = '[2001:db8::6]:4006';
-      const rvAddress = '[2600:1901:8130:98a:0:1::]:9516';
       final initial = PeersState(
         peers: {
           hex: PeerState(
@@ -510,7 +507,6 @@ void main() {
             isFriend: true,
             lastDirectReachAt: directReachAt,
             hasLiveUdpConnection: true,
-            knownRvServers: {rvHex: rvAddress},
           ),
         },
       );
@@ -535,7 +531,6 @@ void main() {
       expect(peer.isFriend, isTrue);
       expect(peer.hasLiveUdpConnection, isTrue);
       expect(peer.lastDirectReachAt, directReachAt);
-      expect(peer.knownRvServers, equals({rvHex: rvAddress}));
     });
 
     test('sets connectionState to connected', () {
@@ -632,47 +627,8 @@ void main() {
       expect(result.peers[hex]!.lastUdpSeen, equals(udpSeenAt));
     });
 
-    test('preserves advertised RV servers across later ANNOUNCE updates', () {
-      final pubkey = _testPubkey(5);
-      final rvPubkey = _testPubkey(50);
-      final hex = _pubkeyHex(pubkey);
-      final rvHex = _pubkeyHex(rvPubkey);
-      const rvAddress = '[2600:1901:8130:98a:0:1::]:9516';
-
-      var state = peersReducer(
-        PeersState.initial,
-        PeerAnnounceReceivedAction(
-          publicKey: pubkey,
-          nickname: 'Dan',
-          protocolVersion: 1,
-          rssi: -48,
-          transport: PeerTransport.udp,
-          udpAddress: '[2a00:a041:e567:f100:4c38:ab70:6484:6f45]:61785',
-        ),
-      );
-
-      state = peersReducer(
-        state,
-        PeerRvServersUpdatedAction(
-          publicKey: pubkey,
-          rvServers: {rvHex: rvAddress},
-        ),
-      );
-
-      state = peersReducer(
-        state,
-        PeerAnnounceReceivedAction(
-          publicKey: pubkey,
-          nickname: 'Dan',
-          protocolVersion: 1,
-          rssi: -45,
-          transport: PeerTransport.bleDirect,
-          bleCentralDeviceId: 'central-dan',
-        ),
-      );
-
-      expect(state.peers[hex]!.knownRvServers, equals({rvHex: rvAddress}));
-    });
+    // The "preserve RV servers across ANNOUNCE updates" invariant moved with
+    // knownRvServers to the friendship record — see friendships_reducer_test.
   });
 
   // =========================================================================
@@ -1466,36 +1422,8 @@ void main() {
       },
     );
 
-    test('friendRvServers aggregates rendezvous servers from friends only', () {
-      final friendPubkey = _testPubkey(10);
-      final strangerPubkey = _testPubkey(11);
-      final rvA = _pubkeyHex(_testPubkey(50));
-      final rvB = _pubkeyHex(_testPubkey(51));
-      final state = PeersState(
-        peers: {
-          _pubkeyHex(friendPubkey): PeerState(
-            publicKey: friendPubkey,
-            nickname: 'Friend',
-            isFriend: true,
-            knownRvServers: {
-              rvA: '[2001:db8::50]:9516',
-              rvB.toUpperCase(): '198.51.100.51:9516',
-            },
-          ),
-          _pubkeyHex(strangerPubkey): PeerState(
-            publicKey: strangerPubkey,
-            nickname: 'Stranger',
-            isFriend: false,
-            knownRvServers: {_pubkeyHex(_testPubkey(52)): '198.51.100.52:9516'},
-          ),
-        },
-      );
-
-      expect(
-        state.friendRvServers,
-        equals({rvA: '[2001:db8::50]:9516', rvB: '198.51.100.51:9516'}),
-      );
-    });
+    // friendRvServers aggregation moved to FriendshipsState (knownRvServers
+    // is now friendship-scoped). Covered by friendships_state_test.
 
     test('stores FRIEND_LIST updates from direct friends only', () {
       final friendPubkey = _testPubkey(20);

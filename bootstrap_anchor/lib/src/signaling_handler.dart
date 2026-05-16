@@ -50,7 +50,11 @@ class SignalingHandler {
   static const _punchCoordinationCooldown = Duration(seconds: 15);
 
   /// How long an unmatched RECONNECT/AVAILABLE waits for its counterpart.
-  static const _pendingExpiry = Duration(seconds: 30);
+  /// Sized to comfortably outlast a network handover on one side: the moving
+  /// peer may take tens of seconds to drop its stale-cached friend address,
+  /// trigger a fresh RECONNECT, complete its Noise handshake with this anchor
+  /// and ship a secureSignaling. 30s was too tight to survive that chain.
+  static const _pendingExpiry = Duration(minutes: 5);
 
   /// Callback to send a signed signaling packet to a peer.
   Future<bool> Function(Uint8List recipientPubkey, Uint8List signalingPayload)?

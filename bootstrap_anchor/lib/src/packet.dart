@@ -13,7 +13,16 @@ enum PacketType {
   ack(0x06),
   nack(0x07),
   readReceipt(0x08),
-  signaling(0x09);
+  signaling(0x09),
+  noiseHandshake(0x0A),
+  secureMessage(0x0B),
+  secureFragmentStart(0x0C),
+  secureFragmentContinue(0x0D),
+  secureFragmentEnd(0x0E),
+  secureAck(0x0F),
+  secureNack(0x10),
+  secureReadReceipt(0x11),
+  secureSignaling(0x12);
 
   final int value;
   const PacketType(this.value);
@@ -23,6 +32,124 @@ enum PacketType {
       (t) => t.value == value,
       orElse: () => throw ArgumentError('Unknown packet type: $value'),
     );
+  }
+
+  /// Whether this packet type carries application data that must be wrapped in
+  /// a Noise transport session before sending. Mirrors the client-side flag in
+  /// lib/src/models/packet.dart.
+  bool get usesSessionSecurity {
+    switch (this) {
+      case PacketType.message:
+      case PacketType.fragmentStart:
+      case PacketType.fragmentContinue:
+      case PacketType.fragmentEnd:
+      case PacketType.ack:
+      case PacketType.nack:
+      case PacketType.readReceipt:
+      case PacketType.signaling:
+        return true;
+      case PacketType.announce:
+      case PacketType.noiseHandshake:
+      case PacketType.secureMessage:
+      case PacketType.secureFragmentStart:
+      case PacketType.secureFragmentContinue:
+      case PacketType.secureFragmentEnd:
+      case PacketType.secureAck:
+      case PacketType.secureNack:
+      case PacketType.secureReadReceipt:
+      case PacketType.secureSignaling:
+        return false;
+    }
+  }
+
+  /// Whether this packet type is an encrypted Noise transport variant.
+  bool get isSessionEncrypted {
+    switch (this) {
+      case PacketType.secureMessage:
+      case PacketType.secureFragmentStart:
+      case PacketType.secureFragmentContinue:
+      case PacketType.secureFragmentEnd:
+      case PacketType.secureAck:
+      case PacketType.secureNack:
+      case PacketType.secureReadReceipt:
+      case PacketType.secureSignaling:
+        return true;
+      case PacketType.announce:
+      case PacketType.message:
+      case PacketType.fragmentStart:
+      case PacketType.fragmentContinue:
+      case PacketType.fragmentEnd:
+      case PacketType.ack:
+      case PacketType.nack:
+      case PacketType.readReceipt:
+      case PacketType.signaling:
+      case PacketType.noiseHandshake:
+        return false;
+    }
+  }
+
+  PacketType get secureVariant {
+    switch (this) {
+      case PacketType.message:
+        return PacketType.secureMessage;
+      case PacketType.fragmentStart:
+        return PacketType.secureFragmentStart;
+      case PacketType.fragmentContinue:
+        return PacketType.secureFragmentContinue;
+      case PacketType.fragmentEnd:
+        return PacketType.secureFragmentEnd;
+      case PacketType.ack:
+        return PacketType.secureAck;
+      case PacketType.nack:
+        return PacketType.secureNack;
+      case PacketType.readReceipt:
+        return PacketType.secureReadReceipt;
+      case PacketType.signaling:
+        return PacketType.secureSignaling;
+      case PacketType.announce:
+      case PacketType.noiseHandshake:
+      case PacketType.secureMessage:
+      case PacketType.secureFragmentStart:
+      case PacketType.secureFragmentContinue:
+      case PacketType.secureFragmentEnd:
+      case PacketType.secureAck:
+      case PacketType.secureNack:
+      case PacketType.secureReadReceipt:
+      case PacketType.secureSignaling:
+        throw StateError('No secure variant for $this');
+    }
+  }
+
+  PacketType get clearVariant {
+    switch (this) {
+      case PacketType.secureMessage:
+        return PacketType.message;
+      case PacketType.secureFragmentStart:
+        return PacketType.fragmentStart;
+      case PacketType.secureFragmentContinue:
+        return PacketType.fragmentContinue;
+      case PacketType.secureFragmentEnd:
+        return PacketType.fragmentEnd;
+      case PacketType.secureAck:
+        return PacketType.ack;
+      case PacketType.secureNack:
+        return PacketType.nack;
+      case PacketType.secureReadReceipt:
+        return PacketType.readReceipt;
+      case PacketType.secureSignaling:
+        return PacketType.signaling;
+      case PacketType.announce:
+      case PacketType.message:
+      case PacketType.fragmentStart:
+      case PacketType.fragmentContinue:
+      case PacketType.fragmentEnd:
+      case PacketType.ack:
+      case PacketType.nack:
+      case PacketType.readReceipt:
+      case PacketType.signaling:
+      case PacketType.noiseHandshake:
+        throw StateError('No clear variant for $this');
+    }
   }
 }
 
@@ -150,7 +277,8 @@ class GrassrootsPacket {
     offset += 64;
 
     if (data.length < offset + payloadLength) {
-      throw FormatException('Incomplete payload: expected $payloadLength bytes');
+      throw FormatException(
+          'Incomplete payload: expected $payloadLength bytes');
     }
     final payload =
         Uint8List.fromList(data.sublist(offset, offset + payloadLength));
@@ -164,6 +292,31 @@ class GrassrootsPacket {
       recipientPubkey: recipientPubkey,
       payload: payload,
       signature: signature,
+    );
+  }
+
+  /// Copy this packet with one or more fields replaced. Used by the Noise
+  /// session manager when swapping a clear packet for its encrypted variant
+  /// (and vice versa).
+  GrassrootsPacket copyWith({
+    PacketType? type,
+    int? ttl,
+    Uint8List? payload,
+    Uint8List? signature,
+    Uint8List? senderPubkey,
+    Uint8List? recipientPubkey,
+    String? packetId,
+    int? timestamp,
+  }) {
+    return GrassrootsPacket(
+      packetId: packetId ?? this.packetId,
+      type: type ?? this.type,
+      ttl: ttl ?? this.ttl,
+      timestamp: timestamp ?? this.timestamp,
+      senderPubkey: senderPubkey ?? this.senderPubkey,
+      recipientPubkey: recipientPubkey ?? this.recipientPubkey,
+      payload: payload ?? this.payload,
+      signature: signature ?? this.signature,
     );
   }
 

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/store/friendships_state.dart';
 import 'package:grassroots_networking/src/store/friendships_actions.dart';
@@ -471,6 +473,142 @@ void main() {
         final newState = friendshipsReducer(state, action);
 
         expect(identical(newState, state), isTrue);
+      });
+    });
+
+    group('FriendKnownRvServersUpdatedAction', () {
+      // 32-byte pubkey whose hex representation is `peerA`.
+      final peerAKey = Uint8List.fromList(List.generate(
+        32,
+        (i) {
+          // `peerA` is the literal hex string declared above; rebuild bytes
+          // from it so the action's publicKey hashes to the same map key.
+          final hex = peerA;
+          return int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+        },
+      ));
+
+      FriendshipsState withAcceptedFriend({
+        Map<String, String> existingRv = const {},
+      }) {
+        final now = DateTime.now();
+        return FriendshipsState(friendships: {
+          peerA: FriendshipState(
+            peerPubkeyHex: peerA,
+            nickname: 'Alice',
+            status: FriendshipStatus.accepted,
+            createdAt: now,
+            updatedAt: now,
+            knownRvServers: existingRv,
+          ),
+        });
+      }
+
+      test('replaces the friend\'s knownRvServers when the friendship is '
+          'accepted', () {
+        final state = withAcceptedFriend();
+        final action = FriendKnownRvServersUpdatedAction(
+          publicKey: peerAKey,
+          rvServers: {
+            'AABB1122': '[2001:db8::50]:9516',
+            'ccdd3344': '198.51.100.51:9516',
+          },
+        );
+
+        final result = friendshipsReducer(state, action);
+
+        final friendship = result.friendships[peerA]!;
+        expect(
+          friendship.knownRvServers,
+          equals({
+            'aabb1122': '[2001:db8::50]:9516',
+            'ccdd3344': '198.51.100.51:9516',
+          }),
+          reason: 'keys should be lowercased on store',
+        );
+      });
+
+      test('is a no-op when the friendship does not exist', () {
+        const state = FriendshipsState.initial;
+        final action = FriendKnownRvServersUpdatedAction(
+          publicKey: peerAKey,
+          rvServers: const {'aabb1122': '[2001:db8::50]:9516'},
+        );
+
+        final result = friendshipsReducer(state, action);
+
+        expect(identical(result, state), isTrue);
+      });
+
+      test('is a no-op when the friendship is not accepted (e.g. pending)', () {
+        final now = DateTime.now();
+        final state = FriendshipsState(friendships: {
+          peerA: FriendshipState(
+            peerPubkeyHex: peerA,
+            nickname: 'Alice',
+            status: FriendshipStatus.pending,
+            createdAt: now,
+            updatedAt: now,
+          ),
+        });
+        final action = FriendKnownRvServersUpdatedAction(
+          publicKey: peerAKey,
+          rvServers: const {'aabb1122': '[2001:db8::50]:9516'},
+        );
+
+        final result = friendshipsReducer(state, action);
+
+        expect(identical(result, state), isTrue);
+      });
+
+      test('is a no-op when the normalized map equals existing', () {
+        final state = withAcceptedFriend(
+          existingRv: const {'aabb1122': '[2001:db8::50]:9516'},
+        );
+        final action = FriendKnownRvServersUpdatedAction(
+          publicKey: peerAKey,
+          rvServers: const {'AABB1122': '[2001:db8::50]:9516'},
+        );
+
+        final result = friendshipsReducer(state, action);
+
+        expect(identical(result, state), isTrue);
+      });
+    });
+
+    group('friendRvServers getter', () {
+      test('aggregates accepted friends\' RV lists, ignores pending/declined',
+          () {
+        final now = DateTime.now();
+        final state = FriendshipsState(friendships: {
+          peerA: FriendshipState(
+            peerPubkeyHex: peerA,
+            nickname: 'Alice',
+            status: FriendshipStatus.accepted,
+            createdAt: now,
+            updatedAt: now,
+            knownRvServers: const {
+              'rv01': '[2001:db8::50]:9516',
+              'rv02': '198.51.100.51:9516',
+            },
+          ),
+          peerB: FriendshipState(
+            peerPubkeyHex: peerB,
+            nickname: 'Bob',
+            status: FriendshipStatus.pending,
+            createdAt: now,
+            updatedAt: now,
+            knownRvServers: const {'rv99': '198.51.100.99:9516'},
+          ),
+        });
+
+        expect(
+          state.friendRvServers,
+          equals({
+            'rv01': '[2001:db8::50]:9516',
+            'rv02': '198.51.100.51:9516',
+          }),
+        );
       });
     });
   });

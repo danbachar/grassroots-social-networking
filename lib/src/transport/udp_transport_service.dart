@@ -773,26 +773,70 @@ class UdpTransportService extends TransportService {
   void mapIncomingConnectionToPubkey(String tempKey, String pubkeyHex) {
     _tempKeyToPubkey[tempKey] = pubkeyHex;
 
-    // Move from pending to established connections
     final pending = _pendingIncoming.remove(tempKey);
-    if (pending != null && !_peerConnections.containsKey(pubkeyHex)) {
-      _peerConnections[pubkeyHex] = _PeerConnection(
-        pubkeyHex: pubkeyHex,
-        udpSocket: pending.udpSocket,
-        stream: pending.stream,
-        addr: pending.addr,
-        port: pending.port,
-      );
+    if (pending == null) return;
+
+    // If a prior connection for this pubkey is still installed, the peer is
+    // reconnecting from a new address. Replace it: tear the old one down
+    // (close stream + socket, drop address mapping, fire a disconnect event
+    // so application-level state — Noise sessions, hole-punch trackers,
+    // PeerUdpConnectionChangedAction — sees the transition) and install the
+    // fresh entry. The outgoing-side connectToPeer path already overwrites
+    // unconditionally; the incoming side needs to match so a peer that moves
+    // (wifi → cellular, etc.) and re-dials us doesn't leave us with two
+    // half-live sessions — one orphan stream feeding receive-side
+    // lastUdpSeen refreshes, the other a dead socket every sendToPeer
+    // disappears into.
+    final existing = _peerConnections[pubkeyHex];
+    if (existing != null) {
+      _addressToPubkey.remove('${existing.addr.address}:${existing.port}');
+
+      // Tear down the prior session. The new incoming UDXSocket is a
+      // distinct multiplexer entry (different source 5-tuple) so closing
+      // the old socket can't take the new one with it; guard anyway.
+      final closeStream = existing.stream;
+      if (closeStream != null && closeStream != pending.stream) {
+        unawaited(closeStream.close().catchError((Object e) {
+          debugPrint('Error closing stale stream for $pubkeyHex: $e');
+        }));
+      }
+      if (!identical(existing.udpSocket, pending.udpSocket)) {
+        unawaited(existing.udpSocket.close().catchError((Object e) {
+          debugPrint('Error closing stale UDPSocket for $pubkeyHex: $e');
+        }));
+      }
 
       _connectionController.add(TransportConnectionEvent(
         peerId: pubkeyHex,
         transport: TransportType.udp,
-        connected: true,
-        isIncoming: true,
+        connected: false,
+        reason: 'Replaced by incoming reconnect from '
+            '${pending.addr.address}:${pending.port}',
       ));
-
-      debugPrint('Mapped incoming connection $tempKey → $pubkeyHex');
+      debugPrint(
+        'Replacing stale UDP session for $pubkeyHex '
+        '(old=${existing.addr.address}:${existing.port}, '
+        'new=${pending.addr.address}:${pending.port})',
+      );
     }
+
+    _peerConnections[pubkeyHex] = _PeerConnection(
+      pubkeyHex: pubkeyHex,
+      udpSocket: pending.udpSocket,
+      stream: pending.stream,
+      addr: pending.addr,
+      port: pending.port,
+    );
+    _addressToPubkey['${pending.addr.address}:${pending.port}'] = pubkeyHex;
+
+    _connectionController.add(TransportConnectionEvent(
+      peerId: pubkeyHex,
+      transport: TransportType.udp,
+      connected: true,
+      isIncoming: true,
+    ));
+
+    debugPrint('Mapped incoming connection $tempKey → $pubkeyHex');
   }
 
   // ===== Raw UDP Fallback Receive =====

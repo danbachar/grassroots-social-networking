@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:redux/redux.dart';
-import 'package:dart_udx/dart_udx.dart';
+import 'package:grassroots_dart_udx/grassroots_dart_udx.dart';
 
 import '../transport/transport_service.dart';
 import '../transport/address_utils.dart';
@@ -25,7 +25,7 @@ const _defaultUdpDisplayInfo = TransportDisplayInfo(
   color: Colors.green,
 );
 
-/// UDP transport service using dart_udx for reliable streams over UDP.
+/// UDP transport service using grassroots_dart_udx for reliable streams over UDP.
 ///
 /// Uses Grassroots's Ed25519 identity directly. Addressing uses simple
 /// ip:port strings.
@@ -524,7 +524,7 @@ class UdpTransportService extends TransportService {
 
     try {
       await conn.stream!.add(data);
-      debugPrint('Sent ${data.length} bytes to peer $peerId');
+      // debugPrint('Sent ${data.length} bytes to peer $peerId');
       return true;
     } catch (e) {
       debugPrint('Failed to send to peer $peerId: $e');
@@ -681,7 +681,7 @@ class UdpTransportService extends TransportService {
       _handleIncomingStream(socket, stream);
     });
 
-    // Flush any buffered streams (race condition fix from dart_udx)
+    // Flush any buffered streams (race condition fix from grassroots_dart_udx)
     socket.flushStreamBuffer();
   }
 
@@ -715,8 +715,8 @@ class UdpTransportService extends TransportService {
         // that matches _peerConnections.
         final effectiveId = _tempKeyToPubkey[tempKey] ?? tempKey;
 
-        debugPrint(
-            'Received ${data.length} bytes from ${socket.remoteAddress}:${socket.remotePort} (id: $effectiveId)');
+        // debugPrint(
+        //     'Received ${data.length} bytes from ${socket.remoteAddress}:${socket.remotePort} (id: $effectiveId)');
 
         // Emit on data stream
         _dataController.add(TransportDataEvent(
@@ -842,7 +842,7 @@ class UdpTransportService extends TransportService {
       (Uint8List data) {
         if (data.isEmpty) return;
 
-        debugPrint('Received ${data.length} bytes from peer $pubkeyHex');
+        // debugPrint('Received ${data.length} bytes from peer $pubkeyHex');
 
         _dataController.add(TransportDataEvent(
           peerId: pubkeyHex,

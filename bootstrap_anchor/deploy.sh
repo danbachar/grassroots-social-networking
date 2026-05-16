@@ -10,6 +10,17 @@
 # Usage:
 #   ./deploy.sh [PROJECT_ID] [REGION] [ZONE]
 #
+# The build context is the bootstrap_anchor directory itself.
+# grassroots_dart_udx (the UDX dependency, formerly vendored from
+# ../dart-udx) is now pulled from pub.dev during `dart pub get` inside
+# the build stage — no sibling source tree is required.
+#
+# Local build / smoke-test (does not deploy):
+#   cd bootstrap_anchor
+#   docker build -t rendezvous-server .
+#   docker run -p 9514:9514/udp -p 9516:9516/udp \
+#     -v "$(pwd)/data:/app/data" rendezvous-server
+#
 # The server is IPv6-only. Clients on IPv4-only networks are considered
 # to have no Internet for Bitchat's purposes.
 #
@@ -86,30 +97,42 @@ gcloud compute firewall-rules create "${NETWORK}-allow-ssh" \
   --source-ranges=0.0.0.0/0 \
   --quiet 2>/dev/null || echo "SSH firewall rule already exists"
 
-# 2. Build Docker image
-# Build from within bootstrap_anchor/ so the build context is self-contained.
-# Copy dart-udx into the context first because it normally lives one directory
-# up (and may be a symlink at the repo root in git worktrees, which BuildKit
-# refuses to follow out of context).
-echo "--- Building Docker image ---"
-cd "$(dirname "$0")"
-DART_UDX_COPY="$(pwd)/dart-udx"
-rm -rf "$DART_UDX_COPY"
-cp -r ../dart-udx "$DART_UDX_COPY"
-trap 'rm -rf "$DART_UDX_COPY"' EXIT
+# 2. Build & push Docker image
+#
+# Build context is the bootstrap_anchor directory itself — grassroots_dart_udx
+# is pulled from pub.dev during `dart pub get`, so no sibling source tree
+# needs to be in the context.
+#
 # --platform linux/amd64 ensures the binary works on x86_64 GCE VMs even
-# when building on Apple Silicon (which would otherwise produce arm64).
-docker build \
+# when building on Apple Silicon. `docker buildx build --push` is used
+# instead of `docker build` + `docker push` so the amd64 image is shipped
+# straight to the registry without being loaded into the local arm64
+# daemon (which can't run it anyway).
+#
+# The default buildx builder on Docker Desktop uses the `docker` driver,
+# which doesn't route amd64 RUN commands through Rosetta on Apple Silicon
+# (RUN fails with `exec format error`). We provision a dedicated
+# `docker-container` driver builder, which spawns its own BuildKit
+# container that does honor Rosetta translation.
+echo "--- Authenticating Docker against Artifact Registry ---"
+gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+BUILDER=grassroots-builder
+if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+  echo "--- Creating buildx builder ($BUILDER, docker-container driver) ---"
+  docker buildx create --name "$BUILDER" --driver docker-container --bootstrap
+fi
+
+echo "--- Building & pushing image ---"
+cd "$(dirname "$0")"
+docker buildx build \
+  --builder "$BUILDER" \
   --platform linux/amd64 \
+  --push \
   -t "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:latest" \
   .
 
-# 3. Push to Artifact Registry
-echo "--- Pushing image ---"
-gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-docker push "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${IMAGE_NAME}:latest"
-
-# 4. Create firewall rule for IPv6 UDP.
+# 3. Create firewall rule for IPv6 UDP.
 echo "--- Creating firewall rule ---"
 if gcloud compute firewall-rules describe "$FIREWALL_RULE_IPV6" \
     --project="$PROJECT_ID" >/dev/null 2>&1; then
@@ -131,7 +154,7 @@ else
     --quiet
 fi
 
-# 5. Reserve static IPv6 address (idempotent — skips if it already exists).
+# 4. Reserve static IPv6 address (idempotent — skips if it already exists).
 #    Static IPv6 is required for reliable inbound routing on GCE; ephemeral
 #    IPv6 addresses may not receive unsolicited inbound traffic in some zones.
 IPV6_ADDR_NAME="${VM_NAME}-ipv6"
@@ -149,7 +172,7 @@ else
     --quiet
 fi
 
-# 6. Create VM (or update existing)
+# 5. Create VM (or update existing)
 echo "--- Creating VM ---"
 DATA_DISK="${VM_NAME}-data"
 
@@ -209,7 +232,7 @@ else
     --zone="$ZONE" --project="$PROJECT_ID" --quiet
 fi
 
-# 7. Report
+# 6. Report
 echo ""
 echo "--- Deployment complete ---"
 echo ""

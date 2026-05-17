@@ -525,7 +525,6 @@ class UdpTransportService extends TransportService {
 
     try {
       await conn.stream!.add(data);
-      // debugPrint('Sent ${data.length} bytes to peer $peerId');
       return true;
     } catch (e) {
       debugPrint('Failed to send to peer $peerId: $e');
@@ -914,6 +913,95 @@ class UdpTransportService extends TransportService {
         }
       },
     );
+  }
+
+  /// Probe each bound RawDatagramSocket to verify it still accepts sends.
+  /// On Android in particular, a socket that was live when the app went to
+  /// background can come back in a permanently-EPERM state — the file
+  /// descriptor is "open" but every sendto() fails (errno 1, Operation not
+  /// permitted) because the OS policy that blocked sends during background
+  /// poisoned the socket session. The only fix is close + rebind.
+  ///
+  /// Call this on app foreground. If any family is dead, the whole UDP
+  /// transport is torn down and re-initialized — peer connections that
+  /// were riding the dead multiplexer are closed and a disconnect event is
+  /// emitted per peer so `GrassrootsNetwork` can re-establish RV sessions
+  /// on the fresh sockets.
+  ///
+  /// Returns true if any rebind happened.
+  Future<bool> probeAndRebindIfDead() async {
+    if (_rawSockets.isEmpty) return false;
+
+    final dead = <InternetAddressType>[];
+    final probe = Uint8List.fromList(const [0]);
+    for (final entry in _rawSockets.entries) {
+      final family = entry.key;
+      final socket = entry.value;
+      final loopback = family == InternetAddressType.IPv6
+          ? InternetAddress.loopbackIPv6
+          : InternetAddress.loopbackIPv4;
+      final familyLabel =
+          family == InternetAddressType.IPv6 ? "IPv6" : "IPv4";
+      try {
+        final n = socket.send(probe, loopback, 1);
+        if (n <= 0) {
+          debugPrint('[probe] $familyLabel wrote $n bytes on probe — dead');
+          dead.add(family);
+        }
+      } catch (e) {
+        debugPrint('[probe] $familyLabel probe threw $e — dead');
+        dead.add(family);
+      }
+    }
+
+    if (dead.isEmpty) {
+      debugPrint('[probe] UDP sockets healthy');
+      return false;
+    }
+
+    debugPrint('[probe] Rebinding UDP transport — '
+        '${dead.length} dead family/families: '
+        '${dead.map((f) => f == InternetAddressType.IPv6 ? "IPv6" : "IPv4").join(", ")}');
+
+    // Tear down peer connections + multiplexer (keeps _rawSockets around so
+    // stop() doesn't try to use them; we close those ourselves next).
+    final closedPeers = _peerConnections.keys.toList();
+    await stop();
+
+    // Close every raw socket — easier to rebuild the entire stack than to
+    // surgically rebind just the dead families.
+    for (final s in _rawSockets.values) {
+      try {
+        s.close();
+      } catch (_) {}
+    }
+    _rawSockets.clear();
+    _localPorts.clear();
+    _rawSocket = null;
+    _localPort = null;
+    _activeAddressType = null;
+
+    // Notify the coordinator that everyone got disconnected so it can
+    // re-establish (the dead sockets took their peers down with them).
+    for (final pubkeyHex in closedPeers) {
+      if (!_connectionController.isClosed) {
+        _connectionController.add(TransportConnectionEvent(
+          peerId: pubkeyHex,
+          transport: TransportType.udp,
+          connected: false,
+          reason: 'Transport rebound after socket death',
+        ));
+      }
+    }
+
+    _setState(TransportState.uninitialized);
+    final ok = await initialize();
+    if (!ok) {
+      debugPrint('[probe] Re-initialize failed after socket death');
+      return true;
+    }
+    startMultiplexer();
+    return true;
   }
 
   // ===== Internal =====

@@ -3850,7 +3850,7 @@ class GrassrootsNetwork {
   /// false-positive direct dial), the RV will have dropped our AVAILABLE and
   /// no pairing can complete. Re-firing every cycle keeps the pairing window
   /// open until the friend is reachable or we give up the path.
-  void _refireAvailableForUnreachableFriends() {
+  void _refireAvailableForUnreachableFriends({bool force = false}) {
     if (_udpService == null || !_udpAvailable) return;
     final now = DateTime.now();
     for (final friend in _peersState.friends) {
@@ -3858,16 +3858,43 @@ class GrassrootsNetwork {
       if (_udpService!.getPeerIdForPubkey(friend.publicKey) != null) continue;
 
       final last = _availableFanOutLastFiredAt[friend.pubkeyHex];
-      if (last != null && now.difference(last) < _availableRefireInterval) {
+      if (!force &&
+          last != null &&
+          now.difference(last) < _availableRefireInterval) {
         continue;
       }
       debugPrint(
         '[reconnect] Re-firing AVAILABLE for ${friend.displayName} '
-        '(UDP-unreachable for ${last == null ? "unknown" : "${now.difference(last).inSeconds}s"})',
+        '(UDP-unreachable for ${last == null ? "unknown" : "${now.difference(last).inSeconds}s"}${force ? ", forced" : ""})',
       );
       _availableFanOutLastFiredAt[friend.pubkeyHex] = now;
       unawaited(_signalingService.fanOutAvailable(friend.publicKey));
     }
+  }
+
+  /// Called by the host app when it returns to the foreground.
+  ///
+  /// Three steps, in order:
+  ///   1. Probe the raw UDP sockets and rebind the transport if the OS
+  ///      poisoned them while we were backgrounded (Android in particular
+  ///      EPERMs background sends and leaves the socket FD in a permanently
+  ///      broken state — fixable only by close + bind).
+  ///   2. Re-sync configured rendezvous servers (existing UDX sessions may
+  ///      be talking to a stale CID, or the rebind in step 1 just dropped
+  ///      every session).
+  ///   3. Force-refire AVAILABLE for unreachable friends, bypassing the
+  ///      5-minute throttle. Waking up is a strong signal the user is about
+  ///      to interact; latency matters more than RV bandwidth here.
+  Future<void> onAppResumed() async {
+    debugPrint('[lifecycle] App resumed — probing sockets, re-syncing RVs');
+    if (_udpService != null && _udpAvailable) {
+      final rebound = await _udpService!.probeAndRebindIfDead();
+      if (rebound) {
+        debugPrint('[lifecycle] UDP transport rebound after foreground probe');
+      }
+    }
+    unawaited(_syncConfiguredRendezvous(reason: 'app-resumed'));
+    _refireAvailableForUnreachableFriends(force: true);
   }
 
   /// Clean up resources

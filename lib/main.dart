@@ -354,7 +354,7 @@ class GrassrootsHome extends StatefulWidget {
 }
 
 class _GrassrootsHomeState extends State<GrassrootsHome>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   GrassrootsIdentity? _identity;
   GrassrootsNetwork? _grassroots;
   Timer? _refreshTimer;
@@ -397,6 +397,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // Subscribe to Redux store changes - this handles all state updates
     appStore.onChange.listen((_) {
       if (mounted) setState(() {});
@@ -437,12 +438,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _connectivitySubscription?.cancel();
     _refreshTimer?.cancel();
     _grassroots?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    debugPrint('[lifecycle] App state -> $state');
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_grassroots?.onAppResumed() ?? Future.value());
+    }
   }
 
   Future<void> _initialize() async {

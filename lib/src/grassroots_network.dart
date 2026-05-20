@@ -466,6 +466,15 @@ class GrassrootsNetwork {
     );
   }
 
+  /// Force a fresh public-address discovery attempt, bypassing the seeip cache.
+  ///
+  /// Invoked by the UI when the user taps "Retry" on the no-public-address
+  /// warning. Friend/RV reflection runs on its own cadence and is not poked
+  /// here; this only re-runs seeip-based discovery.
+  Future<void> retryPublicAddressDiscovery() async {
+    _publicAddressDiscovery.invalidateCache();
+    await _discoverPublicAddress();
+  }
 
   // ===== Lifecycle =====
 
@@ -821,7 +830,11 @@ class GrassrootsNetwork {
   bool _canDialUdpAddress(AddressInfo address) =>
       _udpService != null &&
       _udpAvailable &&
-      _udpService!.canDialAddress(address.ip);
+      _connectionService.selectBestPairFromAddresses(
+            localAddresses: _connectionLocalCandidates(),
+            remoteAddresses: [address.toAddressString()],
+          ) !=
+          null;
 
   void _resetRendezvousBackoff([String? configKey]) {
     if (configKey == null) {
@@ -834,6 +847,22 @@ class GrassrootsNetwork {
     _rendezvousRetryAfter.remove(configKey);
     _rendezvousLastFailureKind.remove(configKey);
     _lastRendezvousSuppressionLogKey.remove(configKey);
+  }
+
+  /// Clear per-friend proactive-UDP backoff state.
+  ///
+  /// Invoked when our own public address changes, because the prior failures
+  /// were observed through the previous network path: the OS UDP socket may
+  /// have been rebound and NAT mappings invalidated, so the reason for those
+  /// failures may no longer apply. Mirrors [_resetRendezvousBackoff].
+  void _resetAutoUdpBackoff() {
+    if (_autoUdpRetryAfter.isEmpty && _autoUdpLastAddress.isEmpty) return;
+    debugPrint(
+      '[auto-udp] Resetting per-friend backoff '
+      '(${_autoUdpRetryAfter.length} entries) after public-address change',
+    );
+    _autoUdpRetryAfter.clear();
+    _autoUdpLastAddress.clear();
   }
 
   void _logRendezvousSuppression(String configKey, String key, String message) {
@@ -1842,6 +1871,10 @@ class GrassrootsNetwork {
     final previousCandidates = _publicAddressCandidates;
     final discoveredCandidates = <String>{};
 
+    // Clear the failure flag while an attempt is in flight so the UI hides
+    // the warning during retry.
+    store.dispatch(PublicAddressDiscoveryFailedAction(false));
+
     for (final family in const [
       InternetAddressType.IPv6,
       InternetAddressType.IPv4,
@@ -1874,6 +1907,7 @@ class GrassrootsNetwork {
       if (publicAddr != previousAddress ||
           !setEquals(_publicAddressCandidates, previousCandidates)) {
         _resetRendezvousBackoff();
+        _resetAutoUdpBackoff();
         unawaited(_syncConfiguredRendezvous(reason: 'public-address-updated'));
       }
     } else {
@@ -1887,6 +1921,13 @@ class GrassrootsNetwork {
     final bestIp = _publicAddressDiscovery.bestPublicIp;
     if (bestIp != null) {
       store.dispatch(PublicIpUpdatedAction(bestIp.address));
+    }
+
+    // If we still have neither a full public address nor any reflected/
+    // discovered IP, flag discovery as failed so the UI can warn the user.
+    final transports = store.state.transports;
+    if (transports.publicAddress == null && transports.publicIp == null) {
+      store.dispatch(PublicAddressDiscoveryFailedAction(true));
     }
 
     // Discover link-local IPv6 for same-LAN fallback.
@@ -2122,26 +2163,16 @@ class GrassrootsNetwork {
       ]);
 
   Set<String> _connectionLocalCandidates() {
-    final candidates = _candidateAddresses(includeLinkLocal: true);
     final udpService = _udpService;
-    if (udpService == null) return candidates;
+    if (udpService == null) return const {};
 
-    for (final family in udpService.activeAddressTypes) {
-      final hasFamily = candidates.any((address) {
+    return normalizeAddressStrings(
+      _candidateAddresses(includeLinkLocal: true).where((address) {
         final parsed = parseAddressString(address);
-        return parsed?.ip.type == family;
-      });
-      if (hasFamily) continue;
-
-      final port = udpService.localPortForAddressType(family);
-      if (port == null) continue;
-      final bindAddress = family == InternetAddressType.IPv6
-          ? InternetAddress.anyIPv6
-          : InternetAddress.anyIPv4;
-      candidates.add(AddressInfo(bindAddress, port).toAddressString());
-    }
-
-    return candidates;
+        return parsed != null &&
+            udpService.activeAddressTypes.contains(parsed.ip.type);
+      }),
+    );
   }
 
   Set<String> _udpCandidatesForPeer(
@@ -2155,27 +2186,26 @@ class GrassrootsNetwork {
         fallbackAddress,
       ]);
 
-  AddressInfo? _selectUdpRemoteCandidate(
+  AddressCandidatePair? _selectUdpCandidatePair(
     Set<String> remoteCandidates, {
     required String context,
     String? peerLabel,
   }) {
-    final local = parseAddressCandidates(_connectionLocalCandidates());
-    final remote = parseAddressCandidates(remoteCandidates);
-    final pair = _connectionService.selectBestPair(
-      localCandidates: local,
-      remoteCandidates: remote,
+    final localCandidates = _connectionLocalCandidates();
+    final pair = _connectionService.selectBestPairFromAddresses(
+      localAddresses: localCandidates,
+      remoteAddresses: remoteCandidates,
     );
     if (pair == null) {
       final label = peerLabel != null ? ' for $peerLabel' : '';
       debugPrint(
         '[$context] No compatible UDP candidate pair$label: '
-        'local=${local.map((e) => e.toAddressString()).toSet()}, '
+        'local=$localCandidates, '
         'remote=$remoteCandidates',
       );
       return null;
     }
-    return pair.remote;
+    return pair;
   }
 
   GrassrootsPacket _createSignalingPacket(
@@ -2435,18 +2465,24 @@ class GrassrootsNetwork {
     final iAmInitiator = myPubkeyHex.compareTo(pubkeyHex) < 0;
     final peer = store.state.peers.getPeerByPubkeyHex(pubkeyHex);
 
-    final remoteCandidates = _udpCandidatesForPeer(
-      peer,
-      fallbackAddress: udpAddress,
-    );
-    final addr = _selectUdpRemoteCandidate(
+    // After coordinated hole-punching, both sides punched a specific target.
+    // Keep the UDX connect on that target instead of re-selecting a different
+    // advertised candidate that did not just get its NAT mapping opened.
+    final remoteCandidates = performPreConnectPunch
+        ? _udpCandidatesForPeer(
+            peer,
+            fallbackAddress: udpAddress,
+          )
+        : normalizeAddressStrings([udpAddress]);
+    final pair = _selectUdpCandidatePair(
       remoteCandidates,
       context: 'udp-send',
       peerLabel: peerShort,
     );
-    if (addr == null) {
+    if (pair == null) {
       return false;
     }
+    final addr = pair.remote;
     final selectedAddress = addr.toAddressString();
 
     if (!isRendezvous && !iAmInitiator) {
@@ -2521,7 +2557,7 @@ class GrassrootsNetwork {
       debugPrint(
         '[udp-send] Trying direct BLE-assisted hole-punch to $peerShort...',
       );
-      return _attemptDirectPunchWithPeer(peer, addr);
+      return _attemptDirectPunchWithPeer(peer, pair);
     }
 
     return false;
@@ -2610,17 +2646,20 @@ class GrassrootsNetwork {
           final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
           if (peer != null && peer.isFriend) {
             if (_hasLiveBlePath(peer)) {
-              final addr = _parseSupportedUdpAddress(
-                normalizedAddress,
-                context: 'auto-udp',
+              final pair = _selectUdpCandidatePair(
+                _udpCandidatesForPeer(
+                  peer,
+                  fallbackAddress: normalizedAddress,
+                ),
+                context: 'auto-udp-direct-punch',
                 peerLabel: peer.displayName,
               );
-              if (addr != null) {
+              if (pair != null) {
                 debugPrint(
                   '[auto-udp] Direct connect to '
                   '${pubkeyHex.substring(0, 8)} failed, trying direct BLE-assisted hole-punch...',
                 );
-                if (await _attemptDirectPunchWithPeer(peer, addr)) {
+                if (await _attemptDirectPunchWithPeer(peer, pair)) {
                   _autoUdpRetryAfter.remove(pubkeyHex);
                   return;
                 }
@@ -2673,10 +2712,12 @@ class GrassrootsNetwork {
   /// their advertised UDP address timed out.
   Future<bool> _attemptDirectPunchWithPeer(
     PeerState peer,
-    AddressInfo targetAddr,
+    AddressCandidatePair candidatePair,
   ) async {
     final peerHex = peer.pubkeyHex;
     final peerName = peer.displayName;
+    final myAddr = candidatePair.local;
+    final targetAddr = candidatePair.remote;
 
     if (_udpService == null || !_udpAvailable) {
       debugPrint(
@@ -2697,23 +2738,6 @@ class GrassrootsNetwork {
       return false;
     }
 
-    final myAddress = udpAddress;
-    if (myAddress == null || myAddress.isEmpty) {
-      debugPrint(
-        '[direct-punch] No public UDP address available for $peerName',
-      );
-      return false;
-    }
-
-    final myAddr = _parseSupportedUdpAddress(
-      myAddress,
-      context: 'direct-punch',
-      peerLabel: peerName,
-    );
-    if (myAddr == null) {
-      return false;
-    }
-
     if (_holePunchCompleters.containsKey(peerHex)) {
       debugPrint(
         '[direct-punch] Reusing in-flight hole-punch attempt for $peerName',
@@ -2723,7 +2747,8 @@ class GrassrootsNetwork {
     }
 
     debugPrint(
-      '[direct-punch] Asking $peerName to punch toward $myAddress '
+      '[direct-punch] Asking $peerName to punch toward '
+      '${myAddr.toAddressString()} '
       'via direct friend signaling...',
     );
     final sent = await _signalingService.requestDirectPunch(
@@ -2814,10 +2839,16 @@ class GrassrootsNetwork {
       _failHolePunchAttempt(peerHex, 'Invalid punch target address');
       return;
     }
-    if (_udpService == null || !_udpService!.canDialAddress(targetIp)) {
+    final targetAddress = AddressInfo(targetIp, port);
+    if (_udpService == null ||
+        _connectionService.selectBestPairFromAddresses(
+              localAddresses: _connectionLocalCandidates(),
+              remoteAddresses: [targetAddress.toAddressString()],
+            ) ==
+            null) {
       debugPrint(
         '[hole-punch] Unsupported address family in punch initiate: '
-        '$ip:$port. Current UDP socket cannot use '
+        '$ip:$port. No local advertised candidate can use '
         '${targetIp.type == InternetAddressType.IPv6 ? "IPv6" : "IPv4"}.',
       );
       _failHolePunchAttempt(peerHex, 'Unsupported address family');
@@ -2831,7 +2862,7 @@ class GrassrootsNetwork {
       return;
     }
 
-    _holePunchTargets[peerHex] = AddressInfo(targetIp, port);
+    _holePunchTargets[peerHex] = targetAddress;
 
     // Send punch packets to open NAT mappings on both sides.
     debugPrint('[hole-punch] Sending punch packets to $ip:$port...');
@@ -3501,6 +3532,7 @@ class GrassrootsNetwork {
       _publicAddress = reflected;
       store.dispatch(PublicAddressUpdatedAction(reflected));
       _resetRendezvousBackoff();
+      _resetAutoUdpBackoff();
       unawaited(_syncConfiguredRendezvous(reason: 'reflected-address-updated'));
     };
   }

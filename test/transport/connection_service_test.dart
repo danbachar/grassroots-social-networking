@@ -65,5 +65,37 @@ void main() {
 
       expect(pair, isNull);
     });
+
+    test('checks all advertised candidates from both peers', () {
+      final pair = service.selectBestPairFromAddresses(
+        localAddresses: {
+          '198.51.100.10:5001',
+        },
+        remoteAddresses: {
+          '[2606:4700::2]:6000',
+          '198.51.100.20:6001',
+        },
+      );
+
+      expect(pair, isNotNull);
+      expect(pair!.priority, AddressPairPriority.ipv4);
+      expect(pair.local.ip.type, InternetAddressType.IPv4);
+      expect(pair.remote.toAddressString(), '198.51.100.20:6001');
+    });
+
+    test('does not treat wildcard bind addresses as usable candidates', () {
+      final pair = service.selectBestPairFromAddresses(
+        localAddresses: {
+          '[::]:5000',
+          '0.0.0.0:5001',
+        },
+        remoteAddresses: {
+          '[2606:4700::2]:6000',
+          '198.51.100.20:6001',
+        },
+      );
+
+      expect(pair, isNull);
+    });
   });
 }

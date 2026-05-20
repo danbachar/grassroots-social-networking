@@ -35,6 +35,16 @@ enum AddressPairPriority {
 class UdpConnectionService {
   const UdpConnectionService();
 
+  AddressCandidatePair? selectBestPairFromAddresses({
+    required Iterable<String> localAddresses,
+    required Iterable<String> remoteAddresses,
+  }) {
+    return selectBestPair(
+      localCandidates: parseAddressCandidates(localAddresses),
+      remoteCandidates: parseAddressCandidates(remoteAddresses),
+    );
+  }
+
   AddressCandidatePair? selectBestPair({
     required Iterable<AddressInfo> localCandidates,
     required Iterable<AddressInfo> remoteCandidates,
@@ -65,6 +75,7 @@ class UdpConnectionService {
     InternetAddress remote,
   ) {
     if (local.type != remote.type) return null;
+    if (_isUnspecified(local) || _isUnspecified(remote)) return null;
 
     if (_isSameSubnetLinkLocalPair(local, remote)) {
       return AddressPairPriority.linkLocalSameSubnet;
@@ -107,6 +118,17 @@ class UdpConnectionService {
       return true;
     }
 
+    return false;
+  }
+
+  bool _isUnspecified(InternetAddress address) {
+    final bytes = address.rawAddress;
+    if (address.type == InternetAddressType.IPv4) {
+      return bytes.length == 4 && bytes.every((byte) => byte == 0);
+    }
+    if (address.type == InternetAddressType.IPv6) {
+      return bytes.length == 16 && bytes.every((byte) => byte == 0);
+    }
     return false;
   }
 

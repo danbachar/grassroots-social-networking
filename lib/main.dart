@@ -2274,6 +2274,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),
+          onRetryPublicAddressDiscovery: _grassroots == null
+              ? null
+              : () => _grassroots!.retryPublicAddressDiscovery(),
         ),
       ),
     );

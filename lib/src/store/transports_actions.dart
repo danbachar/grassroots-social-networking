@@ -41,6 +41,17 @@ class PublicIpUpdatedAction extends TransportAction {
   PublicIpUpdatedAction(this.publicIp);
 }
 
+/// Sets the publicAddressDiscoveryFailed flag in transports state.
+///
+/// Dispatched with `failed: true` when seeip-based discovery finishes without
+/// producing an address. Dispatched with `failed: false` when a new attempt
+/// starts (so the UI can hide the warning while retrying).
+class PublicAddressDiscoveryFailedAction extends TransportAction {
+  final bool failed;
+
+  PublicAddressDiscoveryFailedAction(this.failed);
+}
+
 /// Clears the discovered public address and public IP.
 class ClearPublicConnectivityAction extends TransportAction {}
 

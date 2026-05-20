@@ -51,6 +51,20 @@ Consume peer link & \func{consumePeerLink(uri)} $\to$ \code{PubKey} & Parse an i
 \bottomrule
 \end{longtable}
 %------------------------------------------------------------------------------
+\subsection{Cold Calls and Trust Levels}
+\label{sec:cold-call-trust}
+%------------------------------------------------------------------------------
+A \emph{cold call} is a first-contact connection attempt between two agents that do not already share an accepted peer relationship or an active authenticated application channel. Cold calls may be initiated by a nearby BLE encounter or by an explicit deep-link shared out-of-band.
+
+Agents may enforce one of two cold-call trust levels across all media:
+\begin{itemize}
+\item \textbf{Open:} The agent accepts unsolicited cold calls from nearby peers discovered through BLE encounters.
+\item \textbf{Closed:} The agent rejects unsolicited cold calls from nearby BLE encounters.
+\end{itemize}
+Explicit cold-calls through deep-links shared out-of-band are not affected by the different trust levels, and can be accepted regardless of the configured trust level.
+
+These trust levels govern who may initiate first contact; they do not change BLE discovery, transport authentication, or rendezvous mechanics once a connection attempt is allowed.
+%------------------------------------------------------------------------------
 \subsection{Point-to-Point Communication}
 \label{sec:p2p}
 %------------------------------------------------------------------------------

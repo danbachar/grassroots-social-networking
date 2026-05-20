@@ -15,6 +15,17 @@ Upon establishing the UDX stream, the peers perform a mutual authentication hand
 \func{onPeerConnected(cb)} fires when the UDX stream is established and authenticated. \func{onPeerDisconnected(cb)} fires when the stream drops.
 
 %------------------------------------------------------------------------------
+\subsection{IP Cold-Call Bootstrap}
+\label{sec:ip-cold-call}
+%------------------------------------------------------------------------------
+Cold-call trust policy is medium-agnostic and defined in Section~\ref{sec:cold-call-trust}. Over IP, an allowed cold call is bootstrapped by a deep-link sent out-of-band from agent~$A$ to agent~$B$.  The deep-link is encoded and contains: (i)~$A$'s public key, (ii)~$A$'s nickname, (iii)~at least one rendezvous (RV) server address used by~$A$, and (iv)~$A$'s current public IP:port address.
+
+When~$B$ opens the deep-link in the app, \func{consumePeerLink(uri)} parses and registers~$A$'s identity and then attempts to establish connectivity using the included address and RV information (Section~\ref{sec:discovery}).  For the cold-call to succeed, one of the following requirements must hold: \begin{itemize}
+    \item $A$ is well-connected and can accept unsolicited requests to its advertised IP:port (without hole-punching), or
+    \item $A$ has an active connection to at least one rendezvous server, so rendezvous bootstrap can proceed (Section~\ref{sec:rendezvous}).
+\end{itemize}
+
+%------------------------------------------------------------------------------
 \subsection{IP Communication}
 \label{sec:ip-comm}
 %------------------------------------------------------------------------------

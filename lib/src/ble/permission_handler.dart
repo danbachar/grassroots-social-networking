@@ -6,22 +6,21 @@ import 'package:flutter/foundation.dart';
 enum PermissionResult {
   /// All required permissions granted
   granted,
-  
+
   /// Some permissions denied
   denied,
-  
+
   /// Permissions permanently denied (need to go to settings)
   permanentlyDenied,
 }
 
 /// Handles permission requests for BLE functionality.
-/// 
+///
 /// Required permissions:
 /// - Android 12+: BLUETOOTH_SCAN, BLUETOOTH_CONNECT, BLUETOOTH_ADVERTISE
 /// - Android <12: BLUETOOTH, BLUETOOTH_ADMIN, ACCESS_FINE_LOCATION
-/// - iOS: Bluetooth (handled automatically), Location for background
+/// - iOS: Bluetooth usage strings in Info.plist; CoreBluetooth prompts when used
 class PermissionHandler {
-  
   /// Check if all required permissions are granted
   Future<bool> hasRequiredPermissions() async {
     if (Platform.isAndroid) {
@@ -31,24 +30,24 @@ class PermissionHandler {
     }
     return false;
   }
-  
+
   /// Request all required permissions
-  /// 
+  ///
   /// Returns [PermissionResult] indicating success/failure
   Future<PermissionResult> requestPermissions() async {
     debugPrint('Requesting BLE permissions');
-    
+
     if (Platform.isAndroid) {
       return await _requestAndroidPermissions();
     } else if (Platform.isIOS) {
       return await _requestIOSPermissions();
     }
-    
+
     return PermissionResult.denied;
   }
-  
+
   // ===== Android =====
-  
+
   Future<bool> _checkAndroidPermissions() async {
     // BLUETOOTH_SCAN/CONNECT/ADVERTISE are runtime on API 31+ and a no-op
     // (granted by manifest) on API 23-30. Either way checking them works.
@@ -114,9 +113,9 @@ class PermissionHandler {
     debugPrint('BLE permissions granted (location is optional)');
     return PermissionResult.granted;
   }
-  
+
   // ===== iOS =====
-  
+
   Future<bool> _checkIOSPermissions() async {
     // iOS handles Bluetooth permissions automatically via Info.plist
     // since iOS 13+. No need to check bluetooth permission explicitly.
@@ -124,14 +123,15 @@ class PermissionHandler {
     debugPrint('iOS: Bluetooth permissions handled by Info.plist');
     return true;
   }
-  
+
   Future<PermissionResult> _requestIOSPermissions() async {
     // iOS 13+ handles Bluetooth automatically via Info.plist
     // No explicit permission request needed for Bluetooth
-    debugPrint('iOS: Bluetooth permissions granted automatically via Info.plist');
+    debugPrint(
+        'iOS: Bluetooth permissions granted automatically via Info.plist');
     return PermissionResult.granted;
   }
-  
+
   /// Open app settings for manual permission grant
   Future<bool> openSettings() async {
     return await openAppSettings();

@@ -3990,6 +3990,11 @@ class GrassrootsNetwork {
   /// Start the periodic scan timer
   void _startScanTimer() {
     _scanTimer?.cancel();
+    if (config.scanDuration == null) {
+      // BLE start() already requested a continuous scan. Do not replace it
+      // with the finite default scan window from BleTransportService.scan().
+      return;
+    }
     _scanTimer = Timer.periodic(config.scanInterval, (_) {
       // debugPrint('Scan timer is up! Scanning for new devices 📡');
       _periodicScan();
@@ -4067,7 +4072,6 @@ class GrassrootsNetwork {
           )
         : await _createSignedAnnounce();
 
-    // debugPrint('[ble-announce] payload size=${announce.length}');
     final sent = await _bleService!.sendToPeer(deviceId, announce);
     if (sent) {
       if (isFriend) {
@@ -4075,9 +4079,6 @@ class GrassrootsNetwork {
       } else {
         _bleFriendAnnounceSent.remove(deviceId);
       }
-      debugPrint(
-        '[ble-announce] Sent immediate ANNOUNCE to $deviceId (friend: $isFriend)',
-      );
     } else {
       debugPrint('[ble-announce] Failed to send ANNOUNCE to $deviceId');
     }

@@ -18,6 +18,8 @@ Grassroots Networking is a **peer-to-peer messaging transport** — a thin layer
 
 When refactoring, DO NOT keep old code "for legacy" or "for compatibility". Fully replace old implementations, remove unused imports and dead code, and update all call sites. Use the Redux store (`AppState`) exclusively for shared state — no mutable singletons.
 
+This applies to **wire-format decoders too**: when you add a field to a packet, do not write the decoder to "gracefully handle truncated/old payloads where the field is missing." There is no old version in the wild — the new field is required, and a payload that lacks it is malformed and must throw. Tolerance for a hypothetical previous version is a compatibility shim by another name.
+
 ## No Store-and-Forward / No Relaying
 
 Grassroots does NOT cache, relay, or forward messages on behalf of other peers. A send either succeeds (recipient is online and reachable) or fails immediately. The application layer handles retry. This is a deliberate design choice — keeping the transport layer stateless and simple.

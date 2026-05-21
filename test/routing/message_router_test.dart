@@ -232,15 +232,11 @@ void main() {
         expect(peer!.bleDeviceId, equals('ble-device-1'));
       });
 
-      test('resolves BLE announce from scan-discovered service UUID', () async {
-        // The peripheral receives the ANNOUNCE with the per-packet RSSI from
-        // the BLE plugin (-58). The scan-discovered entry (-48) is only used
-        // to resolve the BLE device ID/role — RSSI now comes from the live
-        // packet, not the older advertisement cache.
+      test('uses scan RSSI when BLE announce arrives without payload RSSI',
+          () async {
         store.dispatch(BleDeviceDiscoveredAction(
           deviceId: 'scan-device-1',
-          serviceUuid: GrassrootsIdentity.deriveServiceUuid(otherPubkey),
-          rssi: -48,
+          rssi: -42,
         ));
 
         final payload = buildAnnouncePayload(pubkey: otherPubkey);
@@ -252,13 +248,37 @@ void main() {
         await router.processPacket(
           p,
           transport: PeerTransport.bleDirect,
-          rssi: -58,
+          bleDeviceId: 'scan-device-1',
+          bleRole: BleRole.central,
+          rssi: null,
         );
 
         final peer = store.state.peers.getPeerByPubkey(otherPubkey);
         expect(peer, isNotNull);
         expect(peer!.bleDeviceId, equals('scan-device-1'));
-        expect(peer.rssi, equals(-58));
+        expect(peer.rssi, equals(-42));
+      });
+
+      test('keeps peripheral-only RSSI as null', () async {
+        final payload = buildAnnouncePayload(pubkey: otherPubkey);
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'peripheral:central-1',
+          bleRole: BleRole.peripheral,
+          rssi: null,
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.hasBleConnection, isTrue);
+        expect(peer.blePeripheralDeviceId, equals('peripheral:central-1'));
+        expect(peer.rssi, isNull);
       });
 
       test('includes udpAddress from ANNOUNCE payload', () async {
@@ -443,6 +463,33 @@ void main() {
         );
 
         expect(messageReceived, isTrue);
+      });
+
+      test('does not overwrite known RSSI when payload RSSI is null',
+          () async {
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: otherPubkey,
+          nickname: 'Alice',
+          protocolVersion: 1,
+          rssi: -44,
+          bleCentralDeviceId: 'central:peer-1',
+        ));
+
+        final p = await signedPacket(
+          type: PacketType.message,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([42]),
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+          rssi: null,
+        );
+
+        final peer = store.state.peers.getPeerByPubkey(otherPubkey);
+        expect(peer, isNotNull);
+        expect(peer!.rssi, equals(-44));
       });
 
       test('drops message addressed to someone else', () async {
@@ -697,7 +744,6 @@ void main() {
       test('does not attach scan-discovered BLE ID to UDP ANNOUNCE', () async {
         store.dispatch(BleDeviceDiscoveredAction(
           deviceId: 'scan-device-1',
-          serviceUuid: GrassrootsIdentity.deriveServiceUuid(otherPubkey),
           rssi: -42,
         ));
 
@@ -721,7 +767,7 @@ void main() {
         expect(peer, isNotNull);
         expect(peer!.hasBleConnection, isFalse);
         expect(peer.bleDeviceId, isNull);
-        // UDP-only peer has no BLE link, so rssi is null (no -100 sentinel).
+        // UDP-only peer has no BLE link, so rssi is null.
         expect(peer.rssi, isNull);
         expect(store.state.peers.nearbyBlePeers, isEmpty);
       });

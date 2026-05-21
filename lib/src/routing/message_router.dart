@@ -164,11 +164,10 @@ class MessageRouter {
     }
 
     // Refresh per-packet RSSI on every verified BLE packet from a known peer.
-    // The plugin reports `payload.rssi` for every received BLE packet
-    // regardless of role, so this keeps the indicator current during
-    // conversation traffic (not just on the next advertisement). For ANNOUNCE
-    // packets, _handleAnnounce already covers the RSSI update via
-    // PeerAnnounceReceivedAction.
+    // The plugin emits `payload.rssi` as null when the OS doesn't expose a
+    // remote-RSSI measurement (peripheral-role writes on both platforms,
+    // central paths before the first poll). For ANNOUNCE packets,
+    // _handleAnnounce covers the RSSI update via PeerAnnounceReceivedAction.
     if (transport == PeerTransport.bleDirect &&
         rssi != null &&
         packet.type != PacketType.announce) {
@@ -256,30 +255,45 @@ class MessageRouter {
     final data = protocolHandler.decodeAnnounce(packet.payload);
     final pubkey = data.publicKey;
 
-    // Use the per-packet RSSI from the BLE plugin (passed in via `rssi` for BLE
-    // ANNOUNCEs; null for UDP ANNOUNCEs). This is always more current than the
-    // advertisement RSSI cached on `DiscoveredPeerState`, especially on the
-    // peripheral side where our scanner may not have seen the central yet.
-    final int? effectiveRssi =
-        transport == PeerTransport.bleDirect ? rssi : null;
-
     // Resolve BLE metadata only for packets that actually arrived over BLE.
     // UDP ANNOUNCEs can coincide with stale scan results; treating those as a
     // live BLE path makes UDP-only friends appear in the Nearby/Connected list.
     final isBleAnnounce = transport == PeerTransport.bleDirect;
     String? resolvedBleDeviceId = isBleAnnounce ? bleDeviceId : null;
     BleRole? resolvedBleRole = isBleAnnounce ? bleRole : null;
+    DiscoveredPeerState? discoveredPeer;
+    if (isBleAnnounce && bleDeviceId != null) {
+      discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
+    }
     if (isBleAnnounce && bleDeviceId == null) {
       // No transport-provided device ID — try to find one from our scan results
       // by matching on the service UUID derived from their pubkey. (We do NOT
       // use this lookup to source RSSI; the per-packet value above is fresher.)
       final theirServiceUuid = GrassrootsIdentity.deriveServiceUuid(pubkey);
-      final discoveredPeer =
+      final found =
           _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
-      if (discoveredPeer != null) {
-        resolvedBleDeviceId = discoveredPeer.transportId;
+      if (found != null) {
+        resolvedBleDeviceId = found.transportId;
         // If we found via scan, that means our central discovered them.
         resolvedBleRole ??= BleRole.central;
+        discoveredPeer ??= found;
+      }
+    }
+
+    // RSSI source priority for BLE-arrived ANNOUNCEs:
+    //   1. Per-payload arrival RSSI (our own radio's measurement on this
+    //      packet) — strongest source.
+    //   2. Scan-time RSSI for the same pathId — also our own measurement,
+    //      just slightly older.
+    // Peripheral-only paths have no local measurement (the plugin emits
+    // null) and leave effectiveRssi null; the UI shows "-- dBm" until the
+    // reverse central dial fills it in.
+    int? effectiveRssi;
+    if (isBleAnnounce) {
+      if (rssi != null) {
+        effectiveRssi = rssi;
+      } else if (discoveredPeer?.rssi != null) {
+        effectiveRssi = discoveredPeer!.rssi;
       }
     }
 

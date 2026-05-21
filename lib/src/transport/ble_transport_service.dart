@@ -344,8 +344,11 @@ class BleTransportService extends TransportService {
   @override
   Future<void> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
     // Sort by RSSI descending so the strongest signals get the data first.
+    // Paths without a known RSSI (peripheral-role on iOS/Android, where the
+    // OS doesn't expose remote signal strength) sort last via a very-weak
+    // fallback so they still receive the broadcast.
     final ready = _readyPaths.toList()
-      ..sort((a, b) => b.rssi.compareTo(a.rssi));
+      ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
     for (final path in ready) {
       if (excludePeerIds != null && excludePeerIds.contains(path.pathId)) {
         continue;
@@ -463,9 +466,12 @@ class BleTransportService extends TransportService {
 
 
   /// Process an incoming raw BLE packet. Deserializes and forwards to the
-  /// MessageRouter via [onBlePacketReceived].
+  /// MessageRouter via [onBlePacketReceived]. `rssi` is nullable because
+  /// peripheral-role payloads carry no remote-RSSI measurement on either
+  /// platform; the downstream router treats null as "unknown" and skips
+  /// updating peer RSSI from that packet.
   void onPacketReceived(Uint8List data,
-      {String? fromDeviceId, required int rssi, BleRole? bleRole}) {
+      {String? fromDeviceId, required int? rssi, BleRole? bleRole}) {
     if (_stopped) return;
     try {
       final packet = GrassrootsPacket.deserialize(data);
@@ -544,10 +550,13 @@ class BleTransportService extends TransportService {
     // signal strength.
     final pubkey = getPubkeyForPeerId(pathId);
     if (pubkey != null) {
-      store.dispatch(PeerRssiUpdatedAction(
-        publicKey: pubkey,
-        rssi: adv.rssi,
-      ));
+      final existingPeer = _peersState.getPeerByPubkey(pubkey);
+      if (existingPeer?.rssi == null || existingPeer?.rssi != adv.rssi) {
+        store.dispatch(PeerRssiUpdatedAction(
+          publicKey: pubkey,
+          rssi: adv.rssi,
+        ));
+      }
     }
 
     if (existing != null && (existing.isConnected || existing.isConnecting)) {

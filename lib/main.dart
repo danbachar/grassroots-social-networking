@@ -1744,14 +1744,15 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     final hasPendingRequest =
         appStore.state.friendships.hasPendingRequest(peerHex);
 
-    // RSSI signal strength indicator. Peers in this list come from
-    // `nearbyBlePeers`, which is filtered by `hasBleConnection`, and any peer
-    // with a live BLE link has received at least one BLE packet — so `rssi`
-    // is always non-null here. The `!` reflects that invariant.
-    final rssiDbm = peer.rssi!;
+    // RSSI is unavailable for some peripheral-role BLE links because the OS
+    // does not expose remote signal strength to the GATT server side.
+    final rssiDbm = peer.rssi;
     final IconData signalIcon;
     final Color signalColor;
-    if (rssiDbm < -80) {
+    if (rssiDbm == null) {
+      signalIcon = Icons.signal_cellular_alt;
+      signalColor = Colors.grey;
+    } else if (rssiDbm < -80) {
       signalIcon = Icons.signal_cellular_alt_1_bar;
       signalColor = Colors.red;
     } else if (rssiDbm < -60) {
@@ -1886,7 +1887,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                 children: [
                   Icon(signalIcon, color: signalColor, size: 20),
                   Text(
-                    '$rssiDbm dBm',
+                    rssiDbm == null ? '-- dBm' : '$rssiDbm dBm',
                     style: TextStyle(fontSize: 10, color: signalColor),
                   ),
                 ],

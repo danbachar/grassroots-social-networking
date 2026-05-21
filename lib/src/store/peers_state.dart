@@ -118,10 +118,9 @@ class PeerState {
 
   /// Latest BLE signal strength in dBm.
   ///
-  /// Null when the peer has no live BLE link (UDP-only friends, or peers we
-  /// last saw via BLE that have since disconnected). Non-null exactly when at
-  /// least one BLE packet has been received from this peer and BLE is still
-  /// the live transport. Cleared by `PeerBleDisconnectedAction` when the last
+  /// Null when the peer has no live BLE link or when the BLE stack cannot
+  /// report a real measurement for the current role (for example GATT-server
+  /// peripheral writes). Cleared by `PeerBleDisconnectedAction` when the last
   /// BLE path drops.
   final int? rssi;
 

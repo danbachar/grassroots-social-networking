@@ -16,13 +16,11 @@ class BleDeviceDiscoveredAction extends PeerAction {
   final String deviceId;
   final String? displayName;
   final int rssi;
-  final String? serviceUuid;
 
   BleDeviceDiscoveredAction({
     required this.deviceId,
     this.displayName,
     required this.rssi,
-    this.serviceUuid,
   });
 }
 

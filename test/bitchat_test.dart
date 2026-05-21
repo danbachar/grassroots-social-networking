@@ -3,7 +3,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:grassroots_networking/src/mesh/bloom_filter.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
-import 'package:cryptography/cryptography.dart';
 
 void main() {
   group('GrassrootsPacket', () {
@@ -36,7 +35,8 @@ void main() {
     });
 
     test('serializes with recipient pubkey', () {
-      final recipientPubkey = Uint8List.fromList(List.generate(32, (i) => 32 + i));
+      final recipientPubkey =
+          Uint8List.fromList(List.generate(32, (i) => 32 + i));
 
       final packet = GrassrootsPacket(
         type: PacketType.message,
@@ -213,26 +213,12 @@ void main() {
     });
   });
 
-  group('GrassrootsIdentity', () {
-    test('derives BLE service UUID from public key', () async {
-      final keyPair = await Ed25519().newKeyPair();
-      final identity = await GrassrootsIdentity.create(
-        keyPair: keyPair,
-        nickname: 'Test',
-      );
-
-      // UUID should be derived from last 16 bytes of pubkey
-      final uuid = identity.bleServiceUuid;
-      expect(uuid.length, equals(36)); // UUID format with dashes
-      expect(uuid, contains('-'));
-    });
-  });
-
   group('Peer', () {
     test('creates peer with correct state', () {
       final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
 
-      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -80);
+      final peer = Peer(
+          publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -80);
 
       expect(peer.connectionState, equals(PeerConnectionState.discovered));
       expect(peer.isReachable, isFalse);
@@ -241,7 +227,8 @@ void main() {
     test('generates correct display name', () {
       final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
 
-      final peer = Peer(publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -90);
+      final peer = Peer(
+          publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -90);
 
       // Without nickname, should use fingerprint
       expect(peer.displayName, equals(peer.shortFingerprint));
@@ -253,7 +240,8 @@ void main() {
   });
 
   group('computeStaleUdpPeerPubkeys', () {
-    test('returns only connected UDP peers that missed the stale threshold', () {
+    test('returns only connected UDP peers that missed the stale threshold',
+        () {
       final now = DateTime.now();
       final stalePubkey =
           Uint8List.fromList(List.generate(32, (i) => (i + 1) % 256));

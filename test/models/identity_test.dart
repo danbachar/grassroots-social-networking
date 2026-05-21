@@ -51,58 +51,20 @@ void main() {
       });
     });
 
-    group('bleServiceUuid', () {
-      test('returns correctly formatted UUID string (8-4-4-4-12)', () {
-        final uuid = identity.bleServiceUuid;
-        final parts = uuid.split('-');
-        expect(parts.length, equals(5));
-        expect(parts[0].length, equals(8));
-        expect(parts[1].length, equals(4));
-        expect(parts[2].length, equals(4));
-        expect(parts[3].length, equals(4));
-        expect(parts[4].length, equals(12));
-      });
-
-      test('UUID is lowercase hex', () {
-        final uuid = identity.bleServiceUuid;
-        final hexOnly = uuid.replaceAll('-', '');
-        expect(hexOnly, matches(RegExp(r'^[0-9a-f]{32}$')));
-      });
-
-      test('UUID starts with Grassroots prefix and ends with last 8 bytes of pubkey', () {
-        final uuid = identity.bleServiceUuid;
-        final hexOnly = uuid.replaceAll('-', '');
-
-        // First 16 hex chars = Grassroots prefix
-        expect(hexOnly.substring(0, 16),
-            equals(GrassrootsIdentity.grassrootsUuidPrefix));
-
-        // Last 16 hex chars = last 8 bytes of pubkey
-        final last8 = identity.publicKey.sublist(24, 32);
-        final expectedSuffix =
-            last8.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-        expect(hexOnly.substring(16), equals(expectedSuffix));
-      });
-
-      test('deriveServiceUuid static method matches bleServiceUuid getter', () {
-        expect(GrassrootsIdentity.deriveServiceUuid(identity.publicKey),
-            equals(identity.bleServiceUuid));
+    group('discoveryServiceUuid', () {
+      test('is a single shared dashed 128-bit UUID for every Grassroots peer',
+          () {
+        expect(GrassrootsIdentity.discoveryServiceUuid,
+            matches(RegExp(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')));
+        expect(
+            GrassrootsIdentity.discoveryServiceUuid.replaceAll('-', ''),
+            startsWith(GrassrootsIdentity.grassrootsUuidPrefix));
       });
 
       test('grassrootsUuidPrefix is 8 bytes (16 hex chars)', () {
         expect(GrassrootsIdentity.grassrootsUuidPrefix.length, equals(16));
         expect(GrassrootsIdentity.grassrootsUuidPrefix,
             matches(RegExp(r'^[0-9a-f]{16}$')));
-      });
-
-      test('different identities produce different UUIDs', () async {
-        final algorithm = Ed25519();
-        final keyPair2 = await algorithm.newKeyPair();
-        final identity2 = await GrassrootsIdentity.create(
-          keyPair: keyPair2,
-          nickname: 'Bob',
-        );
-        expect(identity.bleServiceUuid, isNot(equals(identity2.bleServiceUuid)));
       });
     });
 
@@ -157,12 +119,6 @@ void main() {
           Uint8List.fromList(restoredPk.bytes),
           equals(identity.publicKey),
         );
-      });
-
-      test('restored identity has valid bleServiceUuid', () {
-        final json = identity.toJson();
-        final restored = GrassrootsIdentity.fromMap(json);
-        expect(restored.bleServiceUuid, equals(identity.bleServiceUuid));
       });
 
       test('restored identity has valid shortFingerprint', () {

@@ -21,7 +21,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         rssi: action.rssi,
         discoveredAt: now,
         lastSeen: now,
-        serviceUuid: action.serviceUuid,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)
@@ -36,7 +35,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         displayName: (action.displayName?.isNotEmpty ?? false)
             ? action.displayName
             : existing.displayName,
-        serviceUuid: action.serviceUuid ?? existing.serviceUuid,
       );
       return state.copyWith(
         discoveredBlePeers: Map.from(state.discoveredBlePeers)

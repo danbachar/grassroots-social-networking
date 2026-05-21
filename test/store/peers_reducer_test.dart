@@ -28,7 +28,6 @@ void main() {
         deviceId: 'device-1',
         displayName: 'Pixel 7',
         rssi: -55,
-        serviceUuid: 'uuid-abc',
       );
 
       final result = peersReducer(state, action);
@@ -38,7 +37,6 @@ void main() {
       expect(peer.transportId, 'device-1');
       expect(peer.displayName, 'Pixel 7');
       expect(peer.rssi, -55);
-      expect(peer.serviceUuid, 'uuid-abc');
       expect(peer.isConnecting, false);
       expect(peer.isConnected, false);
     });

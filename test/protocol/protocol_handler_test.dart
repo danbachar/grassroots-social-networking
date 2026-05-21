@@ -90,13 +90,9 @@ void main() {
 
         final payload = emptyHandler.createAnnouncePayload();
 
-        // Should have valid structure with 0-length nickname
-        expect(
-            payload.length,
-            equals(32 +
-                2 +
-                1 +
-                2)); // pubkey + version + nickLen(0) + candidateCount(0)
+        // Should have valid structure with 0-length nickname.
+        // pubkey + version + nickLen(0) + candidateCount(0)
+        expect(payload.length, equals(32 + 2 + 1 + 2));
         expect(payload[34], equals(0)); // nickname length = 0
       });
 
@@ -170,6 +166,7 @@ void main() {
       });
 
       test('handles empty nickname in payload', () {
+        // pubkey(32) + version(2) + nickLen(1) + candidateCount(2)
         final buffer = ByteData(32 + 2 + 1 + 2);
         var offset = 0;
 

@@ -1,6 +1,7 @@
 import 'dart:async';
 
-import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer.dart' as ble;
+import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer.dart'
+    as ble;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:redux/redux.dart';
@@ -68,6 +69,12 @@ class BleTransportService extends TransportService {
   /// Latest known plugin state per pathId (synchronous mirror of `paths()`).
   /// This is a strict cache of plugin facts, not consumer state.
   final Map<String, ble.BlePath> _paths = {};
+
+  /// iOS can surface an inbound Android GATT-server connection without ever
+  /// completing the matching outbound CoreBluetooth central path. When that
+  /// central dial times out, avoid immediately redialing the same
+  /// CBPeripheral identifier on every duplicate advertisement.
+  final Map<String, DateTime> _iosCentralDialBackoffUntil = {};
 
   /// True while a `start()` call is in flight. Prevents re-entrant `start()`
   /// from `_onAdapterStateChanged` running concurrently with the original.
@@ -167,16 +174,14 @@ class BleTransportService extends TransportService {
 
     try {
       _adapterSub = _ble.adapterStateChanges.listen((s) {
-        // debugPrint('[grassroots_bluetooth_layer] adapter → $s');
         _onAdapterStateChanged(s);
       });
       _advertisementSub = _ble.advertisements.listen(_onAdvertisement);
       _pathSub = _ble.pathChanges.listen(_onPathChanged);
       _payloadSub = _ble.payloads.listen(_onPayload);
-      // Surface plugin diagnostic logs in the Dart console too — on iOS
-      // they're already going to NSLog, but we want them in `flutter run`.
-      // _logSub = _ble.logs.listen((msg) => debugPrint('[grassroots_bluetooth_layer] $msg'));
-      _logSub = _ble.logs.listen((msg) => {});
+      _logSub = _ble.logs.listen(
+        (msg) => debugPrint('[grassroots_bluetooth_layer] $msg'),
+      );
 
       // `restoreState: true` opts the iOS plugin into CoreBluetooth's
       // state-preservation. With this on, when iOS suspends and later
@@ -245,7 +250,18 @@ class BleTransportService extends TransportService {
         try {
           await _ble.startScan(
             serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
+            // Pass the exact shared discovery UUID so CoreBluetooth gets an
+            // OS-level service filter. Prefix-only scanning is a Dart/plugin
+            // post-filter and was unreliable on iOS; Android still keeps the
+            // software prefix check as an extra guard.
+            serviceUuids: const [GrassrootsIdentity.discoveryServiceUuid],
             timeout: Duration.zero, // continuous scan
+            // iOS CoreBluetooth deduplicates per-peer advertisements by
+            // default; with allowDuplicates=true it keeps delivering
+            // didDiscover so we see liveness/RSSI updates and so a peer that
+            // joined mid-scan still gets observed. It costs a bit more power,
+            // but also gives us fresh chances to retry a missing reverse leg.
+            allowDuplicates: true,
           );
           anyStarted = true;
         } catch (e) {
@@ -319,7 +335,13 @@ class BleTransportService extends TransportService {
     try {
       await _ble.startScan(
         serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
+        // Match the continuous-scan path: same OS-level service filter and
+        // plugin-side prefix guard.
+        serviceUuids: const [GrassrootsIdentity.discoveryServiceUuid],
         timeout: t,
+        // Match the continuous-scan path so already-discovered peers keep
+        // surfacing for RSSI refreshes and reverse-leg retries.
+        allowDuplicates: true,
       );
     } catch (e) {
       debugPrint('scan() failed: $e');
@@ -363,6 +385,9 @@ class BleTransportService extends TransportService {
 
   @override
   void associatePeerWithPubkey(String peerId, Uint8List pubkey) {
+    final path = _paths[peerId];
+    if (path == null || !_isReady(path)) return;
+
     final role = _roleFromPathId(peerId);
     if (role == null) return;
     store.dispatch(AssociateBleDeviceAction(
@@ -377,7 +402,9 @@ class BleTransportService extends TransportService {
     final peer = _peersState.getPeerByPubkey(pubkey);
     if (peer == null) return null;
 
-    // Prefer the central path (we initiated → typically more reliable on iOS).
+    // Prefer our central path because writes go directly to the peer's GATT
+    // characteristic; fall back to the inbound peripheral path when that is
+    // the only ready route.
     final centralId = peer.bleCentralDeviceId;
     if (centralId != null && isDeviceConnected(centralId)) {
       return centralId;
@@ -450,9 +477,12 @@ class BleTransportService extends TransportService {
         serviceUuid: GrassrootsIdentity.discoveryServiceUuid,
         characteristicUuid: _grassrootsCharacteristicUuid,
         androidMtu: _requestedAndroidMtu,
+        // Apple's docs say CoreBluetooth's connect can legitimately take
+        // 10-15s. When iOS and Android are both also acting as centrals, the
+        // BLE stack often needs that whole window to negotiate PHY,
+        // connection interval, and MTU.
+        timeout: const Duration(seconds: 30),
       );
-      // Path lifecycle (connecting → connected → ready, or failed) is
-      // dispatched solely by `_onPathChanged` from the plugin event stream.
       return true;
     } catch (e) {
       // The plugin throws synchronously only for invalid args / adapter off.
@@ -463,7 +493,6 @@ class BleTransportService extends TransportService {
       return false;
     }
   }
-
 
   /// Process an incoming raw BLE packet. Deserializes and forwards to the
   /// MessageRouter via [onBlePacketReceived]. `rssi` is nullable because
@@ -560,6 +589,15 @@ class BleTransportService extends TransportService {
     if (existing != null && (existing.isConnected || existing.isConnecting)) {
       return;
     }
+    if (_shouldYieldCentralDialToRemote(adv)) {
+      // Let Apple devices take the first central role when Android is in auto
+      // mode. Once their inbound peripheral path is ready, we can attempt the
+      // reverse central leg.
+      return;
+    }
+    if (_centralDialBackoffActive(adv.remoteId)) {
+      return;
+    }
     // BLE address rotation produces a fresh pathId every ~30s for the same
     // peer. With a single shared discovery UUID we can't tell pre-connect
     // whether this is a new peer or a known one wearing a new MAC. Cap
@@ -577,6 +615,9 @@ class BleTransportService extends TransportService {
   /// Each `connectGatt` consumes a controller slot for ~5s on Android; too
   /// many parallel dials starve real connections.
   static const int _maxInFlightCentralDials = 2;
+  static const String _centralPathPrefix = 'central:';
+  static const String _peripheralPathPrefix = 'peripheral:';
+  static const Duration _iosCentralDialFailureBackoff = Duration(minutes: 2);
 
   int _inFlightCentralDials() {
     var count = 0;
@@ -589,6 +630,119 @@ class BleTransportService extends TransportService {
       }
     }
     return count;
+  }
+
+  bool get _usesConservativeCentralDialing =>
+      defaultTargetPlatform == TargetPlatform.iOS;
+
+  bool _shouldYieldCentralDialToRemote(ble.BleAdvertisement adv) {
+    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return false;
+    if (defaultTargetPlatform != TargetPlatform.android) return false;
+    if (!_advertisementLooksLikeAppleDevice(adv)) return false;
+    return !_hasReadyPeripheralPathForRemote(adv.remoteId);
+  }
+
+  bool _hasReadyPeripheralPathForRemote(String remoteId) {
+    final path = _paths['$_peripheralPathPrefix$remoteId'];
+    return path != null && _isReady(path);
+  }
+
+  void _maybeDialReverseCentralAfterPeripheralReady(ble.BlePath path) {
+    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
+    if (path.role != ble.BleRole.peripheral || !_isReady(path)) return;
+
+    final remoteId = _remoteIdForPeripheralPath(path.pathId);
+    if (remoteId == null) return;
+
+    final centralPathId = '$_centralPathPrefix$remoteId';
+    final knownCentralPath = _paths[centralPathId];
+    if (knownCentralPath != null &&
+        (knownCentralPath.state == ble.BlePathState.connecting ||
+            knownCentralPath.state == ble.BlePathState.connected ||
+            knownCentralPath.state == ble.BlePathState.subscribed ||
+            knownCentralPath.state == ble.BlePathState.ready)) {
+      return;
+    }
+
+    // Only dial a reverse leg when scan already proved the same remote ID is
+    // advertising our GATT service. This avoids blind dials for centrals that
+    // subscribed to us but are not advertising as Grassroots peripherals.
+    if (_peersState.getDiscoveredBlePeer(centralPathId) == null) return;
+    if (_centralDialBackoffActive(remoteId)) return;
+    if (_inFlightCentralDials() >= _maxInFlightCentralDials) return;
+
+    debugPrint(
+      '[ble] peripheral path ${path.pathId} is ready; dialing reverse '
+      'central path $centralPathId.',
+    );
+    unawaited(connectToDevice(centralPathId));
+  }
+
+  bool _advertisementLooksLikeAppleDevice(ble.BleAdvertisement adv) {
+    final manufacturerData = adv.manufacturerData;
+    if (manufacturerData != null &&
+        manufacturerData.length >= 2 &&
+        manufacturerData[0] == 0x4c &&
+        manufacturerData[1] == 0x00) {
+      return true;
+    }
+
+    final name = [
+      adv.advertisedName,
+      adv.platformName,
+    ].whereType<String>().join(' ').toLowerCase();
+    return name.contains('iphone') ||
+        name.contains('ipad') ||
+        name.contains('ipod');
+  }
+
+  bool _centralDialBackoffActive(String remoteId) {
+    if (!_usesConservativeCentralDialing) return false;
+
+    final until = _iosCentralDialBackoffUntil[remoteId];
+    if (until == null) return false;
+
+    final now = DateTime.now();
+    if (!now.isBefore(until)) {
+      _iosCentralDialBackoffUntil.remove(remoteId);
+      return false;
+    }
+    return true;
+  }
+
+  void _markCentralDialBackoff(ble.BlePath path) {
+    if (!_usesConservativeCentralDialing) return;
+    if (path.role != ble.BleRole.central) return;
+
+    final remoteId = _remoteIdForCentralPath(path.pathId);
+    if (remoteId == null) return;
+
+    final until = DateTime.now().add(_iosCentralDialFailureBackoff);
+    _iosCentralDialBackoffUntil[remoteId] = until;
+    debugPrint(
+      '[ble] iOS central dial backoff: remoteId=$remoteId '
+      'until=${until.toIso8601String()} '
+      'after state=${path.state} error=${path.error ?? "none"}',
+    );
+  }
+
+  void _clearCentralDialBackoff(ble.BlePath path) {
+    if (path.role != ble.BleRole.central) return;
+
+    final remoteId = _remoteIdForCentralPath(path.pathId);
+    if (remoteId == null) return;
+
+    _iosCentralDialBackoffUntil.remove(remoteId);
+  }
+
+  String? _remoteIdForCentralPath(String pathId) {
+    if (!pathId.startsWith(_centralPathPrefix)) return null;
+    return pathId.substring(_centralPathPrefix.length);
+  }
+
+  String? _remoteIdForPeripheralPath(String pathId) {
+    if (!pathId.startsWith(_peripheralPathPrefix)) return null;
+    return pathId.substring(_peripheralPathPrefix.length);
   }
 
   void _onPathChanged(ble.BlePath path) {
@@ -610,12 +764,11 @@ class BleTransportService extends TransportService {
         break;
       case ble.BlePathState.connected:
       case ble.BlePathState.subscribed:
-        // Not yet sendable — wait for `ready`. Don't dispatch a Connected
-        // action; the application semantics rely on `ready` to mean "you
-        // can send the ANNOUNCE now."
+        // Not yet sendable — wait for `ready`.
         break;
       case ble.BlePathState.ready:
         if (previous?.state != ble.BlePathState.ready) {
+          _clearCentralDialBackoff(path);
           store.dispatch(BleDeviceConnectedAction(path.pathId));
           _addConnectionEvent(TransportConnectionEvent(
             peerId: path.pathId,
@@ -624,17 +777,26 @@ class BleTransportService extends TransportService {
             reason: role.name,
             isIncoming: role == BleRole.peripheral,
           ));
+          _maybeDialReverseCentralAfterPeripheralReady(path);
         }
         break;
       case ble.BlePathState.failed:
         if (path.role == ble.BleRole.central) {
           store.dispatch(BleDeviceConnectionFailedAction(path.pathId));
         }
+        _markCentralDialBackoff(path);
         _emitDisconnect(path, role);
         _paths.remove(path.pathId);
         break;
       case ble.BlePathState.disconnected:
       case ble.BlePathState.stale:
+        if (path.role == ble.BleRole.central &&
+            previous != null &&
+            previous.state != ble.BlePathState.ready &&
+            previous.state != ble.BlePathState.disconnected &&
+            previous.state != ble.BlePathState.stale) {
+          _markCentralDialBackoff(path);
+        }
         _emitDisconnect(path, role);
         _paths.remove(path.pathId);
         break;
@@ -664,11 +826,11 @@ class BleTransportService extends TransportService {
 
   void _onPayload(ble.BlePayload payload) {
     if (_stopped) return;
-    // Drop payloads from paths the plugin has already declared dead. This
-    // prevents a late ANNOUNCE arriving on a just-disconnected path from
-    // resurrecting that path's pathId in PeerState.bleCentralDeviceId/
-    // blePeripheralDeviceId via the PeerAnnounceReceivedAction reducer.
-    if (!_paths.containsKey(payload.pathId)) return;
+    // Drop payloads unless the plugin currently marks the path ready. This
+    // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
+    // not-sendable paths from populating PeerState BLE role fields.
+    final path = _paths[payload.pathId];
+    if (path == null || !_isReady(path)) return;
 
     final role = payload.role == ble.BleRole.central
         ? BleRole.central

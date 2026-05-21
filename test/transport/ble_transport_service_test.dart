@@ -13,12 +13,15 @@ import 'package:grassroots_networking/src/transport/ble_transport_service.dart';
 import 'package:grassroots_networking/src/transport/transport_service.dart'
     show TransportState;
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 
 /// Records the sequence of host API calls so tests can assert them.
 class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   final List<String> calls = [];
+  final List<BleScanRequest> scanRequests = [];
 
   @override
   Future<void> initialize(BleInitializeOptions options) async {
@@ -43,6 +46,7 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
 
   @override
   Future<void> startScan(BleScanRequest request) async {
+    scanRequests.add(request);
     calls.add('startScan:${request.serviceUuidPrefix}');
   }
 
@@ -201,6 +205,128 @@ void main() {
       expect(transport.connectedPeerIds, isEmpty);
     });
 
+    test('iOS backs off same central remote after a timeout', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      const remoteId = 'AABBCC';
+      const pathId = 'central:$remoteId';
+      const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+        error: 'Connection timed out.',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -54,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
+    test('Android auto mode yields central role to iOS advertisements',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      const remoteId = '45:B3:F7:F1:53:28';
+      const pathId = 'central:$remoteId';
+      const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        platformName: 'iPhone',
+        serviceUuids: [serviceUuid],
+        rssi: -11,
+        connectable: true,
+        manufacturerData: Uint8List.fromList([0x4c, 0x00]),
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true);
+      expect(hostApi.calls.where((c) => c == 'connect:$remoteId'), isEmpty);
+    });
+
+    test('central-only mode still dials iOS advertisements', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      store.dispatch(SetBleRoleModeAction(BleRoleMode.centralOnly));
+
+      const remoteId = '45:B3:F7:F1:53:28';
+      const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        platformName: 'iPhone',
+        serviceUuids: [serviceUuid],
+        rssi: -11,
+        connectable: true,
+        manufacturerData: Uint8List.fromList([0x4c, 0x00]),
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
+    test(
+        'Android auto mode dials iOS as soon as inbound peripheral path is ready',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      const remoteId = '45:B3:F7:F1:53:28';
+      const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        platformName: 'iPhone',
+        serviceUuids: [serviceUuid],
+        rssi: -11,
+        connectable: true,
+        manufacturerData: Uint8List.fromList([0x4c, 0x00]),
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c == 'connect:$remoteId'), isEmpty);
+
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$remoteId',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
       const pathId = 'central:DEADBEEF';
 
@@ -274,15 +400,35 @@ void main() {
     test('peripheral-only mode never starts scanning', () async {
       store.dispatch(SetBleRoleModeAction(BleRoleMode.peripheralOnly));
       hostApi.calls.clear();
+      hostApi.scanRequests.clear();
 
       await transport.start();
       expect(hostApi.calls.where((c) => c.startsWith('startAdvertising:')),
           hasLength(1));
       expect(hostApi.calls, contains('stopScan'));
       expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty);
+      expect(hostApi.scanRequests, isEmpty);
 
       await transport.scan();
       expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty);
+      expect(hostApi.scanRequests, isEmpty);
+    });
+
+    test('scans with exact discovery UUID and duplicate advertisements',
+        () async {
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      expect(hostApi.scanRequests, hasLength(1));
+      final request = hostApi.scanRequests.single;
+      expect(request.serviceUuidPrefix,
+          equals(GrassrootsIdentity.grassrootsUuidPrefix));
+      expect(request.serviceUuids,
+          equals([GrassrootsIdentity.discoveryServiceUuid]));
+      expect(request.timeoutMs, equals(0));
+      expect(request.allowDuplicates, isTrue);
     });
   });
 
@@ -292,7 +438,8 @@ void main() {
         'connected', () async {
       final hostApi = _RecordingHostApi();
       final callbacks = FakeGrassrootsBluetoothCallbacks();
-      final ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       final store = Store<AppState>(appReducer, initialState: AppState.initial);
       final transport = BleTransportService(
         identity: await _makeIdentity('Sym'),

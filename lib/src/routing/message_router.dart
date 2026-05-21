@@ -265,20 +265,6 @@ class MessageRouter {
     if (isBleAnnounce && bleDeviceId != null) {
       discoveredPeer = _peersState.getDiscoveredBlePeer(bleDeviceId);
     }
-    if (isBleAnnounce && bleDeviceId == null) {
-      // No transport-provided device ID — try to find one from our scan results
-      // by matching on the service UUID derived from their pubkey. (We do NOT
-      // use this lookup to source RSSI; the per-packet value above is fresher.)
-      final theirServiceUuid = GrassrootsIdentity.deriveServiceUuid(pubkey);
-      final found =
-          _peersState.findDiscoveredBlePeerByServiceUuid(theirServiceUuid);
-      if (found != null) {
-        resolvedBleDeviceId = found.transportId;
-        // If we found via scan, that means our central discovered them.
-        resolvedBleRole ??= BleRole.central;
-        discoveredPeer ??= found;
-      }
-    }
 
     // RSSI source priority for BLE-arrived ANNOUNCEs:
     //   1. Per-payload arrival RSSI (our own radio's measurement on this

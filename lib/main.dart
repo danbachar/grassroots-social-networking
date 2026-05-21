@@ -91,7 +91,6 @@ Map<String, dynamic> _serializeAppState(AppState state) {
             'rssi': e.value.rssi,
             'isConnecting': e.value.isConnecting,
             'isConnected': e.value.isConnected,
-            'serviceUuid': e.value.serviceUuid,
             'lastSeen': e.value.lastSeen.toIso8601String(),
           },
       },
@@ -2089,9 +2088,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
           _buildInfoCard(
             title: 'Service UUID',
-            value: _identity?.bleServiceUuid ?? '...',
+            value: GrassrootsIdentity.discoveryServiceUuid,
             icon: Icons.bluetooth,
-            onCopy: () => _copyToClipboard(_identity?.bleServiceUuid ?? ''),
+            onCopy: () =>
+                _copyToClipboard(GrassrootsIdentity.discoveryServiceUuid),
           ),
           const SizedBox(height: 12),
 
@@ -2108,10 +2108,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           ),
           const SizedBox(height: 12),
 
-          // Regenerate identity (dev / topology-test affordance).
-          // Re-rolls the Ed25519 keypair so peers re-derive lex order, BLE
-          // service UUID rotates, and the device gets to play a fresh role
-          // (central vs peripheral) on each link without uninstall + reinstall.
+          // Regenerate identity (dev/testing affordance).
+          // Re-rolls the Ed25519 keypair so peers treat this install as a new
+          // device without requiring uninstall + reinstall.
           OutlinedButton.icon(
             icon: const Icon(Icons.refresh),
             label: const Text('Regenerate Identity'),
@@ -2395,10 +2394,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
 
   /// Generate a brand-new Ed25519 keypair and restart Grassroots under the new
-  /// identity. Useful for testing BLE topology — the lex tie-break that
-  /// decides who dials is keyed off the service UUID (derived from pubkey),
-  /// so reshuffling the key reshuffles central/peripheral roles without an
-  /// uninstall+reinstall cycle.
+  /// identity. Useful for testing discovery and identity reset behavior
+  /// without an uninstall+reinstall cycle.
   Future<void> _regenerateIdentity() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -2409,8 +2406,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           'transport under the new identity. Your peers will see you as a '
           'new device — existing friendships, discovered peers and BLE '
           'connection state are dropped.\n\n'
-          'Used to flip BLE central/peripheral roles for testing without '
-          'uninstall + reinstall.',
+          'Useful for testing identity reset behavior without uninstall + '
+          'reinstall.',
         ),
         actions: [
           TextButton(

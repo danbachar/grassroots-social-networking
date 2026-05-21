@@ -3,28 +3,27 @@ import 'dart:typed_data';
 import 'package:cryptography/cryptography.dart';
 
 /// Identity provided by GSG layer to Grassroots transport.
-/// 
+///
 /// GSG is responsible for:
 /// - Generating and persisting the Ed25519 keypair
 /// - Passing it to Grassroots at initialization
-/// 
+///
 /// Grassroots uses this for:
-/// - Deriving BLE Service UUID (Grassroots prefix + last 64 bits of pubkey)
 /// - Signing packets
 /// - Peer identification via ANNOUNCE
 class GrassrootsIdentity {
   /// Ed25519 public key (32 bytes)
   late final Uint8List publicKey;
-  
+
   /// Ed25519 private key (64 bytes - seed + public key)
   /// This is kept private and used only for signing
   late final Uint8List privateKey;
 
   final SimpleKeyPair keyPair;
-  
+
   /// Optional human-readable nickname for ANNOUNCE (mutable)
   String nickname;
-  
+
   // Private constructor - use create() factory method instead
   GrassrootsIdentity._internal({
     required this.keyPair,
@@ -32,7 +31,7 @@ class GrassrootsIdentity {
     required this.publicKey,
     required this.privateKey,
   });
-  
+
   /// Create identity from a keypair (use this instead of constructor)
   static Future<GrassrootsIdentity> create({
     required SimpleKeyPair keyPair,
@@ -43,13 +42,14 @@ class GrassrootsIdentity {
     if (publicKey.length != 32) {
       throw ArgumentError('Public key must be 32 bytes (Ed25519)');
     }
-    
+
     final seed = await keyPair.extractPrivateKeyBytes();
     final privateKey = Uint8List.fromList([...seed, ...pk.bytes]);
     if (privateKey.length != 64) {
-      throw ArgumentError('Private key must be 64 bytes (Ed25519 seed + pubkey)');
+      throw ArgumentError(
+          'Private key must be 64 bytes (Ed25519 seed + pubkey)');
     }
-    
+
     return GrassrootsIdentity._internal(
       keyPair: keyPair,
       publicKey: publicKey,
@@ -57,7 +57,7 @@ class GrassrootsIdentity {
       nickname: nickname,
     );
   }
-  
+
   /// Static 8-byte prefix identifying Grassroots devices on BLE.
   /// First 8 bytes of SHA-256("grassroots").
   static const String grassrootsUuidPrefix = '84c403160871e5ad';
@@ -81,42 +81,16 @@ class GrassrootsIdentity {
   static const String discoveryServiceUuid =
       '84c40316-0871-e5ad-0000-000000000000';
 
-  /// Derive a per-peer BLE Service UUID from a public key.
-  /// Format: Grassroots prefix (8 bytes) + last 8 bytes of public key.
-  ///
-  /// No longer used for the live BLE transport (which uses
-  /// [discoveryServiceUuid] for cross-platform compatibility). Kept for
-  /// debug/UI use — the suffix uniquely identifies the peer.
-  static String deriveServiceUuid(Uint8List pubkey) {
-    if (pubkey.length < 32) {
-      throw ArgumentError('Public key must be at least 32 bytes');
-    }
-    final suffixBytes = pubkey.sublist(24, 32);
-    final suffix =
-        suffixBytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    final hex = '$grassrootsUuidPrefix$suffix';
-    return '${hex.substring(0, 8)}-'
-        '${hex.substring(8, 12)}-'
-        '${hex.substring(12, 16)}-'
-        '${hex.substring(16, 20)}-'
-        '${hex.substring(20, 32)}';
-  }
-
-  /// Per-peer BLE Service UUID derived from this identity's public key.
-  /// See [discoveryServiceUuid] for the actually-advertised UUID.
-  String get bleServiceUuid => deriveServiceUuid(publicKey);
-
-  /// Get fingerprint (first 8 bytes of SHA-256 hash of public key) for display
-  /// Full verification uses the complete public key
+  /// Short display fingerprint from the first 8 bytes of the public key.
+  /// Full verification uses the complete public key.
   String get shortFingerprint {
-    // TODO: Implement SHA-256 hash and take first 8 bytes
-    // For now, use first 8 bytes of pubkey as placeholder
-    return publicKey.sublist(0, 8)
+    return publicKey
+        .sublist(0, 8)
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join(':')
         .toUpperCase();
   }
-  
+
   @override
   String toString() => 'GrassrootsIdentity($nickname)';
 

@@ -1,5 +1,3 @@
-import 'dart:typed_data';
-
 import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
 import '../transport/address_utils.dart';
@@ -38,11 +36,6 @@ class DiscoveredPeerState {
   /// True iff the plugin's last path state was `ready` with `canSend=true`.
   final bool isConnected;
 
-  /// Service UUID derived from the peer's public key. The Grassroots prefix
-  /// is the first 8 hex bytes; the next 8 are the pubkey tail. Same peer
-  /// across BLE address rotations always advertises the same service UUID.
-  final String? serviceUuid;
-
   const DiscoveredPeerState({
     required this.transportId,
     this.displayName,
@@ -51,7 +44,6 @@ class DiscoveredPeerState {
     required this.lastSeen,
     this.isConnecting = false,
     this.isConnected = false,
-    this.serviceUuid,
   });
 
   /// Signal quality indicator (0.0 - 1.0), derived from rssi.
@@ -69,7 +61,6 @@ class DiscoveredPeerState {
     DateTime? lastSeen,
     bool? isConnecting,
     bool? isConnected,
-    String? serviceUuid,
   }) {
     return DiscoveredPeerState(
       transportId: transportId ?? this.transportId,
@@ -79,7 +70,6 @@ class DiscoveredPeerState {
       lastSeen: lastSeen ?? this.lastSeen,
       isConnecting: isConnecting ?? this.isConnecting,
       isConnected: isConnected ?? this.isConnected,
-      serviceUuid: serviceUuid ?? this.serviceUuid,
     );
   }
 
@@ -91,17 +81,15 @@ class DiscoveredPeerState {
           transportId == other.transportId &&
           rssi == other.rssi &&
           isConnecting == other.isConnecting &&
-          isConnected == other.isConnected &&
-          serviceUuid == other.serviceUuid;
+          isConnected == other.isConnected;
 
   @override
   int get hashCode => Object.hash(
-    transportId,
-    rssi,
-    isConnecting,
-    isConnected,
-    serviceUuid,
-  );
+        transportId,
+        rssi,
+        isConnecting,
+        isConnected,
+      );
 
   @override
   String toString() =>
@@ -452,17 +440,6 @@ class PeersState {
   /// Get discovered BLE peer by device ID
   DiscoveredPeerState? getDiscoveredBlePeer(String deviceId) =>
       discoveredBlePeers[deviceId];
-
-  /// Find discovered BLE peer by service UUID
-  DiscoveredPeerState? findDiscoveredBlePeerByServiceUuid(String serviceUuid) {
-    final lowerUuid = serviceUuid.toLowerCase();
-    for (final peer in discoveredBlePeers.values) {
-      if (peer.serviceUuid?.toLowerCase() == lowerUuid) {
-        return peer;
-      }
-    }
-    return null;
-  }
 
   /// Check if a peer is reachable by pubkey
   bool isPeerReachable(Uint8List pubkey) {

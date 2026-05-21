@@ -19,8 +19,8 @@ const _defaultBleDisplayInfo = TransportDisplayInfo(
   color: Colors.blue,
 );
 
-/// Grassroots characteristic UUID — fixed across all peers regardless of the
-/// rotated 128-bit service UUID derived from each peer's public key.
+/// Grassroots characteristic UUID — fixed across all peers inside the shared
+/// discovery GATT service.
 const String _grassrootsCharacteristicUuid =
     '0000ff01-0000-1000-8000-00805f9b34fb';
 
@@ -39,8 +39,8 @@ const int _requestedAndroidMtu = 247;
 ///
 /// ## Architecture
 ///
-/// - **Peripheral mode**: advertises our service UUID, accepts incoming
-///   connections, exposes one notify+write characteristic.
+/// - **Peripheral mode**: advertises the shared Grassroots service UUID,
+///   accepts incoming connections, exposes one notify+write characteristic.
 /// - **Central mode**: scans for peers advertising the Grassroots service
 ///   prefix and connects to them.
 /// - **Direct delivery only**. No relaying, no store-and-forward.
@@ -524,8 +524,7 @@ class BleTransportService extends TransportService {
 
   void _onAdvertisement(ble.BleAdvertisement adv) {
     final pathId = 'central:${adv.remoteId}';
-    final serviceUuid = _firstGrassrootsServiceUuid(adv.serviceUuids);
-    if (serviceUuid == null) {
+    if (_firstGrassrootsServiceUuid(adv.serviceUuids) == null) {
       // Plugin already filters by Grassroots prefix, but defensively skip
       // anything that lost its service UUID before reaching us.
       return;
@@ -537,7 +536,6 @@ class BleTransportService extends TransportService {
         deviceId: pathId,
         displayName: adv.advertisedName ?? adv.platformName,
         rssi: adv.rssi,
-        serviceUuid: serviceUuid,
       ));
     } else {
       store.dispatch(BleDeviceRssiUpdatedAction(

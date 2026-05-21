@@ -23,7 +23,6 @@ void main() {
         final action = BleDeviceDiscoveredAction(
           deviceId: 'dev1',
           rssi: -50,
-          serviceUuid: 'uuid1',
         );
 
         final result = appReducer(initial, action);
@@ -34,7 +33,6 @@ void main() {
         final discovered = result.peers.discoveredBlePeers['dev1']!;
         expect(discovered.transportId, 'dev1');
         expect(discovered.rssi, -50);
-        expect(discovered.serviceUuid, 'uuid1');
 
         // Other state sections remain unchanged
         expect(result.messages, equals(initial.messages));

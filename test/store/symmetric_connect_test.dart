@@ -28,7 +28,6 @@ void main() {
       state = peersReducer(state, BleDeviceDiscoveredAction(
         deviceId: pathId,
         rssi: -55,
-        serviceUuid: 'uuid-1',
       ));
       state = peersReducer(state, BleDeviceConnectingAction(pathId));
       state = peersReducer(state, BleDeviceConnectedAction(pathId));
@@ -75,7 +74,7 @@ void main() {
       var aView = PeersState.initial;
       const aPath = 'central:B-MAC';
       aView = peersReducer(aView,
-          BleDeviceDiscoveredAction(deviceId: aPath, rssi: -55, serviceUuid: 'b-uuid'));
+          BleDeviceDiscoveredAction(deviceId: aPath, rssi: -55));
       aView = peersReducer(aView, BleDeviceConnectingAction(aPath));
       aView = peersReducer(aView, BleDeviceConnectedAction(aPath));
       aView = peersReducer(aView, PeerAnnounceReceivedAction(
@@ -232,7 +231,6 @@ void main() {
       state = peersReducer(state, BleDeviceDiscoveredAction(
         deviceId: pathId,
         rssi: -50,
-        serviceUuid: 'uuid-h',
       ));
 
       final disc = state.discoveredBlePeers[pathId]!;

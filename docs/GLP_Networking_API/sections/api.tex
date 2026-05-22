@@ -51,10 +51,10 @@ Consume peer link & \func{consumePeerLink(uri)} $\to$ \code{PubKey} & Parse an i
 \bottomrule
 \end{longtable}
 %------------------------------------------------------------------------------
-\subsection{Cold Calls and Trust Levels}
+\subsection{Cold Calls and Trusted Environment Levels}
 \label{sec:cold-call-trust}
 %------------------------------------------------------------------------------
-A \emph{cold call} is a first-contact connection attempt between two agents that do not already share an accepted peer relationship or an active authenticated application channel. Cold calls may be initiated by a nearby BLE encounter or by an explicit deep-link shared out-of-band.
+A \emph{cold call} is a first-contact connection attempt between two agents that do not already share an accepted peer relationship or an active authenticated application channel. Cold calls may be initiated by a nearby BLE encounter or by an explicit deep-link shared out-of-band, requiring IP connectivity (Section~\ref{sec:ip-cold-call}).
 
 Agents may enforce one of two cold-call trust levels across all media:
 \begin{itemize}
@@ -63,7 +63,9 @@ Agents may enforce one of two cold-call trust levels across all media:
 \end{itemize}
 Explicit cold-calls through deep-links shared out-of-band are not affected by the different trust levels, and can be accepted regardless of the configured trust level.
 
-These trust levels govern who may initiate first contact; they do not change BLE discovery, transport authentication, or rendezvous mechanics once a connection attempt is allowed.
+In the \textbf{Open} trust level, an agent responds to any nearby Grassroots BLE encounter by completing the ANNOUNCE exchange, thereby revealing its full public key and allowing first contact. In the \textbf{Closed} trust level, an agent does not complete ANNOUNCE with an unknown nearby device: it uses the derived UUID
+to recognize already-known peers, and ignores unmatched BLE encounters. 
+
 %------------------------------------------------------------------------------
 \subsection{Point-to-Point Communication}
 \label{sec:p2p}

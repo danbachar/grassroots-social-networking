@@ -8,7 +8,8 @@ Mobile agents typically run on smartphones behind NAT and do not have static IP 
 \subsection{Rendezvous Agents}
 \label{sec:rv-agents}
 %------------------------------------------------------------------------------
-A \emph{rendezvous agent} is a lightweight GLP agent that runs at a known, static, globally-routable IP address.  Its sole purpose is to coordinate hole-punching between agents that have lost connectivity.  A rendezvous agent:
+A \emph{rendezvous agent} is a lightweight GLP agent that runs at a known, static, globally-routable IP address.  Its purpose is to coordinate hole-punching between agents that have lost connectivity, and facilitate IP cold-calls.  A rendezvous agent:
+
 \begin{itemize}
 \item Has no friends list and does not participate in the social graph.
 \item Accepts cold-call connections from any agent.

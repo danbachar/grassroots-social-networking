@@ -15,10 +15,12 @@ Upon establishing the UDX stream, the peers perform a mutual authentication hand
 \func{onPeerConnected(cb)} fires when the UDX stream is established and authenticated. \func{onPeerDisconnected(cb)} fires when the stream drops.
 
 %------------------------------------------------------------------------------
-\subsection{IP Cold-Call Bootstrap}
+\subsection{IP Cold-Call}
 \label{sec:ip-cold-call}
 %------------------------------------------------------------------------------
-Cold-call trust policy is medium-agnostic and defined in Section~\ref{sec:cold-call-trust}. Over IP, an allowed cold call is bootstrapped by a deep-link sent out-of-band from agent~$A$ to agent~$B$.  The deep-link is encoded and contains: (i)~$A$'s public key, (ii)~$A$'s nickname, (iii)~at least one rendezvous (RV) server address used by~$A$, and (iv)~$A$'s current public IP:port address.
+
+Cold-call trust policy is medium-agnostic and defined in Section~\ref{sec:cold-call-trust}. Over IP, an allowed cold call is bootstrapped by a deep-link sent out-of-band from agent~$A$ to agent~$B$.  The deep-link is valid for a limited time, encoded, and contains: (i)~$A$'s public key, (ii)~$A$'s nickname, (iii)~at least one rendezvous (RV) server address used by~$A$, (iv)~$A$'s current public IP:port address, and (v) a nonce created by $A$.
+Rendezvous servers allow the bootstrapping of friendships outside of BLE range over IP, and will be explained in Section~\ref{sec:rv-agents}.
 
 When~$B$ opens the deep-link in the app, \func{consumePeerLink(uri)} parses and registers~$A$'s identity and then attempts to establish connectivity using the included address and RV information (Section~\ref{sec:discovery}).  For the cold-call to succeed, one of the following requirements must hold: \begin{itemize}
     \item $A$ is well-connected and can accept unsolicited requests to its advertised IP:port (without hole-punching), or

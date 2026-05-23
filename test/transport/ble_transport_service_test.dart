@@ -414,7 +414,7 @@ void main() {
       expect(hostApi.scanRequests, isEmpty);
     });
 
-    test('scans with exact discovery UUID and duplicate advertisements',
+    test('scans by Grassroots prefix and allows duplicate advertisements',
         () async {
       hostApi.calls.clear();
       hostApi.scanRequests.clear();
@@ -425,8 +425,7 @@ void main() {
       final request = hostApi.scanRequests.single;
       expect(request.serviceUuidPrefix,
           equals(GrassrootsIdentity.grassrootsUuidPrefix));
-      expect(request.serviceUuids,
-          equals([GrassrootsIdentity.discoveryServiceUuid]));
+      expect(request.serviceUuids, isEmpty);
       expect(request.timeoutMs, equals(0));
       expect(request.allowDuplicates, isTrue);
     });

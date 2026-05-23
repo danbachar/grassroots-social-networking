@@ -2088,10 +2088,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
           _buildInfoCard(
             title: 'Service UUID',
-            value: GrassrootsIdentity.discoveryServiceUuid,
+            value: _identity?.bleServiceUuid ?? '...',
             icon: Icons.bluetooth,
-            onCopy: () =>
-                _copyToClipboard(GrassrootsIdentity.discoveryServiceUuid),
+            onCopy: () => _copyToClipboard(_identity?.bleServiceUuid ?? ''),
           ),
           const SizedBox(height: 12),
 

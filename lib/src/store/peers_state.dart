@@ -21,6 +21,9 @@ class DiscoveredPeerState {
   /// Always populated for `DiscoveredPeerState` because every advertisement carries RSSI.
   final int rssi;
 
+  /// Grassroots service UUID from the advertisement. With derived UUIDs this
+  /// is the pre-connect identity hint used only for discovery decisions.
+  final String? serviceUuid;
 
   /// First time we observed an advertisement matching this pathId.
   final DateTime discoveredAt;
@@ -40,6 +43,7 @@ class DiscoveredPeerState {
     required this.transportId,
     this.displayName,
     required this.rssi,
+    this.serviceUuid,
     required this.discoveredAt,
     required this.lastSeen,
     this.isConnecting = false,
@@ -57,6 +61,7 @@ class DiscoveredPeerState {
     String? transportId,
     String? displayName,
     int? rssi,
+    String? serviceUuid,
     DateTime? discoveredAt,
     DateTime? lastSeen,
     bool? isConnecting,
@@ -66,6 +71,7 @@ class DiscoveredPeerState {
       transportId: transportId ?? this.transportId,
       displayName: displayName ?? this.displayName,
       rssi: rssi ?? this.rssi,
+      serviceUuid: serviceUuid ?? this.serviceUuid,
       discoveredAt: discoveredAt ?? this.discoveredAt,
       lastSeen: lastSeen ?? this.lastSeen,
       isConnecting: isConnecting ?? this.isConnecting,
@@ -80,6 +86,7 @@ class DiscoveredPeerState {
           runtimeType == other.runtimeType &&
           transportId == other.transportId &&
           rssi == other.rssi &&
+          serviceUuid == other.serviceUuid &&
           isConnecting == other.isConnecting &&
           isConnected == other.isConnected;
 
@@ -87,6 +94,7 @@ class DiscoveredPeerState {
   int get hashCode => Object.hash(
         transportId,
         rssi,
+        serviceUuid,
         isConnecting,
         isConnected,
       );
@@ -214,10 +222,10 @@ class PeerState {
 
   /// UDP candidates in first-seen order, including legacy fields.
   Set<String> get allUdpAddressCandidates => normalizeAddressStrings([
-    linkLocalAddress,
-    udpAddress,
-    ...udpAddressCandidates,
-  ]);
+        linkLocalAddress,
+        udpAddress,
+        ...udpAddressCandidates,
+      ]);
 
   /// Whether this peer has any publicly routable UDP candidate.
   bool get hasPublicUdpAddress =>
@@ -315,20 +323,20 @@ class PeerState {
 
   @override
   int get hashCode => Object.hash(
-    pubkeyHex,
-    nickname,
-    connectionState,
-    transport,
-    rssi,
-    bleCentralDeviceId,
-    blePeripheralDeviceId,
-    udpAddress,
-    linkLocalAddress,
-    Object.hashAll(udpAddressCandidates.toList()..sort()),
-    isFriend,
-    lastDirectReachAt,
-    hasLiveUdpConnection,
-  );
+        pubkeyHex,
+        nickname,
+        connectionState,
+        transport,
+        rssi,
+        bleCentralDeviceId,
+        blePeripheralDeviceId,
+        udpAddress,
+        linkLocalAddress,
+        Object.hashAll(udpAddressCandidates.toList()..sort()),
+        isFriend,
+        lastDirectReachAt,
+        hasLiveUdpConnection,
+      );
 }
 
 /// Complete peers state for Redux store
@@ -472,10 +480,10 @@ class PeersState {
 
   @override
   int get hashCode => Object.hash(
-    _hashStringKeyedMap(discoveredBlePeers),
-    _hashStringKeyedMap(peers),
-    _hashStringSetMap(friendsOfFriends),
-  );
+        _hashStringKeyedMap(discoveredBlePeers),
+        _hashStringKeyedMap(peers),
+        _hashStringSetMap(friendsOfFriends),
+      );
 }
 
 int _hashStringKeyedMap<T>(Map<String, T> map) {

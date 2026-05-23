@@ -20,8 +20,8 @@ const _defaultBleDisplayInfo = TransportDisplayInfo(
   color: Colors.blue,
 );
 
-/// Grassroots characteristic UUID — fixed across all peers inside the shared
-/// discovery GATT service.
+/// Grassroots characteristic UUID, fixed across all peers. The containing
+/// service UUID is derived from the advertiser's public key.
 const String _grassrootsCharacteristicUuid =
     '0000ff01-0000-1000-8000-00805f9b34fb';
 
@@ -40,7 +40,7 @@ const int _requestedAndroidMtu = 247;
 ///
 /// ## Architecture
 ///
-/// - **Peripheral mode**: advertises the shared Grassroots service UUID,
+/// - **Peripheral mode**: advertises our derived Grassroots service UUID,
 ///   accepts incoming connections, exposes one notify+write characteristic.
 /// - **Central mode**: scans for peers advertising the Grassroots service
 ///   prefix and connects to them.
@@ -229,7 +229,7 @@ class BleTransportService extends TransportService {
       if (shouldAdvertise) {
         try {
           await _ble.startAdvertising(
-            serviceUuid: GrassrootsIdentity.discoveryServiceUuid,
+            serviceUuid: identity.bleServiceUuid,
             characteristicUuid: _grassrootsCharacteristicUuid,
             localName: localName,
             bondless: true,
@@ -250,11 +250,6 @@ class BleTransportService extends TransportService {
         try {
           await _ble.startScan(
             serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
-            // Pass the exact shared discovery UUID so CoreBluetooth gets an
-            // OS-level service filter. Prefix-only scanning is a Dart/plugin
-            // post-filter and was unreliable on iOS; Android still keeps the
-            // software prefix check as an extra guard.
-            serviceUuids: const [GrassrootsIdentity.discoveryServiceUuid],
             timeout: Duration.zero, // continuous scan
             // iOS CoreBluetooth deduplicates per-peer advertisements by
             // default; with allowDuplicates=true it keeps delivering
@@ -335,9 +330,6 @@ class BleTransportService extends TransportService {
     try {
       await _ble.startScan(
         serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
-        // Match the continuous-scan path: same OS-level service filter and
-        // plugin-side prefix guard.
-        serviceUuids: const [GrassrootsIdentity.discoveryServiceUuid],
         timeout: t,
         // Match the continuous-scan path so already-discovered peers keep
         // surfacing for RSSI refreshes and reverse-leg retries.
@@ -466,15 +458,17 @@ class BleTransportService extends TransportService {
     if (discovered?.isConnecting == true) {
       return false;
     }
+    final serviceUuid = discovered?.serviceUuid;
+    if (serviceUuid == null) {
+      debugPrint('Cannot connect to $pathId: no advertised service UUID');
+      return false;
+    }
 
     final remoteId = pathId.substring('central:'.length);
     try {
       await _ble.connect(
         remoteId: remoteId,
-        // All Grassroots peers host the same discovery UUID on their GATT
-        // server. Per-peer identity is established post-connect via
-        // ANNOUNCE — never via the service UUID.
-        serviceUuid: GrassrootsIdentity.discoveryServiceUuid,
+        serviceUuid: serviceUuid,
         characteristicUuid: _grassrootsCharacteristicUuid,
         androidMtu: _requestedAndroidMtu,
         // Apple's docs say CoreBluetooth's connect can legitimately take
@@ -553,7 +547,8 @@ class BleTransportService extends TransportService {
 
   void _onAdvertisement(ble.BleAdvertisement adv) {
     final pathId = 'central:${adv.remoteId}';
-    if (_firstGrassrootsServiceUuid(adv.serviceUuids) == null) {
+    final serviceUuid = _firstGrassrootsServiceUuid(adv.serviceUuids);
+    if (serviceUuid == null) {
       // Plugin already filters by Grassroots prefix, but defensively skip
       // anything that lost its service UUID before reaching us.
       return;
@@ -565,6 +560,7 @@ class BleTransportService extends TransportService {
         deviceId: pathId,
         displayName: adv.advertisedName ?? adv.platformName,
         rssi: adv.rssi,
+        serviceUuid: serviceUuid,
       ));
     } else {
       store.dispatch(BleDeviceRssiUpdatedAction(
@@ -599,11 +595,8 @@ class BleTransportService extends TransportService {
       return;
     }
     // BLE address rotation produces a fresh pathId every ~30s for the same
-    // peer. With a single shared discovery UUID we can't tell pre-connect
-    // whether this is a new peer or a known one wearing a new MAC. Cap
-    // the number of in-flight central dials so a chatty rotator can't
-    // exhaust the BLE stack's connection slots; let one dial succeed and
-    // ANNOUNCE then disambiguate.
+    // peer. Cap the number of in-flight central dials so a chatty rotator
+    // can't exhaust the BLE stack's connection slots.
     if (_inFlightCentralDials() >= _maxInFlightCentralDials) {
       return;
     }

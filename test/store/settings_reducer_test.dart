@@ -195,7 +195,7 @@ void main() {
 
       test('AddRendezvousServerAction deduplicates matching server', () {
         final state = SettingsState(
-          rendezvousServers: [serverA],
+          rendezvousServers: const [serverA],
           anchorAddress: serverA.address,
           anchorPubkeyHex: serverA.pubkeyHex,
         );
@@ -210,7 +210,7 @@ void main() {
 
       test('RemoveRendezvousServerAction removes only matching server', () {
         final state = SettingsState(
-          rendezvousServers: [serverA, serverB],
+          rendezvousServers: const [serverA, serverB],
           anchorAddress: serverA.address,
           anchorPubkeyHex: serverA.pubkeyHex,
         );
@@ -236,6 +236,20 @@ void main() {
         );
 
         expect(result.configuredRendezvousServers, equals(const [serverA]));
+      });
+    });
+
+    group('SetColdCallTrustLevelAction', () {
+      test('updates cold-call trust level', () {
+        const state = SettingsState.initial;
+        final result = settingsReducer(
+          state,
+          SetColdCallTrustLevelAction(ColdCallTrustLevel.closed),
+        );
+
+        expect(result.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(result.bluetoothEnabled, state.bluetoothEnabled);
+        expect(result.udpEnabled, state.udpEnabled);
       });
     });
 

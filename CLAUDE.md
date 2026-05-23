@@ -26,7 +26,7 @@ Grassroots does NOT cache, relay, or forward messages on behalf of other peers. 
 
 ## BLE Discovery & Identity
 
-Every device advertises a public-key-derived Grassroots service UUID: a fixed Grassroots prefix plus the first 8 bytes of SHA-256(public key). The UUID is only a discovery hint, never an authorization proof. Identity is established by the signed ANNOUNCE handshake, which carries the full public key, nickname, and signature.
+Every device advertises a public-key-derived Grassroots service UUID: a fixed Grassroots prefix plus the first 8 bytes of SHA-256(public key). The UUID is only a discovery hint, never an authorization proof. Identity is established by the signed ANNOUNCE handshake, which carries the full public key, nickname, and signature. In open cold-call mode, nearby unknown BLE peers may complete ANNOUNCE; in closed mode, unknown nearby peers do not get ANNOUNCE, and friend-only metadata is sent only after signed ANNOUNCE authenticates an accepted friend.
 
 ## Well-Connected Friends & Hole-Punching
 

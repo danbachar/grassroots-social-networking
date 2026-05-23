@@ -26,6 +26,16 @@ enum BleRoleMode {
   peripheralOnly,
 }
 
+/// Policy for unsolicited first contact from peers that do not already have
+/// an accepted relationship with us.
+enum ColdCallTrustLevel {
+  /// Complete BLE ANNOUNCE with nearby strangers and allow first contact.
+  open,
+
+  /// Do not complete BLE ANNOUNCE with unknown nearby peers.
+  closed,
+}
+
 /// Extension for display info
 extension TransportProtocolDisplay on TransportProtocol {
   String get displayName {
@@ -114,6 +124,9 @@ class SettingsState {
   /// Which BLE roles this device should run. Default `auto`.
   final BleRoleMode bleRoleMode;
 
+  /// Whether unsolicited nearby BLE peers may complete first-contact ANNOUNCE.
+  final ColdCallTrustLevel coldCallTrustLevel;
+
   const SettingsState({
     this.bluetoothEnabled = true,
     this.udpEnabled = true,
@@ -125,6 +138,7 @@ class SettingsState {
     this.anchorPubkeyHex,
     this.rendezvousServers = const [],
     this.bleRoleMode = BleRoleMode.auto,
+    this.coldCallTrustLevel = ColdCallTrustLevel.open,
   });
 
   static const SettingsState initial = SettingsState();
@@ -184,6 +198,7 @@ class SettingsState {
     List<TransportProtocol>? transportPriority,
     List<RendezvousServerSettings>? rendezvousServers,
     BleRoleMode? bleRoleMode,
+    ColdCallTrustLevel? coldCallTrustLevel,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? anchorAddress = _sentinel,
     Object? anchorPubkeyHex = _sentinel,
@@ -194,6 +209,7 @@ class SettingsState {
       transportPriority: transportPriority ?? this.transportPriority,
       rendezvousServers: rendezvousServers ?? this.rendezvousServers,
       bleRoleMode: bleRoleMode ?? this.bleRoleMode,
+      coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       anchorAddress: identical(anchorAddress, _sentinel)
           ? this.anchorAddress
           : anchorAddress as String?,
@@ -212,6 +228,7 @@ class SettingsState {
         'rendezvousServers':
             rendezvousServers.map((server) => server.toJson()).toList(),
         'bleRoleMode': bleRoleMode.name,
+        'coldCallTrustLevel': coldCallTrustLevel.name,
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -225,6 +242,11 @@ class SettingsState {
     final bleRoleMode = BleRoleMode.values.firstWhere(
       (m) => m.name == roleModeName,
       orElse: () => BleRoleMode.auto,
+    );
+    final trustLevelName = json['coldCallTrustLevel'] as String?;
+    final coldCallTrustLevel = ColdCallTrustLevel.values.firstWhere(
+      (level) => level.name == trustLevelName,
+      orElse: () => ColdCallTrustLevel.open,
     );
 
     return SettingsState(
@@ -241,6 +263,7 @@ class SettingsState {
       anchorPubkeyHex: json['anchorPubkeyHex'] as String?,
       rendezvousServers: rendezvousServers,
       bleRoleMode: bleRoleMode,
+      coldCallTrustLevel: coldCallTrustLevel,
     );
   }
 
@@ -255,7 +278,8 @@ class SettingsState {
           anchorAddress == other.anchorAddress &&
           anchorPubkeyHex == other.anchorPubkeyHex &&
           listEquals(rendezvousServers, other.rendezvousServers) &&
-          bleRoleMode == other.bleRoleMode;
+          bleRoleMode == other.bleRoleMode &&
+          coldCallTrustLevel == other.coldCallTrustLevel;
 
   @override
   int get hashCode => Object.hash(
@@ -266,6 +290,7 @@ class SettingsState {
         anchorPubkeyHex,
         Object.hashAll(rendezvousServers),
         bleRoleMode,
+        coldCallTrustLevel,
       );
 
   @override

@@ -60,6 +60,18 @@ class MessageRouter {
     int? observedPort,
   })? onSignalingReceived;
 
+  /// Called after signature verification and before a BLE ANNOUNCE is applied.
+  /// Return false to reject first contact from that sender.
+  bool Function(
+    Uint8List senderPubkey, {
+    String? bleDeviceId,
+    BleRole? bleRole,
+  })? shouldAcceptBleAnnounce;
+
+  /// Called when [shouldAcceptBleAnnounce] rejects a verified BLE ANNOUNCE.
+  void Function(Uint8List senderPubkey, String? bleDeviceId)?
+      onBleAnnounceRejected;
+
   /// Called when a verified packet arrives over UDP, providing the sender's
   /// pubkey so the coordinator can map the connection (replacing tempKey-based
   /// identification that previously required ANNOUNCE as the first message).
@@ -182,6 +194,22 @@ class MessageRouter {
 
     // ANNOUNCE always processed (peer may have updated info)
     if (packet.type == PacketType.announce) {
+      if (transport == PeerTransport.bleDirect) {
+        final accepted = shouldAcceptBleAnnounce?.call(
+              packet.senderPubkey,
+              bleDeviceId: bleDeviceId,
+              bleRole: bleRole,
+            ) ??
+            true;
+        if (!accepted) {
+          debugPrint(
+            '[trust] Dropping BLE ANNOUNCE from '
+            '${_pubkeyToHex(packet.senderPubkey).substring(0, 8)}',
+          );
+          onBleAnnounceRejected?.call(packet.senderPubkey, bleDeviceId);
+          return;
+        }
+      }
       _handleAnnounce(
         packet,
         transport: transport,

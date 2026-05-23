@@ -19,6 +19,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         transportId: action.deviceId,
         displayName: action.displayName,
         rssi: action.rssi,
+        serviceUuid: action.serviceUuid,
         discoveredAt: now,
         lastSeen: now,
       );
@@ -31,6 +32,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
       // Update existing
       final updated = existing.copyWith(
         rssi: action.rssi,
+        serviceUuid: action.serviceUuid,
         lastSeen: now,
         displayName: (action.displayName?.isNotEmpty ?? false)
             ? action.displayName
@@ -194,8 +196,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
           : existing.udpAddressCandidates;
       // If the UDP address changed, prior reachability observation is stale
       // because it was bound to the previous address/network path.
-      final preserveReach =
-          newUdpAddress == existing.udpAddress &&
+      final preserveReach = newUdpAddress == existing.udpAddress &&
           setEquals(newUdpAddressCandidates, existing.udpAddressCandidates);
       // RSSI: copyWith already treats null as "no update" (rssi ?? this.rssi),
       // so a UDP ANNOUNCE (action.rssi == null) keeps any existing BLE-derived
@@ -212,9 +213,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         blePeripheralDeviceId:
             action.blePeripheralDeviceId ?? existing.blePeripheralDeviceId,
         lastBleSeen: isBle ? now : existing.lastBleSeen,
-        lastUdpSeen: action.transport == PeerTransport.udp
-            ? now
-            : existing.lastUdpSeen,
+        lastUdpSeen:
+            action.transport == PeerTransport.udp ? now : existing.lastUdpSeen,
         udpAddress: newUdpAddress,
         linkLocalAddress: action.linkLocalAddress ?? existing.linkLocalAddress,
         udpAddressCandidates: newUdpAddressCandidates,
@@ -252,9 +252,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
           action.role == null || action.role == BleRole.peripheral;
 
       final newCentralId = clearCentral ? null : existing.bleCentralDeviceId;
-      final newPeripheralId = clearPeripheral
-          ? null
-          : existing.blePeripheralDeviceId;
+      final newPeripheralId =
+          clearPeripheral ? null : existing.blePeripheralDeviceId;
       final hasAnyBle = newCentralId != null || newPeripheralId != null;
 
       // If no other transport, mark as disconnected
@@ -429,8 +428,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
               ...existing.udpAddressCandidates,
             ]);
       // If the address changed, prior reachability observation is stale.
-      final preserveReach =
-          newAddress == existing.udpAddress &&
+      final preserveReach = newAddress == existing.udpAddress &&
           setEquals(newCandidates, existing.udpAddressCandidates);
       final updated = PeerState(
         publicKey: existing.publicKey,

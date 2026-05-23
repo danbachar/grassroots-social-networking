@@ -26,7 +26,7 @@ Grassroots does NOT cache, relay, or forward messages on behalf of other peers. 
 
 ## BLE Discovery & Identity
 
-Every device advertises the same well-known Grassroots discovery service UUID. iOS-to-Android cross-platform discovery only works reliably when there is a single 128-bit UUID in the advertise packet (no per-peer derivation, no local name); pre-connect identity differentiation is impossible. Identity is established **only** post-connect via the ANNOUNCE handshake, which carries the full public key, nickname, and signature. Until ANNOUNCE arrives, a path is anonymous.
+Every device advertises a public-key-derived Grassroots service UUID: a fixed Grassroots prefix plus the first 8 bytes of SHA-256(public key). The UUID is only a discovery hint, never an authorization proof. Identity is established by the signed ANNOUNCE handshake, which carries the full public key, nickname, and signature.
 
 ## Well-Connected Friends & Hole-Punching
 

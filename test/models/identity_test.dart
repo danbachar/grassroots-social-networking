@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
+import 'package:cryptography/dart.dart' show DartSha256;
 import 'package:grassroots_networking/src/models/identity.dart';
 
 void main() {
@@ -51,14 +52,49 @@ void main() {
       });
     });
 
-    group('discoveryServiceUuid', () {
-      test('is a single shared dashed 128-bit UUID for every Grassroots peer',
+    group('bleServiceUuid', () {
+      test('returns correctly formatted UUID string (8-4-4-4-12)', () {
+        final uuid = identity.bleServiceUuid;
+        final parts = uuid.split('-');
+        expect(parts.length, equals(5));
+        expect(parts[0].length, equals(8));
+        expect(parts[1].length, equals(4));
+        expect(parts[2].length, equals(4));
+        expect(parts[3].length, equals(4));
+        expect(parts[4].length, equals(12));
+      });
+
+      test(
+          'UUID starts with Grassroots prefix and ends with SHA-256 pubkey suffix',
           () {
-        expect(GrassrootsIdentity.discoveryServiceUuid,
-            matches(RegExp(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')));
+        final uuid = identity.bleServiceUuid;
+        final hexOnly = uuid.replaceAll('-', '');
+
+        expect(hexOnly.substring(0, 16),
+            equals(GrassrootsIdentity.grassrootsUuidPrefix));
+
+        final digest = const DartSha256().hashSync(identity.publicKey).bytes;
+        final expectedSuffix = digest
+            .sublist(0, 8)
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
+        expect(hexOnly.substring(16), equals(expectedSuffix));
+      });
+
+      test('deriveServiceUuid static method matches bleServiceUuid getter', () {
+        expect(GrassrootsIdentity.deriveServiceUuid(identity.publicKey),
+            equals(identity.bleServiceUuid));
+      });
+
+      test('different identities produce different UUIDs', () async {
+        final algorithm = Ed25519();
+        final keyPair2 = await algorithm.newKeyPair();
+        final identity2 = await GrassrootsIdentity.create(
+          keyPair: keyPair2,
+          nickname: 'Bob',
+        );
         expect(
-            GrassrootsIdentity.discoveryServiceUuid.replaceAll('-', ''),
-            startsWith(GrassrootsIdentity.grassrootsUuidPrefix));
+            identity.bleServiceUuid, isNot(equals(identity2.bleServiceUuid)));
       });
 
       test('grassrootsUuidPrefix is 8 bytes (16 hex chars)', () {
@@ -109,7 +145,8 @@ void main() {
         expect(restored.nickname, equals(identity.nickname));
       });
 
-      test('fromMap restores a working GrassrootsIdentity with valid keyPair', () async {
+      test('fromMap restores a working GrassrootsIdentity with valid keyPair',
+          () async {
         final json = identity.toJson();
         final restored = GrassrootsIdentity.fromMap(json);
 
@@ -125,6 +162,12 @@ void main() {
         final json = identity.toJson();
         final restored = GrassrootsIdentity.fromMap(json);
         expect(restored.shortFingerprint, equals(identity.shortFingerprint));
+      });
+
+      test('restored identity has valid bleServiceUuid', () {
+        final json = identity.toJson();
+        final restored = GrassrootsIdentity.fromMap(json);
+        expect(restored.bleServiceUuid, equals(identity.bleServiceUuid));
       });
     });
 

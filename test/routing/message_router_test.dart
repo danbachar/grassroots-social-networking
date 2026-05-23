@@ -190,6 +190,33 @@ void main() {
     // =========================================================================
 
     group('processPacket (BLE) - ANNOUNCE', () {
+      test('can reject verified BLE ANNOUNCE before peer state is created',
+          () async {
+        String? rejectedDeviceId;
+        router.shouldAcceptBleAnnounce =
+            (_, {String? bleDeviceId, BleRole? bleRole}) => false;
+        router.onBleAnnounceRejected = (_, bleDeviceId) {
+          rejectedDeviceId = bleDeviceId;
+        };
+
+        final payload =
+            buildAnnouncePayload(pubkey: otherPubkey, nickname: 'Alice');
+        final p = await signedPacket(
+          type: PacketType.announce,
+          payload: payload,
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'central:test',
+          rssi: -55,
+        );
+
+        expect(store.state.peers.getPeerByPubkey(otherPubkey), isNull);
+        expect(rejectedDeviceId, equals('central:test'));
+      });
+
       test('decodes ANNOUNCE and dispatches PeerAnnounceReceivedAction',
           () async {
         final payload =
@@ -465,8 +492,7 @@ void main() {
         expect(messageReceived, isTrue);
       });
 
-      test('does not overwrite known RSSI when payload RSSI is null',
-          () async {
+      test('does not overwrite known RSSI when payload RSSI is null', () async {
         store.dispatch(PeerAnnounceReceivedAction(
           publicKey: otherPubkey,
           nickname: 'Alice',

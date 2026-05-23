@@ -405,6 +405,9 @@ class GrassrootsNetwork {
   /// Whether UDP is currently enabled and available
   bool get isUdpEnabled => _udpAvailable && _isUdpEnabledInSettings;
 
+  ColdCallTrustLevel get coldCallTrustLevel =>
+      store.state.settings.coldCallTrustLevel;
+
   List<RendezvousServerSettings> get configuredRendezvousServers =>
       store.state.settings.configuredRendezvousServers;
 
@@ -1550,6 +1553,11 @@ class GrassrootsNetwork {
     await _bleService?.applyRoleModeChange();
   }
 
+  Future<void> setColdCallTrustLevel(ColdCallTrustLevel level) async {
+    if (store.state.settings.coldCallTrustLevel == level) return;
+    store.dispatch(SetColdCallTrustLevelAction(level));
+  }
+
   static const _uuid = Uuid();
 
   // ===== Messaging =====
@@ -2043,6 +2051,13 @@ class GrassrootsNetwork {
 
   static String _pubkeyToHex(Uint8List pubkey) =>
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  bool _isAcceptedFriendPubkey(Uint8List pubkey) {
+    final hex = _pubkeyToHex(pubkey);
+    final peer = _peersState.getPeerByPubkeyHex(hex);
+    if (peer?.isFriend == true) return true;
+    return store.state.friendships.isFriend(hex);
+  }
 
   Future<void> _startNoiseHandshakeForPeer({
     required PeerTransport transport,
@@ -3567,6 +3582,19 @@ class GrassrootsNetwork {
       );
     };
 
+    _messageRouter.shouldAcceptBleAnnounce =
+        (senderPubkey, {String? bleDeviceId, BleRole? bleRole}) {
+      if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.open) {
+        return true;
+      }
+      return _isAcceptedFriendPubkey(senderPubkey);
+    };
+
+    _messageRouter.onBleAnnounceRejected = (senderPubkey, bleDeviceId) {
+      if (bleDeviceId == null) return;
+      unawaited(_bleService?.disconnectDevice(bleDeviceId));
+    };
+
     // Peer disconnected at BLE level
     _bleService!.onPeerDisconnected = (peer) {
       debugPrint('BLE Peer disconnected: ${peer.displayName}');
@@ -4059,12 +4087,24 @@ class GrassrootsNetwork {
   Future<bool> _sendAnnounceToDevice(String deviceId) async {
     if (_bleService == null || !_bleAvailable) return false;
 
-    // Check if this device ID belongs to a known friend
+    // Check if this device ID already belongs to an authenticated friend.
     final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
-    final isFriend =
-        pubkey != null && _peersState.getPeerByPubkey(pubkey)?.isFriend == true;
+    final isFriend = pubkey != null && _isAcceptedFriendPubkey(pubkey);
 
-    // Friends get our address + link-local, non-friends (or unknown) don't
+    final friendHint = _bleService!.getFriendPubkeyHintForPeerId(deviceId);
+    final allowsColdCall =
+        store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.open;
+    if (!isFriend && !allowsColdCall && friendHint == null) {
+      debugPrint(
+        '[ble-announce] Suppressed ANNOUNCE to $deviceId '
+        '(closed trust, unknown peer)',
+      );
+      return false;
+    }
+
+    // Authenticated friends get our address + link-local. Non-friends, and
+    // derived-UUID friend hints that have not yet sent a signed ANNOUNCE, get
+    // only identity. A spoofed derived UUID must not unlock friend metadata.
     final announce = isFriend
         ? await _createSignedAnnounce(
             address: udpAddress,

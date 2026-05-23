@@ -72,3 +72,10 @@ class SetBleRoleModeAction extends SettingsAction {
 
   SetBleRoleModeAction(this.mode);
 }
+
+/// Set whether nearby unknown peers may complete BLE first contact.
+class SetColdCallTrustLevelAction extends SettingsAction {
+  final ColdCallTrustLevel level;
+
+  SetColdCallTrustLevelAction(this.level);
+}

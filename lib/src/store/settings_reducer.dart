@@ -95,5 +95,9 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(bleRoleMode: action.mode);
   }
 
+  if (action is SetColdCallTrustLevelAction) {
+    return state.copyWith(coldCallTrustLevel: action.level);
+  }
+
   return state;
 }

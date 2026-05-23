@@ -419,6 +419,26 @@ class BleTransportService extends TransportService {
     return null;
   }
 
+  /// Accepted-friend hint for a BLE path.
+  ///
+  /// For already authenticated paths this returns the mapped friend pubkey.
+  /// For pre-ANNOUNCE central paths it may return a friend whose derived
+  /// service UUID matches the advertisement. That second case is only a hint:
+  /// callers must not send friend-only metadata until a signed ANNOUNCE maps
+  /// the path to the same public key.
+  Uint8List? getFriendPubkeyHintForPeerId(String peerId) {
+    final mappedPubkey = getPubkeyForPeerId(peerId);
+    if (mappedPubkey != null) {
+      final peer = _peersState.getPeerByPubkey(mappedPubkey);
+      if (peer?.isFriend == true) return mappedPubkey;
+    }
+
+    final discovered = _peersState.getDiscoveredBlePeer(peerId);
+    final serviceUuid = discovered?.serviceUuid;
+    if (serviceUuid == null) return null;
+    return _friendPubkeyForDerivedServiceUuid(serviceUuid);
+  }
+
   @override
   Future<void> dispose() async {
     await stop();
@@ -463,6 +483,11 @@ class BleTransportService extends TransportService {
       debugPrint('Cannot connect to $pathId: no advertised service UUID');
       return false;
     }
+    if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed &&
+        _friendPubkeyForDerivedServiceUuid(serviceUuid) == null) {
+      debugPrint('Skipping $pathId: closed trust and unknown service UUID');
+      return false;
+    }
 
     final remoteId = pathId.substring('central:'.length);
     try {
@@ -485,6 +510,14 @@ class BleTransportService extends TransportService {
       // plugin would otherwise correct via a `failed` event).
       store.dispatch(BleDeviceConnectionFailedAction(pathId));
       return false;
+    }
+  }
+
+  Future<void> disconnectDevice(String pathId, {bool forget = true}) async {
+    try {
+      await _ble.disconnect(pathId, forget: forget);
+    } catch (e) {
+      debugPrint('disconnect() failed for $pathId: $e');
     }
   }
 
@@ -592,6 +625,10 @@ class BleTransportService extends TransportService {
       return;
     }
     if (_centralDialBackoffActive(adv.remoteId)) {
+      return;
+    }
+    if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed &&
+        _friendPubkeyForDerivedServiceUuid(serviceUuid) == null) {
       return;
     }
     // BLE address rotation produces a fresh pathId every ~30s for the same
@@ -854,6 +891,17 @@ class BleTransportService extends TransportService {
       path.state == ble.BlePathState.ready && path.canSend;
 
   Iterable<ble.BlePath> get _readyPaths => _paths.values.where(_isReady);
+
+  Uint8List? _friendPubkeyForDerivedServiceUuid(String serviceUuid) {
+    final normalized = serviceUuid.toLowerCase();
+    for (final peer in _peersState.friends) {
+      if (GrassrootsIdentity.deriveServiceUuid(peer.publicKey).toLowerCase() ==
+          normalized) {
+        return peer.publicKey;
+      }
+    }
+    return null;
+  }
 
   BleRole? _roleFromPathId(String pathId) {
     if (pathId.startsWith('central:')) return BleRole.central;

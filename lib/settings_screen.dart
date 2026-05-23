@@ -140,6 +140,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           if (_bluetoothEnabled && widget.onBleRoleModeChanged != null)
             _buildBleRoleModeSelector(),
 
+          if (_bluetoothEnabled) _buildColdCallTrustSelector(),
+
           // UDP Toggle
           _buildTransportTile(
             icon: Icons.public,
@@ -395,6 +397,86 @@ class _SettingsScreenState extends State<SettingsScreen> {
               if (selection.isEmpty) return;
               final next = selection.first;
               await widget.onBleRoleModeChanged?.call(next);
+              widget.onSettingsChanged?.call();
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildColdCallTrustSelector() {
+    final level = widget.store.state.settings.coldCallTrustLevel;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.verified_user_outlined,
+                  size: 16, color: Color(0xFF1B3D2F)),
+              const SizedBox(width: 6),
+              Text(
+                'Cold calls',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.green[800],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'A "cold call" is an unsolicited BLE first-contact attempt from a '
+            'nearby peer you have not friended yet. This setting controls '
+            'whether you reply.\n\n'
+            '• Open — anyone in range can complete the signed ANNOUNCE '
+            'handshake, so you can discover and meet new peers. Strangers '
+            'learn your public key and nickname, but never your address '
+            'or any friend-only metadata.\n'
+            '• Closed — first contact from non-friends is refused. Nearby '
+            'devices still see your service advertisement, but ANNOUNCE is '
+            'not sent and incoming ANNOUNCEs from strangers are dropped, '
+            'so unknown peers cannot learn your nickname over BLE.',
+            style: TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            switch (level) {
+              ColdCallTrustLevel.open =>
+                'Currently open: nearby unknown peers can complete first '
+                    'contact.',
+              ColdCallTrustLevel.closed =>
+                'Currently closed: only accepted friends complete BLE first '
+                    'contact.',
+            },
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.green[800],
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 8),
+          SegmentedButton<ColdCallTrustLevel>(
+            segments: const [
+              ButtonSegment(
+                value: ColdCallTrustLevel.open,
+                label: Text('Open'),
+                icon: Icon(Icons.sensors),
+              ),
+              ButtonSegment(
+                value: ColdCallTrustLevel.closed,
+                label: Text('Closed'),
+                icon: Icon(Icons.lock_outline),
+              ),
+            ],
+            selected: {level},
+            onSelectionChanged: (selection) {
+              if (selection.isEmpty) return;
+              widget.store
+                  .dispatch(SetColdCallTrustLevelAction(selection.first));
               widget.onSettingsChanged?.call();
             },
           ),

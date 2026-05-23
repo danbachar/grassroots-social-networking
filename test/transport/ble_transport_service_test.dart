@@ -6,6 +6,8 @@ import 'dart:typed_data';
 import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer_testing.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
+import 'package:grassroots_networking/src/store/peers_actions.dart'
+    show FriendEstablishedAction;
 import 'package:grassroots_networking/src/store/reducers.dart';
 import 'package:grassroots_networking/src/store/settings_actions.dart';
 import 'package:grassroots_networking/src/store/settings_state.dart';
@@ -428,6 +430,39 @@ void main() {
       expect(request.serviceUuids, isEmpty);
       expect(request.timeoutMs, equals(0));
       expect(request.allowDuplicates, isTrue);
+    });
+
+    test('closed trust dials only derived UUIDs for accepted friends',
+        () async {
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      const unknownRemoteId = 'UNKNOWN';
+      const unknownUuid = '84c40316-0871-e5ad-ffff-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: unknownRemoteId,
+        serviceUuids: [unknownUuid],
+        rssi: -62,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$unknownRemoteId'), isEmpty);
+
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+
+      const friendRemoteId = 'FRIEND';
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: friendRemoteId,
+        serviceUuids: [friend.bleServiceUuid],
+        rssi: -50,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c == 'connect:$friendRemoteId'),
+          hasLength(1));
     });
   });
 

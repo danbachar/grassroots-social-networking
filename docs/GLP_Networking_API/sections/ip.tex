@@ -19,13 +19,9 @@ Upon establishing the UDX stream, the peers perform a mutual authentication hand
 \label{sec:ip-cold-call}
 %------------------------------------------------------------------------------
 
-Cold-call trust policy is medium-agnostic and defined in Section~\ref{sec:cold-call-trust}. Over IP, an allowed cold call is bootstrapped by a deep-link sent out-of-band from agent~$A$ to agent~$B$.  The deep-link is valid for a limited time, encoded, and contains: (i)~$A$'s public key, (ii)~$A$'s nickname, (iii)~at least one rendezvous (RV) server address used by~$A$, (iv)~$A$'s current public IP:port address, and (v) a nonce created by $A$.
-Rendezvous servers allow the bootstrapping of friendships outside of BLE range over IP, and will be explained in Section~\ref{sec:rv-agents}.
+Over IP, a cold call is bootstrapped by a deep-link sent out-of-band from inviting agent~$A$ to some holder~$B$.  The link is a signed bearer invitation: at creation time $A$ need not know~$B$'s public key, and possession of a valid unused link authorizes exactly one first-contact attempt.
 
-When~$B$ opens the deep-link in the app, \func{consumePeerLink(uri)} parses and registers~$A$'s identity and then attempts to establish connectivity using the included address and RV information (Section~\ref{sec:discovery}).  For the cold-call to succeed, one of the following requirements must hold: \begin{itemize}
-    \item $A$ is well-connected and can accept unsolicited requests to its advertised IP:port (without hole-punching), or
-    \item $A$ has an active connection to at least one rendezvous server, so rendezvous bootstrap can proceed (Section~\ref{sec:rendezvous}).
-\end{itemize}
+\func{generatePeerLink()} produces the link and registers the invite with a chosen rendezvous (RV) server. \func{consumePeerLink(uri)} verifies $A$'s signature, registers~$A$'s identity, and submits a cold-call claim to the RV server named in the link.  The RV server validates the claim and forwards $B$'s identity to~$A$; if $A$ accepts the friendship request, the standard rendezvous protocol (Section~\ref{sec:rv-protocol}) ensues with the RV server as the signaling agent.  Once the UDP path is open, the peers run UDX and Noise~XX (Section~\ref{sec:ip-connection}), after which the madGLP cold-call payload is delivered to $A$'s index-0 serializer.  Full invite mechanics are specified in Appendix~\ref{appendix:ip-cold-call-invites}.
 
 %------------------------------------------------------------------------------
 \subsection{IP Communication}

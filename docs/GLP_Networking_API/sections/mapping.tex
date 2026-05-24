@@ -12,7 +12,7 @@ Each madGLP agent identifier (e.g., \code{alice}, \code{bob}) is mapped to an Ed
 \item \func{resolve(pubKey)} $\to$ \code{AgentId}: given a public key, return the madGLP agent name.
 \end{itemize}
 This mapping is established during peer discovery: when agent $p$ discovers agent $q$ via the networking layer, the discovery handshake provides $q$'s public key, and the runtime registers the association between $q$'s agent name and public key.
-For cold-calls, the sender must know the target agent's public key. This is obtained either through peer discovery (e.g., BLE proximity) or through out-of-band peer exchange (Section~\ref{sec:discovery}).
+For cold-calls, the sender of the network payload must know the target agent's public key. This is obtained either through peer discovery (e.g., BLE proximity) or through out-of-band peer exchange (Section~\ref{sec:discovery}).  In an IP peer-link cold-call, $A$ creates the signed invite, but the holder~$B$ becomes the first network sender: the invite supplies $A_{\mathit{pk}}$, allowing~$B$ to address $A$'s index-0 serializer.
 %------------------------------------------------------------------------------
 \subsection{Message Serialization}
 \label{sec:serialization}

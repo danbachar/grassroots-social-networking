@@ -7,7 +7,7 @@ This section specifies the interface between the madGLP runtime and the networki
 \subsection{Identity}
 \label{sec:identity}
 %------------------------------------------------------------------------------
-Each agent has an Ed25519 key pair. The 32-byte public key serves as the agent's globally unique identity, used for addressing, authentication, and encryption. Identity is persistent across sessions.
+Each agent has an Ed25519 key pair. The 32-byte public key serves as the agent's globally unique identity, used for addressing, authentication, and signing. Identity is persistent across sessions.
 \begin{longtable}{L{4cm} L{4.5cm} L{5.5cm}}
 \toprule
 \rowcolor{headerblue}
@@ -27,7 +27,7 @@ Retrieve identity & \func{getIdentity()} $\to$ \code{PubKey} & Return the agent'
 %------------------------------------------------------------------------------
 The networking layer notifies the runtime when peers become reachable or unreachable, regardless of the underlying medium.
 
-When two agents cannot discover each other via BLE proximity, they may exchange identities out-of-band using \func{generatePeerLink()} and \func{consumePeerLink(uri)}.
+When two agents cannot discover each other via BLE proximity, they may exchange identities out-of-band using \func{generatePeerLink()} and \func{consumePeerLink(uri)}.  A peer link is a signed, time-limited bearer invitation: possession of a valid unused link authorizes one first-contact attempt by the holder.
 \begin{longtable}{L{4cm} L{5cm} L{5cm}}
 \toprule
 \rowcolor{headerblue}
@@ -45,23 +45,23 @@ Peer disconnected & \func{onPeerDisconnected(cb)} & Callback when a peer is no l
 Check reachability & \func{isPeerReachable(pk)} $\to$ \code{bool} & Whether the given peer is currently reachable via any medium. \\
 \rowcolor{rowgray}
 Connectivity status & \func{onConnectivityStatus(cb)} & Callback when the networking layer detects a change in the agent's public IP address.  Triggers the rendezvous protocol (Section~\ref{sec:rendezvous}).  Fired on startup and on address change. \\
-Generate peer link & \func{generatePeerLink()} $\to$ \code{URI} & Generate a URI encoding the agent's public key, nickname, and optionally its current IP address and the addresses of its rendezvous agents. Suitable for transmission via QR code, messaging app, email, or any other out-of-band channel. \\
+Generate peer link & \func{generatePeerLink()} $\to$ \code{URI} & Generate a signed, one-time, RV-mediated peer-link invitation for out-of-band sharing.  Full semantics are specified in Appendix~\ref{appendix:ip-cold-call-invites}. \\
 \rowcolor{rowgray}
-Consume peer link & \func{consumePeerLink(uri)} $\to$ \code{PubKey} & Parse an incoming peer link, register the remote agent's identity, and attempt to establish connectivity (via the included address or via shared rendezvous agents). Returns the remote agent's public key. \\
+Consume peer link & \func{consumePeerLink(uri)} $\to$ \code{PubKey} & Verify and redeem an incoming peer-link invitation through a listed rendezvous server, register the inviter's identity, and attempt first contact.  Returns the inviter's public key; see Appendix~\ref{appendix:ip-cold-call-invites}. \\
 \bottomrule
 \end{longtable}
 %------------------------------------------------------------------------------
 \subsection{Cold Calls and Trusted Environment Levels}
 \label{sec:cold-call-trust}
 %------------------------------------------------------------------------------
-A \emph{cold call} is a first-contact connection attempt between two agents that do not already share an accepted peer relationship or an active authenticated application channel. Cold calls may be initiated by a nearby BLE encounter or by an explicit deep-link shared out-of-band, requiring IP connectivity (Section~\ref{sec:ip-cold-call}).
+A \emph{cold call} is a first-contact connection attempt between two agents that do not already share an active grassroots networking communication channel. Cold calls may be initiated by a nearby BLE encounter or by an explicit deep-link shared out-of-band, requiring IP connectivity (Section~\ref{sec:ip-cold-call}).  In the IP case, the inviting agent need not know the redeemer's public key before the link is opened.  A cold call is implicitly a friendship request: accepting the cold call establishes friendship.
 
-Agents may enforce one of two cold-call trust levels across all media:
+Agents may enforce one of two cold-call trust levels, affecting BLE encounters:
 \begin{itemize}
-\item \textbf{Open:} The agent accepts unsolicited cold calls from nearby peers discovered through BLE encounters.
-\item \textbf{Closed:} The agent rejects unsolicited cold calls from nearby BLE encounters.
+\item \textbf{Open:} The agent surfaces unsolicited cold calls from nearby BLE peers as friendship requests for the user to accept or decline.
+\item \textbf{Closed:} The agent ignores unsolicited cold calls from nearby BLE encounters without surfacing them.
 \end{itemize}
-Explicit cold-calls through deep-links shared out-of-band are not affected by the different trust levels, and can be accepted regardless of the configured trust level.
+Explicit cold-calls through deep-links shared out-of-band are not affected by the different trust levels: the link is itself an explicit invitation by its creator, so the resulting friendship request is always surfaced for the user to accept or decline regardless of the configured trust level.  The invite link includes authorization: it contains a temporary, one-time 256-bit token generated by its creator that is consumed upon usage; see Appendix~\ref{appendix:ip-cold-call-invites} for the whole invite flow.
 
 In the \textbf{Open} trust level, an agent responds to any nearby Grassroots BLE encounter by completing the ANNOUNCE exchange, thereby revealing its full public key and allowing first contact. In the \textbf{Closed} trust level, an agent does not complete ANNOUNCE with an unknown nearby device: it uses the derived UUID
 to recognize already-known peers, and ignores unmatched BLE encounters. 

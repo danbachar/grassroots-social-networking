@@ -15,7 +15,7 @@ Each agent advertises a BLE GATT service whose 128-bit (16-byte) UUID has two pa
 \func{getPeers()} performs a BLE scan for devices whose service UUID matches the Grassroots prefix. \func{onPeerDiscovered(cb)} fires for each matching device found.
 Upon successful BLE connection, an ANNOUNCE packet is exchanged containing the agent's full 32-byte public key and a human-readable nickname. No Bluetooth bonding or pairing confirmation is required; application-level encryption (using the Ed25519 keys) is used instead.
 
-A BLE encounter with an unknown nearby agent is a local cold-call opportunity. Whether that first contact is accepted is governed by the medium-agnostic cold-call trust levels in Section~\ref{sec:cold-call-trust}.
+A BLE encounter with an unknown nearby agent is a local cold-call opportunity, implicitly a friendship request. Whether the agent surfaces it for the user to accept or decline is governed by the environmental trust levels in Section~\ref{sec:cold-call-trust}.
 %------------------------------------------------------------------------------
 \subsection{BLE Communication}
 \label{sec:ble-comm}

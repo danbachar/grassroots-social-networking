@@ -5,12 +5,12 @@
 %==============================================================================
 The rendezvous agent processes cold-call messages on its input stream.  A $\mathit{reconnect}$ message from agent~$A$ includes~$A$'s public key, friend~$B$'s public key, a friendship proof, and a reply variable.  An $\mathit{available}$ message from~$B$ includes both public keys and a reply variable.
 
-The agent verifies the friendship proof via \code{verify\_friendship} and observes~$A$'s public address via \code{peer\_address} (both body system predicates).  It searches a pending list for a matching request from the other side.  If found, \code{complete\_rendezvous} constructs the reply values in its head: $B$ receives $\mathit{punch}(\mathit{Addr}_A)$ and $A$ receives $\mathit{initiated}$.  If the proof is invalid, the reply is bound to $\mathit{rejected}$.  If no match is found, the request is stored in the pending list.
+The agent verifies the friendship proof via \code{verify\_friendship} and observes each connecting agent's public address via \code{peer\_address} (both body system predicates).  It searches a pending list for a matching request from the other side.  If found, \code{complete\_rendezvous} constructs the reply values in its head: $A$ receives $\mathit{punch}(\mathit{Addr}_B)$ and $B$ receives $\mathit{punch}(\mathit{Addr}_A)$.  If the proof is invalid, the reply is bound to $\mathit{rejected}$.  If no match is found, the request is stored in the pending list.
 
 The key GLP mechanism is the \emph{reply-variable chain}: each cold-call message contains a reply variable (a writer held by the sender).  As the rendezvous agent processes the message, the reply variable is threaded through writer$\to$reader handoffs.  When both sides are matched, the assignments propagate back through the chain to the original senders.
 
 \begin{verbatim}
-SignalReply ::= punch(Constant) ; initiated ; rejected.
+SignalReply ::= punch(Constant) ; rejected.
 VerifyResult ::= ok ; invalid.
 
 SignalMsg ::= reconnect(Constant, Constant, Constant, SignalReply?)
@@ -20,8 +20,8 @@ SignalMsg ::= reconnect(Constant, Constant, Constant, SignalReply?)
 
 PendingEntry ::= needs(Constant, Constant, Constant, SignalReply?)
                  %% needs(A_pk, B_pk, AddrA, ReplyA?)
-               ; ready(Constant, Constant, SignalReply?).
-                 %% ready(B_pk, A_pk, ReplyB?)
+               ; ready(Constant, Constant, Constant, SignalReply?).
+                 %% ready(B_pk, A_pk, AddrB, ReplyB?)
 PendingList ::= [] ; [PendingEntry | PendingList].
 
 procedure rv_agent(Stream(SignalMsg)?, PendingList?).
@@ -34,7 +34,9 @@ rv_agent([reconnect(A, B, Proof, ReplyA?)|In], Pending) :-
     rv_agent(In?, Pending1?).
 
 rv_agent([available(B, A, ReplyB?)|In], Pending) :-
-    find_needs(A?, B?, ReplyB, Pending?, Pending1),
+    ground(A?), ground(B?) |
+    peer_address(B?, AddrB),
+    find_needs(A?, B?, AddrB?, ReplyB, Pending?, Pending1),
     rv_agent(In?, Pending1?).
 
 rv_agent([], _).
@@ -47,26 +49,26 @@ handle_verify(invalid, _, _, _, rejected, Pending, Pending?).
 
 procedure find_ready(Constant?, Constant?, Constant?, SignalReply,
                      PendingList?, PendingList).
-find_ready(A, B, AddrA, ReplyA?, [ready(B2, A2, ReplyB?)|Ps], Ps?) :-
+find_ready(A, B, AddrA, ReplyA?, [ready(B2, A2, AddrB, ReplyB?)|Ps], Ps?) :-
     A? =?= A2?, B? =?= B2? |
-    complete_rendezvous(AddrA?, ReplyA, ReplyB).
+    complete_rendezvous(AddrA?, AddrB?, ReplyA, ReplyB).
 find_ready(A, B, AddrA, ReplyA?, [P|Ps], [P?|Ps1?]) :-
     otherwise |
     find_ready(A?, B?, AddrA?, ReplyA, Ps?, Ps1).
 find_ready(A, B, AddrA, ReplyA?, [], [needs(A?, B?, AddrA?, ReplyA)]).
 
-procedure find_needs(Constant?, Constant?, SignalReply,
+procedure find_needs(Constant?, Constant?, Constant?, SignalReply,
                      PendingList?, PendingList).
-find_needs(A, B, ReplyB?, [needs(A2, B2, AddrA, ReplyA?)|Ps], Ps?) :-
+find_needs(A, B, AddrB, ReplyB?, [needs(A2, B2, AddrA, ReplyA?)|Ps], Ps?) :-
     A? =?= A2?, B? =?= B2? |
-    complete_rendezvous(AddrA?, ReplyA, ReplyB).
-find_needs(A, B, ReplyB?, [P|Ps], [P?|Ps1?]) :-
+    complete_rendezvous(AddrA?, AddrB?, ReplyA, ReplyB).
+find_needs(A, B, AddrB, ReplyB?, [P|Ps], [P?|Ps1?]) :-
     otherwise |
-    find_needs(A?, B?, ReplyB, Ps?, Ps1).
-find_needs(A, B, ReplyB?, [], [ready(B?, A?, ReplyB)]).
+    find_needs(A?, B?, AddrB?, ReplyB, Ps?, Ps1).
+find_needs(A, B, AddrB, ReplyB?, [], [ready(B?, A?, AddrB?, ReplyB)]).
 
-procedure complete_rendezvous(Constant?, SignalReply, SignalReply).
-complete_rendezvous(AddrA, initiated, punch(AddrA?)).
+procedure complete_rendezvous(Constant?, Constant?, SignalReply, SignalReply).
+complete_rendezvous(AddrA, AddrB, punch(AddrB?), punch(AddrA?)).
 \end{verbatim}
 
 The system predicates \code{peer\_address/2}, \code{verify\_friendship/4}, and \code{punch\_udp/1} are described in Section~\ref{sec:rv-predicates}.
@@ -75,10 +77,10 @@ The system predicates \code{peer\_address/2}, \code{verify\_friendship/4}, and \
 \section{Rendezvous Client --- GLP Implementation}
 \label{appendix:rv-client}
 %==============================================================================
-The client side provides building blocks for agents that need to use a rendezvous agent.  \code{make\_reconnect} constructs a $\mathit{reconnect}$ cold-call message with a fresh reply variable embedded, returning the message and the paired reply reader.  \code{make\_available} does the same for $\mathit{available}$ messages.  \code{handle\_reply} dispatches on the reply: $\mathit{punch}(\mathit{Addr})$ triggers \code{punch\_udp}; $\mathit{initiated}$ and $\mathit{rejected}$ require no networking action.
+The client side provides building blocks for agents that need to use a rendezvous agent.  \code{make\_reconnect} constructs a $\mathit{reconnect}$ cold-call message with a fresh reply variable embedded, returning the message and the paired reply reader.  \code{make\_available} does the same for $\mathit{available}$ messages.  \code{handle\_reply} dispatches on the reply: $\mathit{punch}(\mathit{Addr})$ triggers \code{punch\_udp}; $\mathit{rejected}$ requires no networking action.
 
 \begin{verbatim}
-SignalReply ::= punch(Constant) ; initiated ; rejected.
+SignalReply ::= punch(Constant) ; rejected.
 
 SignalMsg ::= reconnect(Constant, Constant, Constant, SignalReply?)
               %% reconnect(A_pk, B_pk, Proof, Reply)
@@ -98,7 +100,6 @@ make_available(B, A,
 
 procedure handle_reply(SignalReply?).
 handle_reply(punch(Addr)) :- ground(Addr?) | punch_udp(Addr?).
-handle_reply(initiated).
 handle_reply(rejected).
 \end{verbatim}
 
@@ -110,7 +111,7 @@ test_full_scenario(ReplyA?, ReplyB?) :-
     make_available(bob, alice, MsgB, ReplyB),
     rv_agent([MsgA?, MsgB?], []).
 \end{verbatim}
-After execution, $\mathit{ReplyA}$ is bound to $\mathit{initiated}$ and $\mathit{ReplyB}$ to $\mathit{punch}(\mathit{stub\_addr\_alice})$.
+After execution, $\mathit{ReplyA}$ is bound to $\mathit{punch}(\mathit{stub\_addr\_bob})$ and $\mathit{ReplyB}$ to $\mathit{punch}(\mathit{stub\_addr\_alice})$.
 
 %==============================================================================
 \section{Friends-Based Rendezvous --- GLP Implementation}
@@ -179,3 +180,56 @@ update_addr(Key, NewAddr, [F|Fs], [F?|Fs1?]) :-
     otherwise | update_addr(Key?, NewAddr?, Fs?, Fs1).
 update_addr(_, _, [], []).
 \end{verbatim}
+
+%==============================================================================
+\section{IP Cold-Call Invite Redemption}
+\label{appendix:ip-cold-call-invites}
+%==============================================================================
+An IP cold-call peer link is a signed bearer invitation created by agent~$A$ for an as-yet-unknown holder~$B$.  The link is base64url-encoded and is redeemed through a rendezvous server.
+
+\begin{verbatim}
+Invite ::= invite(
+    A_pk,
+    A_nickname,
+    RvServer,        %% RV address and public key
+    Nonce256,
+    ExpiresAt,
+    SignatureA
+).
+\end{verbatim}
+
+\noindent \code{Nonce256} is 256 uniformly random bits.  \code{ExpiresAt} is one hour after creation. \code{RvServer} contains a rendezvous server's public address and key. \code{SignatureA} is an Ed25519 signature by~$A$ over all preceding fields. The nonce is usable exactly once: $A$ records the invite as unused with the rendezvous agent when the link is generated, and the rendezvous agent marks it consumed atomically when accepting the first-contact payload.  Possession of the link authorizes a first-contact attempt; friendship is established only when $A$ accepts the resulting cold call from $B$.
+
+The link is base64-encoded for compact URI transport, allowing the recipient to open it as a deep-link.  The protocol relies on the out-of-band channel to deliver the link to the intended recipient, and relies on the 256-bit nonce, one-hour expiration, and $A$'s signature to prevent guessing, replay, and tampering.
+
+Both $A$ and any holder of the link derive an opaque invite identifier and proof key:
+\[
+\begin{aligned}
+\mathit{InviteId}  &= H(\text{``glp invite id''} \mid \mathit{Nonce256}),\\
+\mathit{InviteKey} &= \mathit{HKDF}(\mathit{Nonce256},
+    \text{``glp invite proof''} \mid A_{\mathit{pk}} \mid
+    \mathit{RvServer} \mid \mathit{ExpiresAt}).
+\end{aligned}
+\]
+The raw nonce is not sent over the IP network.  Network messages use \code{InviteId} plus MACs under \code{InviteKey}, so passive observers and off-path attackers cannot learn or guess the nonce from redemption traffic.
+
+\subsection{Rendezvous-Gated Redemption}
+\label{appendix:rv-invite-redemption}
+
+\begin{enumerate}
+\item \textbf{Generation and registration.}  $A$ picks a fresh 256-bit secret, computes the invite ID and proof key from it, and assembles the link (public key, nickname, the chosen rendezvous server~$S$'s address and public key, secret, expiration).  $A$ signs the link with its private key and records the invite locally as unused until the expiration.  Over $A$'s existing authenticated connection to~$S$, $A$ registers the invite by sending $A$'s public key, the invite ID, the proof key, and the expiration.  $S$ stores these together with an ``unused'' flag.
+
+\item \textbf{Link delivery.}  $A$ sends the base64url-encoded link to~$B$ out-of-band.
+
+\item \textbf{Cold-call claim.}  $B$ opens the link.  \func{consumePeerLink(uri)} decodes it, verifies $A$'s signature, checks that it is still valid, registers $A$'s public key and nickname locally, and recomputes the invite ID and proof key from the secret.  $B$ opens an encrypted, authenticated connection to~$S$ (using $S$'s public key from the link) and submits a cold-call claim: the invite ID, $B$'s public key, $B$'s nickname, and a short proof computed from the proof key covering $A$'s public key, $B$'s public key, the invite ID, and a fresh nonce of $B$'s own.  $B$ then sends a standard rendezvous \code{available} message naming itself and~$A$.
+
+\item \textbf{Claim validation and forwarding.}  $S$ checks four conditions: the invite ID is registered for~$A$; the expiration is still in the future; the invite is still marked unused; and the proof verifies against the proof key stored in step~1.  On any failure, $S$ rejects the claim.  On success, $S$ atomically flips the invite to ``used'' and forwards $B$'s public key and nickname to~$A$ over $A$'s existing connection to~$S$.
+
+\item \textbf{Acceptance.}  $A$ presents $B$'s public key and nickname to the application layer as a friendship request.  If $A$ accepts the request (which is the friendship decision), $A$ sends~$S$ a standard rendezvous \code{reconnect} message naming~$B$.  In place of the friendship attestation that the reconnect message normally carries, the proof field references the invite ID that $A$ pre-registered with~$S$ in step~1; $S$ matches it against its invite state to authorize the request.
+
+\item \textbf{Signaling.}  $S$ now holds $A$'s \code{reconnect} and $B$'s \code{available} for the same pair of public keys, and the standard rendezvous protocol (Section~\ref{sec:rv-protocol}) takes over with~$S$ as the signaling agent.  $S$ observes both public addresses from the connections it holds and sends each side the other's address.
+
+\item \textbf{UDP path and Noise handshake.}  $A$ and~$B$ each send UDP packets toward the address they received.  Once the UDP path is open, the side designated as initiator (by a deterministic rule based on the public keys) opens a UDX stream, and both sides run the Noise~XX handshake using their Ed25519 keys (Section~\ref{sec:ip-connection}).  The rendezvous server sees signaling metadata and observed addresses, never the encrypted payload.
+
+\item \textbf{Cold-call delivery.}  Only after the Noise-authenticated UDX stream is established does $B$ send the madGLP cold-call payload, which the networking layer delivers to $A$'s index-0 serializer.  The friendship between $A$ and $B$ was established by $A$'s acceptance in step~5.
+\end{enumerate}

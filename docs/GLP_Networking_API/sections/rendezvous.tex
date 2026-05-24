@@ -13,7 +13,7 @@ A \emph{rendezvous agent} is a lightweight GLP agent that runs at a known, stati
 \begin{itemize}
 \item Has no friends list and does not participate in the social graph.
 \item Accepts cold-call connections from any agent.
-\item Verifies \emph{friendship proofs} (Section~\ref{sec:friendship-proof}) to confirm that the requesting agents are friends.
+\item Verifies \emph{friendship proofs} (Section~\ref{sec:friendship-proof}) to confirm that reconnecting agents are friends, and verifies signed invite capabilities for first-contact IP cold-calls (Section~\ref{sec:ip-cold-call}).
 \item Observes each connecting agent's public IP address from the networking layer (via the \code{peer\_address/2} system predicate), serving as an address-discovery mechanism.
 \item Coordinates UDP hole-punching between the two agents by relaying their addresses.
 \end{itemize}
@@ -42,6 +42,10 @@ While connected, agents share with their friends which rendezvous servers they u
 \paragraph{Friendship proof.}
 \label{sec:friendship-proof}
 When two agents establish friendship, each signs a \emph{friendship attestation}: a statement binding the two agents' public keys, signed by the attesting agent's Ed25519 key.  An agent can present this attestation to a rendezvous agent to prove that it is a friend of the other agent.  The rendezvous agent verifies the signature without needing to know anything about the social graph.
+
+\paragraph{Invite capability.}
+\label{sec:invite-capability}
+For a first-contact IP cold-call, no friendship attestation exists yet.  Instead, the inviter's signed peer link acts as a one-time bearer capability.  The link contains a 256-bit nonce, but the nonce is not sent to the rendezvous agent during redemption.  The inviter registers an invite identifier and proof key derived from the nonce; the redeemer derives the same values from the link and sends a MAC proof of possession.  The rendezvous agent accepts a redemption only if the link signature is valid, the expiration time has not passed, the invite identifier was registered by the inviter, the proof verifies, and the invite is still unused.  A successful redemption consumes the invite atomically, and the rendezvous agent then forwards the redeemer's identity to the inviter.  Accepting the cold call is accepting the friendship request: the inviter's acceptance establishes friendship and gates the subsequent rendezvous-protocol signaling and Noise handshake.
 
 %------------------------------------------------------------------------------
 \subsection{Friends-Based Rendezvous}
@@ -182,7 +186,7 @@ Three components have been implemented in GLP, pass SRSW checking and type check
 \begin{itemize}
 \item \textbf{Rendezvous agent} (Appendix~\ref{appendix:rv-agent}): the server-side agent that processes cold-call $\mathit{reconnect}$ and $\mathit{available}$ messages, verifies friendship proofs, observes connecting agents' addresses via \code{peer\_address/2}, maintains a pending request list, and matches requesting pairs.  Invalid proofs are rejected via the reply variable.  The key mechanism is the \emph{reply-variable chain}: reply variables embedded in cold-call messages are threaded through writer$\to$reader handoffs and assigned when both sides are matched, propagating values back to the original senders.
 
-\item \textbf{Rendezvous client} (Appendix~\ref{appendix:rv-client}): the client-side building blocks used by agents to construct cold-call messages with embedded reply variables and to dispatch on the replies ($\mathit{punch}$, $\mathit{initiated}$, or $\mathit{rejected}$).  An end-to-end test wires client and server together on a shared message stream, demonstrating the full bootstrap protocol in both arrival orders.
+\item \textbf{Rendezvous client} (Appendix~\ref{appendix:rv-client}): the client-side building blocks used by agents to construct cold-call messages with embedded reply variables and to dispatch on the replies ($\mathit{punch}$ or $\mathit{rejected}$).  An end-to-end test wires client and server together on a shared message stream, demonstrating the full bootstrap protocol in both arrival orders.
 
 \item \textbf{A single friends-based mediation step} (Appendix~\ref{appendix:fmrv}): an extension of the social graph agent in which the friends list is extended to include each friend's current IP address.  The mediating friend uses a fused \code{lookup\_and\_send} procedure that, in a single traversal, locates a friend's entry, prepends a $\mathit{punch\_to}$ message to that friend's output stream, and returns the friend's address.  The $\mathit{mediate}$ clause calls this procedure twice with cross-references, leveraging GLP's suspension mechanism to resolve the mutual address dependency.  Unknown peers are handled gracefully via an $\mathit{AddrResult}$ type ($\mathit{found}(\mathit{Addr})$ or $\mathit{not\_found}$).
 \end{itemize}

@@ -29,9 +29,9 @@ Disconnect & \func{onPeerDisconnected(cb)} & Runtime $\leftarrow$ Network & Agen
 Reachable & \func{isPeerReachable(pk)} & Runtime $\to$ Network & Check before send \\
 \rowcolor{rowgray}
 Connectivity & \func{onConnectivityStatus(cb)} & Runtime $\leftarrow$ Network & Report IP address changes \\
-Gen link & \func{generatePeerLink()} & Runtime $\to$ Network & Create shareable identity URI \\
+Gen link & \func{generatePeerLink()} & Runtime $\to$ Network & Create signed RV-mediated invite URI \\
 \rowcolor{rowgray}
-Use link & \func{consumePeerLink(uri)} & Runtime $\to$ Network & Import peer from URI \\
+Use link & \func{consumePeerLink(uri)} & Runtime $\to$ Network & Redeem invite through RV and import inviter \\
 \midrule
 \multicolumn{4}{l}{\textbf{Communication}} \\
 \midrule

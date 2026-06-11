@@ -138,6 +138,9 @@ void main() {
       callbacks = FakeGrassrootsBluetoothCallbacks();
       ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       store = Store<AppState>(appReducer, initialState: AppState.initial);
+      // The suite exercises open-mode dialing toward unknown peers; the
+      // default trust level is closed.
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       transport = BleTransportService(
         // Low service UUID → this transport is the deterministic first-mover,
         // so the existing "advertisement → dial" expectations hold against the
@@ -837,6 +840,9 @@ void main() {
       hostApi = _RecordingHostApi();
       ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       store = Store<AppState>(appReducer, initialState: AppState.initial);
+      // The suite exercises open-mode dialing toward unknown peers; the
+      // default trust level is closed.
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       // Reset transport state so initialize works again
       // (no easy way to reset Redux from outside).
       transport = BleTransportService(
@@ -933,6 +939,7 @@ void main() {
       final ble =
           GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       final store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       final transport = BleTransportService(
         identity: await _makeIdentity('Sym'),
         store: store,
@@ -981,6 +988,7 @@ void main() {
       final ble =
           GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       final store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       final transport = BleTransportService(
         identity: identity,
         store: store,
@@ -1157,6 +1165,7 @@ void main() {
       final ble =
           GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       final store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       final transport = BleTransportService(
         identity: identity,
         store: store,
@@ -1692,6 +1701,9 @@ void main() {
       final ble =
           GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       store = Store<AppState>(appReducer, initialState: AppState.initial);
+      // The suite exercises open-mode dialing toward unknown peers; the
+      // default trust level is closed.
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
       transport = BleTransportService(
         identity: await _makeIdentity('Watchdog'),
         store: store,

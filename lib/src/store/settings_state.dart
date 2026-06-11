@@ -138,7 +138,7 @@ class SettingsState {
     this.anchorPubkeyHex,
     this.rendezvousServers = const [],
     this.bleRoleMode = BleRoleMode.auto,
-    this.coldCallTrustLevel = ColdCallTrustLevel.open,
+    this.coldCallTrustLevel = ColdCallTrustLevel.closed,
   });
 
   static const SettingsState initial = SettingsState();
@@ -246,7 +246,7 @@ class SettingsState {
     final trustLevelName = json['coldCallTrustLevel'] as String?;
     final coldCallTrustLevel = ColdCallTrustLevel.values.firstWhere(
       (level) => level.name == trustLevelName,
-      orElse: () => ColdCallTrustLevel.open,
+      orElse: () => ColdCallTrustLevel.closed,
     );
 
     return SettingsState(

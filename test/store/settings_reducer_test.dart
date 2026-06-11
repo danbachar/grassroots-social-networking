@@ -240,14 +240,21 @@ void main() {
     });
 
     group('SetColdCallTrustLevelAction', () {
+      test('defaults to closed until set', () {
+        expect(
+          SettingsState.initial.coldCallTrustLevel,
+          ColdCallTrustLevel.closed,
+        );
+      });
+
       test('updates cold-call trust level', () {
         const state = SettingsState.initial;
         final result = settingsReducer(
           state,
-          SetColdCallTrustLevelAction(ColdCallTrustLevel.closed),
+          SetColdCallTrustLevelAction(ColdCallTrustLevel.open),
         );
 
-        expect(result.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(result.coldCallTrustLevel, ColdCallTrustLevel.open);
         expect(result.bluetoothEnabled, state.bluetoothEnabled);
         expect(result.udpEnabled, state.udpEnabled);
       });

@@ -644,6 +644,10 @@ class GrassrootsNetwork {
   /// Check if a peer is reachable via any transport
   bool isPeerReachable(Uint8List pubkey) => _peersState.isPeerReachable(pubkey);
 
+  /// The agent's current public `ip:port`, or null if not yet known.
+  /// Address changes are surfaced via [onConnectivityStatusChanged].
+  String? getPublicAddress() => store.state.transports.publicAddress;
+
   /// Get peer by public key - from Redux store
   PeerState? getPeer(Uint8List pubkey) => _peersState.getPeerByPubkey(pubkey);
 

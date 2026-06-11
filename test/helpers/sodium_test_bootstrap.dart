@@ -5,22 +5,27 @@ import 'dart:io' show File, Platform;
 import 'package:sodium/sodium.dart' as sodium;
 import 'package:sodium/sodium_sumo.dart' as sodium_sumo;
 import 'package:sodium_libs/sodium_libs.dart' as sodium_libs
-    show SodiumInit, SodiumPlatform;
+    show SodiumPlatform;
+import 'package:sodium_libs/sodium_libs_sumo.dart' as sodium_libs_sumo
+    show SodiumSumoInit;
 
 bool _registeredSodiumPlatform = false;
 
-/// Registers the sodium platform plugin in plain Flutter test isolates.
+/// Registers the sodium platform plugin in plain Flutter test isolates and
+/// returns a SUMO handle (needed for the Ed25519↔X25519 conversion the Noise
+/// session manager performs). A [sodium_sumo.SodiumSumo] is also a
+/// [sodium.Sodium], so callers needing only the base API can hold it as one.
 ///
 /// App launches normally get this through Flutter's generated plugin
-/// registrant. These unit tests call [SodiumInit.init] directly, so they need
-/// to install the host platform implementation first.
-Future<sodium.Sodium> initTestSodium() async {
+/// registrant. These unit tests call [SodiumSumoInit.init] directly, so they
+/// need to install the host platform implementation first.
+Future<sodium_sumo.SodiumSumo> initTestSodium() async {
   if (!_registeredSodiumPlatform) {
     sodium_libs.SodiumPlatform.instance = _TestSodiumPlatform();
     _registeredSodiumPlatform = true;
   }
 
-  return sodium_libs.SodiumInit.init();
+  return sodium_libs_sumo.SodiumSumoInit.init();
 }
 
 class _TestSodiumPlatform extends sodium_libs.SodiumPlatform {

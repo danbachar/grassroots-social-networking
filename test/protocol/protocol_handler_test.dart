@@ -114,6 +114,24 @@ void main() {
           }),
         );
       });
+
+      test('round-trips a non-ASCII / emoji nickname as UTF-8', () async {
+        final keyPair = await Ed25519().newKeyPair();
+        const fancyNick = 'Zoë 🌱🚀 名字';
+        final fancyIdentity = await GrassrootsIdentity.create(
+          keyPair: keyPair,
+          nickname: fancyNick,
+        );
+        final fancyHandler =
+            ProtocolHandler(identity: fancyIdentity, sodium: sodium);
+
+        final payload = fancyHandler.createAnnouncePayload();
+        final decoded = fancyHandler.decodeAnnounce(payload);
+
+        expect(decoded.nickname, equals(fancyNick));
+        // The 1-byte length prefix counts UTF-8 bytes, not characters.
+        expect(payload[34], equals(utf8.encode(fancyNick).length));
+      });
     });
 
     group('decodeAnnounce', () {

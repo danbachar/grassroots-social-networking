@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:grassroots_dart_udx/grassroots_dart_udx.dart';
+import 'package:sodium/sodium_sumo.dart' as libsodium;
 
 import 'address_table.dart';
 import 'identity.dart';
+import 'libsodium_loader.dart';
 import 'noise_session_manager.dart';
 import 'packet.dart';
 import 'peer_table.dart';
@@ -81,7 +83,12 @@ class AnchorServer {
     _peerTable = PeerTable();
     _addressTable = AddressTable();
     _codec = const SignalingCodec();
-    _noiseSessions = NoiseSessionManager(identity: _identity);
+
+    final sodium = await libsodium.SodiumSumoInit.init(loadLibsodium);
+    _noiseSessions =
+        NoiseSessionManager(identity: _identity, sodium: sodium);
+    _log('Noise static pubkey: '
+        '${_pubkeyToHex(await _noiseSessions.staticPublicKey())}');
 
     _signalingHandler = SignalingHandler(
       protocol: _protocol,

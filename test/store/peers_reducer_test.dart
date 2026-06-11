@@ -766,7 +766,11 @@ void main() {
       expect(peer.bleCentralDeviceId, isNull);
     });
 
-    test('keeps connected if has live UDP connection', () {
+    test(
+        'does NOT consult UDP state — connectionState flips to disconnected '
+        'once both BLE roles are gone, regardless of UDP liveness. UDP '
+        'fields are preserved untouched (a different action drives those).',
+        () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
@@ -786,9 +790,14 @@ void main() {
       final result = peersReducer(initial, action);
 
       final peer = result.peers[hex]!;
-      expect(peer.connectionState, PeerConnectionState.connected);
+      // BLE is the only thing this action governs. Once both roles clear,
+      // connectionState reflects "no live BLE", and UDP-derived state is
+      // left for `PeerUdpDisconnectedAction` / `PeerUdpConnectionChangedAction`
+      // to manage.
+      expect(peer.connectionState, PeerConnectionState.disconnected);
       expect(peer.bleCentralDeviceId, isNull);
       expect(peer.blePeripheralDeviceId, isNull);
+      // UDP fields untouched.
       expect(peer.udpAddress, '[2001:db8::1]:4001');
       expect(peer.hasLiveUdpConnection, isTrue);
     });
@@ -1347,13 +1356,19 @@ void main() {
       expect(peer.bleDeviceId, 'central-1');
     });
 
-    test('isReachable with BLE', () {
-      final peer = PeerState(
+    test('isReachable requires an authenticated BLE session, not just a link',
+        () {
+      final linkOnly = PeerState(
         publicKey: _testPubkey(1),
         nickname: 'Alice',
         blePeripheralDeviceId: 'peripheral-1',
       );
-      expect(peer.isReachable, true);
+      // A raw BLE link without a completed Noise session is not reachable —
+      // onPeerConnected fires only after authentication (#2b).
+      expect(linkOnly.isReachable, false);
+
+      final authenticated = linkOnly.copyWith(bleAuthenticated: true);
+      expect(authenticated.isReachable, true);
     });
 
     test('activeTransport prefers BLE', () {
@@ -1387,6 +1402,78 @@ void main() {
 
       expect(peer.hasPublicUdpAddress, isFalse);
       expect(peer.isWellConnected, isFalse);
+    });
+
+    test(
+        'nearbyBlePeers includes any peer with a live BLE path regardless '
+        'of connectionState or friendship', () {
+      final stranger = _testPubkey(1);
+      final friend = _testPubkey(2);
+      final discoveredNoBle = _testPubkey(3);
+      // A peer whose `connectionState` was somehow not flipped to connected
+      // (stale Redux row, race during ANNOUNCE) but who still has a BLE
+      // attachment should be counted as "nearby". The BLE attachment is the
+      // ground truth, not the global state flag.
+      final state = PeersState(
+        peers: {
+          _pubkeyHex(stranger): PeerState(
+            publicKey: stranger,
+            nickname: 'Stranger',
+            connectionState: PeerConnectionState.discovered,
+            bleCentralDeviceId: 'central:stranger',
+          ),
+          _pubkeyHex(friend): PeerState(
+            publicKey: friend,
+            nickname: 'Friend',
+            connectionState: PeerConnectionState.connected,
+            blePeripheralDeviceId: 'peripheral:friend',
+            isFriend: true,
+          ),
+          _pubkeyHex(discoveredNoBle): PeerState(
+            publicKey: discoveredNoBle,
+            nickname: 'UdpOnly',
+            connectionState: PeerConnectionState.connected,
+            udpAddress: '[2001:db8::1]:4001',
+          ),
+        },
+      );
+      final hexes = state.nearbyBlePeers.map((p) => p.pubkeyHex).toSet();
+      expect(hexes, equals({_pubkeyHex(stranger), _pubkeyHex(friend)}),
+          reason: 'Filter is `hasBleConnection`, full stop.');
+    });
+
+    test('onlineFriends filters purely by friend × live UDP, ignores BLE', () {
+      final udpFriend = _testPubkey(1);
+      final bleFriend = _testPubkey(2);
+      final udpStranger = _testPubkey(3);
+      final state = PeersState(
+        peers: {
+          _pubkeyHex(udpFriend): PeerState(
+            publicKey: udpFriend,
+            nickname: 'UdpFriend',
+            connectionState: PeerConnectionState.disconnected,
+            hasLiveUdpConnection: true,
+            isFriend: true,
+          ),
+          _pubkeyHex(bleFriend): PeerState(
+            publicKey: bleFriend,
+            nickname: 'BleFriend',
+            connectionState: PeerConnectionState.connected,
+            bleCentralDeviceId: 'central:friend',
+            isFriend: true,
+          ),
+          _pubkeyHex(udpStranger): PeerState(
+            publicKey: udpStranger,
+            nickname: 'UdpStranger',
+            hasLiveUdpConnection: true,
+          ),
+        },
+      );
+      final hexes = state.onlineFriends.map((p) => p.pubkeyHex).toSet();
+      expect(hexes, equals({_pubkeyHex(udpFriend)}),
+          reason: 'A friend with a live UDP stream is "online" even if '
+              '`connectionState` says disconnected. BLE-only friends and '
+              'UDP-connected strangers do not count.');
     });
   });
 

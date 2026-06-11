@@ -3,13 +3,13 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:sodium_libs/sodium_libs_sumo.dart' as libsodium;
 
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
 
 const _noiseProtocolName = 'Noise_XX_25519_ChaChaPoly_SHA256';
-const _staticSeedLabel = 'grassroots-noise-static-v1';
 const _handshakePayloadVersion = 1;
 const _applicationPayloadVersion = 1;
 const _aeadMacLength = 16;
@@ -44,21 +44,30 @@ class NoiseHandshakeResult {
 
 /// Owns Noise XX session state, keyed by transport medium plus peer identity.
 ///
-/// The Noise static key is derived from the local Ed25519 seed and every
-/// handshake packet is still signed by the Ed25519 transport identity. That
-/// binds the Noise static key to the public key the rest of Grassroots already
-/// trusts, without asking the application to persist a second keypair.
+/// The Noise static key is the X25519 form of the local Ed25519 transport
+/// identity, derived via the standard birational map (libsodium
+/// `crypto_sign_ed25519_*_to_curve25519`). Because the public half is a public
+/// function of the Ed25519 public key, each peer recomputes the expected static
+/// from the counterpart's known identity and verifies the Noise-delivered static
+/// against it, aborting on mismatch (see [_verifyRemoteStatic]) — the key check
+/// in `docs/GLP_Networking_API/sections/ip.tex` §IP Connection. Handshake
+/// packets are additionally Ed25519-signed at the transport layer.
 class NoiseSessionManager {
   final GrassrootsIdentity identity;
+
+  /// libsodium handle providing the Ed25519↔X25519 conversion used to derive
+  /// and verify Noise static keys.
+  final libsodium.SodiumSumo sodium;
+
   final Duration handshakeTimeout;
 
-  final X25519 _x25519 = X25519();
   final Map<_SessionKey, _SessionEntry> _entries = {};
 
   Future<SimpleKeyPair>? _staticKeyPairFuture;
 
   NoiseSessionManager({
     required this.identity,
+    required this.sodium,
     this.handshakeTimeout = const Duration(seconds: 5),
   });
 
@@ -129,9 +138,9 @@ class NoiseSessionManager {
       case _NoiseHandshakeMessage.message1:
         return _handleMessage1(entry, key, body);
       case _NoiseHandshakeMessage.message2:
-        return _handleMessage2(entry, key, body);
+        return _handleMessage2(entry, key, remotePubkey, body);
       case _NoiseHandshakeMessage.message3:
-        return _handleMessage3(entry, key, body);
+        return _handleMessage3(entry, key, remotePubkey, body);
     }
   }
 
@@ -178,11 +187,6 @@ class NoiseSessionManager {
 
   void reset(PeerTransport transport, Uint8List remotePubkey) {
     final removed = _entries.remove(_SessionKey(transport, _hex(remotePubkey)));
-    removed?.complete(false);
-  }
-
-  void resetByPubkeyHex(PeerTransport transport, String pubkeyHex) {
-    final removed = _entries.remove(_SessionKey(transport, pubkeyHex));
     removed?.complete(false);
   }
 
@@ -237,6 +241,7 @@ class NoiseSessionManager {
   Future<NoiseHandshakeResult> _handleMessage2(
     _SessionEntry entry,
     _SessionKey key,
+    Uint8List remotePubkey,
     Uint8List body,
   ) async {
     final handshake = entry.handshake;
@@ -247,6 +252,11 @@ class NoiseSessionManager {
     }
 
     await handshake.readMessage2(body);
+    if (!_verifyRemoteStatic(handshake, remotePubkey)) {
+      _entries.remove(key);
+      entry.complete(false);
+      return const NoiseHandshakeResult();
+    }
     final responseBody = await handshake.writeMessage3();
     final session = await handshake.splitForInitiator();
     entry
@@ -265,6 +275,7 @@ class NoiseSessionManager {
   Future<NoiseHandshakeResult> _handleMessage3(
     _SessionEntry entry,
     _SessionKey key,
+    Uint8List remotePubkey,
     Uint8List body,
   ) async {
     final handshake = entry.handshake;
@@ -275,6 +286,11 @@ class NoiseSessionManager {
     }
 
     await handshake.readMessage3(body);
+    if (!_verifyRemoteStatic(handshake, remotePubkey)) {
+      _entries.remove(key);
+      entry.complete(false);
+      return const NoiseHandshakeResult();
+    }
     final session = await handshake.splitForResponder();
     entry
       ..session = session
@@ -285,12 +301,58 @@ class NoiseSessionManager {
 
   Future<SimpleKeyPair> _staticKeyPair() {
     return _staticKeyPairFuture ??= () async {
-      final seedMaterial = BytesBuilder()
-        ..add(utf8.encode(_staticSeedLabel))
-        ..add(identity.privateKey.sublist(0, 32));
-      final seedHash = await Sha256().hash(seedMaterial.toBytes());
-      return _x25519.newKeyPairFromSeed(seedHash.bytes);
+      // Derive the Noise static key from the Ed25519 identity via the standard
+      // birational map, so its public half is recomputable from the identity's
+      // public key by any peer (see [_verifyRemoteStatic]).
+      final edSecret = libsodium.SecureKey.fromList(sodium, identity.privateKey);
+      try {
+        final curveSecret = sodium.crypto.sign.skToCurve25519(edSecret);
+        try {
+          return SimpleKeyPairData(
+            curveSecret.extractBytes(),
+            publicKey: SimplePublicKey(
+              sodium.crypto.sign.pkToCurve25519(identity.publicKey),
+              type: KeyPairType.x25519,
+            ),
+            type: KeyPairType.x25519,
+          );
+        } finally {
+          curveSecret.dispose();
+        }
+      } finally {
+        edSecret.dispose();
+      }
     }();
+  }
+
+  /// Verify the Noise-delivered remote static key equals the X25519 form of the
+  /// claimed sender's Ed25519 identity ([remotePubkey]). A mismatch — a peer
+  /// presenting a static that does not belong to the identity it claims, or a
+  /// tampered handshake — aborts the handshake. Implements the key check in
+  /// `docs/GLP_Networking_API/sections/ip.tex` §IP Connection.
+  bool _verifyRemoteStatic(
+    _NoiseHandshakeState handshake,
+    Uint8List remotePubkey,
+  ) {
+    final delivered = handshake.remoteStaticPublicKey;
+    if (delivered == null) return false;
+    final Uint8List expected;
+    try {
+      expected = sodium.crypto.sign.pkToCurve25519(remotePubkey);
+    } catch (_) {
+      // Not a valid Ed25519 point — cannot be an honest peer's key.
+      return false;
+    }
+    return _bytesEqual(delivered.bytes, expected);
+  }
+
+  static bool _bytesEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
   }
 }
 
@@ -336,6 +398,11 @@ class _NoiseHandshakeState {
   SimplePublicKey? _remoteStaticPublicKey;
   _NoiseTransportSession? _initiatorSession;
   _NoiseTransportSession? _responderSession;
+
+  /// The remote peer's static public key as delivered in the XX handshake
+  /// (messages 2/3). Verified against the expected identity by
+  /// [NoiseSessionManager._verifyRemoteStatic].
+  SimplePublicKey? get remoteStaticPublicKey => _remoteStaticPublicKey;
 
   _NoiseHandshakeState._({
     required this.role,

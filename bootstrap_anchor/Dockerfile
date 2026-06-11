@@ -21,8 +21,12 @@ RUN dart compile exe bin/server.dart -o bin/rendezvous_server
 # Runtime stage — minimal image
 FROM debian:bookworm-slim
 
+# libsodium23 provides the native library loaded via FFI for Noise static-key
+# derivation (Ed25519↔X25519 birational map). Without it the server aborts at
+# startup when initializing libsodium.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libsodium23 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -462,6 +462,59 @@ void main() {
         expect(identical(newState, state), isTrue);
         expect(newState.friendships.isEmpty, isTrue);
       });
+
+      test('is no-op when the address is unchanged', () {
+        final now = DateTime.now();
+        final existingFriendship = FriendshipState(
+          peerPubkeyHex: peerA,
+          nickname: 'Alice',
+          status: FriendshipStatus.accepted,
+          udpAddress: '[2001:db8::1]:4001',
+          createdAt: now,
+          updatedAt: now,
+        );
+        final state = FriendshipsState(
+          friendships: {peerA: existingFriendship},
+        );
+
+        final action = UpdateFriendshipUdpAddressAction(
+          peerPubkeyHex: peerA,
+          udpAddress: '[2001:db8::1]:4001',
+        );
+
+        final newState = friendshipsReducer(state, action);
+
+        // Identical state: no updatedAt churn, no persistence write.
+        expect(identical(newState, state), isTrue);
+      });
+
+      test('null address preserves the stored one (never clears)', () {
+        final now = DateTime.now();
+        final existingFriendship = FriendshipState(
+          peerPubkeyHex: peerA,
+          nickname: 'Alice',
+          status: FriendshipStatus.accepted,
+          udpAddress: '[2001:db8::1]:4001',
+          createdAt: now,
+          updatedAt: now,
+        );
+        final state = FriendshipsState(
+          friendships: {peerA: existingFriendship},
+        );
+
+        final action = UpdateFriendshipUdpAddressAction(
+          peerPubkeyHex: peerA,
+          udpAddress: null,
+        );
+
+        final newState = friendshipsReducer(state, action);
+
+        expect(identical(newState, state), isTrue);
+        expect(
+          newState.friendships[peerA]!.udpAddress,
+          equals('[2001:db8::1]:4001'),
+        );
+      });
     });
 
     group('unknown action', () {

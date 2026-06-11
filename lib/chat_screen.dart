@@ -51,6 +51,23 @@ class _ChatScreenState extends State<ChatScreen> {
   /// take seconds per image).
   bool _sendingMedia = false;
 
+  /// True when the list is scrolled far enough up that the latest message is
+  /// off-screen — drives the floating "jump to latest" button at the bottom
+  /// right. We only auto-scroll on outgoing sends; otherwise an incoming
+  /// message or an unrelated Redux dispatch (RSSI tick, status change, …)
+  /// would yank the user back to the bottom while they're reading history.
+  bool _showScrollDownButton = false;
+
+  /// How many pixels from the bottom we still treat as "at the bottom".
+  /// Tolerates a small gap so the button doesn't flicker on inertia.
+  static const double _atBottomThreshold = 80.0;
+
+  /// Message ids we've already fired a read receipt for during this screen's
+  /// lifetime. Read receipts are best-effort UX info, not delivery-critical,
+  /// so we only track in-memory: closing and reopening the chat will re-send
+  /// receipts (the peer dedupes by messageId).
+  final Set<String> _sentReadReceiptIds = {};
+
   String get _peerHex => ChatMessage.pubkeyToHex(widget.peer.publicKey);
   String get _myHex => ChatMessage.pubkeyToHex(widget.myPubkey);
 
@@ -65,9 +82,12 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     // Listen to Redux store for all state updates
     _storeSubscription = widget.store.onChange.listen((_) => _onStoreChanged());
-    // Mark messages as read and send read receipts when opening chat
-    widget.store.dispatch(MarkMessagesReadAction(_peerHex));
-    _sendReadReceipts();
+    // Track whether we're at the bottom so we can toggle the jump-to-latest
+    // button. The ListView gives us pixels-from-the-bottom via the controller.
+    _scrollController.addListener(_onScrollChanged);
+    // Mark every already-loaded incoming message as read and fire receipts.
+    // Subsequent incoming messages are receipted from `_onStoreChanged`.
+    _flushReadReceipts();
     // Android can kill the Flutter Activity while the camera app is in the
     // foreground (memory pressure). When we come back, the original
     // pickImage future is dead but the captured file is recoverable here.
@@ -122,36 +142,80 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// Send read receipts for all unread incoming messages
-  void _sendReadReceipts() {
+  /// Send a read receipt for every incoming message in the conversation we
+  /// haven't already receipted during this screen's lifetime, and clear the
+  /// per-peer unread badge.
+  ///
+  /// Called on initial open AND on every Redux store change while the screen
+  /// is mounted. The dedupe set ensures we only send one receipt per
+  /// messageId per session — without it every dispatch (~once a second
+  /// between RSSI ticks, status updates, etc.) would re-send a receipt for
+  /// every old message.
+  ///
+  /// The semantics are "while this chat is open, every visible incoming
+  /// message has been read by the user" — a small generosity (it counts
+  /// messages off-screen too) that matches the user's expectation that
+  /// staying in the conversation means they're caught up.
+  void _flushReadReceipts() {
     final messages = widget.store.state.messages.getConversation(_peerHex);
     final senderPubkey = widget.peer.publicKey;
 
     for (final message in messages) {
-      // Only send read receipts for incoming messages with a messageId
-      if (!message.isOutgoing && message.messageId != null) {
-        widget.grassroots.sendReadReceipt(
-          messageId: message.messageId!,
-          senderPubkey: senderPubkey,
-        );
-      }
+      if (message.isOutgoing) continue;
+      final id = message.messageId;
+      if (id == null) continue;
+      if (!_sentReadReceiptIds.add(id)) continue;
+      widget.grassroots.sendReadReceipt(
+        messageId: id,
+        senderPubkey: senderPubkey,
+      );
+    }
+
+    // Keep the unread counter at zero while the chat is open so a freshly
+    // arrived incoming message doesn't briefly show a badge on the
+    // conversation list. Guarded to avoid a dispatch loop: only fire when
+    // there's actually something to clear.
+    if (widget.store.state.messages.getUnreadCount(_peerHex) > 0) {
+      widget.store.dispatch(MarkMessagesReadAction(_peerHex));
     }
   }
 
   @override
   void dispose() {
     _storeSubscription?.cancel();
+    _scrollController.removeListener(_onScrollChanged);
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
   void _onStoreChanged() {
-    // Rebuild to update messages, friendships, and status checkmarks
-    if (mounted) {
-      setState(() {});
-      _scrollToBottom();
-    }
+    // Rebuild to update messages, friendships, and status checkmarks.
+    // Intentionally do NOT auto-scroll here: store changes fire on every
+    // dispatch (RSSI ticks, status updates, queue events, …) and snapping
+    // to the bottom would prevent the user from reading older messages.
+    // Scrolling-on-send is handled explicitly by `_sendMessage` /
+    // `_sendPicture`. For incoming messages the user discovers them via
+    // the floating jump-to-latest button instead.
+    if (!mounted) return;
+    setState(() {});
+    // While the chat is open, every incoming message counts as read. The
+    // dedupe set in `_flushReadReceipts` keeps us from re-sending a receipt
+    // every dispatch (peer-RSSI ticks etc.), so this is cheap.
+    _flushReadReceipts();
+  }
+
+  void _onScrollChanged() {
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    // `maxScrollExtent - pixels` is the gap below the current viewport.
+    // 0 means flush at the bottom; >threshold means the latest message is
+    // off-screen.
+    final atBottom =
+        (position.maxScrollExtent - position.pixels) <= _atBottomThreshold;
+    if (atBottom == !_showScrollDownButton) return; // no flip needed
+    if (!mounted) return;
+    setState(() => _showScrollDownButton = !atBottom);
   }
 
   static const _uuid = Uuid();
@@ -166,7 +230,7 @@ class _ChatScreenState extends State<ChatScreen> {
     // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
 // and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
 // would corrupt either format.
-final messageId = _uuid.v4();
+    final messageId = _uuid.v4();
 
     // Save to conversation immediately so the message appears in the UI
     widget.store.dispatch(SaveChatMessageAction(
@@ -213,8 +277,8 @@ final messageId = _uuid.v4();
                 SwitchListTile(
                   secondary: const Icon(Icons.local_fire_department),
                   title: const Text('Send as 1-time view'),
-                  subtitle:
-                      const Text('Recipient sees a blurred preview; deletes after one view'),
+                  subtitle: const Text(
+                      'Recipient sees a blurred preview; deletes after one view'),
                   value: viewOnce,
                   onChanged: (v) => setSheet(() => viewOnce = v),
                 ),
@@ -251,8 +315,7 @@ final messageId = _uuid.v4();
       return;
     }
     if (picked == null) {
-      debugPrint(
-          '[picture-send] pickImage returned null — user cancelled, OR '
+      debugPrint('[picture-send] pickImage returned null — user cancelled, OR '
           'Activity was killed while in $source. Will retry retrieveLostData on next entry.');
       return;
     }
@@ -260,7 +323,6 @@ final messageId = _uuid.v4();
 
     await _sendPicture(picked, viewOnce: viewOnce);
   }
-
 
   Future<void> _sendPicture(XFile picked, {required bool viewOnce}) async {
     if (_sendingMedia) return;
@@ -276,15 +338,15 @@ final messageId = _uuid.v4();
       debugPrint(
           '[picture-send] compressed: ${compressed.length} bytes (was ${raw.length})');
 
-      final mime =
-          picked.mimeType ?? 'image/jpeg'; // imagePicker may omit on some platforms
+      final mime = picked.mimeType ??
+          'image/jpeg'; // imagePicker may omit on some platforms
       final mediaFile = await writeMediaFile(compressed, mime);
       debugPrint('[picture-send] wrote ${mediaFile.path}');
 
       // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
 // and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
 // would corrupt either format.
-final messageId = _uuid.v4();
+      final messageId = _uuid.v4();
 
       widget.store.dispatch(SaveChatMessageAction(
         senderPubkeyHex: _myHex,
@@ -305,26 +367,23 @@ final messageId = _uuid.v4();
         imageBytes: compressed,
       );
       final wireBytes = block.serialize();
-      debugPrint(
-          '[picture-send] block serialized: ${wireBytes.length} bytes; '
+      debugPrint('[picture-send] block serialized: ${wireBytes.length} bytes; '
           'dispatching to grassroots.send for peer ${widget.peer.displayName}');
 
       final sentMessageId = await widget.grassroots
           .send(widget.peer.publicKey, wireBytes, messageId: messageId);
 
       if (sentMessageId == null) {
-        // send() returns null when the peer isn't reachable on any transport
-        // (no BLE link, no UDP address, no friend-discovery candidate). Mark
-        // the bubble as failed so the user sees a red "!" instead of an
-        // ambiguous "still sending".
+        // send() returns null only for invalid input; offline peers are queued
+        // by GrassrootsNetwork and retain a clock-style status until reachable.
         debugPrint(
-            '[picture-send] grassroots.send returned null — no transport for ${widget.peer.displayName}');
+            '[picture-send] grassroots.send returned null for ${widget.peer.displayName}');
         widget.store.dispatch(MessageFailedAction(messageId: messageId));
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(
-                'Could not reach ${widget.peer.displayName} — no BLE or UDP transport available.',
+                'Could not queue picture for ${widget.peer.displayName}.',
               ),
               duration: const Duration(seconds: 3),
             ),
@@ -372,7 +431,7 @@ final messageId = _uuid.v4();
 
   void _forwardMessage(ChatMessageState message) {
     // Show dialog to select a peer to forward to
-    final peers = widget.grassroots.connectedPeers;
+    final peers = widget.grassroots.getPeers();
 
     if (peers.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -503,14 +562,36 @@ final messageId = _uuid.v4();
             child: Builder(builder: (context) {
               final messages =
                   widget.store.state.messages.getConversation(_peerHex);
-              return ListView.builder(
-                controller: _scrollController,
-                padding: const EdgeInsets.all(16),
-                itemCount: messages.length,
-                itemBuilder: (context, index) {
-                  final message = messages[index];
-                  return _buildMessageWidget(message);
-                },
+              return Stack(
+                children: [
+                  ListView.builder(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.all(16),
+                    itemCount: messages.length,
+                    itemBuilder: (context, index) {
+                      final message = messages[index];
+                      return _buildMessageWidget(message);
+                    },
+                  ),
+                  // Jump-to-latest button. Visible whenever the user is more
+                  // than `_atBottomThreshold` pixels above `maxScrollExtent`.
+                  Positioned(
+                    right: 16,
+                    bottom: 16,
+                    child: AnimatedOpacity(
+                      opacity: _showScrollDownButton ? 1.0 : 0.0,
+                      duration: const Duration(milliseconds: 150),
+                      child: IgnorePointer(
+                        ignoring: !_showScrollDownButton,
+                        child: FloatingActionButton.small(
+                          heroTag: 'chat-scroll-down',
+                          onPressed: _scrollToBottom,
+                          child: const Icon(Icons.arrow_downward),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               );
             }),
           ),
@@ -720,8 +801,8 @@ final messageId = _uuid.v4();
     // Refresh from store so the dialog reflects the latest udpAddress /
     // connection state, not just the snapshot widget.peer was built with.
     // RV-list lives on the friendship record (persisted, friendship-scoped).
-    final peer = widget.store.state.peers.getPeerByPubkeyHex(_peerHex) ??
-        widget.peer;
+    final peer =
+        widget.store.state.peers.getPeerByPubkeyHex(_peerHex) ?? widget.peer;
     final friendship = widget.store.state.friendships.getFriendship(_peerHex);
     final knownRvServers =
         friendship?.knownRvServers ?? const <String, String>{};
@@ -745,8 +826,7 @@ final messageId = _uuid.v4();
                       ? 'Connected (${peer.bleCentralDeviceId != null && peer.blePeripheralDeviceId != null ? 'central + peripheral' : peer.bleCentralDeviceId != null ? 'central' : 'peripheral'})'
                       : 'Not connected'),
               const SizedBox(height: 8),
-              _buildInfoRow(
-                  'Internet',
+              _buildInfoRow('Internet',
                   peer.udpAddress != null ? peer.udpAddress! : 'No address'),
               if (_isFriend) ...[
                 const SizedBox(height: 8),
@@ -809,8 +889,7 @@ final messageId = _uuid.v4();
               Expanded(
                 child: Text(
                   address,
-                  style:
-                      const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
                 ),
               ),
               IconButton(
@@ -838,8 +917,7 @@ final messageId = _uuid.v4();
               Expanded(
                 child: Text(
                   pubkeyHex,
-                  style:
-                      const TextStyle(fontFamily: 'monospace', fontSize: 11),
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -1160,6 +1238,13 @@ class _MessageBubble extends StatelessWidget {
         // Clock icon (sending)
         return const Icon(
           Icons.access_time,
+          size: 14,
+          color: Colors.white70,
+        );
+      case MessageStatus.queued:
+        // Clock icon (queued until the peer is reachable)
+        return const Icon(
+          Icons.schedule,
           size: 14,
           color: Colors.white70,
         );

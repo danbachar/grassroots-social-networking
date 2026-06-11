@@ -136,8 +136,14 @@ FriendshipsState friendshipsReducer(FriendshipsState state, FriendshipAction act
     final existing = state.friendships[action.peerPubkeyHex];
     if (existing == null) return state;
 
+    // A null action address preserves the stored one (never clear
+    // unilaterally); an unchanged address is a no-op so it doesn't churn
+    // updatedAt or trigger a persistence write.
+    final newAddress = action.udpAddress ?? existing.udpAddress;
+    if (newAddress == existing.udpAddress) return state;
+
     final friendship = existing.copyWith(
-      udpAddress: action.udpAddress ?? existing.udpAddress,
+      udpAddress: newAddress,
       updatedAt: DateTime.now(),
     );
     return state.copyWith(

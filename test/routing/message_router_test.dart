@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
@@ -136,7 +137,7 @@ void main() {
     group('signature verification', () {
       test('drops packet with zero signature (unsigned)', () async {
         bool anyCalled = false;
-        router.onMessageReceived = (_, __, ___) => anyCalled = true;
+        router.onMessageReceived = (_, __, ___, ____) => anyCalled = true;
         router.onAckReceived = (_) => anyCalled = true;
         router.onReadReceiptReceived = (_) => anyCalled = true;
         router.onPeerAnnounced = (_, __,
@@ -163,7 +164,7 @@ void main() {
 
       test('drops packet with tampered payload', () async {
         bool anyCalled = false;
-        router.onMessageReceived = (_, __, ___) => anyCalled = true;
+        router.onMessageReceived = (_, __, ___, ____) => anyCalled = true;
 
         // Create and sign a valid packet
         final p = await signedPacket(
@@ -449,10 +450,12 @@ void main() {
         String? receivedId;
         Uint8List? receivedPubkey;
         Uint8List? receivedPayload;
-        router.onMessageReceived = (id, pubkey, payload) {
+        PeerTransport? receivedTransport;
+        router.onMessageReceived = (id, pubkey, payload, transport) {
           receivedId = id;
           receivedPubkey = pubkey;
           receivedPayload = payload;
+          receivedTransport = transport;
         };
 
         final msgPayload = Uint8List.fromList([1, 2, 3, 4, 5]);
@@ -471,11 +474,32 @@ void main() {
         expect(receivedId, isNotNull);
         expect(receivedPubkey, equals(otherPubkey));
         expect(receivedPayload, equals(msgPayload));
+        expect(receivedTransport, equals(PeerTransport.bleDirect));
+      });
+
+      test('reports the authoritative arrival transport (UDP)', () async {
+        PeerTransport? receivedTransport;
+        router.onMessageReceived = (_, __, ___, transport) {
+          receivedTransport = transport;
+        };
+
+        final p = await signedPacket(
+          type: PacketType.message,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([9, 9, 9]),
+        );
+
+        await router.processPacket(
+          p,
+          transport: PeerTransport.udp,
+        );
+
+        expect(receivedTransport, equals(PeerTransport.udp));
       });
 
       test('delivers broadcast message (no recipient)', () async {
         bool messageReceived = false;
-        router.onMessageReceived = (_, __, ___) => messageReceived = true;
+        router.onMessageReceived = (_, __, ___, ____) => messageReceived = true;
 
         final p = await signedPacket(
           type: PacketType.message,
@@ -520,7 +544,7 @@ void main() {
 
       test('drops message addressed to someone else', () async {
         bool messageReceived = false;
-        router.onMessageReceived = (_, __, ___) => messageReceived = true;
+        router.onMessageReceived = (_, __, ___, ____) => messageReceived = true;
 
         // Create a third identity for the intended recipient
         final algorithm = Ed25519();
@@ -553,7 +577,7 @@ void main() {
     group('processPacket - deduplication', () {
       test('drops duplicate non-ANNOUNCE packets', () async {
         int messageCount = 0;
-        router.onMessageReceived = (_, __, ___) => messageCount++;
+        router.onMessageReceived = (_, __, ___, ____) => messageCount++;
 
         final p = await signedPacket(
           type: PacketType.message,
@@ -583,7 +607,7 @@ void main() {
 
       test('markSeen prevents processing of pre-marked packet', () async {
         int messageCount = 0;
-        router.onMessageReceived = (_, __, ___) => messageCount++;
+        router.onMessageReceived = (_, __, ___, ____) => messageCount++;
 
         router.markSeen('33333333-3333-3333-3333-333333333333');
 
@@ -609,6 +633,62 @@ void main() {
         router.markSeen('seen-id');
         expect(router.isDuplicate('seen-id'), isTrue);
       });
+
+      test(
+          'duplicate MESSAGE re-ACKs without re-firing onMessageReceived. '
+          'This is what stops the sender\'s watchdog from looping forever '
+          'when its original ACK was lost.', () async {
+        int deliveries = 0;
+        final ackRequests = <String>[];
+        router.onMessageReceived = (_, __, ___, ____) => deliveries++;
+        router.onAckRequested = (_, __, packetId) => ackRequests.add(packetId);
+
+        final p = await signedPacket(
+          type: PacketType.message,
+          packetId: '44444444-4444-4444-4444-444444444444',
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([1]),
+        );
+
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, rssi: -60);
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, rssi: -60);
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, rssi: -60);
+
+        expect(deliveries, equals(1),
+            reason: 'Recipient must not double-deliver to the app.');
+        expect(ackRequests, hasLength(3),
+            reason:
+                'Recipient must re-ACK every duplicate so the sender can stop '
+                'retrying.');
+        expect(ackRequests, everyElement(p.packetId));
+      });
+
+      test(
+          'duplicate non-MESSAGE packets (e.g. ACK, signaling) are still '
+          'dropped at the wire level — no re-fire of their callbacks.',
+          () async {
+        int ackReceived = 0;
+        router.onAckReceived = (_) => ackReceived++;
+
+        final ackPayload = utf8.encode('mid-1234');
+        final p = await signedPacket(
+          type: PacketType.ack,
+          packetId: '55555555-5555-5555-5555-555555555555',
+          payload: Uint8List.fromList(ackPayload),
+        );
+
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, rssi: -60);
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, rssi: -60);
+
+        expect(ackReceived, equals(1),
+            reason: 'ACK packets keep the existing wire-level dedup so a '
+                'spurious double-ACK isn\'t processed twice.');
+      });
     });
 
     // =========================================================================
@@ -618,7 +698,7 @@ void main() {
     group('processPacket - fragments', () {
       test('reassembles fragmented message and delivers', () async {
         Uint8List? reassembledPayload;
-        router.onMessageReceived = (_, __, payload) {
+        router.onMessageReceived = (_, __, payload, ___) {
           reassembledPayload = payload;
         };
 
@@ -673,7 +753,7 @@ void main() {
 
       test('NACK is silently ignored', () async {
         bool anyCalled = false;
-        router.onMessageReceived = (_, __, ___) => anyCalled = true;
+        router.onMessageReceived = (_, __, ___, ____) => anyCalled = true;
         router.onAckReceived = (_) => anyCalled = true;
         router.onReadReceiptReceived = (_) => anyCalled = true;
 
@@ -854,7 +934,7 @@ void main() {
         String? receivedId;
         Uint8List? receivedPubkey;
         Uint8List? receivedPayload;
-        router.onMessageReceived = (id, pubkey, payload) {
+        router.onMessageReceived = (id, pubkey, payload, _) {
           receivedId = id;
           receivedPubkey = pubkey;
           receivedPayload = payload;
@@ -903,7 +983,7 @@ void main() {
         PeerTransport? ackTransport;
         String? ackPeerId;
         String? ackMessageId;
-        router.onMessageReceived = (_, __, ___) {};
+        router.onMessageReceived = (_, __, ___, ____) {};
         router.onAckRequested = (transport, peerId, messageId) {
           ackTransport = transport;
           ackPeerId = peerId;
@@ -936,7 +1016,7 @@ void main() {
         PeerTransport? ackTransport;
         String? ackPeerId;
         String? ackMessageId;
-        router.onMessageReceived = (_, __, ___) {};
+        router.onMessageReceived = (_, __, ___, ____) {};
         router.onAckRequested = (transport, peerId, messageId) {
           ackTransport = transport;
           ackPeerId = peerId;

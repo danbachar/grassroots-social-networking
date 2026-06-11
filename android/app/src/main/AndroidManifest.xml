@@ -27,6 +27,15 @@
     <!-- Notifications (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Foreground service keeping the transport process unfrozen while
+         backgrounded / screen-off. Without it, cached-app freezing stops the
+         Dart VM: ANNOUNCEs go silent, scan results stop being processed, and
+         reverse BLE legs never dial. `connectedDevice` matches our
+         persistent BLE GATT connections (its API-34+ prerequisite is
+         satisfied by the Bluetooth runtime permissions above). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <!-- Required features.
          Camera is invoked via image_picker → ACTION_IMAGE_CAPTURE intent,
          which runs in the system camera app's own process, so we do NOT
@@ -62,6 +71,10 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name=".TransportForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

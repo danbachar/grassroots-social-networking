@@ -153,6 +153,16 @@ class PeerUdpConnectionChangedAction extends PeerAction {
   });
 }
 
+/// A BLE Noise XX session with a peer completed authentication.
+/// Sets [PeerState.bleAuthenticated] — the BLE half of consolidated
+/// reachability. Cleared by [PeerBleDisconnectedAction] when the last BLE
+/// path drops.
+class PeerBleAuthenticatedAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerBleAuthenticatedAction(this.publicKey);
+}
+
 /// A verified UDP packet was received from a peer.
 ///
 /// Updates UDP-specific freshness so stale UDX sessions can be aged out even

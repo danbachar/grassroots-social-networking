@@ -11,6 +11,9 @@ enum MessageStatus {
   /// Message is being sent (clock icon)
   sending,
 
+  /// Message is queued until the peer becomes reachable
+  queued,
+
   /// Message failed to send (red !)
   failed,
 
@@ -56,6 +59,19 @@ class MessageFailedAction extends MessageAction {
   final DateTime timestamp;
 
   MessageFailedAction({
+    required this.messageId,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+}
+
+/// A message is queued until the recipient becomes reachable
+/// Status: queued (clock icon)
+class MessageQueuedAction extends MessageAction {
+  /// Message ID that was queued
+  final String messageId;
+  final DateTime timestamp;
+
+  MessageQueuedAction({
     required this.messageId,
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();

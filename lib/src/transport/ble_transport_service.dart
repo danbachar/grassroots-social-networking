@@ -24,6 +24,12 @@ const _defaultBleDisplayInfo = TransportDisplayInfo(
 const String _grassrootsCharacteristicUuid =
     '0000ff01-0000-1000-8000-00805f9b34fb';
 
+/// Fixed local name advertised by iOS devices. The iOS-central → non-iOS
+/// second link is measurably broken (see CLAUDE.md, "Dual-Role BLE Is
+/// Mandatory"), so peers that see this marker in an advertisement yield the
+/// pair's first dial to the iOS device and open the reverse leg themselves.
+const String grassrootsIosLocalName = 'grs-ios';
+
 /// MTU we request from the peer on every central connect. ANNOUNCE alone is
 /// ~200 bytes, far over the default ATT MTU of 23 (20-byte payload). 247 is
 /// the largest most Android stacks negotiate; the actual value is whatever
@@ -88,7 +94,7 @@ class BleTransportService extends TransportService {
   final Map<String, ble.BlePath> _paths = {};
 
   /// Derived service UUIDs (lowercase) whose advertisements have carried the
-  /// iOS platform marker ([ble.grassrootsIosLocalName]) this session. Like
+  /// iOS platform marker ([grassrootsIosLocalName]) this session. Like
   /// [_paths] this is a cache of transport facts, not consumer state: a
   /// peer's platform never changes, but the marker is only present while the
   /// iOS app is foregrounded, so we remember every sighting. Used to scope
@@ -916,7 +922,7 @@ class BleTransportService extends TransportService {
   ///
   /// So for mixed pairs iOS must own the first link and the non-iOS side the
   /// reverse leg. iOS peers are recognized by the fixed `grs-ios` local name
-  /// their advertisements carry (see [ble.grassrootsIosLocalName]); among
+  /// their advertisements carry (see [grassrootsIosLocalName]); among
   /// same-platform peers the deterministic service-UUID tiebreaker (mirroring
   /// the UDP "smaller pubkey initiates" convention) avoids the mutual-dial
   /// collision. Every waiting branch is backstopped by [firstMoverFallback]
@@ -978,14 +984,14 @@ class BleTransportService extends TransportService {
       _iosMarkedServiceUuids.contains(serviceUuid.toLowerCase());
 
   /// Whether [adv] carries the fixed iOS platform marker
-  /// ([ble.grassrootsIosLocalName]) in its local name. iOS surfaces a scanned
+  /// ([grassrootsIosLocalName]) in its local name. iOS surfaces a scanned
   /// local name as `advertisedName`; Android surfaces the scan-response name
   /// there too, with the GAP-cached name in `platformName` — check both.
   /// Absence proves nothing (backgrounded iOS drops the name), which is why
   /// every marker-dependent branch in [_shouldOpenCentralLeg] has a fallback.
   bool _advertisementCarriesIosMarker(ble.BleAdvertisement adv) {
-    return adv.advertisedName == ble.grassrootsIosLocalName ||
-        adv.platformName == ble.grassrootsIosLocalName;
+    return adv.advertisedName == grassrootsIosLocalName ||
+        adv.platformName == grassrootsIosLocalName;
   }
 
   /// Cold-start tie-breaker between same-platform peers: the one whose

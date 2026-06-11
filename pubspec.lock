@@ -461,7 +461,7 @@ packages:
     description:
       path: "."
       ref: main
-      resolved-ref: c3a19696e49b10652b79dc289f919775e0290446
+      resolved-ref: 5806da3e124281588ff21c12574de8b789825b57
       url: "git@github.com:danbachar/grassroots-bluetooth-layer.git"
     source: git
     version: "0.1.0"

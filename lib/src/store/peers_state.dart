@@ -19,6 +19,10 @@ class DiscoveredPeerState {
 
   /// Latest signal strength reported by the plugin's advertisement stream.
   /// Always populated for `DiscoveredPeerState` because every advertisement carries RSSI.
+  /// Signal strength in dBm at last observation. Always a real
+  /// negative-dBm measurement: the BLE plugin drops any advertisement whose
+  /// RSSI is non-negative (a platform-level "no measurement" sentinel) so
+  /// only real measurements reach this field.
   final int rssi;
 
   /// Grassroots service UUID from the advertisement. With derived UUIDs this
@@ -162,11 +166,19 @@ class PeerState {
   /// any prior observation was for a different network path.
   final DateTime? lastDirectReachAt;
 
-  /// Whether there is a live UDX connection to this peer.
-  /// Set true when UDX handshake completes, false when the stream closes.
-  /// Unlike [udpAddress] (which is preserved for reconnection), this reflects
-  /// the actual transport-level connection state right now.
+  /// Whether there is an authenticated UDP path to this peer — a live UDX
+  /// connection whose Noise XX session has completed. Set true when the Noise
+  /// handshake authenticates (not on the bare UDX connect), false when the
+  /// stream closes. Unlike [udpAddress] (preserved for reconnection), this
+  /// reflects the actual authenticated-connection state right now.
   final bool hasLiveUdpConnection;
+
+  /// Whether there is an authenticated BLE path to this peer — a live BLE link
+  /// whose Noise XX session has completed. Set true when the BLE Noise
+  /// handshake authenticates, cleared when the last BLE path drops. Distinct
+  /// from [hasBleConnection] (the raw link, set on ANNOUNCE so we can route the
+  /// handshake itself): a peer is only [isReachable] once authenticated.
+  final bool bleAuthenticated;
 
   const PeerState({
     required this.publicKey,
@@ -186,6 +198,7 @@ class PeerState {
     this.isFriend = false,
     this.lastDirectReachAt,
     this.hasLiveUdpConnection = false,
+    this.bleAuthenticated = false,
   });
 
   /// Hex representation of public key (for map keys)
@@ -214,10 +227,12 @@ class PeerState {
   /// Prefers central (we initiated) since sendToPeer tries central service first.
   String? get bleDeviceId => bleCentralDeviceId ?? blePeripheralDeviceId;
 
-  /// Whether this peer is potentially reachable via any transport.
-  /// For UDP, a stored address is sufficient (we can attempt to connect).
-  /// See [isLiveReachable] for actual live connection status.
-  bool get isReachable =>
+  /// Whether we have an address candidate for this peer that we could attempt
+  /// to dial. For UDP, a stored address suffices; for BLE, a live path. This
+  /// is the predicate for "do we know how to reach them at all" — used to
+  /// pick well-connected friends as signaling intermediaries even when not
+  /// currently connected. See [isReachable] for live-now status.
+  bool get hasKnownAddress =>
       hasBleConnection || allUdpAddressCandidates.isNotEmpty;
 
   /// UDP candidates in first-seen order, including legacy fields.
@@ -235,9 +250,16 @@ class PeerState {
   /// least one globally routable UDP address.
   bool get isWellConnected => hasPublicUdpAddress;
 
-  /// Whether this peer has a live, active connection right now.
-  /// Use this for UI "online" status — not for signaling/discovery.
-  bool get isLiveReachable => hasBleConnection || hasLiveUdpConnection;
+  /// Whether this peer is reachable right now via any *authenticated*
+  /// transport. This is the canonical "can a send succeed without queueing"
+  /// predicate and the basis for the consolidated
+  /// onPeerConnected/onPeerDisconnected callbacks on [GrassrootsNetwork].
+  ///
+  /// Reachability requires a completed Noise session — spec
+  /// `docs/GLP_Networking_API/sections/ip.tex` §IP Connection: connected fires
+  /// once the stream is "established and authenticated". A raw BLE/UDX link
+  /// without a session does not count as reachable.
+  bool get isReachable => bleAuthenticated || hasLiveUdpConnection;
 
   /// The currently active transport based on available connections.
   /// BLE is preferred when available; falls back to UDP, then stored value.
@@ -277,6 +299,7 @@ class PeerState {
     DateTime? lastDirectReachAt,
     bool clearLastDirectReachAt = false,
     bool? hasLiveUdpConnection,
+    bool? bleAuthenticated,
   }) {
     return PeerState(
       publicKey: publicKey ?? this.publicKey,
@@ -299,6 +322,7 @@ class PeerState {
           ? null
           : lastDirectReachAt ?? this.lastDirectReachAt,
       hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
+      bleAuthenticated: bleAuthenticated ?? this.bleAuthenticated,
     );
   }
 
@@ -379,10 +403,21 @@ class PeersState {
   List<PeerState> get blePeers =>
       peers.values.where((p) => p.hasBleConnection).toList();
 
-  /// Nearby peers - connected peers reachable via BLE (in physical proximity)
-  /// Use this for the "Nearby" section in UI.
+  /// Nearby peers — anyone (friend or stranger) we currently hold a live BLE
+  /// path to (central or peripheral). Used for the "Connected Peers" /
+  /// "Nearby" UI section.
+  ///
+  /// Deliberately filters by `hasBleConnection` alone, NOT by
+  /// `connectionState`. `connectionState` is a strict projection of
+  /// transport-emitted facts and stays at `connected` until an explicit BLE
+  /// disconnect surfaces — which can be missed when the path-state machine
+  /// drifts through `failed`/`subscribed` without a clean `ready → dropped`
+  /// transition. The BLE device-id fields are the ground truth of whether
+  /// we still hold a path. The `_removeStalePeers` sweep in
+  /// `GrassrootsNetwork` clears those ids on `lastBleSeen` staleness so a
+  /// peer that's gone silent for two announce cycles falls off this list.
   List<PeerState> get nearbyBlePeers =>
-      peers.values.where((p) => p.isConnected && p.hasBleConnection).toList();
+      peers.values.where((p) => p.hasBleConnection).toList();
 
   /// Peers with a live UDP connection
   List<PeerState> get udpPeers =>
@@ -391,15 +426,21 @@ class PeersState {
   /// All friends
   List<PeerState> get friends => peers.values.where((p) => p.isFriend).toList();
 
-  /// Online friends - friends with a live UDP connection (not nearby via BLE).
-  /// Use this for the "Friends Online" section in UI.
+  /// Online friends — friends with a live UDP connection. Used for the
+  /// "Friends Online" UI section.
+  ///
+  /// Filters purely on `hasLiveUdpConnection`. The earlier formulation also
+  /// required `isConnected`, but that mixed BLE-derived state into a
+  /// UDP-only signal — a friend whose BLE drops would otherwise fall off
+  /// this list even with a perfectly live UDP stream. UDP liveness is the
+  /// only thing that matters here.
   List<PeerState> get onlineFriends => peers.values
-      .where((p) => p.isFriend && p.isConnected && p.hasLiveUdpConnection)
+      .where((p) => p.isFriend && p.hasLiveUdpConnection)
       .toList();
 
   /// Well-connected friends that can serve as signaling nodes
   List<PeerState> get wellConnectedFriends => peers.values
-      .where((p) => p.isFriend && p.isWellConnected && p.isReachable)
+      .where((p) => p.isFriend && p.isWellConnected && p.hasKnownAddress)
       .toList();
 
   /// Direct accepted friend public keys.
@@ -420,7 +461,7 @@ class PeersState {
     final targetHex = targetPubkeyHex.toLowerCase();
     final mediators = <PeerState>[];
     for (final friend in friends) {
-      if (!friend.isLiveReachable) continue;
+      if (!friend.isReachable) continue;
       if (friend.pubkeyHex == targetHex) continue;
       if (friendsOfFriends[friend.pubkeyHex]?.contains(targetHex) == true) {
         mediators.add(friend);
@@ -448,6 +489,25 @@ class PeersState {
   /// Get discovered BLE peer by device ID
   DiscoveredPeerState? getDiscoveredBlePeer(String deviceId) =>
       discoveredBlePeers[deviceId];
+
+  /// Find every discovered BLE peer advertising the given derived service
+  /// UUID, regardless of radio MAC / CBPeripheral identifier. The service
+  /// UUID is `Grassroots-prefix + SHA-256(pubkey)[0..8]` and is stable across
+  /// MAC rotations, so this is how we recognise the same logical peer when
+  /// its radio identifier changes (frequent on iOS without bonding).
+  ///
+  /// Returns an empty iterable when `serviceUuid` is null/empty so callers
+  /// don't have to null-check.
+  Iterable<DiscoveredPeerState> getDiscoveredBlePeersByServiceUuid(
+    String? serviceUuid,
+  ) {
+    if (serviceUuid == null || serviceUuid.isEmpty) {
+      return const <DiscoveredPeerState>[];
+    }
+    final normalized = serviceUuid.toLowerCase();
+    return discoveredBlePeers.values
+        .where((p) => p.serviceUuid?.toLowerCase() == normalized);
+  }
 
   /// Check if a peer is reachable by pubkey
   bool isPeerReachable(Uint8List pubkey) {

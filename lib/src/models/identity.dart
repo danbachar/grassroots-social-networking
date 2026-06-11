@@ -60,6 +60,21 @@ class GrassrootsIdentity {
     );
   }
 
+  /// Generate a fresh Ed25519 identity.
+  ///
+  /// Spec `putIdentity()` (`docs/GLP_Networking_API/sections/api.tex` §Identity)
+  /// generates *and* persists; here generation lives on the model and
+  /// persistence on `IdentityStore.putIdentity`. The app calls this once on
+  /// first launch and persists the result. When [nickname] is omitted a
+  /// placeholder is derived from the public key.
+  static Future<GrassrootsIdentity> generate({String? nickname}) async {
+    final keyPair = await Ed25519().newKeyPair();
+    final pk = await keyPair.extractPublicKey();
+    final resolvedNickname = nickname ??
+        'User_${pk.bytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
+    return create(keyPair: keyPair, nickname: resolvedNickname);
+  }
+
   /// Static 8-byte prefix identifying Grassroots devices on BLE.
   /// First 8 bytes of SHA-256("grassroots").
   static const String grassrootsUuidPrefix = '84c403160871e5ad';

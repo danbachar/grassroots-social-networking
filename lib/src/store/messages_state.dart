@@ -51,15 +51,18 @@ class OutgoingMessage {
       recipientPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   OutgoingMessage copyWith({
+    MessageTransport? transport,
+    Uint8List? recipientPubkey,
+    int? payloadSize,
     MessageStatus? status,
     DateTime? deliveredAt,
     DateTime? readAt,
   }) {
     return OutgoingMessage(
       messageId: messageId,
-      transport: transport,
-      recipientPubkey: recipientPubkey,
-      payloadSize: payloadSize,
+      transport: transport ?? this.transport,
+      recipientPubkey: recipientPubkey ?? this.recipientPubkey,
+      payloadSize: payloadSize ?? this.payloadSize,
       sentAt: sentAt,
       status: status ?? this.status,
       deliveredAt: deliveredAt ?? this.deliveredAt,
@@ -379,22 +382,24 @@ class MessagesState {
   }
 
   /// Outgoing messages with status 'sent' (pending delivery)
-  List<OutgoingMessage> get pendingDeliveryMessages =>
-      outgoingMessages.values
-          .where((m) => m.status == MessageStatus.sent)
-          .toList();
+  List<OutgoingMessage> get pendingDeliveryMessages => outgoingMessages.values
+      .where((m) => m.status == MessageStatus.sent)
+      .toList();
+
+  /// Outgoing messages queued until the recipient is reachable.
+  List<OutgoingMessage> get queuedMessages => outgoingMessages.values
+      .where((m) => m.status == MessageStatus.queued)
+      .toList();
 
   /// Outgoing messages with status 'delivered' (pending read)
-  List<OutgoingMessage> get deliveredMessages =>
-      outgoingMessages.values
-          .where((m) => m.status == MessageStatus.delivered)
-          .toList();
+  List<OutgoingMessage> get deliveredMessages => outgoingMessages.values
+      .where((m) => m.status == MessageStatus.delivered)
+      .toList();
 
   /// Outgoing messages with status 'read'
-  List<OutgoingMessage> get readMessages =>
-      outgoingMessages.values
-          .where((m) => m.status == MessageStatus.read)
-          .toList();
+  List<OutgoingMessage> get readMessages => outgoingMessages.values
+      .where((m) => m.status == MessageStatus.read)
+      .toList();
 
   /// Count of outgoing messages by transport
   int outgoingCountByTransport(MessageTransport transport) =>

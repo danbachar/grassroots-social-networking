@@ -554,7 +554,7 @@ class SignalingService {
       return;
     }
 
-    if (!targetPeer.isLiveReachable) {
+    if (!targetPeer.isReachable) {
       debugPrint(
         'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — target '
         '${targetHex.substring(0, 8)} is not live on this mediator',

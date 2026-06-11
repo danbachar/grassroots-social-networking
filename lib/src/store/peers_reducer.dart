@@ -13,9 +13,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final existing = state.discoveredBlePeers[action.deviceId];
     final now = DateTime.now();
 
+    final DiscoveredPeerState newOrUpdated;
     if (existing == null) {
-      // New discovery
-      final newPeer = DiscoveredPeerState(
+      newOrUpdated = DiscoveredPeerState(
         transportId: action.deviceId,
         displayName: action.displayName,
         rssi: action.rssi,
@@ -23,14 +23,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         discoveredAt: now,
         lastSeen: now,
       );
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = newPeer,
-      );
     } else {
       // TODO: this should be a different action, use update rssi
-      // Update existing
-      final updated = existing.copyWith(
+      newOrUpdated = existing.copyWith(
         rssi: action.rssi,
         serviceUuid: action.serviceUuid,
         lastSeen: now,
@@ -38,11 +33,33 @@ PeersState peersReducer(PeersState state, dynamic action) {
             ? action.displayName
             : existing.displayName,
       );
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = updated,
-      );
     }
+
+    // Dedupe MAC-rotation ghost entries. A derived service UUID identifies the
+    // logical peer (Grassroots-prefix + SHA-256(pubkey)[0..8]) and is stable
+    // across BLE address rotations, while the deviceId / pathId is tied to
+    // the radio MAC (Android) or CBPeripheral identifier (iOS without
+    // bonding) and rotates ~every 15 min. Without this cleanup the map
+    // accumulates one dead entry per rotation, each one keeps getting
+    // re-dialed by `_onAdvertisement`, and we end up in a status-133 storm.
+    //
+    // Only prune entries that are NOT currently connected or in-flight: if
+    // we still have a live or pending path on the old MAC, leave it alone —
+    // the live-path guard in `_onAdvertisement` is what stops the new MAC
+    // from racing a parallel dial.
+    final updatedMap =
+        Map<String, DiscoveredPeerState>.from(state.discoveredBlePeers);
+    final newServiceUuid = action.serviceUuid?.toLowerCase();
+    if (newServiceUuid != null && newServiceUuid.isNotEmpty) {
+      updatedMap.removeWhere((deviceId, peer) =>
+          deviceId != action.deviceId &&
+          peer.serviceUuid?.toLowerCase() == newServiceUuid &&
+          !peer.isConnected &&
+          !peer.isConnecting);
+    }
+    updatedMap[action.deviceId] = newOrUpdated;
+
+    return state.copyWith(discoveredBlePeers: updatedMap);
   }
 
   if (action is BleDeviceRssiUpdatedAction) {
@@ -256,10 +273,15 @@ PeersState peersReducer(PeersState state, dynamic action) {
           clearPeripheral ? null : existing.blePeripheralDeviceId;
       final hasAnyBle = newCentralId != null || newPeripheralId != null;
 
-      // If no other transport, mark as disconnected
-      final newConnectionState = (hasAnyBle || existing.hasLiveUdpConnection)
-          ? existing.connectionState
-          : PeerConnectionState.disconnected;
+      // A BLE-disconnect event describes a BLE fact. Deliberately do NOT
+      // consult `hasLiveUdpConnection` here: mixing transport-orthogonal
+      // state into the projection muddles two unrelated UI dimensions
+      // ("Connected Peers" cares about BLE; "Friends Online" cares about
+      // UDP). Once both BLE roles are gone the peer's `connectionState`
+      // flips to `disconnected`; UDP-derived state is updated separately
+      // by `PeerUdpDisconnectedAction` / `PeerUdpConnectionChangedAction`.
+      final newConnectionState =
+          hasAnyBle ? existing.connectionState : PeerConnectionState.disconnected;
 
       // Construct directly to allow clearing nullable fields.
       // RSSI is meaningful only while a BLE link exists; clear it when the
@@ -282,9 +304,24 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        // Clear BLE auth only when the last BLE path is gone; a partial drop
+        // (one role) leaves the Noise session intact.
+        bleAuthenticated: hasAnyBle ? existing.bleAuthenticated : false,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
+      );
+    }
+    return state;
+  }
+
+  if (action is PeerBleAuthenticatedAction) {
+    final pubkeyHex = _pubkeyToHex(action.publicKey);
+    final existing = state.peers[pubkeyHex];
+    if (existing != null) {
+      return state.copyWith(
+        peers: Map.from(state.peers)
+          ..[pubkeyHex] = existing.copyWith(bleAuthenticated: true),
       );
     }
     return state;
@@ -343,6 +380,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: false,
+        // Transport independence: a UDP drop must not touch BLE auth.
+        bleAuthenticated: existing.bleAuthenticated,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -448,6 +487,7 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: preserveReach ? existing.lastDirectReachAt : null,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        bleAuthenticated: existing.bleAuthenticated,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -542,6 +582,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         udpAddress: null,
         udpAddressCandidates: const {},
         lastDirectReachAt: null,
+        // Still nearby over BLE — keep the BLE auth state.
+        bleAuthenticated: existing.bleAuthenticated,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,

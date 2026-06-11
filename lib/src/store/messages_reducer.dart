@@ -1,28 +1,59 @@
 import 'messages_state.dart';
 import 'messages_actions.dart';
 
+/// Outgoing-message status transitions are monotonic past `sent`. Once we
+/// have proof of delivery (ACK → `delivered`) or proof of view (read receipt
+/// → `read`), no later action may drag the status back. Same for `failed`:
+/// the user explicitly has to retry, we don't transparently re-attempt.
+///
+/// Returns `true` if the action should be dropped (the existing status is
+/// already at a terminal-ish state that this action would regress).
+bool _isTerminalForRegression(MessageStatus status) =>
+    status == MessageStatus.delivered ||
+    status == MessageStatus.read ||
+    status == MessageStatus.failed;
+
 /// Reducer for messages state
 MessagesState messagesReducer(MessagesState state, MessageAction action) {
   if (action is MessageSendingAction) {
-    final message = OutgoingMessage(
-      messageId: action.messageId,
-      transport: action.transport,
-      recipientPubkey: action.recipientPubkey,
-      payloadSize: action.payloadSize,
-      sentAt: action.timestamp,
-      status: MessageStatus.sending,
-    );
-
     final updated = Map<String, OutgoingMessage>.from(state.outgoingMessages);
-    updated[action.messageId] = message;
+    final existing = state.outgoingMessages[action.messageId];
 
-    // Trim if exceeds max
-    if (updated.length > MessagesState.maxMessages) {
-      final sorted = updated.entries.toList()
-        ..sort((a, b) => a.value.sentAt.compareTo(b.value.sentAt));
-      final toRemove = sorted.take(updated.length - MessagesState.maxMessages);
-      for (final entry in toRemove) {
-        updated.remove(entry.key);
+    if (existing != null) {
+      // Never regress from delivered/read/failed. The drain dispatches
+      // MessageSendingAction blindly; if the message was already delivered
+      // (e.g. ACK arrived before the drain picked it up), this would
+      // otherwise wipe `deliveredAt` and flip the UI checkmarks backward.
+      if (_isTerminalForRegression(existing.status)) {
+        return state;
+      }
+      // Update in place so we preserve `sentAt` and any timestamps; only
+      // bump the transport/payload metadata and the status.
+      updated[action.messageId] = existing.copyWith(
+        transport: action.transport,
+        recipientPubkey: action.recipientPubkey,
+        payloadSize: action.payloadSize,
+        status: MessageStatus.sending,
+      );
+    } else {
+      updated[action.messageId] = OutgoingMessage(
+        messageId: action.messageId,
+        transport: action.transport,
+        recipientPubkey: action.recipientPubkey,
+        payloadSize: action.payloadSize,
+        sentAt: action.timestamp,
+        status: MessageStatus.sending,
+      );
+
+      // Trim if exceeds max
+      if (updated.length > MessagesState.maxMessages) {
+        final sorted = updated.entries.toList()
+          ..sort((a, b) => a.value.sentAt.compareTo(b.value.sentAt));
+        final toRemove =
+            sorted.take(updated.length - MessagesState.maxMessages);
+        for (final entry in toRemove) {
+          updated.remove(entry.key);
+        }
       }
     }
 
@@ -33,9 +64,34 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
     final existing = state.outgoingMessages[action.messageId];
     if (existing == null) return state;
 
+    // Don't downgrade delivered/read to failed: by definition the recipient
+    // already has it, so it's not really failed from their perspective.
+    if (existing.status == MessageStatus.delivered ||
+        existing.status == MessageStatus.read) {
+      return state;
+    }
+
     final updated = Map<String, OutgoingMessage>.from(state.outgoingMessages);
     updated[action.messageId] = existing.copyWith(
       status: MessageStatus.failed,
+    );
+
+    return state.copyWith(outgoingMessages: updated);
+  }
+
+  if (action is MessageQueuedAction) {
+    final existing = state.outgoingMessages[action.messageId];
+    if (existing == null) return state;
+
+    // `sent → queued` is legitimate (BLE-disconnect or ack-timeout re-queue);
+    // `delivered/read/failed → queued` is a regression and gets dropped.
+    if (_isTerminalForRegression(existing.status)) {
+      return state;
+    }
+
+    final updated = Map<String, OutgoingMessage>.from(state.outgoingMessages);
+    updated[action.messageId] = existing.copyWith(
+      status: MessageStatus.queued,
     );
 
     return state.copyWith(outgoingMessages: updated);
@@ -46,8 +102,17 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
     final existing = state.outgoingMessages[action.messageId];
 
     if (existing != null) {
-      // Update existing message (sending -> sent)
+      // If the ACK won the race with `_markSentAndTrackForAck` (rare but
+      // possible for fragmented BLE sends or hot-restart edge cases), don't
+      // walk the status back from delivered/read to sent.
+      if (_isTerminalForRegression(existing.status)) {
+        return state;
+      }
+      // Update existing message (sending/queued -> sent)
       updated[action.messageId] = existing.copyWith(
+        transport: action.transport,
+        recipientPubkey: action.recipientPubkey,
+        payloadSize: action.payloadSize,
         status: MessageStatus.sent,
       );
     } else {
@@ -66,7 +131,8 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
       if (updated.length > MessagesState.maxMessages) {
         final sorted = updated.entries.toList()
           ..sort((a, b) => a.value.sentAt.compareTo(b.value.sentAt));
-        final toRemove = sorted.take(updated.length - MessagesState.maxMessages);
+        final toRemove =
+            sorted.take(updated.length - MessagesState.maxMessages);
         for (final entry in toRemove) {
           updated.remove(entry.key);
         }
@@ -79,6 +145,12 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
   if (action is MessageDeliveredAction) {
     final existing = state.outgoingMessages[action.messageId];
     if (existing == null) return state;
+
+    // Don't regress from read back to delivered if the read receipt landed
+    // first (unlikely but cheap to defend against).
+    if (existing.status == MessageStatus.read) {
+      return state;
+    }
 
     final updated = Map<String, OutgoingMessage>.from(state.outgoingMessages);
     updated[action.messageId] = existing.copyWith(
@@ -130,9 +202,8 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
   // ===== Conversation Actions =====
 
   if (action is SaveChatMessageAction) {
-    final peerHex = action.isOutgoing
-        ? action.recipientPubkeyHex
-        : action.senderPubkeyHex;
+    final peerHex =
+        action.isOutgoing ? action.recipientPubkeyHex : action.senderPubkeyHex;
 
     final chatMessage = ChatMessageState(
       senderPubkeyHex: action.senderPubkeyHex,
@@ -148,8 +219,20 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
       viewOnce: action.viewOnce,
     );
 
-    // Get existing conversation or create new
-    final existingConv = state.conversations[peerHex] ?? [];
+    // Get existing conversation or create new.
+    final existingConv = state.conversations[peerHex] ?? const [];
+
+    // Dedupe by messageId. The MessageRouter Bloom filter normally drops
+    // duplicate inbound packets before they reach `onMessageReceived`, but
+    // the filter resets on dispose (e.g. hot restart), and outgoing sends
+    // dispatch `SaveChatMessageAction` directly from `_sendMessage` /
+    // `_sendPicture`, so a defensive id-check here keeps the chat thread
+    // free of duplicate bubbles regardless.
+    if (action.messageId != null &&
+        existingConv.any((m) => m.messageId == action.messageId)) {
+      return state;
+    }
+
     final newConv = List<ChatMessageState>.from(existingConv)..add(chatMessage);
 
     // Trim if exceeds max per conversation
@@ -205,8 +288,8 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
     // records get pruned here too: with the chat history gone there is nothing
     // for those records to bind to, and they would otherwise leak forever.
     final messageIdsToDrop = <String>{
-      for (final m
-          in (state.conversations[action.peerHex] ?? const <ChatMessageState>[]))
+      for (final m in (state.conversations[action.peerHex] ??
+          const <ChatMessageState>[]))
         if (m.messageId != null) m.messageId!,
     };
 
@@ -217,10 +300,12 @@ MessagesState messagesReducer(MessagesState state, MessageAction action) {
     final newUnreadCounts = Map<String, int>.from(state.unreadCounts)
       ..remove(action.peerHex);
 
-    final newOutgoing = Map<String, OutgoingMessage>.from(state.outgoingMessages)
-      ..removeWhere((id, _) => messageIdsToDrop.contains(id));
-    final newIncoming = Map<String, IncomingMessage>.from(state.incomingMessages)
-      ..removeWhere((id, _) => messageIdsToDrop.contains(id));
+    final newOutgoing =
+        Map<String, OutgoingMessage>.from(state.outgoingMessages)
+          ..removeWhere((id, _) => messageIdsToDrop.contains(id));
+    final newIncoming =
+        Map<String, IncomingMessage>.from(state.incomingMessages)
+          ..removeWhere((id, _) => messageIdsToDrop.contains(id));
 
     return state.copyWith(
       conversations: newConversations,

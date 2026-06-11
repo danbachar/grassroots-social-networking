@@ -6,9 +6,17 @@ import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
+import 'package:sodium_libs/sodium_libs_sumo.dart';
+
+import '../helpers/sodium_test_bootstrap.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  late SodiumSumo sodium;
+  setUpAll(() async {
+    sodium = await initTestSodium();
+  });
 
   Future<GrassrootsIdentity> identity(String nickname) async {
     return GrassrootsIdentity.create(
@@ -36,8 +44,8 @@ void main() {
       () async {
     final alice = await identity('Alice');
     final bob = await identity('Bob');
-    final aliceSessions = NoiseSessionManager(identity: alice);
-    final bobSessions = NoiseSessionManager(identity: bob);
+    final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
 
     Future<void> completeHandshake(PeerTransport transport) async {
       final msg1 = await aliceSessions.startHandshake(
@@ -116,5 +124,59 @@ void main() {
     expect(udpDecrypted.type, PacketType.message);
     expect(bleDecrypted.payload, clear.payload);
     expect(udpDecrypted.payload, clear.payload);
+  });
+
+  test(
+      'aborts the handshake when the delivered static key does not match the '
+      'claimed identity (impersonation)', () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final mallory = await identity('Mallory');
+
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+    final mallorySessions =
+        NoiseSessionManager(identity: mallory, sodium: sodium);
+
+    const transport = PeerTransport.udp;
+
+    // Mallory drives an initiator handshake toward Bob, but every packet she
+    // puts on the wire claims to come from Alice — an identity whose Noise
+    // static she cannot produce. (The outer Ed25519 signature layer would also
+    // reject this; here we prove the Noise layer independently aborts.)
+    final msg1 = await mallorySessions.startHandshake(transport, bob.publicKey);
+    expect(msg1, isNotNull);
+
+    final msg2 = await bobSessions.handleHandshakePacket(
+      handshakePacket(sender: alice, recipient: bob, payload: msg1!),
+      transport: transport,
+    );
+    expect(msg2.responsePayload, isNotNull);
+
+    // Mallory completes her side (she keys the session under Bob, whose static
+    // is genuine), producing a msg3 that carries *Mallory's* static.
+    final msg3 = await mallorySessions.handleHandshakePacket(
+      handshakePacket(
+        sender: bob,
+        recipient: mallory,
+        payload: msg2.responsePayload!,
+      ),
+      transport: transport,
+    );
+    expect(msg3.responsePayload, isNotNull);
+
+    // Bob receives msg3, still labelled as coming from Alice. The delivered
+    // static is Mallory's and does not match the X25519 form of Alice's
+    // identity, so Bob aborts and establishes no session.
+    final finished = await bobSessions.handleHandshakePacket(
+      handshakePacket(
+        sender: alice,
+        recipient: bob,
+        payload: msg3.responsePayload!,
+      ),
+      transport: transport,
+    );
+
+    expect(finished.sessionEstablished, isFalse);
+    expect(bobSessions.hasSession(transport, alice.publicKey), isFalse);
   });
 }

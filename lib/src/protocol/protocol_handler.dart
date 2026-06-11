@@ -31,7 +31,7 @@ class ProtocolHandler {
     String? linkLocalAddress,
     Iterable<String> addressCandidates = const [],
   }) {
-    final nicknameBytes = Uint8List.fromList(identity.nickname.codeUnits);
+    final nicknameBytes = _encodeNickname(identity.nickname);
     final candidates = <String>{
       if (address != null && address.isNotEmpty) address,
       if (linkLocalAddress != null && linkLocalAddress.isNotEmpty)
@@ -125,8 +125,10 @@ class ProtocolHandler {
     // Nickname length (1 byte) + nickname
     final nicknameLength = data[offset];
     offset += 1;
-    final nickname =
-        String.fromCharCodes(data.sublist(offset, offset + nicknameLength));
+    final nickname = utf8.decode(
+      data.sublist(offset, offset + nicknameLength),
+      allowMalformed: true,
+    );
     offset += nicknameLength;
 
     if (offset + 2 > data.length) {
@@ -237,6 +239,22 @@ class ProtocolHandler {
     } catch (_) {
       return false;
     }
+  }
+
+  /// Encode a nickname as UTF-8 for the ANNOUNCE payload, truncated to fit the
+  /// 1-byte length prefix (max 255 bytes) on a code-point boundary so
+  /// multi-byte characters (emoji, non-ASCII names) survive the round-trip.
+  /// The matching decode is `utf8.decode(...)` in [decodeAnnounce].
+  static Uint8List _encodeNickname(String nickname) {
+    final encoded = utf8.encode(nickname);
+    if (encoded.length <= 255) return Uint8List.fromList(encoded);
+    final truncated = <int>[];
+    for (final rune in nickname.runes) {
+      final runeBytes = utf8.encode(String.fromCharCode(rune));
+      if (truncated.length + runeBytes.length > 255) break;
+      truncated.addAll(runeBytes);
+    }
+    return Uint8List.fromList(truncated);
   }
 
   String? _firstNonLinkLocalCandidate(Iterable<String> candidates) {

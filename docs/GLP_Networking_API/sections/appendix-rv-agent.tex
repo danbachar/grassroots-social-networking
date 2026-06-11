@@ -73,6 +73,14 @@ complete_rendezvous(AddrA, AddrB, punch(AddrB?), punch(AddrA?)).
 
 The system predicates \code{peer\_address/2}, \code{verify\_friendship/4}, and \code{punch\_udp/1} are described in Section~\ref{sec:rv-predicates}.
 
+\paragraph{Open: cold-call branch not yet supported.}
+The code above handles only the friend-reconnect form of \code{reconnect}: every \code{reconnect} message is fed unconditionally to \code{verify\_friendship/4}, which rejects anything that is not a valid friendship attestation.  The IP cold-call flow (Appendix~\ref{appendix:ip-cold-call-invites}, step~5), however, has~$A$ send a \code{reconnect} whose \code{Proof} slot carries an invite-ID reference to the pre-registered invite rather than a friendship attestation; the rendezvous agent is expected to dispatch on the proof variant and run a different verifier.  Two candidate resolutions, neither applied here:
+\begin{itemize}
+\item Make the \code{Proof} type polymorphic (friendship attestation vs.\ invite-ID reference) and have \code{rv\_agent} dispatch on the variant before calling the appropriate verifier.
+\item Introduce a dedicated \code{cold\_call\_accept} message type with its own handler, leaving \code{reconnect} untouched.
+\end{itemize}
+The code in this appendix is left as-is pending that choice.
+
 %==============================================================================
 \section{Rendezvous Client --- GLP Implementation}
 \label{appendix:rv-client}
@@ -198,7 +206,7 @@ Invite ::= invite(
 ).
 \end{verbatim}
 
-\noindent \code{Nonce256} is 256 uniformly random bits.  \code{ExpiresAt} is one hour after creation. \code{RvServer} contains a rendezvous server's public address and key. \code{SignatureA} is an Ed25519 signature by~$A$ over all preceding fields. The nonce is usable exactly once: $A$ records the invite as unused with the rendezvous agent when the link is generated, and the rendezvous agent marks it consumed atomically when accepting the first-contact payload.  Possession of the link authorizes a first-contact attempt; friendship is established only when $A$ accepts the resulting cold call from $B$.
+\noindent \code{Nonce256} is 256 uniformly random bits.  \code{ExpiresAt} is one hour after creation. \code{RvServer} contains a rendezvous server's public address and key. \code{SignatureA} is an Ed25519 signature by~$A$ over all preceding fields. The nonce is usable exactly once: $A$ records the invite as unused with the rendezvous agent when the link is generated, and the rendezvous agent marks it consumed atomically when validating the redeemer's claim.  Possession of the link authorizes a first-contact attempt; friendship is established only when $A$ accepts the resulting cold call from $B$.
 
 The link is base64-encoded for compact URI transport, allowing the recipient to open it as a deep-link.  The protocol relies on the out-of-band channel to deliver the link to the intended recipient, and relies on the 256-bit nonce, one-hour expiration, and $A$'s signature to prevent guessing, replay, and tampering.
 

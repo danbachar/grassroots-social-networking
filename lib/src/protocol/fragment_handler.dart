@@ -64,7 +64,7 @@ class _ReassemblyState {
 
 /// Handles fragmentation and reassembly of messages larger than BLE MTU.
 ///
-/// Grassroots fragments messages > 500 bytes:
+/// Grassroots fragments payloads larger than [fragmentThreshold] bytes:
 /// - fragmentStart: contains metadata + first chunk
 /// - fragmentContinue: intermediate chunks
 /// - fragmentEnd: final chunk, triggers reassembly

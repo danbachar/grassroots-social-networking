@@ -29,9 +29,11 @@ class MessageRouter {
   final FragmentHandler fragmentHandler;
   final BloomFilter _seenPackets = BloomFilter();
 
-  /// Called when a message is received
-  void Function(String id, Uint8List senderPubkey, Uint8List payload)?
-      onMessageReceived;
+  /// Called when a message is received. [transport] is the transport the packet
+  /// actually arrived on — authoritative, taken from the receive path rather
+  /// than inferred from peer state.
+  void Function(String id, Uint8List senderPubkey, Uint8List payload,
+      PeerTransport transport)? onMessageReceived;
 
   /// Called when an ACK is received (delivery confirmation)
   void Function(String messageId)? onAckReceived;
@@ -221,8 +223,18 @@ class MessageRouter {
       return;
     }
 
-    // Dedup for non-ANNOUNCE packets
-    if (_seenPackets.checkAndAdd(packet.packetId)) {
+    // Dedup for non-ANNOUNCE, non-MESSAGE/FRAGMENT packets at the wire
+    // level. MESSAGE packets and fragmented messages are deduped inside
+    // `_handleMessage` (keyed by messageId after reassembly) so we can
+    // RE-ACK a duplicate — otherwise the sender's watchdog and BLE-disconnect
+    // re-queue would retry forever, because the original ACK was lost and
+    // the recipient would silently drop every subsequent attempt.
+    final isMessageOrFragment = packet.type == PacketType.message ||
+        packet.type == PacketType.fragmentStart ||
+        packet.type == PacketType.fragmentContinue ||
+        packet.type == PacketType.fragmentEnd;
+    if (!isMessageOrFragment &&
+        _seenPackets.checkAndAdd(packet.packetId)) {
       return;
     }
 
@@ -372,8 +384,23 @@ class MessageRouter {
     String? peerId,
   }) {
     if (!_isForUs(packet)) return;
-    onMessageReceived?.call(
-        packet.packetId, packet.senderPubkey, packet.payload);
+
+    // Dedup by messageId. For single-packet messages `packet.packetId` is
+    // the messageId; for messages that arrived fragmented, `_handleFragment`
+    // synthesizes a packet whose `packetId` is the reassembled messageId.
+    // Either way: only deliver to the app once, but ACK every time so the
+    // sender's watchdog stops retrying when its ACK got lost.
+    final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
+    if (firstSeen) {
+      onMessageReceived?.call(
+          packet.packetId, packet.senderPubkey, packet.payload, transport);
+    } else {
+      debugPrint(
+        'Duplicate message ${packet.packetId.length >= 8 ? packet.packetId.substring(0, 8) : packet.packetId}; '
+        're-ACKing without re-delivering.',
+      );
+    }
+
     // Send ACK back to confirm delivery. The sender waits for this to
     // mark the message as "delivered" (2 checkmarks). Works over both
     // BLE (peerId = bleDeviceId) and UDP (peerId = udpPeerId).

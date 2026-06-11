@@ -2,7 +2,6 @@ import 'package:flutter/foundation.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
@@ -10,10 +9,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:sodium_libs/sodium_libs.dart';
-import 'dart:convert';
+import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'dart:async';
-import 'package:cryptography/cryptography.dart';
 import 'chat_screen.dart';
 import 'chat_models.dart';
 import 'settings_screen.dart';
@@ -39,39 +36,24 @@ late final PersistenceService persistenceService;
 // Global libsodium handle, initialized at app startup. Used by ProtocolHandler
 // for native Ed25519 sign on the main isolate; verifier worker isolates
 // initialize their own Sodium handles independently.
-late final Sodium appSodium;
+late final SodiumSumo appSodium;
 
 Future<GrassrootsIdentity> _initIdentity() async {
-  const storage = FlutterSecureStorage();
-  var identityValue = await storage.read(key: 'identity');
-  if (identityValue == null) {
-    debugPrint('No identity found, generating new one.');
-    final algorithm = Ed25519();
-    final keyPair = await algorithm.newKeyPair();
-    final seed = await keyPair.extractPrivateKeyBytes(); // 32-byte seed
-    final publicKey = await keyPair.extractPublicKey();
-    final publicKeyBytes = publicKey.bytes;
-
-    // Ed25519 private key format: seed (32 bytes) + public key (32 bytes) = 64 bytes
-    final privateKey64 = Uint8List.fromList([...seed, ...publicKeyBytes]);
-
-    String nickname =
-        'User_${publicKeyBytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
-
-    var id = await GrassrootsIdentity.create(
-      keyPair: keyPair,
-      nickname: nickname,
-    );
-
-    identityValue = jsonEncode(id.toJson());
-    await storage.write(key: 'identity', value: identityValue);
-  } else {
+  // Spec putIdentity/getIdentity (docs/GLP_Networking_API/sections/api.tex
+  // §Identity): restore the persisted identity, or generate-and-persist one on
+  // first launch so the same Ed25519 key pair is reused every session.
+  final existing = await IdentityStore.getIdentity();
+  if (existing != null) {
     debugPrint('Identity found in secure storage.');
+    debugPrint('Private Key Bytes (Seed): ${existing.privateKey.length} bytes');
+    debugPrint('Public Key Bytes: ${existing.publicKey.length} bytes');
+    debugPrint('Nickname: ${existing.nickname}');
+    return existing;
   }
 
-  final GrassrootsIdentity identity =
-      GrassrootsIdentity.fromMap(jsonDecode(identityValue));
-
+  debugPrint('No identity found, generating new one.');
+  final identity = await GrassrootsIdentity.generate();
+  await IdentityStore.putIdentity(identity);
   debugPrint('Private Key Bytes (Seed): ${identity.privateKey.length} bytes');
   debugPrint('Public Key Bytes: ${identity.publicKey.length} bytes');
   debugPrint('Nickname: ${identity.nickname}');
@@ -270,10 +252,11 @@ void main() async {
   // This feeds the Debug Logs screen in Settings.
   _setupDebugLogCapture();
 
-  // Initialize libsodium once for the main isolate. Verifier worker isolates
-  // each call SodiumInit.init() themselves — the native binary loads once per
-  // process, but each isolate needs its own Dart-side FFI handle.
-  appSodium = await SodiumInit.init();
+  // Initialize libsodium (SUMO) once for the main isolate. SUMO is required for
+  // the Ed25519↔X25519 conversion used to derive/verify Noise static keys.
+  // Verifier worker isolates init their own (verify-only) handles — the native
+  // binary loads once per process, but each isolate needs its own FFI handle.
+  appSodium = await SodiumSumoInit.init();
 
   // Create persistence service and load persisted state
   persistenceService = PersistenceService();
@@ -420,7 +403,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   }
 
   void _checkPendingChat() {
-    if (_pendingChatPeerHex != null && _grassroots != null && _identity != null) {
+    if (_pendingChatPeerHex != null &&
+        _grassroots != null &&
+        _identity != null) {
       final peerHex = _pendingChatPeerHex!;
       _pendingChatPeerHex = null;
 
@@ -621,12 +606,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     await _showMessageNotification(senderHex, senderName, content);
   }
 
-  Future<void> _handlePictureMessage(
-      String senderHex,
-      String myHex,
-      PictureSayBlock block,
-      String messageId,
-      Uint8List senderPubkey) async {
+  Future<void> _handlePictureMessage(String senderHex, String myHex,
+      PictureSayBlock block, String messageId, Uint8List senderPubkey) async {
     // Persist the image bytes to disk under a SHA-256-named file. dedupes
     // identical images naturally.
     final file = await writeMediaFile(block.imageBytes, block.mime);
@@ -866,7 +847,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     );
 
     // Send via Grassroots
-    final messageId = await _grassroots!.send(peer.publicKey, block.serialize());
+    final messageId =
+        await _grassroots!.send(peer.publicKey, block.serialize());
     if (messageId == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -935,7 +917,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     final block = FriendshipAcceptBlock();
 
     // Send via Grassroots (works over BLE)
-    final messageId = await _grassroots!.send(peer.publicKey, block.serialize());
+    final messageId =
+        await _grassroots!.send(peer.publicKey, block.serialize());
     if (messageId == null) {
       debugPrint('⚠️ Failed to send friendship accept to ${peer.displayName}');
     }
@@ -1326,7 +1309,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   Widget _buildChatListItem(_ChatPreview chat) {
     final displayName = chat.displayName;
     final isFriend = chat.isFriend;
-    final isOnline = chat.peer?.isLiveReachable ?? false;
+    final isOnline = chat.peer?.isReachable ?? false;
 
     return Dismissible(
       key: ValueKey('chat-${chat.peerHex}'),
@@ -1343,7 +1326,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             SizedBox(width: 8),
             Text(
               'Delete',
-              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              style:
+                  TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
             ),
           ],
         ),
@@ -1361,84 +1345,84 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         }
       },
       child: ListTile(
-      leading: Stack(
-        children: [
-          CircleAvatar(
-            backgroundColor: isFriend ? Colors.blue : Colors.blueGrey,
-            child: Text(
-              displayName.isNotEmpty ? displayName[0].toUpperCase() : '?',
-              style: const TextStyle(color: Colors.white),
-            ),
-          ),
-          if (isOnline)
-            Positioned(
-              right: 0,
-              bottom: 0,
-              child: Container(
-                width: 12,
-                height: 12,
-                decoration: BoxDecoration(
-                  color: Colors.green,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.black, width: 2),
-                ),
-              ),
-            ),
-        ],
-      ),
-      title: Row(
-        children: [
-          Expanded(
-            child: Row(
-              children: [
-                Flexible(
-                  child: Text(displayName, overflow: TextOverflow.ellipsis),
-                ),
-                if (isFriend) ...[
-                  const SizedBox(width: 4),
-                  const Icon(Icons.people, size: 14, color: Colors.blue),
-                ],
-              ],
-            ),
-          ),
-          if (chat.unreadCount > 0)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.red,
-                borderRadius: BorderRadius.circular(10),
-              ),
+        leading: Stack(
+          children: [
+            CircleAvatar(
+              backgroundColor: isFriend ? Colors.blue : Colors.blueGrey,
               child: Text(
-                chat.unreadCount.toString(),
-                style: const TextStyle(color: Colors.white, fontSize: 12),
+                displayName.isNotEmpty ? displayName[0].toUpperCase() : '?',
+                style: const TextStyle(color: Colors.white),
               ),
             ),
-        ],
-      ),
-      subtitle: Text(
-        _chatPreviewText(chat.lastMessage),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          color: chat.unreadCount > 0 ? Colors.white : Colors.grey,
-          fontWeight:
-              chat.unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
+            if (isOnline)
+              Positioned(
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    color: Colors.green,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.black, width: 2),
+                  ),
+                ),
+              ),
+          ],
         ),
-      ),
-      trailing: Text(
-        _formatMessageTime(chat.lastMessage.timestamp),
-        style: const TextStyle(color: Colors.grey, fontSize: 12),
-      ),
-      onTap: () {
-        // Live peer wins; otherwise synthesize a stub from the friendship so
-        // the chat opens for offline friends. ChatScreen + grassroots.send
-        // only need the pubkey + nickname; if no transport is live, the send
-        // path emits MessageFailedAction as usual.
-        final peer = chat.peer ?? _stubPeerFromChatPreview(chat);
-        if (peer != null) {
-          _openChat(peer);
-        }
-      },
+        title: Row(
+          children: [
+            Expanded(
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text(displayName, overflow: TextOverflow.ellipsis),
+                  ),
+                  if (isFriend) ...[
+                    const SizedBox(width: 4),
+                    const Icon(Icons.people, size: 14, color: Colors.blue),
+                  ],
+                ],
+              ),
+            ),
+            if (chat.unreadCount > 0)
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  chat.unreadCount.toString(),
+                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                ),
+              ),
+          ],
+        ),
+        subtitle: Text(
+          _chatPreviewText(chat.lastMessage),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            color: chat.unreadCount > 0 ? Colors.white : Colors.grey,
+            fontWeight:
+                chat.unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
+          ),
+        ),
+        trailing: Text(
+          _formatMessageTime(chat.lastMessage.timestamp),
+          style: const TextStyle(color: Colors.grey, fontSize: 12),
+        ),
+        onTap: () {
+          // Live peer wins; otherwise synthesize a stub from the friendship so
+          // the chat opens for offline friends. ChatScreen + grassroots.send
+          // only need the pubkey + nickname; if no transport is live, the send
+          // path queues messages until a connection resumes.
+          final peer = chat.peer ?? _stubPeerFromChatPreview(chat);
+          if (peer != null) {
+            _openChat(peer);
+          }
+        },
       ),
     );
   }
@@ -1669,8 +1653,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                                 fontSize: 12)),
                       ),
                       ...(_peers.values.toList()
-                            ..sort((a, b) => (b.rssi ?? -100)
-                                .compareTo(a.rssi ?? -100)))
+                            ..sort((a, b) =>
+                                (b.rssi ?? -100).compareTo(a.rssi ?? -100)))
                           .map((peer) => _buildPeerListItem(peer)),
                     ],
                   ],
@@ -2378,11 +2362,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     await _grassroots!.updateNickname(newNickname);
 
     // Persist to secure storage
-    const storage = FlutterSecureStorage();
-    await storage.write(
-      key: 'identity',
-      value: jsonEncode(_identity!.toJson()),
-    );
+    await IdentityStore.putIdentity(_identity!);
 
     setState(() {});
 
@@ -2390,7 +2370,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       const SnackBar(content: Text('Nickname updated!')),
     );
   }
-
 
   /// Generate a brand-new Ed25519 keypair and restart Grassroots under the new
   /// identity. Useful for testing discovery and identity reset behavior
@@ -2438,26 +2417,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     });
     await oldGrassroots?.dispose();
 
-    // Fresh keypair + nickname (same shape as _initIdentity for a clean install).
-    final algorithm = Ed25519();
-    final keyPair = await algorithm.newKeyPair();
-    final pk = await keyPair.extractPublicKey();
-    final pkBytes = Uint8List.fromList(pk.bytes);
-    final nickname =
-        'User_${pkBytes.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
-
-    final newIdentity = await GrassrootsIdentity.create(
-      keyPair: keyPair,
-      nickname: nickname,
-    );
+    // Fresh keypair (same shape as _initIdentity for a clean install).
+    final newIdentity = await GrassrootsIdentity.generate();
 
     // Persist immediately so a crash mid-restart doesn't leave us with a
     // stored identity that doesn't match anything in memory.
-    const storage = FlutterSecureStorage();
-    await storage.write(
-      key: 'identity',
-      value: jsonEncode(newIdentity.toJson()),
-    );
+    await IdentityStore.putIdentity(newIdentity);
 
     // Rebuild the transport with the new identity (mirrors _initialize).
     final newGrassroots = GrassrootsNetwork(
@@ -2498,7 +2463,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       ),
     );
   }
-
 
   void _showNicknameChangeAnimation(
       String oldName, String newName, String peerId) {

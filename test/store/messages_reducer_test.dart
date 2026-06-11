@@ -113,6 +113,38 @@ void main() {
     });
   });
 
+  group('MessageQueuedAction', () {
+    test('updates existing message status to queued', () {
+      final state = MessagesState(
+        outgoingMessages: {
+          'msg-1': OutgoingMessage(
+            messageId: 'msg-1',
+            transport: MessageTransport.ble,
+            recipientPubkey: testRecipientPubkey,
+            payloadSize: 128,
+            sentAt: testTimestamp,
+            status: MessageStatus.sending,
+          ),
+        },
+      );
+
+      final action = MessageQueuedAction(messageId: 'msg-1');
+      final newState = messagesReducer(state, action);
+
+      expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.queued);
+      expect(newState.queuedMessages.map((m) => m.messageId), ['msg-1']);
+    });
+
+    test('returns same state for unknown messageId', () {
+      const state = MessagesState.initial;
+
+      final action = MessageQueuedAction(messageId: 'unknown-msg');
+      final newState = messagesReducer(state, action);
+
+      expect(identical(newState, state), isTrue);
+    });
+  });
+
   group('MessageSentAction', () {
     test('updates existing message to sent status', () {
       final state = MessagesState(
@@ -130,7 +162,7 @@ void main() {
 
       final action = MessageSentAction(
         messageId: 'msg-1',
-        transport: MessageTransport.ble,
+        transport: MessageTransport.udp,
         recipientPubkey: testRecipientPubkey,
         payloadSize: 128,
         timestamp: testTimestamp,
@@ -139,6 +171,8 @@ void main() {
       final newState = messagesReducer(state, action);
 
       expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.sent);
+      expect(
+          newState.outgoingMessages['msg-1']!.transport, MessageTransport.udp);
     });
 
     test('creates new message if does not exist (backwards compat)', () {
@@ -270,6 +304,170 @@ void main() {
     });
   });
 
+  group('status-transition monotonicity', () {
+    // Once a message reaches `delivered`, `read`, or `failed`, no earlier
+    // transition (sending / queued / sent) is allowed to walk the status
+    // back. This defends against three real races:
+    //   - ACK arrives before `_markSentAndTrackForAck` registers the entry,
+    //     so `MessageDeliveredAction` lands first and `MessageSentAction`
+    //     follows.
+    //   - Watchdog/disconnect re-queues a message that's already delivered
+    //     (timer fired then ACK landed), dispatching `MessageQueuedAction`.
+    //   - Drain dispatches `MessageSendingAction` for an already-delivered
+    //     queue entry it hasn't yet trimmed.
+
+    OutgoingMessage deliveredAt(MessageStatus status) => OutgoingMessage(
+          messageId: 'msg-1',
+          transport: MessageTransport.ble,
+          recipientPubkey: testRecipientPubkey,
+          payloadSize: 64,
+          sentAt: testTimestamp,
+          status: status,
+          deliveredAt:
+              status == MessageStatus.delivered || status == MessageStatus.read
+                  ? testTimestamp.add(const Duration(milliseconds: 100))
+                  : null,
+          readAt: status == MessageStatus.read
+              ? testTimestamp.add(const Duration(milliseconds: 200))
+              : null,
+        );
+
+    test('MessageSentAction does NOT regress from delivered to sent', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.delivered)},
+      );
+      final action = MessageSentAction(
+        messageId: 'msg-1',
+        transport: MessageTransport.ble,
+        recipientPubkey: testRecipientPubkey,
+        payloadSize: 64,
+        timestamp: testTimestamp,
+      );
+      final newState = messagesReducer(state, action);
+      expect(newState.outgoingMessages['msg-1']!.status,
+          MessageStatus.delivered);
+      expect(newState.outgoingMessages['msg-1']!.deliveredAt,
+          state.outgoingMessages['msg-1']!.deliveredAt,
+          reason: 'deliveredAt must be preserved.');
+    });
+
+    test('MessageSentAction does NOT regress from read to sent', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.read)},
+      );
+      final action = MessageSentAction(
+        messageId: 'msg-1',
+        transport: MessageTransport.ble,
+        recipientPubkey: testRecipientPubkey,
+        payloadSize: 64,
+        timestamp: testTimestamp,
+      );
+      final newState = messagesReducer(state, action);
+      expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.read);
+      expect(newState.outgoingMessages['msg-1']!.readAt,
+          state.outgoingMessages['msg-1']!.readAt);
+    });
+
+    test('MessageQueuedAction does NOT regress from delivered to queued', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.delivered)},
+      );
+      final newState =
+          messagesReducer(state, MessageQueuedAction(messageId: 'msg-1'));
+      expect(newState.outgoingMessages['msg-1']!.status,
+          MessageStatus.delivered);
+    });
+
+    test('MessageQueuedAction DOES allow sent → queued (legitimate re-queue)',
+        () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.sent)},
+      );
+      final newState =
+          messagesReducer(state, MessageQueuedAction(messageId: 'msg-1'));
+      expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.queued,
+          reason: 'BLE-disconnect / ack-timeout re-queue is allowed.');
+    });
+
+    test('MessageSendingAction does NOT regress from delivered, preserves '
+        'deliveredAt', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.delivered)},
+      );
+      final newState = messagesReducer(
+        state,
+        MessageSendingAction(
+          messageId: 'msg-1',
+          transport: MessageTransport.ble,
+          recipientPubkey: testRecipientPubkey,
+          payloadSize: 64,
+          timestamp: testTimestamp,
+        ),
+      );
+      expect(newState.outgoingMessages['msg-1']!.status,
+          MessageStatus.delivered);
+      expect(newState.outgoingMessages['msg-1']!.deliveredAt,
+          state.outgoingMessages['msg-1']!.deliveredAt,
+          reason: 'deliveredAt must survive an erroneous Sending re-dispatch.');
+    });
+
+    test('MessageSendingAction does allow queued → sending (drain step)', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.queued)},
+      );
+      final newState = messagesReducer(
+        state,
+        MessageSendingAction(
+          messageId: 'msg-1',
+          transport: MessageTransport.ble,
+          recipientPubkey: testRecipientPubkey,
+          payloadSize: 64,
+          timestamp: testTimestamp,
+        ),
+      );
+      expect(
+          newState.outgoingMessages['msg-1']!.status, MessageStatus.sending);
+    });
+
+    test('MessageFailedAction does NOT downgrade delivered to failed', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.delivered)},
+      );
+      final newState =
+          messagesReducer(state, MessageFailedAction(messageId: 'msg-1'));
+      expect(newState.outgoingMessages['msg-1']!.status,
+          MessageStatus.delivered);
+    });
+
+    test('MessageDeliveredAction does NOT regress from read to delivered', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.read)},
+      );
+      final newState = messagesReducer(
+        state,
+        MessageDeliveredAction(messageId: 'msg-1', timestamp: testTimestamp),
+      );
+      expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.read);
+    });
+
+    test('failed is terminal: no re-promotion on MessageSendingAction', () {
+      final state = MessagesState(
+        outgoingMessages: {'msg-1': deliveredAt(MessageStatus.failed)},
+      );
+      final newState = messagesReducer(
+        state,
+        MessageSendingAction(
+          messageId: 'msg-1',
+          transport: MessageTransport.ble,
+          recipientPubkey: testRecipientPubkey,
+          payloadSize: 64,
+          timestamp: testTimestamp,
+        ),
+      );
+      expect(newState.outgoingMessages['msg-1']!.status, MessageStatus.failed);
+    });
+  });
+
   group('MessageReceivedAction', () {
     test('creates incoming message record', () {
       const state = MessagesState.initial;
@@ -348,6 +546,55 @@ void main() {
       expect(conv.first.isOutgoing, isTrue);
       expect(conv.first.senderPubkeyHex, senderHex);
       expect(conv.first.recipientPubkeyHex, recipientHex);
+    });
+
+    test('dedupes by messageId — duplicate SaveChatMessageAction is a no-op',
+        () {
+      const state = MessagesState.initial;
+      final firstAction = SaveChatMessageAction(
+        senderPubkeyHex: senderHex,
+        recipientPubkeyHex: recipientHex,
+        content: 'Hello!',
+        isOutgoing: false,
+        timestamp: testTimestamp,
+        messageId: 'msg-dup-1',
+      );
+
+      final after1 = messagesReducer(state, firstAction);
+      // Same messageId arriving again (Bloom filter cleared on hot restart,
+      // or some other unusual path).
+      final secondAction = SaveChatMessageAction(
+        senderPubkeyHex: senderHex,
+        recipientPubkeyHex: recipientHex,
+        content: 'Hello!',
+        isOutgoing: false,
+        timestamp: testTimestamp.add(const Duration(seconds: 1)),
+        messageId: 'msg-dup-1',
+      );
+      final after2 = messagesReducer(after1, secondAction);
+
+      // Second action is dropped — no second bubble in the chat thread.
+      expect(identical(after2, after1), isTrue,
+          reason: 'Duplicate messageId must short-circuit the reducer.');
+      expect(after2.conversations[senderHex]!.length, 1);
+    });
+
+    test('messages without a messageId still append (e.g. friendship blocks)',
+        () {
+      const state = MessagesState.initial;
+      // Friendship messages typically don't carry a messageId. Dedupe only
+      // engages when an id is present.
+      final action = SaveChatMessageAction(
+        senderPubkeyHex: senderHex,
+        recipientPubkeyHex: recipientHex,
+        content: 'Sent a friend request',
+        isOutgoing: true,
+        timestamp: testTimestamp,
+      );
+      final after1 = messagesReducer(state, action);
+      final after2 = messagesReducer(after1, action);
+      expect(after2.conversations[recipientHex]!.length, 2,
+          reason: 'No messageId means no dedupe — both saves stick.');
     });
 
     test('adds incoming message to conversation keyed by senderPubkeyHex', () {
@@ -527,9 +774,11 @@ void main() {
 
       expect(newState.conversations.length, 2);
       expect(newState.conversations['1122']!.length, 1);
-      expect(newState.conversations['1122']!.first.content, 'Restored message 1');
+      expect(
+          newState.conversations['1122']!.first.content, 'Restored message 1');
       expect(newState.conversations['ccdd']!.length, 1);
-      expect(newState.conversations['ccdd']!.first.content, 'Restored message 2');
+      expect(
+          newState.conversations['ccdd']!.first.content, 'Restored message 2');
       expect(newState.unreadCounts['ccdd'], 1);
     });
 
@@ -573,7 +822,9 @@ void main() {
         isOutgoing: true,
       );
       final state = MessagesState(
-        conversations: {'old-r': [existingMsg]},
+        conversations: {
+          'old-r': [existingMsg]
+        },
         unreadCounts: const {'old-r': 2},
       );
 
@@ -586,7 +837,9 @@ void main() {
       );
 
       final action = HydrateConversationsAction(
-        conversations: {'new-r': [newMsg]},
+        conversations: {
+          'new-r': [newMsg]
+        },
         unreadCounts: {'new-r': 1},
       );
 

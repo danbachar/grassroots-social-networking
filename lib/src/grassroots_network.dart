@@ -3,9 +3,10 @@ import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:redux/redux.dart';
-import 'package:sodium_libs/sodium_libs.dart';
+import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:uuid/uuid.dart';
 import 'ble/permission_handler.dart';
+import 'platform/transport_foreground_service.dart';
 import 'signaling/signaling_codec.dart';
 import 'signaling/signaling_service.dart';
 import 'transport/address_utils.dart';
@@ -50,6 +51,24 @@ class GrassrootsNetworkConfig {
   /// Whether to enable UDP transport (can be overridden by TransportSettingsStore)
   final bool enableUdp;
 
+  /// How long to wait for an end-to-end ACK after a message is sent before
+  /// treating it as lost and re-queueing it for the next drain. Covers two
+  /// failure modes that `sendToPeer` cannot detect synchronously:
+  ///
+  /// - **Stale-link writes.** When the remote turns BLE off, Android keeps
+  ///   the central GATT connection open until link-supervision times out
+  ///   (~20–30 s). Writes during that window get queued at the OS layer and
+  ///   the `_ble.send()` call returns success, but the bytes never leave the
+  ///   radio. Without a watchdog the message would sit in `MessageStatus.sent`
+  ///   forever.
+  /// - **UDP loss.** UDX doesn't surface per-packet delivery; an ACK is the
+  ///   only confirmation a message reached the recipient.
+  ///
+  /// Set high enough to tolerate slow links but low enough that the UI
+  /// doesn't feel broken. BLE in-air ACKs are normally sub-second; UDP
+  /// across the open Internet is typically <2 s.
+  final Duration ackTimeout;
+
   const GrassrootsNetworkConfig({
     this.autoConnect = true,
     this.autoStart = true,
@@ -59,6 +78,7 @@ class GrassrootsNetworkConfig {
     this.scanInterval = const Duration(seconds: 10),
     this.enableBle = true,
     this.enableUdp = true,
+    this.ackTimeout = const Duration(seconds: 5),
   });
 }
 
@@ -72,6 +92,67 @@ class _RendezvousConfig {
     required this.pubkey,
     required this.pubkeyHex,
   });
+}
+
+class _QueuedOutboundMessage {
+  final String messageId;
+  final Uint8List recipientPubkey;
+  final Uint8List payload;
+  final DateTime queuedAt;
+  final int attempts;
+
+  _QueuedOutboundMessage({
+    required this.messageId,
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    DateTime? queuedAt,
+    this.attempts = 0,
+  })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
+        payload = Uint8List.fromList(payload),
+        queuedAt = queuedAt ?? DateTime.now();
+
+  String get recipientPubkeyHex =>
+      GrassrootsNetwork._pubkeyToHex(recipientPubkey);
+
+  _QueuedOutboundMessage incrementAttempts() => _QueuedOutboundMessage(
+        messageId: messageId,
+        recipientPubkey: recipientPubkey,
+        payload: payload,
+        queuedAt: queuedAt,
+        attempts: attempts + 1,
+      );
+}
+
+/// Tracks an outgoing message that left the device but has not yet been
+/// ACK'd. Drives both the ack-timeout watchdog and the BLE-disconnect
+/// re-queue: when either fires, we push the payload back onto
+/// [GrassrootsNetwork._outboundMessageQueue] so the next drain re-sends it.
+///
+/// Kept in plain memory rather than Redux because the payload bytes
+/// themselves live here — Redux only stores delivery metadata
+/// ([OutgoingMessage]). Lifecycle: created when `_trySendMessageNow`
+/// dispatches `MessageSentAction`, dropped on `MessageDeliveredAction`
+/// (ACK) or on re-queue (timeout / BLE disconnect).
+class _AckPendingMessage {
+  final String messageId;
+  final Uint8List recipientPubkey;
+  final Uint8List payload;
+
+  /// The BLE pathId the message was written to, or null if it went via UDP.
+  /// Used by the disconnect handler to find which pending messages were on
+  /// a path that just dropped.
+  final String? bleDeviceId;
+
+  /// Watchdog timer; null while paused (e.g. during re-queue or shutdown).
+  Timer? ackTimer;
+
+  _AckPendingMessage({
+    required this.messageId,
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    required this.bleDeviceId,
+  })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
+        payload = Uint8List.fromList(payload);
 }
 
 @visibleForTesting
@@ -98,6 +179,62 @@ bool shouldAcceptRendezvousReply(
   return false;
 }
 
+/// Whether a settings change that just brought a transport up must complete a
+/// deferred [GrassrootsNetwork.start].
+///
+/// The wedge this guards against: with `autoStart` on, the first `initialize()`
+/// can still find no usable transport (e.g. BLE permission denied and UDP off),
+/// in which case it returns without ever calling `start()`, leaving `_started`
+/// false. When the user later enables a transport from settings, the service
+/// initializes but the warm-path per-transport `start()` calls are gated on the
+/// stack already being started — so without this the transport is live but
+/// inert (no advertising, scanning, or announce/scan timers) until the app
+/// restarts.
+///
+/// True only when auto-start was requested, nothing was started yet, and a
+/// transport is now usable. With `autoStart` off the caller manages `start()`
+/// itself, so an unrelated settings change must not start on its behalf; the
+/// disable paths (no transport available) and the warm path (already started)
+/// also return false.
+@visibleForTesting
+bool shouldColdStartAfterSettingsChange({
+  required bool autoStart,
+  required bool wasStarted,
+  required bool startedNow,
+  required bool bleAvailable,
+  required bool udpAvailable,
+}) =>
+    autoStart && !wasStarted && !startedNow && (bleAvailable || udpAvailable);
+
+/// Actions that mirror an accepted friend's live UDP address (peers slice,
+/// which is not persisted) into the friendship record (which is), so the
+/// last-known address survives an app restart and can seed reconnection —
+/// the hydration path in `main.dart` re-associates it on startup.
+///
+/// One action per friend whose live address differs from the stored one.
+/// A friend with no live address produces nothing: the stored address is the
+/// peer's last known location and is never cleared unilaterally (CLAUDE.md
+/// "Peer Address Persistence" — only an explicit peer report may clear it).
+@visibleForTesting
+List<UpdateFriendshipUdpAddressAction> computeFriendUdpAddressMirrorActions({
+  required FriendshipsState friendships,
+  required PeersState peers,
+}) {
+  final actions = <UpdateFriendshipUdpAddressAction>[];
+  for (final friendship in friendships.friends) {
+    final peer =
+        peers.getPeerByPubkeyHex(friendship.peerPubkeyHex.toLowerCase());
+    final address = peer?.udpAddress;
+    if (address == null || address.isEmpty) continue;
+    if (address == friendship.udpAddress) continue;
+    actions.add(UpdateFriendshipUdpAddressAction(
+      peerPubkeyHex: friendship.peerPubkeyHex,
+      udpAddress: address,
+    ));
+  }
+  return actions;
+}
+
 @visibleForTesting
 Set<String> computeStaleUdpPeerPubkeys({
   required Iterable<PeerState> peers,
@@ -114,6 +251,41 @@ Set<String> computeStaleUdpPeerPubkeys({
     if (lastUdpSeen == null) continue;
 
     if (evaluationTime.difference(lastUdpSeen) > staleThreshold) {
+      stale.add(peer.pubkeyHex);
+    }
+  }
+
+  return stale;
+}
+
+/// Peers whose `bleCentralDeviceId` / `blePeripheralDeviceId` is still set but
+/// who haven't surfaced any BLE traffic (ANNOUNCE, message, ACK, RSSI poll)
+/// within [staleThreshold]. The BLE transport plugin is supposed to emit a
+/// disconnect when a path drops, but in practice that signal is brittle: a
+/// path that drifts through `failed` / `subscribed` (status-133 storms, GATT
+/// reinit churn) without a clean `ready → dropped` transition never fires
+/// `_emitDisconnect`. This sweep is the safety net — applies equally to
+/// friends and strangers, so the UI's "Connected Peers" list stops showing
+/// peers we have no live BLE link to.
+@visibleForTesting
+Set<String> computeStaleBlePeerPubkeys({
+  required Iterable<PeerState> peers,
+  required Duration staleThreshold,
+  DateTime? now,
+}) {
+  final evaluationTime = now ?? DateTime.now();
+  final stale = <String>{};
+
+  for (final peer in peers) {
+    if (!peer.hasBleConnection) continue;
+    final lastBleSeen = peer.lastBleSeen;
+    // Without a `lastBleSeen` timestamp we can't say anything. Treat as
+    // fresh — the very next ANNOUNCE will populate the field, and any
+    // explicit disconnect from the transport will clear the device-id
+    // before this sweep matters.
+    if (lastBleSeen == null) continue;
+
+    if (evaluationTime.difference(lastBleSeen) > staleThreshold) {
       stale.add(peer.pubkeyHex);
     }
   }
@@ -159,10 +331,12 @@ class GrassrootsNetwork {
   /// Redux store for app state
   final Store<AppState> store;
 
-  /// Initialized libsodium instance for native Ed25519 sign/verify.
-  /// The caller (typically `main()`) is responsible for `await SodiumInit.init()`
-  /// once at app startup and passing the result here.
-  final Sodium sodium;
+  /// Initialized libsodium (SUMO) instance for native Ed25519 sign/verify and
+  /// the Ed25519↔X25519 conversion used to derive/verify Noise static keys.
+  /// The caller (typically `main()`) is responsible for
+  /// `await SodiumSumoInit.init()` once at app startup and passing the result
+  /// here. SUMO is required for `crypto_sign_ed25519_*_to_curve25519`.
+  final SodiumSumo sodium;
 
   /// Subscription for listening to store changes
   StreamSubscription<AppState>? _storeSubscription;
@@ -172,6 +346,20 @@ class GrassrootsNetwork {
 
   /// Last accepted friend set broadcast through FRIEND_LIST.
   Set<String> _lastFriendPubkeyHexes = const {};
+
+  /// Per-peer `isReachable` snapshot from the previous store tick. Used by
+  /// the reachability subscriber to detect false→true (fire onPeerConnected)
+  /// and true→false (fire onPeerDisconnected) transitions across the
+  /// consolidated view of all transports. A missing entry is treated as
+  /// `false` so a peer that materializes already-reachable fires connect.
+  final Map<String, bool> _lastKnownReachability = {};
+
+  /// Pubkeys (hex) already surfaced via [onPeerDiscovered] this session.
+  /// Discovery is the identity-learned event — the first accepted ANNOUNCE
+  /// carrying a peer's public key + nickname — which precedes the Noise session
+  /// and therefore [onPeerConnected]. Fired once per identity; a peer going out
+  /// of range and returning is a re-*connect*, not a re-discover.
+  final Set<String> _discoveredPubkeyHexes = {};
 
   /// Permission handler
   final PermissionHandler _permissions = PermissionHandler();
@@ -292,6 +480,20 @@ class GrassrootsNetwork {
   /// addressed ANNOUNCE as soon as we know who is on the other side.
   final Set<String> _bleFriendAnnounceSent = {};
 
+  /// FIFO outbound message queues keyed by recipient public-key hex.
+  ///
+  /// These hold application payloads that could not be sent because no live
+  /// BLE/UDP path was available. They drain when the peer announces or a UDP
+  /// connection event reports the peer as connected.
+  final Map<String, List<_QueuedOutboundMessage>> _outboundMessageQueue = {};
+  final Set<String> _outboundQueueDrainsInProgress = {};
+
+  /// Messages that left the device but have not been ACK'd yet. Keyed by
+  /// `messageId`. The ack-timeout watchdog and the BLE-disconnect re-queue
+  /// path both consult this map; ACK handling drops the entry. See
+  /// [_AckPendingMessage] for the full rationale.
+  final Map<String, _AckPendingMessage> _ackPendingMessages = {};
+
   /// Serialize rendezvous connect/re-announce work so a public-address update
   /// cannot race a save-triggered connect or a signaling-triggered re-register.
   Future<void> _rendezvousTaskQueue = Future.value();
@@ -307,7 +509,8 @@ class GrassrootsNetwork {
   // ===== Public callbacks =====
 
   /// Called when an application message is received.
-  /// Parameters: messageId, senderPubkey, payload (raw GSG block data), transport
+  /// Parameters: messageId, senderPubkey, payload (raw GSG block data),
+  /// transport (the transport the message actually arrived on).
   void Function(
     String messageId,
     Uint8List senderPubkey,
@@ -315,17 +518,53 @@ class GrassrootsNetwork {
     MessageTransport transport,
   )? onMessageReceived;
 
-  /// Called when a new peer connects and exchanges ANNOUNCE
-  void Function(Peer peer)? onPeerConnected;
+  /// Spec-compliant receive callback
+  /// (`docs/GLP_Networking_API/sections/api.tex` §onReceive).
+  ///
+  /// Fired alongside [onMessageReceived] for every accepted message. Use this
+  /// when you only need the sender's pubkey and payload. The richer
+  /// [onMessageReceived] variant additionally provides a transport-assigned
+  /// `messageId` (useful for dedup / ACK correlation; also dispatched via the
+  /// Redux `MessageReceivedAction`) and the transport the message actually
+  /// arrived on (taken from the receive path).
+  void Function(Uint8List senderPubkey, Uint8List payload)? onReceive;
 
-  /// Called when an existing peer sends an ANNOUNCE update
-  void Function(Peer peer)? onPeerUpdated;
+  /// Spec: `docs/GLP_Networking_API/sections/api.tex` §onPeerDiscovered.
+  /// Fires when a new peer's identity becomes known to us for the first
+  /// time (the first ANNOUNCE arrives carrying their pubkey and nickname).
+  /// Receives the peer's public key and nickname per the spec.
+  void Function(Uint8List publicKey, String nickname)? onPeerDiscovered;
 
-  /// Called when a peer disconnects
-  void Function(Peer peer)? onPeerDisconnected;
+  /// Called when a peer becomes reachable (transitions from zero live
+  /// transports to one or more). Fires again if the peer disconnects and
+  /// later reconnects.
+  void Function(PeerState peer)? onPeerConnected;
+
+  /// Called when an existing peer sends an ANNOUNCE update.
+  void Function(PeerState peer)? onPeerUpdated;
+
+  /// Called when a peer is no longer reachable (transitions to zero live
+  /// transports). Does not fire when losing one of multiple live transports.
+  void Function(PeerState peer)? onPeerDisconnected;
 
   /// Called when UDP transport becomes available
   void Function()? onUdpInitialized;
+
+  /// Spec: `docs/GLP_Networking_API/sections/api.tex` §onConnectivityStatus
+  /// (named `onConnectivityStatusChanged` here — the spec name reads like a
+  /// status getter; this is a change-event callback).
+  /// "Callback when the networking layer detects a change in the agent's
+  /// public IP address. Triggers the rendezvous protocol. Fired on startup
+  /// and on address change."
+  ///
+  /// Receives `(oldAddress, newAddress)` as `ip:port` strings (or null when
+  /// no public address is available). The caller derives the kind of
+  /// change:
+  ///   - startup / gain: `oldAddress == null && newAddress != null`
+  ///   - loss:           `oldAddress != null && newAddress == null`
+  ///   - update:         both non-null and `oldAddress != newAddress`
+  void Function(String? oldAddress, String? newAddress)?
+      onConnectivityStatusChanged;
 
   // ===== Convenience accessors for Redux state =====
 
@@ -339,7 +578,7 @@ class GrassrootsNetwork {
   }) {
     _protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
     _fragmentHandler = FragmentHandler();
-    _noiseSessions = NoiseSessionManager(identity: identity);
+    _noiseSessions = NoiseSessionManager(identity: identity, sodium: sodium);
     _messageRouter = MessageRouter(
       identity: identity,
       store: store,
@@ -370,6 +609,19 @@ class GrassrootsNetwork {
         _lastFriendPubkeyHexes = friendPubkeyHexes;
         _broadcastFriendListToFriends(reason: 'friendship changed');
       }
+      // Mirror friends' live UDP addresses into the persisted friendship
+      // records so the last-known address survives restart. Converges in one
+      // extra change notification: the mirror dispatch updates the friendship,
+      // after which the addresses compare equal and no further action is
+      // produced. (onChange is an async broadcast stream, so dispatching here
+      // is not reentrant.)
+      for (final action in computeFriendUdpAddressMirrorActions(
+        friendships: state.friendships,
+        peers: state.peers,
+      )) {
+        store.dispatch(action);
+      }
+      _processReachabilityTransitions(state.peers);
     });
   }
 
@@ -381,11 +633,13 @@ class GrassrootsNetwork {
   bool get _udpAvailable =>
       _udpService != null && store.state.transports.udpState.isUsable;
 
-  /// All known peers - from Redux store
-  List<PeerState> get peers => _peersState.peersList;
-
-  /// Connected peers only - from Redux store
-  List<PeerState> get connectedPeers => _peersState.connectedPeers;
+  /// Currently reachable peers — spec `docs/GLP_Networking_API/sections/api.tex`
+  /// §getPeers: "Discover currently reachable peers." Returns only peers
+  /// where `isReachable` is true (i.e. at least one transport is live).
+  /// Callers that need the full list of known peers (including offline ones)
+  /// can read `store.state.peers.peersList` directly.
+  List<PeerState> getPeers() =>
+      _peersState.peersList.where((p) => p.isReachable).toList();
 
   /// Check if a peer is reachable via any transport
   bool isPeerReachable(Uint8List pubkey) => _peersState.isPeerReachable(pubkey);
@@ -682,6 +936,10 @@ class GrassrootsNetwork {
     }
 
     _started = true;
+    // Keep the Android process unfrozen while transports run — a frozen Dart
+    // VM goes ANNOUNCE-silent and never dials reverse BLE legs, while its
+    // radio links stay up (peers then flap us through their stale sweeps).
+    unawaited(TransportForegroundService.start());
     _startAnnounceTimer();
     _startScanTimer();
     if (_udpAvailable) {
@@ -696,6 +954,7 @@ class GrassrootsNetwork {
 
     debugPrint('Stopping Grassroots transport');
     _started = false;
+    unawaited(TransportForegroundService.stop());
     _announceTimer?.cancel();
     _announceTimer = null;
     _scanTimer?.cancel();
@@ -1525,6 +1784,30 @@ class GrassrootsNetwork {
       debugPrint('UDP cleanup complete');
     }
 
+    // Cold-start recovery: if the transport was never started (e.g. the first
+    // initialize() found no usable transport because BLE permission was denied
+    // and UDP was off, so it returned without calling start()) and a transport
+    // has now come up via this settings change, do a full start. Otherwise the
+    // service is live but inert — no advertising, no scanning, no announce/scan
+    // timers, no started flag — until the app restarts. The per-transport
+    // start() calls above only cover the warm path (wasStarted == true); start()
+    // itself is guarded by _started, so this cannot double-start.
+    if (shouldColdStartAfterSettingsChange(
+      autoStart: config.autoStart,
+      wasStarted: wasStarted,
+      startedNow: _started,
+      bleAvailable: _bleAvailable,
+      udpAvailable: _udpAvailable,
+    )) {
+      debugPrint(
+        'Transport came up from settings while never started — starting now',
+      );
+      await start();
+      if (_udpAvailable) {
+        await _reconnectUdpFriends(reason: 'settings-enabled-cold-start');
+      }
+    }
+
     await _handleRendezvousSettingsChange(
       previousSettings: previousSettings,
       currentSettings: currentSettings,
@@ -1568,7 +1851,8 @@ class GrassrootsNetwork {
   /// 1. Bluetooth (if peer is nearby and BLE is enabled)
   /// 2. UDP (if peer has UDP address and UDP is enabled)
   ///
-  /// Returns the message ID if sent successfully, null if failed.
+  /// Returns the message ID if the message was sent or queued, null only for
+  /// invalid input.
   /// The message status can be tracked via store.state.messages.
   ///
   /// Transport selection: tries BLE first (preferred for nearby peers),
@@ -1579,9 +1863,8 @@ class GrassrootsNetwork {
     Uint8List payload, {
     String? messageId,
   }) async {
-    final peer = _peersState.getPeerByPubkey(recipientPubkey);
-    if (peer == null) {
-      debugPrint('Cannot send: peer not found');
+    if (recipientPubkey.length != 32) {
+      debugPrint('Cannot send: recipient public key must be 32 bytes');
       return null;
     }
 
@@ -1599,6 +1882,33 @@ class GrassrootsNetwork {
         payloadSize: payload.length,
       ),
     );
+
+    if (await _trySendMessageNow(
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      messageId: messageId,
+    )) {
+      return messageId;
+    }
+
+    _queueOutboundMessage(
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      messageId: messageId,
+    );
+    return messageId;
+  }
+
+  Future<bool> _trySendMessageNow({
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    required String messageId,
+  }) async {
+    final peer = _peersState.getPeerByPubkey(recipientPubkey);
+    if (peer == null) {
+      debugPrint('Cannot send now: peer not found; message will remain queued');
+      return false;
+    }
 
     // Create the message packet. It is signed after optional session
     // encryption because the signature covers the final wire payload.
@@ -1643,16 +1953,15 @@ class GrassrootsNetwork {
       }
 
       if (success) {
-        store.dispatch(
-          MessageSentAction(
-            messageId: messageId,
-            transport: MessageTransport.ble,
-            recipientPubkey: recipientPubkey,
-            payloadSize: payload.length,
-          ),
+        _markSentAndTrackForAck(
+          messageId: messageId,
+          recipientPubkey: recipientPubkey,
+          payload: payload,
+          transport: MessageTransport.ble,
+          bleDeviceId: bleDeviceId,
         );
         // Delivery confirmed by ACK, not BLE write success.
-        return messageId;
+        return true;
       }
       debugPrint('BLE send failed, falling back to UDP...');
     }
@@ -1675,15 +1984,14 @@ class GrassrootsNetwork {
           // debugPrint(
           //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
           // );
-          store.dispatch(
-            MessageSentAction(
-              messageId: messageId,
-              transport: MessageTransport.udp,
-              recipientPubkey: recipientPubkey,
-              payloadSize: payload.length,
-            ),
+          _markSentAndTrackForAck(
+            messageId: messageId,
+            recipientPubkey: recipientPubkey,
+            payload: payload,
+            transport: MessageTransport.udp,
+            bleDeviceId: null,
           );
-          return messageId;
+          return true;
         }
       }
 
@@ -1700,15 +2008,14 @@ class GrassrootsNetwork {
           packet: packet,
           recipientPubkey: recipientPubkey,
         )) {
-          store.dispatch(
-            MessageSentAction(
-              messageId: messageId,
-              transport: MessageTransport.udp,
-              recipientPubkey: recipientPubkey,
-              payloadSize: payload.length,
-            ),
+          _markSentAndTrackForAck(
+            messageId: messageId,
+            recipientPubkey: recipientPubkey,
+            payload: payload,
+            transport: MessageTransport.udp,
+            bleDeviceId: null,
           );
-          return messageId;
+          return true;
         }
       }
 
@@ -1731,15 +2038,14 @@ class GrassrootsNetwork {
               packet: packet,
               recipientPubkey: recipientPubkey,
             )) {
-              store.dispatch(
-                MessageSentAction(
-                  messageId: messageId,
-                  transport: MessageTransport.udp,
-                  recipientPubkey: recipientPubkey,
-                  payloadSize: payload.length,
-                ),
+              _markSentAndTrackForAck(
+                messageId: messageId,
+                recipientPubkey: recipientPubkey,
+                payload: payload,
+                transport: MessageTransport.udp,
+                bleDeviceId: null,
               );
-              return messageId;
+              return true;
             }
           }
         }
@@ -1747,11 +2053,288 @@ class GrassrootsNetwork {
       }
     }
 
-    // All transports failed
-    store.dispatch(MessageFailedAction(messageId: messageId));
-    debugPrint('All transports failed to send message to ${peer.displayName}');
-    return null;
+    debugPrint(
+      'No transport currently available for ${peer.displayName}; queuing message',
+    );
+    return false;
   }
+
+  void _queueOutboundMessage({
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    required String messageId,
+  }) {
+    final pubkeyHex = _pubkeyToHex(recipientPubkey);
+    final queue = _outboundMessageQueue.putIfAbsent(pubkeyHex, () => []);
+    final existingIndex = queue.indexWhere((msg) => msg.messageId == messageId);
+    final queued = _QueuedOutboundMessage(
+      messageId: messageId,
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      queuedAt: existingIndex >= 0 ? queue[existingIndex].queuedAt : null,
+      attempts: existingIndex >= 0 ? queue[existingIndex].attempts : 0,
+    );
+
+    if (existingIndex >= 0) {
+      queue[existingIndex] = queued;
+    } else {
+      queue.add(queued);
+    }
+
+    store.dispatch(MessageQueuedAction(messageId: messageId));
+    debugPrint(
+      '[queue] Queued message $messageId for ${pubkeyHex.substring(0, 8)} '
+      '(${queue.length} pending)',
+    );
+  }
+
+  void _drainQueuedMessagesForPeer(Uint8List recipientPubkey) {
+    final pubkeyHex = _pubkeyToHex(recipientPubkey);
+    final queue = _outboundMessageQueue[pubkeyHex];
+    if (queue == null || queue.isEmpty) return;
+    if (_outboundQueueDrainsInProgress.contains(pubkeyHex)) return;
+
+    _outboundQueueDrainsInProgress.add(pubkeyHex);
+    unawaited(() async {
+      try {
+        while (queue.isNotEmpty) {
+          final queued = queue.first;
+
+          // Skip messages whose Redux status is already past `sent` (i.e.
+          // delivered/read/failed). The race that gets us here: an ACK
+          // arrived after the watchdog timer fired and re-queued the
+          // message, so the message is both `delivered` in Redux AND
+          // present in the outbound queue. Re-sending would burn a round
+          // trip and trigger duplicate-drop on the recipient.
+          final current =
+              store.state.messages.outgoingMessages[queued.messageId];
+          if (current != null &&
+              (current.status == MessageStatus.delivered ||
+                  current.status == MessageStatus.read ||
+                  current.status == MessageStatus.failed)) {
+            debugPrint(
+              '[queue] Skipping ${queued.messageId} for '
+              '${pubkeyHex.substring(0, 8)} — already ${current.status.name}',
+            );
+            queue.removeAt(0);
+            continue;
+          }
+
+          final attemptCounted = queued.incrementAttempts();
+          queue[0] = attemptCounted;
+
+          store.dispatch(
+            MessageSendingAction(
+              messageId: attemptCounted.messageId,
+              transport: MessageTransport.ble,
+              recipientPubkey: attemptCounted.recipientPubkey,
+              payloadSize: attemptCounted.payload.length,
+            ),
+          );
+
+          final sent = await _trySendMessageNow(
+            recipientPubkey: attemptCounted.recipientPubkey,
+            payload: attemptCounted.payload,
+            messageId: attemptCounted.messageId,
+          );
+
+          if (!sent) {
+            store.dispatch(
+                MessageQueuedAction(messageId: attemptCounted.messageId));
+            debugPrint(
+              '[queue] Drain paused for ${pubkeyHex.substring(0, 8)} after '
+              '${attemptCounted.attempts} attempt(s)',
+            );
+            break;
+          }
+
+          queue.removeAt(0);
+          debugPrint(
+            '[queue] Sent queued message ${attemptCounted.messageId} to '
+            '${pubkeyHex.substring(0, 8)} (${queue.length} remaining)',
+          );
+        }
+
+        if (queue.isEmpty) {
+          _outboundMessageQueue.remove(pubkeyHex);
+        }
+      } finally {
+        _outboundQueueDrainsInProgress.remove(pubkeyHex);
+      }
+    }());
+  }
+
+  void _drainQueuedMessagesForLivePeers() {
+    final queuedPeerHexes = List<String>.from(_outboundMessageQueue.keys);
+    for (final pubkeyHex in queuedPeerHexes) {
+      final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
+      if (peer == null || !_hasLiveSendPath(peer)) continue;
+      _drainQueuedMessagesForPeer(peer.publicKey);
+    }
+  }
+
+  // ===== ACK-pending tracker =====
+  //
+  // `sendToPeer` (BLE) and `_sendPacketViaUdp` return success the moment the
+  // OS accepts the bytes — they cannot tell whether the recipient actually
+  // got them. Two failure modes leak through:
+  //
+  //   - **Stale link.** The remote turns BLE off; Android keeps the central
+  //     GATT connection "open" until link-supervision times out (~20–30 s).
+  //     Writes during that window queue at the OS layer and silently die.
+  //   - **UDP loss.** UDX doesn't surface per-packet delivery.
+  //
+  // For every successful send we register the messageId+payload in
+  // `_ackPendingMessages` along with a watchdog timer. The recipient's ACK
+  // cancels the timer; if it doesn't arrive, the timer fires and pushes the
+  // payload back onto the outbound queue for the next drain. The BLE
+  // disconnect listener also walks the map and re-queues anything that was
+  // in flight on the dropped path — that path it doesn't even need to wait
+  // for the timeout.
+  //
+  // Note: this is a watchdog in `GrassrootsNetwork` (the coordinator), not
+  // a reducer-side heuristic. Per `CLAUDE.md`, reducers must only project
+  // transport-emitted facts; inference about "I haven't heard back" lives
+  // here and surfaces as an explicit `MessageQueuedAction` when it triggers.
+
+  /// Dispatches `MessageSentAction` and registers the message in
+  /// [_ackPendingMessages] with a fresh ack-timeout watchdog.
+  void _markSentAndTrackForAck({
+    required String messageId,
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    required MessageTransport transport,
+    required String? bleDeviceId,
+  }) {
+    store.dispatch(
+      MessageSentAction(
+        messageId: messageId,
+        transport: transport,
+        recipientPubkey: recipientPubkey,
+        payloadSize: payload.length,
+      ),
+    );
+    _trackAckPending(
+      messageId: messageId,
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      bleDeviceId: bleDeviceId,
+    );
+  }
+
+  void _trackAckPending({
+    required String messageId,
+    required Uint8List recipientPubkey,
+    required Uint8List payload,
+    required String? bleDeviceId,
+  }) {
+    // Cancel any previous in-flight tracking for this messageId so a quick
+    // resend-after-drain doesn't leak two timers for the same id.
+    _ackPendingMessages.remove(messageId)?.ackTimer?.cancel();
+
+    final pending = _AckPendingMessage(
+      messageId: messageId,
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      bleDeviceId: bleDeviceId,
+    );
+    pending.ackTimer = Timer(
+      config.ackTimeout,
+      () => _onAckTimedOut(messageId),
+    );
+    _ackPendingMessages[messageId] = pending;
+  }
+
+  /// ACK arrived for a message — drop the watchdog. Called from the ACK
+  /// handler after `MessageDeliveredAction` is dispatched.
+  void _clearAckPending(String messageId) {
+    _ackPendingMessages.remove(messageId)?.ackTimer?.cancel();
+  }
+
+  void _onAckTimedOut(String messageId) {
+    final pending = _ackPendingMessages.remove(messageId);
+    if (pending == null) return;
+    pending.ackTimer = null;
+
+    // Race guard: if the ACK arrived between `_clearAckPending` and the
+    // timer firing — or before `_markSentAndTrackForAck` even registered
+    // this entry, in which case `_clearAckPending` was a no-op — the
+    // message is already delivered in Redux. Re-queueing would silently
+    // burn a redundant retry.
+    final current = store.state.messages.outgoingMessages[messageId];
+    if (current != null &&
+        (current.status == MessageStatus.delivered ||
+            current.status == MessageStatus.read)) {
+      return;
+    }
+
+    debugPrint(
+      '[ack-timeout] No ACK for $messageId within '
+      '${config.ackTimeout.inMilliseconds}ms; re-queueing.',
+    );
+    _requeueAckPendingMessage(pending);
+  }
+
+  /// BLE path dropped — re-queue every message we sent on that path that
+  /// is still waiting for an ACK. The watchdog would catch them eventually,
+  /// but the disconnect is hard evidence the bytes never landed, so don't
+  /// make the user wait.
+  void _requeueMessagesOnBleDisconnect(String bleDeviceId) {
+    // Snapshot before mutating: re-queueing pushes into a different map but
+    // we also remove from `_ackPendingMessages`, and direct iteration would
+    // throw on concurrent modification.
+    final affected = _ackPendingMessages.values
+        .where((p) => p.bleDeviceId == bleDeviceId)
+        .toList(growable: false);
+    for (final pending in affected) {
+      _ackPendingMessages.remove(pending.messageId);
+      pending.ackTimer?.cancel();
+      pending.ackTimer = null;
+
+      // Skip re-queue if the ACK already landed (Redux says delivered/read).
+      // The disconnect fires after the link supervision detects the drop,
+      // which can be several seconds late on Android — plenty of room for
+      // an ACK to have arrived in the interim.
+      final current =
+          store.state.messages.outgoingMessages[pending.messageId];
+      if (current != null &&
+          (current.status == MessageStatus.delivered ||
+              current.status == MessageStatus.read)) {
+        continue;
+      }
+
+      debugPrint(
+        '[ble-disconnect] Re-queueing in-flight message '
+        '${pending.messageId} after $bleDeviceId dropped.',
+      );
+      _requeueAckPendingMessage(pending);
+    }
+  }
+
+  void _requeueAckPendingMessage(_AckPendingMessage pending) {
+    // Pushes back into `_outboundMessageQueue`, which also dispatches
+    // `MessageQueuedAction` (status `sent` → `queued`). The next drain
+    // trigger (ANNOUNCE / UDP connect / app resume / stale-peer tick) will
+    // attempt redelivery.
+    _queueOutboundMessage(
+      recipientPubkey: pending.recipientPubkey,
+      payload: pending.payload,
+      messageId: pending.messageId,
+    );
+  }
+
+  @visibleForTesting
+  int queuedMessageCountForPeer(Uint8List pubkey) =>
+      _outboundMessageQueue[_pubkeyToHex(pubkey)]?.length ?? 0;
+
+  @visibleForTesting
+  int get queuedMessageCount => _outboundMessageQueue.values.fold<int>(
+        0,
+        (count, queue) => count + queue.length,
+      );
+
+  @visibleForTesting
+  int get ackPendingMessageCount => _ackPendingMessages.length;
 
   /// Send a read receipt to the original sender of a message.
   /// Call this when the user has read/viewed a message.
@@ -1917,12 +2500,19 @@ class GrassrootsNetwork {
         _resetRendezvousBackoff();
         _resetAutoUdpBackoff();
         unawaited(_syncConfiguredRendezvous(reason: 'public-address-updated'));
+        // Spec onConnectivityStatus: fires on every public address change.
+        // Startup case is `previousAddress == null`, gain case same.
+        onConnectivityStatusChanged?.call(previousAddress, publicAddr);
       }
     } else {
       debugPrint(
         'Could not discover a public UDP address. '
         'No UDP address will be advertised.',
       );
+      if (previousAddress != null) {
+        // Spec onConnectivityStatus: address became unavailable.
+        onConnectivityStatusChanged?.call(previousAddress, null);
+      }
     }
 
     // Always update the display IP (even if no full address/port available).
@@ -2049,6 +2639,12 @@ class GrassrootsNetwork {
   bool _hasLiveBlePath(PeerState? peer) =>
       _connectedBleDeviceIdForPeer(peer) != null;
 
+  bool _hasLiveSendPath(PeerState? peer) {
+    if (peer == null) return false;
+    if (_hasLiveBlePath(peer)) return true;
+    return _udpService?.getPeerIdForPubkey(peer.publicKey) != null;
+  }
+
   static String _pubkeyToHex(Uint8List pubkey) =>
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
@@ -2057,6 +2653,32 @@ class GrassrootsNetwork {
     final peer = _peersState.getPeerByPubkeyHex(hex);
     if (peer?.isFriend == true) return true;
     return store.state.friendships.isFriend(hex);
+  }
+
+  /// Fired when a Noise XX session for [transport] with [pubkey] completes
+  /// authentication. Consolidated reachability — and therefore
+  /// [onPeerConnected] — is gated on this: a transport counts toward
+  /// `isReachable` only once its session is authenticated (spec
+  /// `docs/GLP_Networking_API/sections/ip.tex` §IP Connection, "established and
+  /// authenticated"). Also drains any queued messages now that an encrypted
+  /// channel exists.
+  void _onNoiseSessionEstablished(PeerTransport transport, Uint8List pubkey) {
+    switch (transport) {
+      case PeerTransport.udp:
+        store.dispatch(
+          PeerUdpConnectionChangedAction(
+            pubkeyHex: _pubkeyToHex(pubkey),
+            connected: true,
+          ),
+        );
+        break;
+      case PeerTransport.bleDirect:
+        store.dispatch(PeerBleAuthenticatedAction(pubkey));
+        break;
+      case PeerTransport.webrtc:
+        break;
+    }
+    _drainQueuedMessagesForPeer(pubkey);
   }
 
   Future<void> _startNoiseHandshakeForPeer({
@@ -3112,9 +3734,11 @@ class GrassrootsNetwork {
   /// Set up MessageRouter callbacks to dispatch to Redux and application layer
   void _setupRouterCallbacks() {
     // Message received from any transport
-    _messageRouter.onMessageReceived = (messageId, senderPubkey, payload) {
-      final peer = store.state.peers.getPeerByPubkey(senderPubkey);
-      final transport = peer?.activeTransport == PeerTransport.udp
+    _messageRouter.onMessageReceived =
+        (messageId, senderPubkey, payload, arrivalTransport) {
+      // Authoritative arrival transport from the receive path (not inferred
+      // from the peer's preferred/active transport).
+      final transport = arrivalTransport == PeerTransport.udp
           ? MessageTransport.udp
           : MessageTransport.ble;
 
@@ -3127,12 +3751,14 @@ class GrassrootsNetwork {
         ),
       );
       onMessageReceived?.call(messageId, senderPubkey, payload, transport);
+      onReceive?.call(senderPubkey, payload);
     };
 
     // ACK received (UDP delivery confirmation)
     _messageRouter.onAckReceived = (messageId) {
       debugPrint('ACK received for message $messageId');
       store.dispatch(MessageDeliveredAction(messageId: messageId));
+      _clearAckPending(messageId);
     };
 
     // Read receipt received
@@ -3165,6 +3791,9 @@ class GrassrootsNetwork {
             peerId: peerId,
             payload: response,
           );
+        }
+        if (result.sessionEstablished) {
+          _onNoiseSessionEstablished(transport, packet.senderPubkey);
         }
       } catch (e) {
         debugPrint('[noise] Dropping handshake packet: $e');
@@ -3299,17 +3928,28 @@ class GrassrootsNetwork {
         }
       }
 
-      if (isNew) {
-        final peerState = store.state.peers.getPeerByPubkey(data.publicKey);
-        if (peerState != null) {
-          onPeerConnected?.call(_peerStateToLegacyPeer(peerState));
-        }
-      } else {
-        final peerState = store.state.peers.getPeerByPubkey(data.publicKey);
-        if (peerState != null) {
-          onPeerUpdated?.call(_peerStateToLegacyPeer(peerState));
-        }
+      // onPeerDiscovered is the identity-learned event: a peer's public key and
+      // nickname arrive in the signed ANNOUNCE, which is sent in the clear and
+      // precedes the Noise session. Because onPeerConnected is gated on an
+      // authenticated Noise session (see processReachabilityTransitions),
+      // discovery strictly precedes connection — so we surface it here, once per
+      // identity, rather than coupling it to the reachability transition. The
+      // rendezvous server is infrastructure, not a discoverable peer.
+      if (!_isRendezvousPubkeyHex(pubkeyHex) &&
+          _discoveredPubkeyHexes.add(pubkeyHex)) {
+        onPeerDiscovered?.call(data.publicKey, data.nickname);
       }
+
+      // onPeerConnected is driven by the reachability subscriber (it fires once
+      // the peer is reachable = an authenticated Noise session exists). We still
+      // fire onPeerUpdated on subsequent ANNOUNCEs for callers that want every
+      // update regardless of reachability transitions.
+      final peerState = store.state.peers.getPeerByPubkey(data.publicKey);
+      if (peerState != null && !isNew) {
+        onPeerUpdated?.call(peerState);
+      }
+
+      _drainQueuedMessagesForPeer(data.publicKey);
     };
 
     // ACK request (router asks us to send ACK back to sender)
@@ -3539,30 +4179,33 @@ class GrassrootsNetwork {
       }
 
       final reflected = AddressInfo(reflectedIp, port).toAddressString();
-      if (reflected == _publicAddress) return; // No change
+      final previous = _publicAddress;
+      if (reflected == previous) return; // No change
 
       debugPrint(
-        'Public address updated via reflection: $_publicAddress → $reflected',
+        'Public address updated via reflection: $previous → $reflected',
       );
       _publicAddress = reflected;
       store.dispatch(PublicAddressUpdatedAction(reflected));
       _resetRendezvousBackoff();
       _resetAutoUdpBackoff();
       unawaited(_syncConfiguredRendezvous(reason: 'reflected-address-updated'));
+      // Spec onConnectivityStatus: RV-reflection-driven address change.
+      onConnectivityStatusChanged?.call(previous, reflected);
     };
   }
 
-  /// Convert PeerState to Peer for application callbacks
-  Peer _peerStateToLegacyPeer(PeerState state) {
-    return Peer(
-      publicKey: state.publicKey,
-      nickname: state.nickname,
-      connectionState: state.connectionState,
-      transport: state.transport,
-      bleDeviceId: state.bleDeviceId,
-      udpAddress: state.udpAddress,
-      rssi: state.rssi,
-      protocolVersion: state.protocolVersion,
+  /// Diff each peer's `isReachable` flag against the previous store tick and
+  /// fire the consolidated `onPeerConnected` / `onPeerDisconnected` callbacks
+  /// on transitions. Delegates to the testable top-level
+  /// [processReachabilityTransitions] function so the diff logic is unit-
+  /// testable without a full `GrassrootsNetwork` harness.
+  void _processReachabilityTransitions(PeersState peersState) {
+    processReachabilityTransitions(
+      peersState: peersState,
+      lastKnownReachability: _lastKnownReachability,
+      onConnected: onPeerConnected,
+      onDisconnected: onPeerDisconnected,
     );
   }
 
@@ -3595,23 +4238,28 @@ class GrassrootsNetwork {
       unawaited(_bleService?.disconnectDevice(bleDeviceId));
     };
 
-    // Peer disconnected at BLE level
+    // BLE-level disconnect cleans up the per-transport Noise session.
+    // The consolidated application-level onPeerDisconnected is fired by
+    // the reachability subscriber when the *last* live transport drops.
     _bleService!.onPeerDisconnected = (peer) {
       debugPrint('BLE Peer disconnected: ${peer.displayName}');
       _noiseSessions.reset(PeerTransport.bleDirect, peer.publicKey);
-      onPeerDisconnected?.call(peer);
     };
 
-    // Listen to connection events for bookkeeping only. ANNOUNCE traffic is
-    // driven exclusively by the periodic announce timer — sending on stream
-    // establishment would race with the periodic broadcast and the
-    // application's BLE-address rotation handling.
+    // Per spec (`docs/GLP_Networking_API/sections/ble.tex` §BLE Discovery):
+    // "Upon successful BLE connection, an ANNOUNCE packet is exchanged."
+    // Fire an immediate directed ANNOUNCE to the newly connected path so the
+    // peer learns our identity within milliseconds rather than waiting up to
+    // a full periodic-broadcast cycle. The periodic broadcast still runs as
+    // a keep-alive and as a refresh after BLE-address rotation; receivers
+    // treat repeated ANNOUNCEs from the same pubkey as idempotent.
     _bleService!.connectionStream.listen((event) {
       if (event.connected) {
-        // debugPrint('BLE device connected: ${event.peerId}');
+        unawaited(_sendAnnounceToDevice(event.peerId));
       } else {
         debugPrint('BLE device disconnected: ${event.peerId}');
         _bleFriendAnnounceSent.remove(event.peerId);
+        _requeueMessagesOnBleDisconnect(event.peerId);
       }
     });
   }
@@ -3762,14 +4410,34 @@ class GrassrootsNetwork {
         } else {
           _clearHolePunchState(event.peerId);
         }
-        _onUdpPeerDisconnected(event.peerId);
+        final disconnectedPeer = _peersState.getPeerByPubkeyHex(event.peerId);
+        if (disconnectedPeer != null) {
+          _onUdpPeerDisconnected(disconnectedPeer);
+        }
       }
-      store.dispatch(
-        PeerUdpConnectionChangedAction(
-          pubkeyHex: event.peerId,
-          connected: event.connected,
-        ),
-      );
+      if (!event.connected) {
+        // Disconnect is immediate — drop reachability now.
+        store.dispatch(
+          PeerUdpConnectionChangedAction(
+            pubkeyHex: event.peerId,
+            connected: false,
+          ),
+        );
+      } else if (_isRendezvousPubkeyHex(event.peerId)) {
+        // The rendezvous server runs no Noise handshake, so its raw UDX
+        // connection is its reachability (gate exemption). Real peers become
+        // reachable only once their Noise session authenticates — see
+        // [_onNoiseSessionEstablished].
+        store.dispatch(
+          PeerUdpConnectionChangedAction(
+            pubkeyHex: event.peerId,
+            connected: true,
+          ),
+        );
+      }
+      if (event.connected) {
+        _drainQueuedMessagesForPeer(_hexToBytes(event.peerId));
+      }
     });
   }
 
@@ -3829,7 +4497,7 @@ class GrassrootsNetwork {
   void _broadcastFriendListToFriends({required String reason}) {
     final friendPubkeys = _ownFriendListEntries();
     for (final friend in _peersState.friends) {
-      if (!friend.isLiveReachable) continue;
+      if (!friend.isReachable) continue;
       debugPrint(
         '[fof] Broadcasting friend list to ${friend.displayName} ($reason)',
       );
@@ -3861,7 +4529,7 @@ class GrassrootsNetwork {
     for (final commonHex in commonFriendHexes) {
       if (commonHex == reconnectedFriendHex) continue;
       final common = _peersState.getPeerByPubkeyHex(commonHex);
-      if (common == null || !common.isFriend || !common.isLiveReachable) {
+      if (common == null || !common.isFriend || !common.isReachable) {
         continue;
       }
       debugPrint(
@@ -3882,13 +4550,14 @@ class GrassrootsNetwork {
     ];
   }
 
-  void _onUdpPeerDisconnected(String pubkeyHex) {
-    _noiseSessions.resetByPubkeyHex(PeerTransport.udp, pubkeyHex);
-    final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
-    if (peer == null || !peer.isFriend) return;
+  void _onUdpPeerDisconnected(PeerState peer) {
+    _noiseSessions.reset(PeerTransport.udp, peer.publicKey);
+    if (!peer.isFriend) return;
 
-    // Don't fire the application-level onPeerDisconnected here — the peer
-    // may still be reachable via BLE, and BLE/UDP are independent transports.
+    // Overall reachability is tracked by the reachability subscriber on the
+    // store, which fires the consolidated onPeerDisconnected when the last
+    // live transport drops. This handler only owns UDP-specific recovery —
+    // fanning out AVAILABLE so signaling mediators can help re-establish.
 
     final facilitatorCount = store.state.peers.wellConnectedFriends.length +
         _configuredRendezvousServers().length +
@@ -3898,7 +4567,7 @@ class GrassrootsNetwork {
     debugPrint(
       '[reconnect] UDP path to ${peer.displayName} dropped — fanning out AVAILABLE',
     );
-    _availableFanOutLastFiredAt[pubkeyHex] = DateTime.now();
+    _availableFanOutLastFiredAt[peer.pubkeyHex] = DateTime.now();
     unawaited(_signalingService.fanOutAvailable(peer.publicKey));
   }
 
@@ -3955,6 +4624,7 @@ class GrassrootsNetwork {
     }
     unawaited(_syncConfiguredRendezvous(reason: 'app-resumed'));
     _refireAvailableForUnreachableFriends(force: true);
+    _drainQueuedMessagesForLivePeers();
   }
 
   /// Clean up resources
@@ -3984,6 +4654,13 @@ class GrassrootsNetwork {
     _holePunchRemoteReady.clear();
     _holePunchConnectionInProgress.clear();
     _availableFanOutLastFiredAt.clear();
+    _outboundMessageQueue.clear();
+    _outboundQueueDrainsInProgress.clear();
+
+    for (final pending in _ackPendingMessages.values) {
+      pending.ackTimer?.cancel();
+    }
+    _ackPendingMessages.clear();
 
     _messageRouter.dispose();
     _signalingService.dispose();
@@ -4012,6 +4689,7 @@ class GrassrootsNetwork {
       _removeStalePeers();
       _discoverUnreachableFriends();
       _refireAvailableForUnreachableFriends();
+      _drainQueuedMessagesForLivePeers();
     });
   }
 
@@ -4080,10 +4758,10 @@ class GrassrootsNetwork {
   /// gap where the previous periodic broadcast had to omit our address
   /// because we hadn't yet linked the device ID to a pubkey).
   ///
-  /// Crucially, NOT called on BLE-connection-established events — the
-  /// connection-stream listener is bookkeeping only. ANNOUNCE traffic is
-  /// strictly cycle-driven; firing on stream establishment races the
-  /// periodic broadcast and the BLE-address-rotation handling.
+  /// Also fired immediately when a BLE path becomes connected (per spec
+  /// §BLE Discovery: ANNOUNCE is exchanged upon successful BLE connection).
+  /// Receivers treat repeated ANNOUNCEs from the same pubkey as idempotent,
+  /// so racing with the periodic broadcast is harmless.
   Future<bool> _sendAnnounceToDevice(String deviceId) async {
     if (_bleService == null || !_bleAvailable) return false;
 
@@ -4288,6 +4966,45 @@ class GrassrootsNetwork {
       }
     }
 
+    // Sweep stale BLE attachments. The BLE plugin can fail to surface a
+    // disconnect when the path drifts through `failed`/`subscribed` instead
+    // of cleanly dropping from `ready`. Without this safety net the peer's
+    // `bleCentralDeviceId` / `blePeripheralDeviceId` stay set indefinitely
+    // and `nearbyBlePeers` keeps showing them. Friends and strangers are
+    // treated identically — both should fall off "Connected Peers" once
+    // they've been silent over BLE for two announce cycles.
+    final staleBlePeers = computeStaleBlePeerPubkeys(
+      peers: _peersState.peersList,
+      staleThreshold: staleThreshold,
+    );
+    for (final pubkeyHex in staleBlePeers) {
+      final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
+      if (peer == null) continue;
+      debugPrint(
+        '[ble-stale] No BLE traffic from ${peer.displayName} for '
+        '${staleThreshold.inSeconds}s; synthesizing disconnect',
+      );
+      // Redux is a strict projection of transport facts — so when we
+      // synthesize a disconnect, make it a fact: physically tear down any
+      // plugin paths still attached to this peer. An ANNOUNCE-quiet link is
+      // often still alive at the radio level; clearing only the Redux
+      // attachment blinds the identity-keyed dial guards, and the recovery
+      // dial then opens a doomed SECOND link to a device we are still
+      // linked with (20s connecting-wedge on iOS, GATT-133 churn on
+      // Android). Tearing the radio down first makes the recovery dial a
+      // legitimate first link.
+      final centralId = peer.bleCentralDeviceId;
+      if (centralId != null) {
+        unawaited(_bleService?.disconnectDevice(centralId, forget: true));
+      }
+      final peripheralId = peer.blePeripheralDeviceId;
+      if (peripheralId != null) {
+        unawaited(_bleService?.disconnectDevice(peripheralId, forget: true));
+      }
+      // role: null clears both central and peripheral attachments.
+      store.dispatch(PeerBleDisconnectedAction(peer.publicKey));
+    }
+
     // Dispatch action to remove stale peers via Redux
     store.dispatch(StaleDiscoveredBlePeersRemovedAction(staleThreshold));
     store.dispatch(StalePeersRemovedAction(staleThreshold));
@@ -4323,5 +5040,65 @@ class GrassrootsNetwork {
       await Future.delayed(FragmentHandler.fragmentDelay);
     }
     return true;
+  }
+}
+
+/// Diff each peer's `isReachable` against the previous tick and fire the
+/// consolidated reachability callbacks on transitions. Pure-ish: the only
+/// side effects are calling [onConnected] / [onDisconnected] and mutating
+/// [lastKnownReachability] in place.
+///
+/// Semantics:
+///   - previous absent (treated as `false`) or `false` → current `true`:
+///     fire [onConnected] with the current `PeerState`. (Discovery —
+///     onPeerDiscovered — is surfaced separately at ANNOUNCE receipt, because a
+///     peer's identity is known before its Noise session authenticates.)
+///   - previous `true` → current `false`: fire [onDisconnected].
+///   - reachable peer removed from [peersState.peersList] entirely
+///     (e.g. PeerRemovedAction): fire [onDisconnected] with a minimal
+///     synthetic `PeerState` carrying only the identity, since the original
+///     state is gone.
+///   - state unchanged or one-of-two transports flipping while the other
+///     stays live: no fire.
+@visibleForTesting
+void processReachabilityTransitions({
+  required PeersState peersState,
+  required Map<String, bool> lastKnownReachability,
+  required void Function(PeerState peer)? onConnected,
+  required void Function(PeerState peer)? onDisconnected,
+}) {
+  final seenPubkeys = <String>{};
+
+  for (final peer in peersState.peersList) {
+    final pk = peer.pubkeyHex;
+    seenPubkeys.add(pk);
+    final previous = lastKnownReachability[pk] ?? false;
+    final current = peer.isReachable;
+    if (previous == current) continue;
+    lastKnownReachability[pk] = current;
+    if (current) {
+      onConnected?.call(peer);
+    } else {
+      onDisconnected?.call(peer);
+    }
+  }
+
+  // Removed-while-reachable: surface as a disconnect with a synthesized stub.
+  final missing = lastKnownReachability.keys
+      .where((pk) => !seenPubkeys.contains(pk) && lastKnownReachability[pk]!)
+      .toList(growable: false);
+  for (final pk in missing) {
+    lastKnownReachability.remove(pk);
+    final cb = onDisconnected;
+    if (cb == null) continue;
+    cb(PeerState(
+      publicKey: Uint8List.fromList([
+        for (var i = 0; i < pk.length; i += 2)
+          int.parse(pk.substring(i, i + 2), radix: 16)
+      ]),
+      nickname: '',
+      connectionState: PeerConnectionState.disconnected,
+      transport: PeerTransport.udp,
+    ));
   }
 }

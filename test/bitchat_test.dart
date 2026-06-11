@@ -213,32 +213,6 @@ void main() {
     });
   });
 
-  group('Peer', () {
-    test('creates peer with correct state', () {
-      final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
-
-      final peer = Peer(
-          publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -80);
-
-      expect(peer.connectionState, equals(PeerConnectionState.discovered));
-      expect(peer.isReachable, isFalse);
-    });
-
-    test('generates correct display name', () {
-      final pubkey = Uint8List.fromList(List.generate(32, (i) => i));
-
-      final peer = Peer(
-          publicKey: pubkey, transport: PeerTransport.bleDirect, rssi: -90);
-
-      // Without nickname, should use fingerprint
-      expect(peer.displayName, equals(peer.shortFingerprint));
-
-      // With nickname
-      peer.nickname = 'Bob';
-      expect(peer.displayName, equals('Bob'));
-    });
-  });
-
   group('computeStaleUdpPeerPubkeys', () {
     test('returns only connected UDP peers that missed the stale threshold',
         () {
@@ -282,6 +256,84 @@ void main() {
       );
 
       expect(stale, equals({toHex(stalePubkey)}));
+    });
+  });
+
+  group('computeStaleBlePeerPubkeys', () {
+    String toHex(Uint8List pubkey) =>
+        pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+    test(
+        'flags BLE-attached peers whose lastBleSeen is older than the '
+        'staleness window, ignoring isFriend (friends and strangers alike)',
+        () {
+      final now = DateTime.now();
+      final staleFriend =
+          Uint8List.fromList(List.generate(32, (i) => (i + 1) % 256));
+      final staleStranger =
+          Uint8List.fromList(List.generate(32, (i) => (i + 11) % 256));
+      final freshPeer =
+          Uint8List.fromList(List.generate(32, (i) => (i + 21) % 256));
+      final udpOnly =
+          Uint8List.fromList(List.generate(32, (i) => (i + 31) % 256));
+
+      final stale = computeStaleBlePeerPubkeys(
+        peers: [
+          PeerState(
+            publicKey: staleFriend,
+            nickname: 'StaleFriend',
+            isFriend: true,
+            bleCentralDeviceId: 'central:friend',
+            lastBleSeen: now.subtract(const Duration(seconds: 31)),
+          ),
+          PeerState(
+            publicKey: staleStranger,
+            nickname: 'StaleStranger',
+            blePeripheralDeviceId: 'peripheral:stranger',
+            lastBleSeen: now.subtract(const Duration(seconds: 60)),
+          ),
+          PeerState(
+            publicKey: freshPeer,
+            nickname: 'Fresh',
+            bleCentralDeviceId: 'central:fresh',
+            lastBleSeen: now.subtract(const Duration(seconds: 5)),
+          ),
+          PeerState(
+            publicKey: udpOnly,
+            nickname: 'UdpOnly',
+            udpAddress: '[2001:db8::1]:4001',
+            // No BLE attachment, no lastBleSeen — must not be flagged.
+          ),
+        ],
+        staleThreshold: const Duration(seconds: 20),
+        now: now,
+      );
+
+      expect(stale, equals({toHex(staleFriend), toHex(staleStranger)}));
+    });
+
+    test('does NOT flag peers with no lastBleSeen — they\'re treated as fresh',
+        () {
+      final now = DateTime.now();
+      final neverSeenButAttached =
+          Uint8List.fromList(List.generate(32, (i) => (i + 1) % 256));
+
+      final stale = computeStaleBlePeerPubkeys(
+        peers: [
+          PeerState(
+            publicKey: neverSeenButAttached,
+            nickname: 'NewAttachment',
+            bleCentralDeviceId: 'central:new',
+            // lastBleSeen left null — the very next ANNOUNCE/RSSI tick
+            // populates it. Sweeping this would prematurely clear a path
+            // that's mid-handshake.
+          ),
+        ],
+        staleThreshold: const Duration(seconds: 20),
+        now: now,
+      );
+
+      expect(stale, isEmpty);
     });
   });
 }

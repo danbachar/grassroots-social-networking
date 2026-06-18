@@ -5,10 +5,11 @@
 /// - [BleTransportService]: Bluetooth Low Energy direct transport
 /// - [UdpTransportService]: UDP peer-to-peer transport
 ///
-/// NOTE: This is a direct peer-to-peer transport layer.
-/// There is NO mesh routing, NO forwarding, NO store-and-forward.
-/// All messages go directly from sender to recipient.
-/// The application layer (GSG) handles any forwarding needs.
+/// NOTE: The BLE transport is an opportunistic mesh — packets are relayed by
+/// managed flooding (TTL-bounded, bloom-deduplicated) and store-carried for
+/// recipients that are temporarily out of range. The UDP transport is direct
+/// point-to-point. Relays forward sealed, recipient-addressed packets; only the
+/// recipient can decrypt the content (see CLAUDE.md → Mesh Envelope & Trust).
 library;
 
 export 'transport_service.dart';

@@ -21,11 +21,18 @@ class ProtocolHandler {
 
   // ===== Encoding =====
 
-  /// Create ANNOUNCE payload
+  /// Create ANNOUNCE payload.
+  ///
+  /// ANNOUNCE is the one packet type whose sender is *meant* to be visible: it
+  /// is a neighbor-local (non-relayed) presence broadcast, and the packet header
+  /// no longer carries a sender or signature. So the announce authenticates
+  /// itself — the payload ends with an Ed25519 signature over everything before
+  /// it, verifiable against the embedded pubkey ([decodeAnnounce] enforces it).
   ///
   /// Format:
   /// [pubkey(32) + version(2) + nickLen(1) + nick
-  ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
+  ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)
+  ///  + signature(64)]
   Uint8List createAnnouncePayload({
     String? address,
     String? linkLocalAddress,
@@ -64,7 +71,10 @@ class ProtocolHandler {
       buffer.add(candidateBytes);
     }
 
-    return buffer.toBytes();
+    // Self-sign: append an Ed25519 signature over the announce body so the
+    // pubkey↔nickname↔address binding is verifiable hop-locally.
+    final body = buffer.toBytes();
+    return Uint8List.fromList([...body, ..._signAnnounceBody(body)]);
   }
 
   /// Create MESSAGE packet.
@@ -80,10 +90,8 @@ class ProtocolHandler {
   }) {
     return GrassrootsPacket(
       type: PacketType.message,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: Uint8List(64), // Caller must sign before sending
       packetId: packetId,
     );
   }
@@ -96,10 +104,8 @@ class ProtocolHandler {
     final payload = utf8.encode(messageId);
     return GrassrootsPacket(
       type: PacketType.readReceipt,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: Uint8List(64), // Caller must sign before sending
     );
   }
 
@@ -111,50 +117,59 @@ class ProtocolHandler {
   /// [pubkey(32) + version(2) + nickLen(1) + nick
   ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
   AnnounceData decodeAnnounce(Uint8List data) {
-    var offset = 0;
+    if (data.length < 32 + 64) {
+      throw const FormatException('ANNOUNCE payload too short');
+    }
 
-    // Pubkey (32 bytes)
-    final pubkey = data.sublist(offset, offset + 32);
-    offset += 32;
+    // Split off and verify the trailing Ed25519 signature over the body. A
+    // forged or tampered ANNOUNCE fails here and is dropped by the caller.
+    final body = Uint8List.sublistView(data, 0, data.length - 64);
+    final signature = Uint8List.sublistView(data, data.length - 64);
+    final pubkey = Uint8List.fromList(body.sublist(0, 32));
+    if (!_verifyAnnounceBody(body, signature, pubkey)) {
+      throw const FormatException('ANNOUNCE signature invalid');
+    }
+
+    var offset = 32; // pubkey extracted above
 
     // Version (2 bytes)
-    final version = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+    final version = ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
         .getUint16(0, Endian.big);
     offset += 2;
 
     // Nickname length (1 byte) + nickname
-    final nicknameLength = data[offset];
+    final nicknameLength = body[offset];
     offset += 1;
     final nickname = utf8.decode(
-      data.sublist(offset, offset + nicknameLength),
+      body.sublist(offset, offset + nicknameLength),
       allowMalformed: true,
     );
     offset += nicknameLength;
 
-    if (offset + 2 > data.length) {
+    if (offset + 2 > body.length) {
       throw const FormatException('ANNOUNCE payload missing candidates');
     }
 
     final addressCandidates = <String>{};
     final candidateCount =
-        ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+        ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
             .getUint16(0, Endian.big);
     offset += 2;
     for (var i = 0; i < candidateCount; i++) {
-      if (offset + 2 > data.length) {
+      if (offset + 2 > body.length) {
         throw const FormatException('ANNOUNCE candidate length missing');
       }
       final candidateLength =
-          ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+          ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
               .getUint16(0, Endian.big);
       offset += 2;
-      if (offset + candidateLength > data.length) {
+      if (offset + candidateLength > body.length) {
         throw const FormatException('ANNOUNCE candidate truncated');
       }
       if (candidateLength > 0) {
         addressCandidates.add(
           String.fromCharCodes(
-            data.sublist(offset, offset + candidateLength),
+            body.sublist(offset, offset + candidateLength),
           ),
         );
       }
@@ -187,54 +202,44 @@ class ProtocolHandler {
     final payload = utf8.encode(messageId);
     return GrassrootsPacket(
       type: PacketType.ack,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: Uint8List(64), // Caller must sign before sending
     );
   }
 
-  // ===== Signing & Verification =====
+  // ===== ANNOUNCE Signing & Verification =====
+  //
+  // Only ANNOUNCE is signed now. Every other packet type is either a Noise
+  // handshake (authenticated by the handshake itself) or session-encrypted
+  // (authenticated end-to-end by the AEAD tag). Relays never verify — they
+  // forward sealed, sender-anonymous packets by recipient ID.
 
-  /// Sign a packet with the identity's Ed25519 private key.
-  ///
-  /// Mutates [packet.signature] in place. Uses libsodium's native Ed25519
-  /// (~5-10ms on Android, ~1-3ms on iOS) instead of the pure-Dart
-  /// `cryptography` implementation (~150-200ms on Android) — relevant when
-  /// signing fragmented payloads where the sender signs every fragment in
-  /// a tight loop.
-  Future<void> signPacket(GrassrootsPacket packet) async {
-    final signableBytes = packet.getSignableBytes();
-    // The identity's `privateKey` is the standard 64-byte Ed25519 secret
-    // key (32-byte seed concatenated with the 32-byte public key) — exactly
-    // what libsodium's `crypto_sign_detached` expects.
+  /// Sign the ANNOUNCE body with the identity's Ed25519 private key.
+  Uint8List _signAnnounceBody(Uint8List body) {
+    // The identity's `privateKey` is the standard 64-byte Ed25519 secret key
+    // (32-byte seed concatenated with the 32-byte public key).
     final secretKey = SecureKey.fromList(_sodium, identity.privateKey);
     try {
-      final signature = _sodium.crypto.sign.detached(
-        message: signableBytes,
+      return _sodium.crypto.sign.detached(
+        message: body,
         secretKey: secretKey,
       );
-      packet.signature = signature;
     } finally {
       secretKey.dispose();
     }
   }
 
-  /// Verify a packet's Ed25519 signature against the sender's public key.
-  ///
-  /// Native libsodium verify (~5-10ms on Android) is fast enough that we run
-  /// on the main isolate — even a fully fragmented 100 KB picture (~315
-  /// individually signed BitchatPackets) totals ~2-3s of CPU spread across
-  /// the BLE arrival window, comfortably interleaved with the event loop's
-  /// other work.
-  ///
-  /// Returns true if the signature is valid; false on any error.
-  Future<bool> verifyPacket(GrassrootsPacket packet) async {
+  /// Verify an ANNOUNCE body signature against the embedded pubkey.
+  bool _verifyAnnounceBody(
+    Uint8List body,
+    Uint8List signature,
+    Uint8List pubkey,
+  ) {
     try {
       return _sodium.crypto.sign.verifyDetached(
-        signature: packet.signature,
-        message: packet.getSignableBytes(),
-        publicKey: packet.senderPubkey,
+        signature: signature,
+        message: body,
+        publicKey: pubkey,
       );
     } catch (_) {
       return false;

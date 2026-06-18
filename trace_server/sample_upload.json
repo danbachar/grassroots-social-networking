@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "uploadId": "0d6f5b2e-2c1a-4f7e-9b3a-1f2e3d4c5b6a",
+  "deviceId": "7c9a1f04-3e52-4d8b-bf61-2a0e9d5c4b73",
+  "platform": "android",
+  "appVersion": "1.4.0+57",
+  "generatedAt": "2026-06-18T08:01:11Z",
+  "consent": true,
+  "records": [
+    {
+      "type": "message",
+      "t": 1750233671000,
+      "dir": "sent",
+      "messageId": "b1c2d3e4-0000-1111-2222-333344445555",
+      "peer": "p0",
+      "transport": "ble",
+      "msgClass": "data",
+      "blockType": "text",
+      "payloadSize": 184,
+      "controlBytes": 282,
+      "sentAt": 1750233671000,
+      "deliveredAt": 1750233671940,
+      "e2eLatencyMs": 940,
+      "deliverySuccess": true,
+      "degreeAtEvent": 3,
+      "queueDepthAtSend": 0,
+      "attempts": 1,
+      "dupCount": 0,
+      "hopCount": 1,
+      "deliveryMethod": "direct",
+      "dtnHop": 0,
+      "dtnTimeStoredMs": 0
+    },
+    {
+      "type": "contact",
+      "peer": "p0",
+      "transport": "ble",
+      "leg": "central",
+      "isIncoming": false,
+      "startedAt": 1750233600000,
+      "endedAt": 1750233780000,
+      "durationMs": 180000,
+      "interContactMs": 540000,
+      "bytesSent": 4096,
+      "bytesRecv": 8192,
+      "throughputBps": 553,
+      "rssi": -67
+    },
+    {
+      "type": "density",
+      "t": 1750233671000,
+      "lat": 32.7766,
+      "lon": 35.0233,
+      "geocell": "sv8wr",
+      "rssi": -67,
+      "relationsEstablished": 12,
+      "peersConnectedNow": 3,
+      "advertisements": 47
+    },
+    {
+      "type": "visit",
+      "placeId": "sv8wr",
+      "arrivedAt": 1750200000000,
+      "leftAt": 1750210800000,
+      "visitMs": 10800000,
+      "returnTimeMs": 86400000,
+      "visitCount": 5
+    },
+    {
+      "type": "buffer",
+      "t": 1750233670000,
+      "event": "drop",
+      "depth": 64,
+      "capacity": 64,
+      "occupancyRate": 1.0,
+      "dropCountCumulative": 3
+    },
+    {
+      "type": "device",
+      "t": 1750233671000,
+      "batteryPct": 73,
+      "batteryDrainPctPerHr": 4.2,
+      "lifecycleState": "paused",
+      "osThrottled": true,
+      "bgDurationMs": 120000,
+      "networkType": "mobile"
+    }
+  ]
+}

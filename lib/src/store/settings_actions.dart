@@ -79,3 +79,29 @@ class SetColdCallTrustLevelAction extends SettingsAction {
 
   SetColdCallTrustLevelAction(this.level);
 }
+
+/// Opt in/out of trace logging + upload. [consentTimestamp] is computed at the
+/// dispatch site (reducers are pure) and stored only when opting in.
+class SetTraceLoggingConsentAction extends SettingsAction {
+  final bool consent;
+  final String? consentTimestamp;
+
+  SetTraceLoggingConsentAction(this.consent, {this.consentTimestamp});
+}
+
+/// Configure the trace-upload server URL and bearer token (either may be null
+/// to clear).
+class SetTraceServerAction extends SettingsAction {
+  final String? url;
+  final String? token;
+
+  SetTraceServerAction({this.url, this.token});
+}
+
+/// Record the local calendar date (yyyy-MM-dd) of the last successful upload,
+/// so the daily prompt fires at most once per day.
+class SetLastTraceUploadDateAction extends SettingsAction {
+  final String date;
+
+  SetLastTraceUploadDateAction(this.date);
+}

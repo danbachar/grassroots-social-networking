@@ -7,7 +7,6 @@ import 'package:sodium_libs/sodium_libs_sumo.dart' as libsodium;
 
 import '../models/identity.dart';
 import '../models/packet.dart';
-import '../models/peer.dart';
 
 const _noiseProtocolName = 'Noise_XX_25519_ChaChaPoly_SHA256';
 const _handshakePayloadVersion = 1;
@@ -61,7 +60,10 @@ class NoiseSessionManager {
 
   final Duration handshakeTimeout;
 
-  final Map<_SessionKey, _SessionEntry> _entries = {};
+  /// Active sessions / in-flight handshakes, keyed by the peer's Ed25519 public
+  /// key (hex). A mesh session is end-to-end and path-independent, so it is NOT
+  /// keyed by transport — the same session serves direct and relayed paths.
+  final Map<String, _SessionEntry> _entries = {};
 
   Future<SimpleKeyPair>? _staticKeyPairFuture;
 
@@ -71,23 +73,20 @@ class NoiseSessionManager {
     this.handshakeTimeout = const Duration(seconds: 5),
   });
 
-  bool hasSession(PeerTransport transport, Uint8List remotePubkey) {
-    return _entries[_SessionKey(transport, _hex(remotePubkey))]?.session !=
-        null;
+  bool hasSession(Uint8List remotePubkey) {
+    return _entries[_hex(remotePubkey)]?.session != null;
   }
 
   /// Starts an XX initiator handshake if no session or in-flight handshake
   /// exists. Returns the encoded first handshake payload to send, or null if
   /// the caller should simply wait for the existing handshake.
-  Future<Uint8List?> startHandshake(
-    PeerTransport transport,
-    Uint8List remotePubkey,
-  ) async {
-    final key = _SessionKey(transport, _hex(remotePubkey));
-    final entry = _entries.putIfAbsent(key, _SessionEntry.new);
+  Future<Uint8List?> startHandshake(Uint8List remotePubkey) async {
+    final hex = _hex(remotePubkey);
+    final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
     if (entry.session != null || entry.handshake != null) {
       return null;
     }
+    entry.remotePubkey = Uint8List.fromList(remotePubkey);
 
     final handshake = await _NoiseHandshakeState.create(
       role: NoiseHandshakeRole.initiator,
@@ -101,12 +100,8 @@ class NoiseSessionManager {
     return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
   }
 
-  Future<bool> waitForSession(
-    PeerTransport transport,
-    Uint8List remotePubkey,
-  ) async {
-    final key = _SessionKey(transport, _hex(remotePubkey));
-    final entry = _entries[key];
+  Future<bool> waitForSession(Uint8List remotePubkey) async {
+    final entry = _entries[_hex(remotePubkey)];
     if (entry?.session != null) return true;
 
     final completer = entry?.completer;
@@ -116,7 +111,7 @@ class NoiseSessionManager {
       return await completer.future.timeout(
         handshakeTimeout,
         onTimeout: () {
-          reset(transport, remotePubkey);
+          reset(remotePubkey);
           return false;
         },
       );
@@ -125,78 +120,80 @@ class NoiseSessionManager {
     }
   }
 
+  /// Handle an inbound Noise handshake packet. [remotePubkey] is the peer's
+  /// Ed25519 identity, resolved by the coordinator from the inbound BLE path
+  /// (the peer's verified self-signed ANNOUNCE) — NOT from the packet, which no
+  /// longer carries a sender. Handshakes are neighbor-local (not flooded).
   Future<NoiseHandshakeResult> handleHandshakePacket(
     GrassrootsPacket packet, {
-    required PeerTransport transport,
+    required Uint8List remotePubkey,
   }) async {
     final (message, body) = _decodeHandshakePayload(packet.payload);
-    final remotePubkey = packet.senderPubkey;
-    final key = _SessionKey(transport, _hex(remotePubkey));
-    final entry = _entries.putIfAbsent(key, _SessionEntry.new);
+    final hex = _hex(remotePubkey);
+    final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
+    entry.remotePubkey = Uint8List.fromList(remotePubkey);
 
     switch (message) {
       case _NoiseHandshakeMessage.message1:
-        return _handleMessage1(entry, key, body);
+        return _handleMessage1(entry, hex, body);
       case _NoiseHandshakeMessage.message2:
-        return _handleMessage2(entry, key, remotePubkey, body);
+        return _handleMessage2(entry, hex, remotePubkey, body);
       case _NoiseHandshakeMessage.message3:
-        return _handleMessage3(entry, key, remotePubkey, body);
+        return _handleMessage3(entry, hex, remotePubkey, body);
     }
   }
 
   Future<GrassrootsPacket> encryptPacket(
     GrassrootsPacket packet, {
-    required PeerTransport transport,
     required Uint8List remotePubkey,
   }) async {
     if (!packet.type.usesSessionSecurity) return packet;
 
-    final key = _SessionKey(transport, _hex(remotePubkey));
-    final session = _entries[key]?.session;
+    final session = _entries[_hex(remotePubkey)]?.session;
     if (session == null) {
-      throw StateError('No Noise session for $transport/${key.pubkeyHex}');
+      throw StateError('No Noise session for ${_hex(remotePubkey)}');
     }
 
-    final encryptedPayload = await session.encryptPayload(packet);
+    final encryptedPayload =
+        await session.encryptPayload(packet, identity.publicKey);
     return packet.copyWith(
       type: packet.type.secureVariant,
       payload: encryptedPayload,
-      signature: Uint8List(64),
     );
   }
 
-  Future<GrassrootsPacket> decryptPacket(
-    GrassrootsPacket packet, {
-    required PeerTransport transport,
-  }) async {
-    if (!packet.type.isSessionEncrypted) return packet;
-
-    final key = _SessionKey(transport, _hex(packet.senderPubkey));
-    final session = _entries[key]?.session;
-    if (session == null) {
-      throw StateError('No Noise session for $transport/${key.pubkeyHex}');
-    }
+  /// Decrypt a sender-anonymous session-encrypted packet by trial-decrypting
+  /// against every active session — the AEAD tag identifies the right one (the
+  /// outer envelope has no sender to look it up by). Returns the cleartext
+  /// packet plus the recovered sender pubkey, or null if no session opens it.
+  Future<(GrassrootsPacket, Uint8List)?> trialDecrypt(
+    GrassrootsPacket packet,
+  ) async {
+    if (!packet.type.isSessionEncrypted) return null;
 
     final clearType = packet.type.clearVariant;
-    final clearPayload = await session.decryptPayload(packet, clearType);
-    return packet.copyWith(
-      type: clearType,
-      payload: clearPayload,
-    );
-  }
-
-  void reset(PeerTransport transport, Uint8List remotePubkey) {
-    final removed = _entries.remove(_SessionKey(transport, _hex(remotePubkey)));
-    removed?.complete(false);
-  }
-
-  void resetTransport(PeerTransport transport) {
-    final keys = _entries.keys
-        .where((key) => key.transport == transport)
-        .toList(growable: false);
-    for (final key in keys) {
-      _entries.remove(key)?.complete(false);
+    for (final entry in _entries.values) {
+      final session = entry.session;
+      final peer = entry.remotePubkey;
+      if (session == null || peer == null) continue;
+      try {
+        final clearPayload =
+            await session.decryptPayload(packet, clearType, peer);
+        return (
+          packet.copyWith(type: clearType, payload: clearPayload),
+          peer,
+        );
+      } catch (_) {
+        // Wrong session (AEAD tag mismatch) or replay — try the next.
+        continue;
+      }
     }
+    return null;
+  }
+
+  void reset(Uint8List remotePubkey) {
+    final removed = _entries.remove(_hex(remotePubkey));
+    removed?.complete(false);
   }
 
   void dispose() {
@@ -208,13 +205,13 @@ class NoiseSessionManager {
 
   Future<NoiseHandshakeResult> _handleMessage1(
     _SessionEntry entry,
-    _SessionKey key,
+    String remoteHex,
     Uint8List body,
   ) async {
     final existingHandshake = entry.handshake;
     if (existingHandshake?.role == NoiseHandshakeRole.initiator) {
       final localHex = _hex(identity.publicKey);
-      if (localHex.compareTo(key.pubkeyHex) < 0) {
+      if (localHex.compareTo(remoteHex) < 0) {
         return const NoiseHandshakeResult();
       }
       entry.complete(false);
@@ -240,7 +237,7 @@ class NoiseSessionManager {
 
   Future<NoiseHandshakeResult> _handleMessage2(
     _SessionEntry entry,
-    _SessionKey key,
+    String remoteHex,
     Uint8List remotePubkey,
     Uint8List body,
   ) async {
@@ -253,7 +250,7 @@ class NoiseSessionManager {
 
     await handshake.readMessage2(body);
     if (!_verifyRemoteStatic(handshake, remotePubkey)) {
-      _entries.remove(key);
+      _entries.remove(remoteHex);
       entry.complete(false);
       return const NoiseHandshakeResult();
     }
@@ -274,7 +271,7 @@ class NoiseSessionManager {
 
   Future<NoiseHandshakeResult> _handleMessage3(
     _SessionEntry entry,
-    _SessionKey key,
+    String remoteHex,
     Uint8List remotePubkey,
     Uint8List body,
   ) async {
@@ -287,7 +284,7 @@ class NoiseSessionManager {
 
     await handshake.readMessage3(body);
     if (!_verifyRemoteStatic(handshake, remotePubkey)) {
-      _entries.remove(key);
+      _entries.remove(remoteHex);
       entry.complete(false);
       return const NoiseHandshakeResult();
     }
@@ -361,6 +358,10 @@ class _SessionEntry {
   _NoiseHandshakeState? handshake;
   Completer<bool>? completer;
 
+  /// The peer's Ed25519 public key (set once known). Used as the AAD sender
+  /// when trial-decrypting an inbound sealed packet against this session.
+  Uint8List? remotePubkey;
+
   void complete(bool value) {
     final pending = completer;
     if (pending != null && !pending.isCompleted) {
@@ -368,23 +369,6 @@ class _SessionEntry {
     }
     completer = null;
   }
-}
-
-class _SessionKey {
-  final PeerTransport transport;
-  final String pubkeyHex;
-
-  const _SessionKey(this.transport, this.pubkeyHex);
-
-  @override
-  bool operator ==(Object other) {
-    return other is _SessionKey &&
-        other.transport == transport &&
-        other.pubkeyHex == pubkeyHex;
-  }
-
-  @override
-  int get hashCode => Object.hash(transport, pubkeyHex);
 }
 
 class _NoiseHandshakeState {
@@ -639,14 +623,17 @@ class _NoiseTransportSession {
     required this.receiveKey,
   });
 
-  Future<Uint8List> encryptPayload(GrassrootsPacket packet) async {
+  Future<Uint8List> encryptPayload(
+    GrassrootsPacket packet,
+    Uint8List senderPubkey,
+  ) async {
     final nonce = _sendNonce++;
     final nonceBytes = _nonceBytes(nonce);
     final secretBox = await _cipher.encrypt(
       packet.payload,
       secretKey: SecretKey(sendKey),
       nonce: _aeadNonce(nonce),
-      aad: _applicationAad(packet, packet.type),
+      aad: _applicationAad(packet, packet.type, senderPubkey),
     );
     return Uint8List.fromList([
       _applicationPayloadVersion,
@@ -658,6 +645,7 @@ class _NoiseTransportSession {
   Future<Uint8List> decryptPayload(
     GrassrootsPacket packet,
     PacketType clearType,
+    Uint8List senderPubkey,
   ) async {
     final payload = packet.payload;
     if (payload.length < 1 + 8 + _aeadMacLength) {
@@ -681,7 +669,7 @@ class _NoiseTransportSession {
     final clear = await _cipher.decrypt(
       secretBox,
       secretKey: SecretKey(receiveKey),
-      aad: _applicationAad(packet, clearType),
+      aad: _applicationAad(packet, clearType, senderPubkey),
     );
     _rememberReceivedNonce(nonce);
     return Uint8List.fromList(clear);
@@ -777,17 +765,22 @@ int _nonceFromBytes(Uint8List nonceBytes) {
   ).getUint64(0, Endian.little);
 }
 
-Uint8List _applicationAad(GrassrootsPacket packet, PacketType clearType) {
+/// Application AEAD AAD: binds the ciphertext to its type, sender, recipient
+/// and packet id — but NOT to ttl/timestamp. TTL is mutated by every relay, so
+/// it cannot be authenticated end-to-end. [senderPubkey] is the originator: the
+/// local identity on encrypt, the session peer on (trial-)decrypt.
+Uint8List _applicationAad(
+  GrassrootsPacket packet,
+  PacketType clearType,
+  Uint8List senderPubkey,
+) {
   final recipient = packet.recipientPubkey ?? Uint8List(32);
   final packetId = _uuidToBytes(packet.packetId);
-  final data = ByteData(1 + 1 + 4 + 32 + 32 + 16);
+  final data = ByteData(1 + 32 + 32 + 16);
   var offset = 0;
   data.setUint8(offset++, clearType.value);
-  data.setUint8(offset++, packet.ttl);
-  data.setUint32(offset, packet.timestamp, Endian.big);
-  offset += 4;
   final bytes = data.buffer.asUint8List();
-  bytes.setRange(offset, offset + 32, packet.senderPubkey);
+  bytes.setRange(offset, offset + 32, senderPubkey);
   offset += 32;
   bytes.setRange(offset, offset + 32, recipient);
   offset += 32;

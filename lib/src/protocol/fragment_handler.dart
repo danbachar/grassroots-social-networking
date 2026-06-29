@@ -33,13 +33,11 @@ class _ReassemblyState {
   final int totalSize;
   final Map<int, Uint8List> receivedChunks = {};
   final DateTime startedAt = DateTime.now();
-  final Uint8List senderPubkey;
 
   _ReassemblyState({
     required this.messageId,
     required this.totalFragments,
     required this.totalSize,
-    required this.senderPubkey,
   });
 
   bool get isComplete => receivedChunks.length == totalFragments;
@@ -118,7 +116,6 @@ class FragmentHandler {
   /// `MessageDeliveredAction` can find the right outgoing-message slot.
   FragmentedMessage fragment({
     required Uint8List payload,
-    required Uint8List senderPubkey,
     Uint8List? recipientPubkey,
     int ttl = GrassrootsPacket.defaultTtl,
     String? messageId,
@@ -171,10 +168,8 @@ class FragmentHandler {
       fragments.add(GrassrootsPacket(
         type: type,
         ttl: ttl,
-        senderPubkey: senderPubkey,
         recipientPubkey: recipientPubkey,
         payload: fragmentPayload,
-        signature: Uint8List(64), // Placeholder - will be signed by caller
       ));
     }
 
@@ -207,12 +202,12 @@ class FragmentHandler {
         'totalFragments=$totalFragments totalSize=${totalSize}B '
         'firstChunk=${chunk.length}B');
 
-    // Create reassembly state
+    // Create reassembly state. The sender is recovered by trial-decrypt in the
+    // router (the packet header is sender-anonymous), so it isn't tracked here.
     _reassemblyBuffer[messageId] = _ReassemblyState(
       messageId: messageId,
       totalFragments: totalFragments,
       totalSize: totalSize,
-      senderPubkey: packet.senderPubkey,
     )..addChunk(0, chunk);
 
     // Check if single-fragment message

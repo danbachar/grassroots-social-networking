@@ -448,23 +448,26 @@ class BleTransportService extends TransportService {
   }
 
   @override
-  Future<void> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
+  Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
     // Sort by RSSI descending so the strongest signals get the data first.
     // Paths without a known RSSI (peripheral-role on iOS/Android, where the
     // OS doesn't expose remote signal strength) sort last via a very-weak
     // fallback so they still receive the broadcast.
     final ready = _readyPaths.toList()
       ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+    var sent = 0;
     for (final path in ready) {
       if (excludePeerIds != null && excludePeerIds.contains(path.pathId)) {
         continue;
       }
       try {
         await _ble.send(path.pathId, data);
+        sent++;
       } catch (e) {
         debugPrint('broadcast send() failed for ${path.pathId}: $e');
       }
     }
+    return sent;
   }
 
   @override

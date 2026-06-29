@@ -971,7 +971,7 @@ class GrassrootsNetwork {
       } catch (e) {
         debugPrint('Error stopping BLE: $e');
       }
-      _noiseSessions.resetTransport(PeerTransport.bleDirect);
+      // Session kept: end-to-end Noise sessions are path-independent.
     }
 
     if (_udpService != null) {
@@ -980,7 +980,7 @@ class GrassrootsNetwork {
       } catch (e) {
         debugPrint('Error stopping UDP: $e');
       }
-      _noiseSessions.resetTransport(PeerTransport.udp);
+      // Session kept: end-to-end Noise sessions are path-independent.
     }
   }
 
@@ -1588,7 +1588,7 @@ class GrassrootsNetwork {
     _holePunchServices.clear();
 
     if (_udpService != null) {
-      _noiseSessions.resetTransport(PeerTransport.udp);
+      // Session kept: end-to-end Noise sessions are path-independent.
       await _udpService!.dispose();
       _udpService = null;
     }
@@ -1712,7 +1712,7 @@ class GrassrootsNetwork {
       // Dispose old service first to clean up native state (GATT server, subscriptions)
       if (_bleService != null) {
         debugPrint('Disposing old BLE service before re-initialization');
-        _noiseSessions.resetTransport(PeerTransport.bleDirect);
+        // Session kept: end-to-end Noise sessions are path-independent.
         await _bleService!.dispose();
         _bleService = null;
       }
@@ -1728,7 +1728,7 @@ class GrassrootsNetwork {
         await _bleService!.dispose();
         _bleService = null;
       }
-      _noiseSessions.resetTransport(PeerTransport.bleDirect);
+      // Session kept: end-to-end Noise sessions are path-independent.
 
       // Reset Redux state so _bleAvailable returns false
       store.dispatch(
@@ -1766,7 +1766,7 @@ class GrassrootsNetwork {
       _holePunchServices.clear();
 
       if (_udpService != null) {
-        _noiseSessions.resetTransport(PeerTransport.udp);
+        // Session kept: end-to-end Noise sessions are path-independent.
         await _udpService!.dispose();
         _udpService = null;
       }
@@ -1926,48 +1926,52 @@ class GrassrootsNetwork {
       packetId: messageId,
     );
 
-    // --- Try BLE first (preferred for nearby peers) ---
-    final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
-    if (_isBleEnabledInSettings &&
-        _bleAvailable &&
-        _bleService != null &&
-        bleDeviceId != null) {
-      debugPrint('Sending via BLE to ${peer.displayName}');
-
-      bool success;
-      if (_fragmentHandler.needsFragmentation(payload)) {
-        success = await _sendFragmentedViaBle(
-          payload: payload,
-          recipientPubkey: recipientPubkey,
-          bleDeviceId: bleDeviceId,
-          messageId: messageId,
-        );
-      } else {
-        final bytes = await _signedPacketBytesForTransport(
-          packet: packet,
-          transport: PeerTransport.bleDirect,
-          recipientPubkey: recipientPubkey,
-          peerId: bleDeviceId,
-        );
-        if (bytes == null) {
-          success = false;
+    // --- BLE mesh: seal to the recipient's session and flood ---
+    // Reaches the recipient whether they are a direct neighbor or several hops
+    // away, as long as we hold an end-to-end Noise session with them. The
+    // session is established neighbor-local (handshake with a direct neighbor)
+    // and then survives the peer drifting out of direct range — which is what
+    // lets us keep messaging them across the mesh.
+    if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
+      // null when the recipient is not a direct neighbor; the handshake inside
+      // _ensureNoiseSession only succeeds for a direct neighbor, but an existing
+      // session lets us flood to a non-adjacent recipient.
+      final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
+      final ready = await _ensureNoiseSession(
+        transport: PeerTransport.bleDirect,
+        recipientPubkey: recipientPubkey,
+        peerId: bleDeviceId,
+      );
+      if (ready) {
+        debugPrint('Flooding message into BLE mesh for ${peer.displayName}');
+        bool success;
+        if (_fragmentHandler.needsFragmentation(payload)) {
+          success = await _sendFragmentedViaBle(
+            payload: payload,
+            recipientPubkey: recipientPubkey,
+            messageId: messageId,
+          );
         } else {
-          success = await _bleService!.sendToPeer(bleDeviceId, bytes);
+          final sealed = await _noiseSessions.encryptPacket(
+            packet,
+            remotePubkey: recipientPubkey,
+          );
+          success = await _floodViaBle(sealed.serialize()) > 0;
+        }
+
+        if (success) {
+          _markSentAndTrackForAck(
+            messageId: messageId,
+            recipientPubkey: recipientPubkey,
+            payload: payload,
+            transport: MessageTransport.ble,
+            bleDeviceId: bleDeviceId,
+          );
+          // Delivery confirmed by ACK, not by flood success.
+          return true;
         }
       }
-
-      if (success) {
-        _markSentAndTrackForAck(
-          messageId: messageId,
-          recipientPubkey: recipientPubkey,
-          payload: payload,
-          transport: MessageTransport.ble,
-          bleDeviceId: bleDeviceId,
-        );
-        // Delivery confirmed by ACK, not BLE write success.
-        return true;
-      }
-      debugPrint('BLE send failed, falling back to UDP...');
+      debugPrint('BLE mesh send unavailable, falling back to UDP...');
     }
 
     // --- Try UDP (direct connection or connect-on-demand) ---
@@ -1977,7 +1981,7 @@ class GrassrootsNetwork {
 
       // Try existing UDX connection first
       if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
-        final bytes = await _signedPacketBytesForTransport(
+        final bytes = await _sealedPacketBytesForTransport(
           packet: packet,
           transport: PeerTransport.udp,
           recipientPubkey: recipientPubkey,
@@ -2360,7 +2364,7 @@ class GrassrootsNetwork {
     if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
       final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
       if (peer != null && bleDeviceId != null) {
-        final bytes = await _signedPacketBytesForTransport(
+        final bytes = await _sealedPacketBytesForTransport(
           packet: packet,
           transport: PeerTransport.bleDirect,
           recipientPubkey: senderPubkey,
@@ -2405,7 +2409,6 @@ class GrassrootsNetwork {
             await _sendFragmentedViaBle(
               payload: payload,
               recipientPubkey: pubkey,
-              bleDeviceId: peerId,
               messageId: _uuid.v4(),
             );
           } else {
@@ -2413,7 +2416,7 @@ class GrassrootsNetwork {
               payload: payload,
               recipientPubkey: pubkey,
             );
-            final bytes = await _signedPacketBytesForTransport(
+            final bytes = await _sealedPacketBytesForTransport(
               packet: packet,
               transport: PeerTransport.bleDirect,
               recipientPubkey: pubkey,
@@ -2439,7 +2442,7 @@ class GrassrootsNetwork {
             payload: payload,
             recipientPubkey: peer.publicKey,
           );
-          final bytes = await _signedPacketBytesForTransport(
+          final bytes = await _sealedPacketBytesForTransport(
             packet: packet,
             transport: PeerTransport.udp,
             recipientPubkey: peer.publicKey,
@@ -2712,12 +2715,9 @@ class GrassrootsNetwork {
     required Uint8List recipientPubkey,
     String? peerId,
   }) async {
-    if (_noiseSessions.hasSession(transport, recipientPubkey)) return true;
+    if (_noiseSessions.hasSession(recipientPubkey)) return true;
 
-    final payload = await _noiseSessions.startHandshake(
-      transport,
-      recipientPubkey,
-    );
+    final payload = await _noiseSessions.startHandshake(recipientPubkey);
     if (payload != null) {
       final sent = await _sendNoiseHandshakePacket(
         transport: transport,
@@ -2726,12 +2726,12 @@ class GrassrootsNetwork {
         payload: payload,
       );
       if (!sent) {
-        _noiseSessions.reset(transport, recipientPubkey);
+        _noiseSessions.reset(recipientPubkey);
         return false;
       }
     }
 
-    return _noiseSessions.waitForSession(transport, recipientPubkey);
+    return _noiseSessions.waitForSession(recipientPubkey);
   }
 
   Future<bool> _sendNoiseHandshakePacket({
@@ -2742,13 +2742,10 @@ class GrassrootsNetwork {
   }) async {
     final packet = GrassrootsPacket(
       type: PacketType.noiseHandshake,
-      ttl: 0,
-      senderPubkey: identity.publicKey,
+      ttl: 1, // neighbor-local: handshakes are not relayed through the mesh
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: Uint8List(64),
     );
-    await _protocolHandler.signPacket(packet);
     final bytes = packet.serialize();
 
     if (transport == PeerTransport.bleDirect) {
@@ -2769,7 +2766,24 @@ class GrassrootsNetwork {
     return false;
   }
 
-  Future<Uint8List?> _signedPacketBytesForTransport({
+  /// Resolve the peer identity for an inbound handshake from the transport path.
+  /// The envelope is sender-anonymous, so for a neighbor-local handshake we map
+  /// the inbound path id back to the peer's pubkey (learned from their verified
+  /// self-signed ANNOUNCE). Returns null if the path isn't yet associated with a
+  /// pubkey (the peer retries after ANNOUNCE propagates).
+  Uint8List? _remotePubkeyForHandshake(PeerTransport transport, String? peerId) {
+    if (peerId == null) return null;
+    switch (transport) {
+      case PeerTransport.bleDirect:
+        return _bleService?.getPubkeyForPeerId(peerId);
+      case PeerTransport.udp:
+        return _udpService?.getPubkeyForPeerId(peerId);
+      case PeerTransport.webrtc:
+        return null;
+    }
+  }
+
+  Future<Uint8List?> _sealedPacketBytesForTransport({
     required GrassrootsPacket packet,
     required PeerTransport transport,
     required Uint8List recipientPubkey,
@@ -2785,11 +2799,9 @@ class GrassrootsNetwork {
       if (!ready) return null;
       outgoing = await _noiseSessions.encryptPacket(
         packet,
-        transport: transport,
         remotePubkey: recipientPubkey,
       );
     }
-    await _protocolHandler.signPacket(outgoing);
     return outgoing.serialize();
   }
 
@@ -2855,10 +2867,8 @@ class GrassrootsNetwork {
   ) {
     return GrassrootsPacket(
       type: PacketType.signaling,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: signalingPayload,
-      signature: Uint8List(64),
     );
   }
 
@@ -2879,7 +2889,7 @@ class GrassrootsNetwork {
     }
 
     final packet = _createSignalingPacket(recipientPubkey, signalingPayload);
-    final bytes = await _signedPacketBytesForTransport(
+    final bytes = await _sealedPacketBytesForTransport(
       packet: packet,
       transport: PeerTransport.bleDirect,
       recipientPubkey: recipientPubkey,
@@ -3073,7 +3083,7 @@ class GrassrootsNetwork {
             );
     if (!connected) return false;
 
-    final bytes = await _signedPacketBytesForTransport(
+    final bytes = await _sealedPacketBytesForTransport(
       packet: packet,
       transport: PeerTransport.udp,
       recipientPubkey: recipientPubkey,
@@ -3782,39 +3792,48 @@ class GrassrootsNetwork {
 
     _messageRouter.onNoiseHandshakeReceived =
         (packet, transport, {String? peerId}) async {
+      // The handshake is neighbor-local and the envelope is sender-anonymous, so
+      // resolve the dialing peer's identity from the inbound path (BLE: the
+      // path→pubkey association from their verified ANNOUNCE; UDP: the mapped
+      // connection). Without it we cannot bind/authenticate the session.
+      final remotePubkey = _remotePubkeyForHandshake(transport, peerId);
+      if (remotePubkey == null) {
+        debugPrint('[noise] Dropping handshake: cannot resolve peer identity');
+        return;
+      }
       try {
         final result = await _noiseSessions.handleHandshakePacket(
           packet,
-          transport: transport,
+          remotePubkey: remotePubkey,
         );
         final response = result.responsePayload;
         if (response != null) {
           await _sendNoiseHandshakePacket(
             transport: transport,
-            recipientPubkey: packet.senderPubkey,
+            recipientPubkey: remotePubkey,
             peerId: peerId,
             payload: response,
           );
         }
         if (result.sessionEstablished) {
-          _onNoiseSessionEstablished(transport, packet.senderPubkey);
+          _onNoiseSessionEstablished(transport, remotePubkey);
         }
       } catch (e) {
         debugPrint('[noise] Dropping handshake packet: $e');
       }
     };
 
-    _messageRouter.decryptSessionPacket =
-        (packet, transport, {String? peerId}) async {
-      try {
-        return await _noiseSessions.decryptPacket(
-          packet,
-          transport: transport,
-        );
-      } catch (e) {
-        debugPrint('[noise] Failed to decrypt session packet: $e');
-        return null;
-      }
+    // Trial-decrypt a sealed, sender-anonymous packet against active sessions.
+    _messageRouter.trialDecrypt = (packet) => _noiseSessions.trialDecrypt(packet);
+
+    // Relay (managed flooding) — rebroadcast a sealed packet to all BLE
+    // neighbors except the inbound path. The router only relays over the BLE
+    // mesh; UDP stays direct.
+    _messageRouter.onRelay = (packet, {String? excludeBlePeerId}) {
+      unawaited(_floodViaBle(
+        packet.serialize(),
+        excludeBlePeerId: excludeBlePeerId,
+      ));
     };
 
     // Peer ANNOUNCE processed
@@ -3956,39 +3975,27 @@ class GrassrootsNetwork {
       _drainQueuedMessagesForPeer(data.publicKey);
     };
 
-    // ACK request (router asks us to send ACK back to sender)
-    _messageRouter.onAckRequested = (transport, peerId, messageId) async {
-      if (peerId == null) {
-        debugPrint('Cannot send ACK for $messageId: no peerId');
-        return;
-      }
-      Uint8List? recipientPubkey;
-      if (transport == PeerTransport.udp) {
-        recipientPubkey = _hexToBytes(peerId);
-      } else if (transport == PeerTransport.bleDirect) {
-        recipientPubkey = _bleService?.getPubkeyForPeerId(peerId);
-      }
-      if (recipientPubkey == null) {
-        debugPrint('Cannot send ACK for $messageId: unknown recipient pubkey');
-        return;
-      }
-
+    // ACK request: the router recovered the original sender by trial-decrypt and
+    // asks us to confirm delivery. The ACK is a recipient-addressed, sealed
+    // packet flooded back through the mesh (BLE) — the sender may be several
+    // hops away — or sent directly over UDP.
+    _messageRouter.onAckRequested = (senderPubkey, messageId, transport) async {
+      // A session with the sender exists (we just decrypted their message).
+      if (!_noiseSessions.hasSession(senderPubkey)) return;
       final ackPacket = _protocolHandler.createAckPacket(
         messageId: messageId,
-        recipientPubkey: recipientPubkey,
+        recipientPubkey: senderPubkey,
       );
-      final bytes = await _signedPacketBytesForTransport(
-        packet: ackPacket,
-        transport: transport,
-        recipientPubkey: recipientPubkey,
-        peerId: peerId,
+      final sealed = await _noiseSessions.encryptPacket(
+        ackPacket,
+        remotePubkey: senderPubkey,
       );
-      if (bytes == null) return;
+      final bytes = sealed.serialize();
 
       if (transport == PeerTransport.udp) {
-        await _udpService?.sendToPeer(peerId, bytes);
-      } else if (transport == PeerTransport.bleDirect) {
-        await _bleService?.sendToPeer(peerId, bytes);
+        await _udpService?.sendToPeer(_pubkeyToHex(senderPubkey), bytes);
+      } else {
+        await _floodViaBle(bytes);
       }
     };
 
@@ -4046,7 +4053,7 @@ class GrassrootsNetwork {
       if (_bleService != null && _bleAvailable) {
         final peerId = _bleService!.getPeerIdForPubkey(recipientPubkey);
         if (peerId != null) {
-          final bytes = await _signedPacketBytesForTransport(
+          final bytes = await _sealedPacketBytesForTransport(
             packet: packet,
             transport: PeerTransport.bleDirect,
             recipientPubkey: recipientPubkey,
@@ -4061,7 +4068,7 @@ class GrassrootsNetwork {
       // Fall back to UDP
       if (_udpService != null && _udpAvailable) {
         if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
-          final bytes = await _signedPacketBytesForTransport(
+          final bytes = await _sealedPacketBytesForTransport(
             packet: packet,
             transport: PeerTransport.udp,
             recipientPubkey: recipientPubkey,
@@ -4247,7 +4254,9 @@ class GrassrootsNetwork {
     // the reachability subscriber when the *last* live transport drops.
     _bleService!.onPeerDisconnected = (peer) {
       debugPrint('BLE Peer disconnected: ${peer.displayName}');
-      _noiseSessions.reset(PeerTransport.bleDirect, peer.publicKey);
+      // Session kept: the end-to-end Noise session is path-independent, so a
+      // peer that drifts out of direct BLE range can still be messaged across
+      // the mesh (and re-reached directly later) without re-handshaking.
     };
 
     // Per spec (`docs/GLP_Networking_API/sections/ble.tex` §BLE Discovery):
@@ -4555,7 +4564,7 @@ class GrassrootsNetwork {
   }
 
   void _onUdpPeerDisconnected(PeerState peer) {
-    _noiseSessions.reset(PeerTransport.udp, peer.publicKey);
+    // Session kept: end-to-end Noise sessions are path-independent.
     if (!peer.isFriend) return;
 
     // Overall reachability is tracked by the reachability subscriber on the
@@ -4857,12 +4866,9 @@ class GrassrootsNetwork {
     );
     final packet = GrassrootsPacket(
       type: PacketType.announce,
-      ttl: 0,
-      senderPubkey: identity.publicKey,
+      ttl: 1, // ANNOUNCE is neighbor-local; its payload is self-signed
       payload: payload,
-      signature: Uint8List(64),
     );
-    await _protocolHandler.signPacket(packet);
     return packet.serialize();
   }
 
@@ -4891,13 +4897,10 @@ class GrassrootsNetwork {
     );
     final packet = GrassrootsPacket(
       type: PacketType.announce,
-      ttl: 0,
-      senderPubkey: identity.publicKey,
+      ttl: 1, // ANNOUNCE is neighbor-local; its payload is self-signed
       recipientPubkey: friendPubkey,
       payload: payload,
-      signature: Uint8List(64),
     );
-    await _protocolHandler.signPacket(packet);
     final bytes = packet.serialize();
 
     // Try BLE first if available
@@ -5021,29 +5024,41 @@ class GrassrootsNetwork {
   Future<bool> _sendFragmentedViaBle({
     required Uint8List payload,
     required Uint8List recipientPubkey,
-    required String bleDeviceId,
     required String messageId,
   }) async {
+    // A session must already exist (we seal each fragment to it). Each fragment
+    // is sealed individually and flooded into the BLE mesh.
+    if (!_noiseSessions.hasSession(recipientPubkey)) return false;
+
     final fragmented = _fragmentHandler.fragment(
       payload: payload,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       messageId: messageId,
     );
 
+    var anySent = false;
     for (final fragment in fragmented.fragments) {
-      final bytes = await _signedPacketBytesForTransport(
-        packet: fragment,
-        transport: PeerTransport.bleDirect,
-        recipientPubkey: recipientPubkey,
-        peerId: bleDeviceId,
+      final sealed = await _noiseSessions.encryptPacket(
+        fragment,
+        remotePubkey: recipientPubkey,
       );
-      if (bytes == null) return false;
-      final sent = await _bleService!.sendToPeer(bleDeviceId, bytes);
-      if (!sent) return false;
+      if (await _floodViaBle(sealed.serialize()) == 0) return false;
+      anySent = true;
       await Future.delayed(FragmentHandler.fragmentDelay);
     }
-    return true;
+    return anySent;
+  }
+
+  /// Flood a serialized packet into the BLE mesh (managed flooding). Returns the
+  /// number of neighbors it was sent to. [excludeBlePeerId] skips the inbound
+  /// path when relaying.
+  Future<int> _floodViaBle(Uint8List bytes, {String? excludeBlePeerId}) async {
+    final service = _bleService;
+    if (service == null || !_bleAvailable) return 0;
+    return service.broadcast(
+      bytes,
+      excludePeerIds: excludeBlePeerId == null ? null : {excludeBlePeerId},
+    );
   }
 }
 

@@ -14,31 +14,31 @@ class Protocol {
 
   const Protocol({required this.identity});
 
-  // ===== Signing & Verification =====
+  // ===== ANNOUNCE signing & verification =====
+  //
+  // The wire envelope is sender-anonymous and unsigned. Only ANNOUNCE — a
+  // presence broadcast whose sender is the point — self-authenticates: its
+  // payload ends with an Ed25519 signature over the body, verified against the
+  // embedded pubkey. Everything else is authenticated end-to-end by Noise.
 
-  /// Sign a packet with our Ed25519 private key.
-  Future<void> signPacket(GrassrootsPacket packet) async {
+  Future<Uint8List> _signAnnounceBody(Uint8List body) async {
     final algorithm = Ed25519();
-    final signableBytes = packet.getSignableBytes();
-    final signature =
-        await algorithm.sign(signableBytes, keyPair: identity.keyPair);
-    packet.signature = Uint8List.fromList(signature.bytes);
+    final signature = await algorithm.sign(body, keyPair: identity.keyPair);
+    return Uint8List.fromList(signature.bytes);
   }
 
-  /// Verify a packet's Ed25519 signature against the sender's public key.
-  Future<bool> verifyPacket(GrassrootsPacket packet) async {
+  Future<bool> _verifyAnnounceBody(
+    Uint8List body,
+    Uint8List signature,
+    Uint8List pubkey,
+  ) async {
     try {
       final algorithm = Ed25519();
-      final signableBytes = packet.getSignableBytes();
-      final publicKey = SimplePublicKey(
-        packet.senderPubkey,
-        type: KeyPairType.ed25519,
+      final publicKey = SimplePublicKey(pubkey, type: KeyPairType.ed25519);
+      return await algorithm.verify(
+        body,
+        signature: Signature(signature, publicKey: publicKey),
       );
-      final signature = Signature(
-        packet.signature,
-        publicKey: publicKey,
-      );
-      return await algorithm.verify(signableBytes, signature: signature);
     } catch (e) {
       return false;
     }
@@ -50,11 +50,11 @@ class Protocol {
   ///
   /// Format: pubkey(32) + version(2) + nickLen(1) + nick
   /// + candidateCount(2) + repeated(candidateLen(2) + candidate)
-  Uint8List createAnnouncePayload({
+  Future<Uint8List> createAnnouncePayload({
     String? address,
     String? linkLocalAddress,
     Iterable<String> addressCandidates = const [],
-  }) {
+  }) async {
     final nicknameBytes = Uint8List.fromList(identity.nickname.codeUnits);
     final candidates = <String>{
       if (address != null && address.isNotEmpty) address,
@@ -87,49 +87,58 @@ class Protocol {
       buffer.add(candidateBytes);
     }
 
-    return buffer.toBytes();
+    // Self-sign: append an Ed25519 signature over the body.
+    final body = buffer.toBytes();
+    return Uint8List.fromList([...body, ...await _signAnnounceBody(body)]);
   }
 
-  /// Decode ANNOUNCE payload.
-  AnnounceData decodeAnnounce(Uint8List data) {
-    var offset = 0;
+  /// Decode and verify an ANNOUNCE payload. Throws on a bad/forged signature.
+  Future<AnnounceData> decodeAnnounce(Uint8List data) async {
+    if (data.length < 32 + 64) {
+      throw const FormatException('ANNOUNCE payload too short');
+    }
+    final body = Uint8List.sublistView(data, 0, data.length - 64);
+    final signature = Uint8List.sublistView(data, data.length - 64);
+    final pubkey = Uint8List.fromList(body.sublist(0, 32));
+    if (!await _verifyAnnounceBody(body, signature, pubkey)) {
+      throw const FormatException('ANNOUNCE signature invalid');
+    }
 
-    final pubkey = data.sublist(offset, offset + 32);
-    offset += 32;
+    var offset = 32; // pubkey extracted above
 
-    final version = ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+    final version = ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
         .getUint16(0, Endian.big);
     offset += 2;
 
-    final nicknameLength = data[offset];
+    final nicknameLength = body[offset];
     offset += 1;
     final nickname =
-        String.fromCharCodes(data.sublist(offset, offset + nicknameLength));
+        String.fromCharCodes(body.sublist(offset, offset + nicknameLength));
     offset += nicknameLength;
 
-    if (offset + 2 > data.length) {
+    if (offset + 2 > body.length) {
       throw const FormatException('ANNOUNCE payload missing candidates');
     }
 
     final addressCandidates = <String>{};
     final candidateCount =
-        ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+        ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
             .getUint16(0, Endian.big);
     offset += 2;
     for (var i = 0; i < candidateCount; i++) {
-      if (offset + 2 > data.length) {
+      if (offset + 2 > body.length) {
         throw const FormatException('ANNOUNCE candidate length missing');
       }
       final candidateLength =
-          ByteData.view(data.buffer, data.offsetInBytes + offset, 2)
+          ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
               .getUint16(0, Endian.big);
       offset += 2;
-      if (offset + candidateLength > data.length) {
+      if (offset + candidateLength > body.length) {
         throw const FormatException('ANNOUNCE candidate truncated');
       }
       if (candidateLength > 0) {
         addressCandidates.add(String.fromCharCodes(
-          data.sublist(offset, offset + candidateLength),
+          body.sublist(offset, offset + candidateLength),
         ));
       }
       offset += candidateLength;
@@ -174,15 +183,14 @@ class Protocol {
     return host.startsWith('169.254.');
   }
 
-  /// Create an ANNOUNCE packet (broadcast).
-  GrassrootsPacket createAnnouncePacket({String? address}) {
-    final payload = createAnnouncePayload(address: address);
+  /// Create an ANNOUNCE packet (broadcast). The payload self-signs.
+  Future<GrassrootsPacket> createAnnouncePacket({String? address}) async {
+    final payload = await createAnnouncePayload(address: address);
     return GrassrootsPacket(
       type: PacketType.announce,
-      senderPubkey: identity.publicKey,
+      ttl: 1, // neighbor-local; payload is self-signed
       recipientPubkey: null, // broadcast
       payload: payload,
-      signature: Uint8List(64), // must sign before sending
     );
   }
 
@@ -194,10 +202,8 @@ class Protocol {
     final payload = Uint8List.fromList(messageId.codeUnits);
     return GrassrootsPacket(
       type: PacketType.ack,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: Uint8List(64),
     );
   }
 
@@ -208,10 +214,8 @@ class Protocol {
   }) {
     return GrassrootsPacket(
       type: PacketType.signaling,
-      senderPubkey: identity.publicKey,
       recipientPubkey: recipientPubkey,
       payload: signalingPayload,
-      signature: Uint8List(64),
     );
   }
 }

@@ -155,24 +155,25 @@ enum PacketType {
 
 /// A Grassroots packet — wire-compatible with the Flutter client.
 ///
-/// Binary format (154-byte header + variable payload):
+/// **Sender-anonymous envelope.** The outer header carries only the recipient
+/// ID — never the sender — and there is no whole-packet signature. Authentication
+/// is end-to-end inside the Noise session (the anchor is a direct peer, so it
+/// recovers the sender from the connection/ANNOUNCE rather than the header).
+///
+/// Binary format (58-byte header + variable payload):
 /// ```
-/// [0]       : Packet type (1 byte)
-/// [1]       : TTL (1 byte)
-/// [2-5]     : Timestamp (4 bytes, seconds since epoch, big-endian)
-/// [6-37]    : Sender public key (32 bytes)
-/// [38-69]   : Recipient public key (32 bytes, zeros for broadcast)
-/// [70-73]   : Payload length (4 bytes, big-endian)
-/// [74-89]   : Packet ID (16 bytes, UUID)
-/// [90-153]  : Signature (64 bytes, Ed25519)
-/// [154-N]   : Payload (variable length)
+/// [0]      : Packet type (1 byte)
+/// [1]      : TTL (1 byte)
+/// [2-5]    : Timestamp (4 bytes, seconds since epoch, big-endian)
+/// [6-37]   : Recipient public key (32 bytes, zeros for broadcast)
+/// [38-53]  : Packet ID (16 bytes, UUID)
+/// [54-57]  : Payload length (4 bytes, big-endian)
+/// [58-N]   : Payload (variable length)
 /// ```
 class GrassrootsPacket {
-  static const int headerSize = 154;
-  static const int payloadLengthOffset = 70;
-  static const int signatureOffset = 90;
-  static const int signatureLength = 64;
-  static const int maxPayloadSize = 346;
+  static const int headerSize = 58;
+  static const int payloadLengthOffset = 54;
+  static const int maxPayloadSize = 442;
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();
@@ -181,30 +182,20 @@ class GrassrootsPacket {
   final PacketType type;
   int ttl;
   final int timestamp;
-  final Uint8List senderPubkey;
   final Uint8List? recipientPubkey;
   final Uint8List payload;
-  Uint8List signature;
 
   GrassrootsPacket({
     String? packetId,
     required this.type,
     this.ttl = defaultTtl,
     int? timestamp,
-    required this.senderPubkey,
     this.recipientPubkey,
     required this.payload,
-    required this.signature,
   })  : packetId = packetId ?? _uuid.v4(),
         timestamp = timestamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 {
-    if (senderPubkey.length != 32) {
-      throw ArgumentError('Sender public key must be 32 bytes');
-    }
     if (recipientPubkey != null && recipientPubkey!.length != 32) {
       throw ArgumentError('Recipient public key must be 32 bytes');
-    }
-    if (signature.length != 64) {
-      throw ArgumentError('Signature must be 64 bytes');
     }
   }
 
@@ -222,8 +213,6 @@ class GrassrootsPacket {
     offset += 4;
 
     final bytes = buffer.buffer.asUint8List();
-    bytes.setRange(offset, offset + 32, senderPubkey);
-    offset += 32;
 
     if (recipientPubkey != null) {
       bytes.setRange(offset, offset + 32, recipientPubkey!);
@@ -232,15 +221,12 @@ class GrassrootsPacket {
     }
     offset += 32;
 
-    buffer.setUint32(offset, payload.length, Endian.big);
-    offset += 4;
-
     final idBytes = _uuidToBytes(packetId);
     bytes.setRange(offset, offset + 16, idBytes);
     offset += 16;
 
-    bytes.setRange(offset, offset + 64, signature);
-    offset += 64;
+    buffer.setUint32(offset, payload.length, Endian.big);
+    offset += 4;
 
     bytes.setRange(offset, offset + payload.length, payload);
     return bytes;
@@ -260,24 +246,18 @@ class GrassrootsPacket {
     final timestamp = buffer.getUint32(offset, Endian.big);
     offset += 4;
 
-    final senderPubkey = Uint8List.fromList(data.sublist(offset, offset + 32));
-    offset += 32;
-
     final recipientBytes = data.sublist(offset, offset + 32);
     final recipientPubkey = recipientBytes.every((b) => b == 0)
         ? null
         : Uint8List.fromList(recipientBytes);
     offset += 32;
 
-    final payloadLength = buffer.getUint32(offset, Endian.big);
-    offset += 4;
-
     final idBytes = data.sublist(offset, offset + 16);
     final packetId = _bytesToUuid(idBytes);
     offset += 16;
 
-    final signature = Uint8List.fromList(data.sublist(offset, offset + 64));
-    offset += 64;
+    final payloadLength = buffer.getUint32(offset, Endian.big);
+    offset += 4;
 
     if (data.length < offset + payloadLength) {
       throw FormatException(
@@ -291,10 +271,8 @@ class GrassrootsPacket {
       type: type,
       ttl: ttl,
       timestamp: timestamp,
-      senderPubkey: senderPubkey,
       recipientPubkey: recipientPubkey,
       payload: payload,
-      signature: signature,
     );
   }
 
@@ -305,8 +283,6 @@ class GrassrootsPacket {
     PacketType? type,
     int? ttl,
     Uint8List? payload,
-    Uint8List? signature,
-    Uint8List? senderPubkey,
     Uint8List? recipientPubkey,
     String? packetId,
     int? timestamp,
@@ -316,19 +292,9 @@ class GrassrootsPacket {
       type: type ?? this.type,
       ttl: ttl ?? this.ttl,
       timestamp: timestamp ?? this.timestamp,
-      senderPubkey: senderPubkey ?? this.senderPubkey,
       recipientPubkey: recipientPubkey ?? this.recipientPubkey,
       payload: payload ?? this.payload,
-      signature: signature ?? this.signature,
     );
-  }
-
-  /// Get bytes for signing (everything except the signature field).
-  Uint8List getSignableBytes() {
-    final serialized = serialize();
-    final signable = Uint8List.fromList(serialized);
-    signable.fillRange(signatureOffset, signatureOffset + signatureLength, 0);
-    return signable;
   }
 
   static Uint8List _uuidToBytes(String uuid) {

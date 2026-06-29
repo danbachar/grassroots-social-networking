@@ -6,12 +6,10 @@ import 'package:grassroots_networking/src/models/packet.dart';
 void main() {
   group('FragmentHandler', () {
     late FragmentHandler handler;
-    late Uint8List senderPubkey;
     late Uint8List recipientPubkey;
 
     setUp(() {
       handler = FragmentHandler();
-      senderPubkey = Uint8List.fromList(List.generate(32, (i) => i));
       recipientPubkey = Uint8List.fromList(List.generate(32, (i) => 100 + i));
     });
 
@@ -40,7 +38,7 @@ void main() {
       test('throws for payload that does not need fragmentation', () {
         final small = Uint8List(100);
         expect(
-          () => handler.fragment(payload: small, senderPubkey: senderPubkey),
+          () => handler.fragment(payload: small),
           throwsArgumentError,
         );
       });
@@ -53,7 +51,6 @@ void main() {
 
         final result = handler.fragment(
           payload: payload,
-          senderPubkey: senderPubkey,
           recipientPubkey: recipientPubkey,
         );
 
@@ -65,20 +62,14 @@ void main() {
 
       test('first fragment has fragmentStart type', () {
         final payload = Uint8List(1000);
-        final result = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final result = handler.fragment(payload: payload);
 
         expect(result.fragments.first.type, equals(PacketType.fragmentStart));
       });
 
       test('last fragment has fragmentEnd type', () {
         final payload = Uint8List(1000);
-        final result = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final result = handler.fragment(payload: payload);
 
         expect(result.fragments.last.type, equals(PacketType.fragmentEnd));
       });
@@ -86,10 +77,7 @@ void main() {
       test('middle fragments have fragmentContinue type', () {
         // Need at least 3 fragments: payload > 2 * maxFragmentPayload
         final payload = Uint8List(FragmentHandler.maxFragmentPayload * 3);
-        final result = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final result = handler.fragment(payload: payload);
 
         expect(result.fragments.length, greaterThanOrEqualTo(3));
         for (var i = 1; i < result.fragments.length - 1; i++) {
@@ -97,23 +85,10 @@ void main() {
         }
       });
 
-      test('all fragments carry correct sender pubkey', () {
-        final payload = Uint8List(1000);
-        final result = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
-
-        for (final fragment in result.fragments) {
-          expect(fragment.senderPubkey, equals(senderPubkey));
-        }
-      });
-
       test('all fragments carry correct recipient pubkey', () {
         final payload = Uint8List(1000);
         final result = handler.fragment(
           payload: payload,
-          senderPubkey: senderPubkey,
           recipientPubkey: recipientPubkey,
         );
 
@@ -122,16 +97,22 @@ void main() {
         }
       });
 
+      test('fragments are broadcast when no recipient is given', () {
+        // The sender-anonymous envelope carries only the recipient; with none
+        // supplied the fragments default to broadcast (no recipient in header).
+        final payload = Uint8List(1000);
+        final result = handler.fragment(payload: payload);
+
+        for (final fragment in result.fragments) {
+          expect(fragment.recipientPubkey, isNull);
+          expect(fragment.isBroadcast, isTrue);
+        }
+      });
+
       test('generates unique message IDs', () {
         final payload = Uint8List(1000);
-        final result1 = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
-        final result2 = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final result1 = handler.fragment(payload: payload);
+        final result2 = handler.fragment(payload: payload);
 
         expect(result1.messageId, isNot(equals(result2.messageId)));
       });
@@ -144,10 +125,7 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         // Feed fragments to a separate handler (simulating the receiver)
         final receiver = FragmentHandler();
@@ -168,10 +146,7 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
@@ -200,10 +175,7 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
@@ -224,10 +196,7 @@ void main() {
 
       test('returns null for incomplete fragments', () {
         final payload = Uint8List(1000);
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
@@ -239,10 +208,7 @@ void main() {
 
       test('returns null for continue fragment without start', () {
         final payload = Uint8List(1500);
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
@@ -255,10 +221,7 @@ void main() {
 
       test('returns null for end fragment without start', () {
         final payload = Uint8List(1000);
-        final fragmented = handler.fragment(
-          payload: payload,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented = handler.fragment(payload: payload);
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
@@ -271,9 +234,8 @@ void main() {
       test('throws for non-fragment packet', () {
         final packet = GrassrootsPacket(
           type: PacketType.message,
-          senderPubkey: senderPubkey,
+          recipientPubkey: recipientPubkey,
           payload: Uint8List(10),
-          signature: Uint8List(64),
         );
 
         expect(
@@ -292,10 +254,7 @@ void main() {
             payload[i] = i % 256;
           }
 
-          final fragmented = handler.fragment(
-            payload: payload,
-            senderPubkey: senderPubkey,
-          );
+          final fragmented = handler.fragment(payload: payload);
 
           final receiver = FragmentHandler();
           ReassembledMessage? result;
@@ -327,14 +286,8 @@ void main() {
           payload2[i] = (i * 7) % 256;
         }
 
-        final fragmented1 = handler.fragment(
-          payload: payload1,
-          senderPubkey: senderPubkey,
-        );
-        final fragmented2 = handler.fragment(
-          payload: payload2,
-          senderPubkey: senderPubkey,
-        );
+        final fragmented1 = handler.fragment(payload: payload1);
+        final fragmented2 = handler.fragment(payload: payload2);
 
         // Interleave fragments: start1, start2, continue1, continue2, end1, end2
         receiver.processFragment(fragmented1.fragments[0]);
@@ -362,7 +315,7 @@ void main() {
         final h = FragmentHandler();
         // Fragment something to populate internal state
         final payload = Uint8List(1000);
-        h.fragment(payload: payload, senderPubkey: senderPubkey);
+        h.fragment(payload: payload);
         expect(() => h.dispose(), returnsNormally);
       });
 

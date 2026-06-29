@@ -4,7 +4,6 @@ import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
-import 'package:grassroots_networking/src/models/peer.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 
@@ -25,105 +24,186 @@ void main() {
     );
   }
 
-  GrassrootsPacket handshakePacket({
-    required GrassrootsIdentity sender,
-    required GrassrootsIdentity recipient,
-    required Uint8List payload,
-  }) {
+  GrassrootsPacket handshakePacket(Uint8List payload) {
     return GrassrootsPacket(
       type: PacketType.noiseHandshake,
       ttl: 0,
-      senderPubkey: sender.publicKey,
-      recipientPubkey: recipient.publicKey,
       payload: payload,
-      signature: Uint8List(64),
     );
   }
 
-  test('establishes independent BLE and UDP sessions for the same peer',
+  /// Drives a full XX handshake between [initiator] (with identity [initPub])
+  /// and [responder] (with identity [respPub]). The wire envelope is
+  /// sender-anonymous, so each side is told the peer's pubkey out of band via
+  /// the `remotePubkey:` argument (resolved by the coordinator from the peer's
+  /// verified ANNOUNCE) — never read off the packet.
+  Future<void> completeHandshake({
+    required NoiseSessionManager initiator,
+    required Uint8List initPub,
+    required NoiseSessionManager responder,
+    required Uint8List respPub,
+  }) async {
+    final m1 = await initiator.startHandshake(respPub);
+    expect(m1, isNotNull);
+
+    final r1 = await responder.handleHandshakePacket(
+      handshakePacket(m1!),
+      remotePubkey: initPub,
+    );
+    expect(r1.responsePayload, isNotNull);
+
+    final r2 = await initiator.handleHandshakePacket(
+      handshakePacket(r1.responsePayload!),
+      remotePubkey: respPub,
+    );
+    expect(r2.sessionEstablished, isTrue);
+    expect(r2.responsePayload, isNotNull);
+
+    final finished = await responder.handleHandshakePacket(
+      handshakePacket(r2.responsePayload!),
+      remotePubkey: initPub,
+    );
+    expect(finished.sessionEstablished, isTrue);
+  }
+
+  test('establishes an end-to-end session and round-trips an encrypted packet',
       () async {
     final alice = await identity('Alice');
     final bob = await identity('Bob');
     final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
     final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
 
-    Future<void> completeHandshake(PeerTransport transport) async {
-      final msg1 = await aliceSessions.startHandshake(
-        transport,
-        bob.publicKey,
-      );
-      expect(msg1, isNotNull);
+    await completeHandshake(
+      initiator: aliceSessions,
+      initPub: alice.publicKey,
+      responder: bobSessions,
+      respPub: bob.publicKey,
+    );
 
-      final msg2 = await bobSessions.handleHandshakePacket(
-        handshakePacket(sender: alice, recipient: bob, payload: msg1!),
-        transport: transport,
-      );
-      expect(msg2.responsePayload, isNotNull);
-
-      final msg3 = await aliceSessions.handleHandshakePacket(
-        handshakePacket(
-          sender: bob,
-          recipient: alice,
-          payload: msg2.responsePayload!,
-        ),
-        transport: transport,
-      );
-      expect(msg3.sessionEstablished, isTrue);
-      expect(msg3.responsePayload, isNotNull);
-
-      final finished = await bobSessions.handleHandshakePacket(
-        handshakePacket(
-          sender: alice,
-          recipient: bob,
-          payload: msg3.responsePayload!,
-        ),
-        transport: transport,
-      );
-      expect(finished.sessionEstablished, isTrue);
-      expect(aliceSessions.hasSession(transport, bob.publicKey), isTrue);
-      expect(bobSessions.hasSession(transport, alice.publicKey), isTrue);
-    }
-
-    await completeHandshake(PeerTransport.bleDirect);
-    await completeHandshake(PeerTransport.udp);
+    // Sessions are keyed by peer identity, not by transport path.
+    expect(aliceSessions.hasSession(bob.publicKey), isTrue);
+    expect(bobSessions.hasSession(alice.publicKey), isTrue);
 
     final clear = GrassrootsPacket(
       type: PacketType.message,
-      senderPubkey: alice.publicKey,
       recipientPubkey: bob.publicKey,
       payload: Uint8List.fromList([1, 2, 3, 4]),
-      signature: Uint8List(64),
     );
 
-    final bleEncrypted = await aliceSessions.encryptPacket(
+    final sealed = await aliceSessions.encryptPacket(
       clear,
-      transport: PeerTransport.bleDirect,
       remotePubkey: bob.publicKey,
     );
-    final udpEncrypted = await aliceSessions.encryptPacket(
+    expect(sealed.type, PacketType.secureMessage);
+    expect(sealed.payload, isNot(equals(clear.payload)));
+
+    // Bob has no sender field on the wire — he demultiplexes by trial-decrypt.
+    final decrypted = await bobSessions.trialDecrypt(sealed);
+    expect(decrypted, isNotNull);
+    final (clearPacket, senderPubkey) = decrypted!;
+    expect(clearPacket.type, PacketType.message);
+    expect(clearPacket.payload, clear.payload);
+    // The recovered sender is Alice, recovered from the session, not the header.
+    expect(senderPubkey, equals(alice.publicKey));
+  });
+
+  test('a relay-mutated TTL still trial-decrypts (AAD excludes TTL)', () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+
+    await completeHandshake(
+      initiator: aliceSessions,
+      initPub: alice.publicKey,
+      responder: bobSessions,
+      respPub: bob.publicKey,
+    );
+
+    final clear = GrassrootsPacket(
+      type: PacketType.message,
+      ttl: 7,
+      recipientPubkey: bob.publicKey,
+      payload: Uint8List.fromList([9, 8, 7, 6, 5]),
+    );
+    final sealed = await aliceSessions.encryptPacket(
       clear,
-      transport: PeerTransport.udp,
       remotePubkey: bob.publicKey,
     );
 
-    expect(bleEncrypted.type, PacketType.secureMessage);
-    expect(udpEncrypted.type, PacketType.secureMessage);
-    expect(bleEncrypted.payload, isNot(equals(clear.payload)));
-    expect(udpEncrypted.payload, isNot(equals(bleEncrypted.payload)));
+    // A relay hop decrements the TTL on the envelope. Because the application
+    // AEAD AAD excludes TTL, the recipient must still open the packet.
+    final relayed = sealed.decrementTtl();
+    expect(relayed.ttl, sealed.ttl - 1);
 
-    final bleDecrypted = await bobSessions.decryptPacket(
-      bleEncrypted,
-      transport: PeerTransport.bleDirect,
-    );
-    final udpDecrypted = await bobSessions.decryptPacket(
-      udpEncrypted,
-      transport: PeerTransport.udp,
+    final decrypted = await bobSessions.trialDecrypt(relayed);
+    expect(decrypted, isNotNull);
+    expect(decrypted!.$1.payload, clear.payload);
+    expect(decrypted.$2, equals(alice.publicKey));
+  });
+
+  test('a replayed sealed packet is rejected on the second trial-decrypt',
+      () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+
+    await completeHandshake(
+      initiator: aliceSessions,
+      initPub: alice.publicKey,
+      responder: bobSessions,
+      respPub: bob.publicKey,
     );
 
-    expect(bleDecrypted.type, PacketType.message);
-    expect(udpDecrypted.type, PacketType.message);
-    expect(bleDecrypted.payload, clear.payload);
-    expect(udpDecrypted.payload, clear.payload);
+    final sealed = await aliceSessions.encryptPacket(
+      GrassrootsPacket(
+        type: PacketType.message,
+        recipientPubkey: bob.publicKey,
+        payload: Uint8List.fromList([42]),
+      ),
+      remotePubkey: bob.publicKey,
+    );
+
+    final first = await bobSessions.trialDecrypt(sealed);
+    expect(first, isNotNull);
+
+    // Same nonce replayed — the session's replay window rejects it, and with no
+    // other open session the trial-decrypt yields null.
+    final second = await bobSessions.trialDecrypt(sealed);
+    expect(second, isNull);
+  });
+
+  test('reset() drops the session so further sealed packets cannot be opened',
+      () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+
+    await completeHandshake(
+      initiator: aliceSessions,
+      initPub: alice.publicKey,
+      responder: bobSessions,
+      respPub: bob.publicKey,
+    );
+    expect(bobSessions.hasSession(alice.publicKey), isTrue);
+
+    final sealed = await aliceSessions.encryptPacket(
+      GrassrootsPacket(
+        type: PacketType.message,
+        recipientPubkey: bob.publicKey,
+        payload: Uint8List.fromList([1, 1, 2, 3, 5]),
+      ),
+      remotePubkey: bob.publicKey,
+    );
+
+    bobSessions.reset(alice.publicKey);
+    expect(bobSessions.hasSession(alice.publicKey), isFalse);
+
+    // With no session left, Bob can no longer open the packet.
+    final decrypted = await bobSessions.trialDecrypt(sealed);
+    expect(decrypted, isNull);
   });
 
   test(
@@ -137,46 +217,35 @@ void main() {
     final mallorySessions =
         NoiseSessionManager(identity: mallory, sodium: sodium);
 
-    const transport = PeerTransport.udp;
-
-    // Mallory drives an initiator handshake toward Bob, but every packet she
-    // puts on the wire claims to come from Alice — an identity whose Noise
-    // static she cannot produce. (The outer Ed25519 signature layer would also
-    // reject this; here we prove the Noise layer independently aborts.)
-    final msg1 = await mallorySessions.startHandshake(transport, bob.publicKey);
+    // Mallory drives an initiator handshake toward Bob, but the coordinator on
+    // Bob's side resolves the peer identity as Alice (e.g. from a forged
+    // ANNOUNCE) — an identity whose Noise static Mallory cannot produce.
+    final msg1 = await mallorySessions.startHandshake(bob.publicKey);
     expect(msg1, isNotNull);
 
     final msg2 = await bobSessions.handleHandshakePacket(
-      handshakePacket(sender: alice, recipient: bob, payload: msg1!),
-      transport: transport,
+      handshakePacket(msg1!),
+      remotePubkey: alice.publicKey,
     );
     expect(msg2.responsePayload, isNotNull);
 
     // Mallory completes her side (she keys the session under Bob, whose static
     // is genuine), producing a msg3 that carries *Mallory's* static.
     final msg3 = await mallorySessions.handleHandshakePacket(
-      handshakePacket(
-        sender: bob,
-        recipient: mallory,
-        payload: msg2.responsePayload!,
-      ),
-      transport: transport,
+      handshakePacket(msg2.responsePayload!),
+      remotePubkey: bob.publicKey,
     );
     expect(msg3.responsePayload, isNotNull);
 
-    // Bob receives msg3, still labelled as coming from Alice. The delivered
+    // Bob receives msg3, still resolved as coming from Alice. The delivered
     // static is Mallory's and does not match the X25519 form of Alice's
     // identity, so Bob aborts and establishes no session.
     final finished = await bobSessions.handleHandshakePacket(
-      handshakePacket(
-        sender: alice,
-        recipient: bob,
-        payload: msg3.responsePayload!,
-      ),
-      transport: transport,
+      handshakePacket(msg3.responsePayload!),
+      remotePubkey: alice.publicKey,
     );
 
     expect(finished.sessionEstablished, isFalse);
-    expect(bobSessions.hasSession(transport, alice.publicKey), isFalse);
+    expect(bobSessions.hasSession(alice.publicKey), isFalse);
   });
 }

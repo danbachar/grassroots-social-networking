@@ -424,7 +424,6 @@ void main() {
           payload: testPayload,
           recipientPubkey: bobIdentity.publicKey,
         );
-        await aliceProto.signPacket(packet);
         final testData = packet.serialize();
         final sent = await alice.sendToPeer(bobPubkeyHex, testData);
         expect(sent, isTrue);
@@ -493,7 +492,6 @@ void main() {
           payload: Uint8List.fromList([4, 3, 2, 1]),
           recipientPubkey: bobIdentity.publicKey,
         );
-        await aliceProto.signPacket(packet);
         final testData = packet.serialize();
         expect(await alice.sendToPeer(bobPubkeyHex, testData), isTrue);
         expect(
@@ -635,7 +633,6 @@ void main() {
           payload: Uint8List.fromList([1, 2, 3, 4, 5]),
           recipientPubkey: bobIdentity.publicKey,
         );
-        await aliceProto.signPacket(packet);
         final testData = packet.serialize();
         await alice.sendToPeer(bobPubkeyHex, testData);
 

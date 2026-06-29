@@ -185,11 +185,14 @@ abstract class TransportService {
   /// Note: This doesn't guarantee delivery for unreliable transports.
   Future<bool> sendToPeer(String peerId, Uint8List data);
 
-  /// Broadcast data to all connected peers.
+  /// Broadcast data to all connected peers. Returns the number of peers it was
+  /// sent to (0 = no neighbors). For BLE this is the managed-flooding primitive
+  /// used to relay and originate mesh packets.
   ///
   /// [excludePeerIds] can be used to exclude specific peers
-  /// (e.g., to skip friends who get a separate addressed ANNOUNCE).
-  Future<void> broadcast(Uint8List data, {Set<String>? excludePeerIds});
+  /// (e.g., the inbound path when relaying, or friends who get a separate
+  /// addressed ANNOUNCE).
+  Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds});
 
   /// Associate a peer with a public key.
   ///

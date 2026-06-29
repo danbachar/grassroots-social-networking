@@ -566,13 +566,15 @@ class UdpTransportService extends TransportService {
       _rawPeerAddresses[pubkeyHex];
 
   @override
-  Future<void> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
+  Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
+    var sent = 0;
     // Send via UDX connections
     for (final entry in _peerConnections.entries) {
       if (excludePeerIds != null && excludePeerIds.contains(entry.key)) {
         continue;
       }
       await sendToPeer(entry.key, data);
+      sent++;
     }
     // Also send via raw UDP to peers where UDX failed
     for (final entry in _rawPeerAddresses.entries) {
@@ -583,7 +585,9 @@ class UdpTransportService extends TransportService {
         continue; // Already sent via UDX
       }
       sendRawTo(entry.key, entry.value.ip, entry.value.port, data);
+      sent++;
     }
+    return sent;
   }
 
   /// Disconnect from a specific peer.

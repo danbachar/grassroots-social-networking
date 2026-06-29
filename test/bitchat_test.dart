@@ -6,21 +6,19 @@ import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 
 void main() {
   group('GrassrootsPacket', () {
-    late Uint8List testPubkey;
     late Uint8List testPayload;
 
     setUp(() {
-      testPubkey = Uint8List.fromList(List.generate(32, (i) => i));
       testPayload = Uint8List.fromList([1, 2, 3, 4, 5]);
     });
 
     test('serializes and deserializes correctly', () {
+      // Sender-anonymous envelope: no sender pubkey, no whole-packet signature.
+      // A broadcast packet (no recipient) round-trips through the 58-byte header.
       final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 5,
-        senderPubkey: testPubkey,
         payload: testPayload,
-        signature: Uint8List(64),
       );
 
       final serialized = packet.serialize();
@@ -28,8 +26,9 @@ void main() {
 
       expect(deserialized.type, equals(packet.type));
       expect(deserialized.ttl, equals(packet.ttl));
+      expect(deserialized.timestamp, equals(packet.timestamp));
       expect(deserialized.packetId, equals(packet.packetId));
-      expect(deserialized.senderPubkey, equals(packet.senderPubkey));
+      expect(deserialized.recipientPubkey, isNull);
       expect(deserialized.payload, equals(packet.payload));
       expect(deserialized.isBroadcast, isTrue);
     });
@@ -41,10 +40,8 @@ void main() {
       final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 7,
-        senderPubkey: testPubkey,
         recipientPubkey: recipientPubkey,
         payload: testPayload,
-        signature: Uint8List(64),
       );
 
       final serialized = packet.serialize();
@@ -58,9 +55,7 @@ void main() {
       final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 5,
-        senderPubkey: testPubkey,
         payload: testPayload,
-        signature: Uint8List(64),
       );
 
       final decremented = packet.decrementTtl();
@@ -72,24 +67,54 @@ void main() {
       final packet = GrassrootsPacket(
         type: PacketType.message,
         ttl: 0,
-        senderPubkey: testPubkey,
         payload: testPayload,
-        signature: Uint8List(64),
       );
 
       expect(() => packet.decrementTtl(), throwsStateError);
     });
 
-    test('throws on invalid pubkey length', () {
+    test('throws on invalid recipient pubkey length', () {
       expect(
         () => GrassrootsPacket(
           type: PacketType.message,
-          senderPubkey: Uint8List(16), // Wrong length
+          recipientPubkey: Uint8List(16), // Wrong length
           payload: testPayload,
-          signature: Uint8List(64),
         ),
         throwsArgumentError,
       );
+    });
+
+    test('header is 58 bytes (sender-anonymous envelope)', () {
+      // No sender pubkey and no whole-packet signature on the wire: an
+      // empty-payload packet serializes to exactly the header size.
+      final packet = GrassrootsPacket(
+        type: PacketType.message,
+        payload: Uint8List(0),
+      );
+      expect(GrassrootsPacket.headerSize, equals(58));
+      expect(packet.serialize().length, equals(58));
+    });
+
+    test('relay-decremented TTL survives a serialize round-trip', () {
+      // Managed flooding: a relay decrements TTL and re-serializes the same
+      // packet. The packet id is preserved (dedup) and the new TTL is on wire.
+      final recipientPubkey =
+          Uint8List.fromList(List.generate(32, (i) => 100 + i));
+      final original = GrassrootsPacket(
+        type: PacketType.secureMessage,
+        ttl: 7,
+        recipientPubkey: recipientPubkey,
+        payload: testPayload,
+      );
+
+      final relayed = original.decrementTtl();
+      final roundTripped =
+          GrassrootsPacket.deserialize(relayed.serialize());
+
+      expect(roundTripped.ttl, equals(6));
+      expect(roundTripped.packetId, equals(original.packetId));
+      expect(roundTripped.recipientPubkey, equals(recipientPubkey));
+      expect(roundTripped.payload, equals(testPayload));
     });
   });
 
@@ -155,11 +180,9 @@ void main() {
 
   group('FragmentHandler', () {
     late FragmentHandler handler;
-    late Uint8List testPubkey;
 
     setUp(() {
       handler = FragmentHandler();
-      testPubkey = Uint8List.fromList(List.generate(32, (i) => i));
     });
 
     tearDown(() {
@@ -181,7 +204,6 @@ void main() {
 
       final fragmented = handler.fragment(
         payload: payload,
-        senderPubkey: testPubkey,
       );
 
       expect(fragmented.fragments.length, greaterThan(1));
@@ -204,7 +226,6 @@ void main() {
 
       final fragmented = handler.fragment(
         payload: payload,
-        senderPubkey: testPubkey,
       );
 
       // Process only first fragment

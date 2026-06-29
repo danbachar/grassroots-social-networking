@@ -460,34 +460,36 @@ class AnchorServer {
       return;
     }
 
-    // Verify signature
-    final isValid = await _protocol.verifyPacket(packet);
-    if (!isValid) {
-      _log('Dropping packet with invalid signature from $peerId');
+    // ANNOUNCE carries its own verified identity (self-signed payload) and is
+    // the packet that binds a connection to a pubkey. The envelope is otherwise
+    // sender-anonymous, so for every other type we resolve the sender from the
+    // connection the bytes arrived on.
+    if (packet.type == PacketType.announce) {
+      await _handleAnnounce(
+        packet,
+        peerId: peerId,
+        observedIp: observedIp,
+        observedPort: observedPort,
+        localPublicAddress: localPublicAddress,
+      );
       return;
     }
 
-    final senderHex = _pubkeyToHex(packet.senderPubkey);
-
-    // Map incoming connection to pubkey. Always rebind a freshly-arrived
-    // tempKey so that a reconnecting peer (new NAT-mapped source port)
-    // replaces its stale `_peerConnections` entry. `_trackPeerConnection`
-    // handles closing the prior stream when addr/port differ.
-    if (peerId.contains(':') && _pendingIncoming.containsKey(peerId)) {
-      _tempKeyToPubkey[peerId] = senderHex;
-      _mapIncomingConnectionToPubkey(peerId, senderHex);
+    final senderHex = _resolveSenderHex(peerId);
+    if (senderHex == null) {
+      _log('Dropping ${packet.type} from $peerId: unidentified sender '
+          '(no prior ANNOUNCE on this connection)');
+      return;
     }
+    final senderPubkey = _hexToBytes(senderHex);
 
     switch (packet.type) {
       case PacketType.announce:
-        _handleAnnounce(packet,
-            observedIp: observedIp,
-            observedPort: observedPort,
-            localPublicAddress: localPublicAddress);
+        break; // handled above
       case PacketType.noiseHandshake:
-        await _handleNoiseHandshake(packet);
+        await _handleNoiseHandshake(packet, senderPubkey);
       case PacketType.secureSignaling:
-        await _handleSecureSignaling(packet,
+        await _handleSecureSignaling(packet, senderPubkey,
             observedIp: observedIp, observedPort: observedPort);
       case PacketType.signaling:
         // Plaintext signaling is no longer accepted — clients must wrap
@@ -521,20 +523,22 @@ class AnchorServer {
   /// completes (message 3), we send a fresh addrReflect over the freshly
   /// established session so the peer learns its public address without having
   /// to wait for another ANNOUNCE cycle.
-  Future<void> _handleNoiseHandshake(GrassrootsPacket packet) async {
-    final senderHex = _pubkeyToHex(packet.senderPubkey);
+  Future<void> _handleNoiseHandshake(
+      GrassrootsPacket packet, Uint8List senderPubkey) async {
+    final senderHex = _pubkeyToHex(senderPubkey);
     try {
-      final result = await _noiseSessions.handleHandshakePacket(packet);
+      final result = await _noiseSessions.handleHandshakePacket(
+        packet,
+        remotePubkey: senderPubkey,
+      );
       final responsePayload = result.responsePayload;
       if (responsePayload != null) {
         final responsePacket = GrassrootsPacket(
           type: PacketType.noiseHandshake,
-          senderPubkey: _identity.publicKey,
-          recipientPubkey: packet.senderPubkey,
+          ttl: 1,
+          recipientPubkey: senderPubkey,
           payload: responsePayload,
-          signature: Uint8List(64),
         );
-        await _protocol.signPacket(responsePacket);
         _sendPacket(senderHex, responsePacket);
       }
       if (result.sessionEstablished) {
@@ -551,20 +555,22 @@ class AnchorServer {
   /// Decrypt an inbound `secureSignaling` packet and feed the plaintext into
   /// the signaling handler. Drops the packet if no session exists.
   Future<void> _handleSecureSignaling(
-    GrassrootsPacket packet, {
+    GrassrootsPacket packet,
+    Uint8List senderPubkey, {
     String? observedIp,
     int? observedPort,
   }) async {
-    final senderHex = _pubkeyToHex(packet.senderPubkey);
+    final senderHex = _pubkeyToHex(senderPubkey);
     if (!_noiseSessions.hasSession(senderHex)) {
       _log('Dropping secureSignaling from ${senderHex.substring(0, 8)}... '
           '(no Noise session)');
       return;
     }
     try {
-      final clear = await _noiseSessions.decryptPacket(packet);
+      final clear =
+          await _noiseSessions.decryptPacket(packet, remotePubkey: senderPubkey);
       _signalingHandler.processSignaling(
-        clear.senderPubkey,
+        senderPubkey,
         clear.payload,
         observedIp: observedIp,
         observedPort: observedPort,
@@ -595,14 +601,30 @@ class AnchorServer {
     );
   }
 
-  void _handleAnnounce(
+  Future<void> _handleAnnounce(
     GrassrootsPacket packet, {
+    required String peerId,
     String? observedIp,
     int? observedPort,
     String? localPublicAddress,
-  }) {
-    final data = _protocol.decodeAnnounce(packet.payload);
+  }) async {
+    final AnnounceData data;
+    try {
+      data = await _protocol.decodeAnnounce(packet.payload);
+    } catch (e) {
+      _log('Dropping ANNOUNCE from $peerId: $e');
+      return;
+    }
     final senderHex = data.pubkeyHex;
+
+    // Bind the connection this ANNOUNCE arrived on to the now-known pubkey, so
+    // subsequent sender-anonymous handshake / secureSignaling packets on the
+    // same connection resolve to this peer. Rebinding a freshly-arrived tempKey
+    // also handles a reconnecting peer (new NAT-mapped source port).
+    if (peerId.contains(':') && _pendingIncoming.containsKey(peerId)) {
+      _tempKeyToPubkey[peerId] = senderHex;
+      _mapIncomingConnectionToPubkey(peerId, senderHex);
+    }
 
     _refreshTrackedAddressFromAnnounce(
       senderHex,
@@ -618,8 +640,8 @@ class AnchorServer {
 
     _log('ANNOUNCE: ${data.nickname} (${senderHex.substring(0, 8)}...)');
     // Send our ANNOUNCE back so they know who we are
-    _sendAnnounceTo(
-      packet.senderPubkey,
+    await _sendAnnounceTo(
+      data.publicKey,
       address: localPublicAddress,
     );
   }
@@ -702,7 +724,6 @@ class AnchorServer {
           '${recipientHex.substring(0, 8)}...: $e');
       return false;
     }
-    await _protocol.signPacket(securePacket);
     final serializedLength = securePacket.serialize().length;
     _log('Signed signaling reply $signalingSummary from '
         '${senderHex.substring(0, 8)}... to ${recipientHex.substring(0, 8)}... '
@@ -719,8 +740,7 @@ class AnchorServer {
     Uint8List recipientPubkey, {
     String? address,
   }) async {
-    final packet = _protocol.createAnnouncePacket(address: address);
-    await _protocol.signPacket(packet);
+    final packet = await _protocol.createAnnouncePacket(address: address);
     _sendPacket(_pubkeyToHex(recipientPubkey), packet);
   }
 
@@ -729,10 +749,9 @@ class AnchorServer {
 
     for (final entry in _peerConnections.entries) {
       try {
-        final packet = _protocol.createAnnouncePacket(
+        final packet = await _protocol.createAnnouncePacket(
           address: entry.value.advertisedLocalAddress,
         );
-        await _protocol.signPacket(packet);
         await entry.value.stream?.add(packet.serialize());
       } catch (e) {
         _log('Failed to send ANNOUNCE to ${entry.key.substring(0, 8)}...: $e');
@@ -911,6 +930,23 @@ class AnchorServer {
 
   static String _pubkeyToHex(Uint8List pubkey) =>
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  static Uint8List _hexToBytes(String hex) {
+    final bytes = Uint8List(hex.length ~/ 2);
+    for (var i = 0; i < bytes.length; i++) {
+      bytes[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return bytes;
+  }
+
+  /// Resolve the pubkey-hex of whoever owns the connection [peerId] arrived on.
+  /// A tracked connection is keyed by pubkeyHex; a pending incoming tempKey was
+  /// bound to a pubkey by that peer's ANNOUNCE. The wire envelope is
+  /// sender-anonymous, so this is how the anchor identifies a peer.
+  String? _resolveSenderHex(String peerId) {
+    if (_peerConnections.containsKey(peerId)) return peerId;
+    return _tempKeyToPubkey[peerId];
+  }
 
   void _log(String message) {
     final ts = DateTime.now().toIso8601String().substring(11, 23);

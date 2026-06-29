@@ -83,11 +83,15 @@ class NoiseSessionManager {
   /// Process an incoming `noiseHandshake` packet. Returns the response payload
   /// (or null if no response should be sent) and whether the session is now
   /// established.
+  /// Handle an inbound handshake. [remotePubkey] is the client identity the
+  /// anchor resolved from the connection / ANNOUNCE (the envelope is
+  /// sender-anonymous), used to bind and verify the session.
   Future<NoiseHandshakeResult> handleHandshakePacket(
-    GrassrootsPacket packet,
-  ) async {
+    GrassrootsPacket packet, {
+    required Uint8List remotePubkey,
+  }) async {
     final (message, body) = _decodeHandshakePayload(packet.payload);
-    final remoteHex = _hex(packet.senderPubkey);
+    final remoteHex = _hex(remotePubkey);
     final entry = _entries.putIfAbsent(remoteHex, _SessionEntry.new);
 
     switch (message) {
@@ -96,7 +100,7 @@ class NoiseSessionManager {
       case _NoiseHandshakeMessage.message2:
         return _handleMessage2(entry, remoteHex, body);
       case _NoiseHandshakeMessage.message3:
-        return _handleMessage3(entry, remoteHex, packet.senderPubkey, body);
+        return _handleMessage3(entry, remoteHex, remotePubkey, body);
     }
   }
 
@@ -113,27 +117,32 @@ class NoiseSessionManager {
       throw StateError('No Noise session for $remotePubkeyHex');
     }
 
-    final encryptedPayload = await session.encryptPayload(packet);
+    final encryptedPayload =
+        await session.encryptPayload(packet, identity.publicKey);
     return packet.copyWith(
       type: packet.type.secureVariant,
       payload: encryptedPayload,
-      signature: Uint8List(64),
     );
   }
 
-  /// Decrypt an incoming encrypted packet using the session for the sender.
-  /// Throws if no session exists or the packet is malformed.
-  Future<GrassrootsPacket> decryptPacket(GrassrootsPacket packet) async {
+  /// Decrypt an incoming encrypted packet using the session for [remotePubkey]
+  /// (the sender the anchor resolved from the connection — the envelope carries
+  /// no sender). Throws if no session exists or the packet is malformed.
+  Future<GrassrootsPacket> decryptPacket(
+    GrassrootsPacket packet, {
+    required Uint8List remotePubkey,
+  }) async {
     if (!packet.type.isSessionEncrypted) return packet;
 
-    final remoteHex = _hex(packet.senderPubkey);
+    final remoteHex = _hex(remotePubkey);
     final session = _entries[remoteHex]?.session;
     if (session == null) {
       throw StateError('No Noise session for $remoteHex');
     }
 
     final clearType = packet.type.clearVariant;
-    final clearPayload = await session.decryptPayload(packet, clearType);
+    final clearPayload =
+        await session.decryptPayload(packet, clearType, remotePubkey);
     return packet.copyWith(
       type: clearType,
       payload: clearPayload,
@@ -477,14 +486,17 @@ class _NoiseTransportSession {
     required this.receiveKey,
   });
 
-  Future<Uint8List> encryptPayload(GrassrootsPacket packet) async {
+  Future<Uint8List> encryptPayload(
+    GrassrootsPacket packet,
+    Uint8List senderPubkey,
+  ) async {
     final nonce = _sendNonce++;
     final nonceBytes = _nonceBytes(nonce);
     final secretBox = await _cipher.encrypt(
       packet.payload,
       secretKey: SecretKey(sendKey),
       nonce: _aeadNonce(nonce),
-      aad: _applicationAad(packet, packet.type),
+      aad: _applicationAad(packet, packet.type, senderPubkey),
     );
     return Uint8List.fromList([
       _applicationPayloadVersion,
@@ -496,6 +508,7 @@ class _NoiseTransportSession {
   Future<Uint8List> decryptPayload(
     GrassrootsPacket packet,
     PacketType clearType,
+    Uint8List senderPubkey,
   ) async {
     final payload = packet.payload;
     if (payload.length < 1 + 8 + _aeadMacLength) {
@@ -519,7 +532,7 @@ class _NoiseTransportSession {
     final clear = await _cipher.decrypt(
       secretBox,
       secretKey: SecretKey(receiveKey),
-      aad: _applicationAad(packet, clearType),
+      aad: _applicationAad(packet, clearType, senderPubkey),
     );
     _rememberReceivedNonce(nonce);
     return Uint8List.fromList(clear);
@@ -610,17 +623,21 @@ int _nonceFromBytes(Uint8List nonceBytes) {
   ).getUint64(0, Endian.little);
 }
 
-Uint8List _applicationAad(GrassrootsPacket packet, PacketType clearType) {
+Uint8List _applicationAad(
+  GrassrootsPacket packet,
+  PacketType clearType,
+  Uint8List senderPubkey,
+) {
+  // Binds type, sender, recipient, packet id — NOT ttl/timestamp (ttl is
+  // mutated by relays; both sides supply the sender out-of-band). Must match the
+  // Flutter client's AAD exactly.
   final recipient = packet.recipientPubkey ?? Uint8List(32);
   final packetId = _uuidToBytes(packet.packetId);
-  final data = ByteData(1 + 1 + 4 + 32 + 32 + 16);
+  final data = ByteData(1 + 32 + 32 + 16);
   var offset = 0;
   data.setUint8(offset++, clearType.value);
-  data.setUint8(offset++, packet.ttl);
-  data.setUint32(offset, packet.timestamp, Endian.big);
-  offset += 4;
   final bytes = data.buffer.asUint8List();
-  bytes.setRange(offset, offset + 32, packet.senderPubkey);
+  bytes.setRange(offset, offset + 32, senderPubkey);
   offset += 32;
   bytes.setRange(offset, offset + 32, recipient);
   offset += 32;

@@ -99,5 +99,24 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(coldCallTrustLevel: action.level);
   }
 
+  if (action is SetTraceLoggingConsentAction) {
+    return state.copyWith(
+      traceLoggingConsent: action.consent,
+      // Stamp consent time on opt-in; clear it on opt-out.
+      consentTimestamp: action.consent ? action.consentTimestamp : null,
+    );
+  }
+
+  if (action is SetTraceServerAction) {
+    return state.copyWith(
+      traceServerUrl: action.url,
+      traceServerToken: action.token,
+    );
+  }
+
+  if (action is SetLastTraceUploadDateAction) {
+    return state.copyWith(lastTraceUploadDate: action.date);
+  }
+
   return state;
 }

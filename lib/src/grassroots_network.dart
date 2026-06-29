@@ -3972,7 +3972,10 @@ class GrassrootsNetwork {
         onPeerUpdated?.call(peerState);
       }
 
+      // A peer reappeared: drain our own queued messages AND re-flood any
+      // store-carry-forward packets we are holding for them.
       _drainQueuedMessagesForPeer(data.publicKey);
+      _messageRouter.flushDtnFor(data.publicKey);
     };
 
     // ACK request: the router recovered the original sender by trial-decrypt and

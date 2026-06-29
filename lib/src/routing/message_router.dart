@@ -1,5 +1,6 @@
 import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
+import '../mesh/dtn_store.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
@@ -28,6 +29,17 @@ class MessageRouter {
   final ProtocolHandler protocolHandler;
   final FragmentHandler fragmentHandler;
   final BloomFilter _seenPackets = BloomFilter();
+
+  /// Store-carry-forward cache: packets relayed for recipients not currently in
+  /// range, re-flooded when they reappear (see [flushDtnFor]).
+  final DtnStore _dtnStore = DtnStore();
+
+  /// Per-neighbor relay budget (managed-flooding abuse cap). A single inbound
+  /// neighbor may have at most [_maxRelaysPerWindow] packets relayed on its
+  /// behalf per [_relayWindow]; excess is dropped.
+  static const Duration _relayWindow = Duration(seconds: 10);
+  static const int _maxRelaysPerWindow = 512;
+  final Map<String, _RelayBudget> _relayBudgets = {};
 
   /// Called when a message is received. [transport] is the transport the packet
   /// actually arrived on — authoritative, taken from the receive path rather
@@ -163,13 +175,21 @@ class MessageRouter {
     if (!forUs) {
       // Open managed flooding: forward the sealed, sender-anonymous packet
       // toward its recipient, unverified and without decrypting. Only the first
-      // sighting is relayed; TTL bounds the hop count.
-      if (firstSeen && packet.ttl > 1) {
+      // sighting is relayed; TTL bounds the hop count; a per-neighbor budget
+      // caps flooding abuse.
+      if (firstSeen && packet.ttl > 1 && _allowRelayFrom(bleDeviceId)) {
         onRelay?.call(
           packet.decrementTtl(),
           excludeBlePeerId:
               transport == PeerTransport.bleDirect ? bleDeviceId : null,
         );
+
+        // Store-carry-forward: if the recipient isn't a currently-reachable
+        // peer, cache the sealed packet and re-flood it when they reappear.
+        final recipientHex = _recipientHex(packet);
+        if (recipientHex != null && !_recipientReachable(packet)) {
+          _dtnStore.store(recipientHex, packet);
+        }
       }
       return;
     }
@@ -470,6 +490,33 @@ class MessageRouter {
     return _pubkeysEqual(packet.recipientPubkey!, identity.publicKey);
   }
 
+  String? _recipientHex(GrassrootsPacket packet) {
+    final r = packet.recipientPubkey;
+    return r == null ? null : _pubkeyToHex(r);
+  }
+
+  bool _recipientReachable(GrassrootsPacket packet) {
+    final r = packet.recipientPubkey;
+    if (r == null) return false;
+    return _peersState.getPeerByPubkey(r)?.isReachable ?? false;
+  }
+
+  /// Per-neighbor flooding cap. Returns false when the inbound neighbor has had
+  /// too many packets relayed on its behalf this window.
+  bool _allowRelayFrom(String? inboundPeerId) {
+    if (inboundPeerId == null) return true; // unattributable (e.g. UDP)
+    final now = DateTime.now();
+    final budget =
+        _relayBudgets.putIfAbsent(inboundPeerId, () => _RelayBudget(now));
+    if (now.difference(budget.windowStart) > _relayWindow) {
+      budget.windowStart = now;
+      budget.count = 0;
+    }
+    if (budget.count >= _maxRelaysPerWindow) return false;
+    budget.count++;
+    return true;
+  }
+
   static bool _pubkeysEqual(Uint8List a, Uint8List b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
@@ -529,10 +576,30 @@ class MessageRouter {
     return _seenPackets.mightContain(packetId);
   }
 
+  /// Re-flood any store-carry-forward packets cached for [recipientPubkey] —
+  /// called by the coordinator when that recipient reappears (their ANNOUNCE /
+  /// peer-connected event). The recipient dedups on their side, so re-delivery
+  /// is safe.
+  void flushDtnFor(Uint8List recipientPubkey) {
+    final cached = _dtnStore.takeFor(_pubkeyToHex(recipientPubkey));
+    for (final packet in cached) {
+      onRelay?.call(packet);
+    }
+  }
+
   // ===== Lifecycle =====
 
   /// Clean up resources
   void dispose() {
     _seenPackets.clear();
+    _dtnStore.clear();
+    _relayBudgets.clear();
   }
+}
+
+/// Per-neighbor relay budget window (managed-flooding abuse cap).
+class _RelayBudget {
+  DateTime windowStart;
+  int count = 0;
+  _RelayBudget(this.windowStart);
 }

@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
 import '../mesh/dtn_store.dart';
+import '../trace/trace_logger.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
@@ -115,12 +117,20 @@ class MessageRouter {
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
 
+  /// Optional opt-in trace logger (null in tests / when logging is off).
+  final TraceLogger? trace;
+
   MessageRouter({
     required this.identity,
     required this.store,
     required this.protocolHandler,
     required this.fragmentHandler,
+    this.trace,
   });
+
+  /// Currently-reachable peer count — the temporal node degree at receipt time.
+  int _reachablePeerCount() =>
+      _peersState.peers.values.where((p) => p.isReachable).length;
 
   // ===== Unified Packet Processing =====
 
@@ -171,6 +181,18 @@ class MessageRouter {
     // The BloomFilter is the "seen packetId" set: it both prevents relay loops
     // (relay each packet at most once) and gates re-processing.
     final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
+
+    if (forUs && !firstSeen && (trace?.enabled ?? false)) {
+      // A duplicate copy of a packet addressed to us arrived (flooding /
+      // retransmit) — the message-duplication signal.
+      unawaited(trace!.log({
+        'type': 'message',
+        'dir': 'dup',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'messageId': packet.packetId,
+        'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+      }));
+    }
 
     if (!forUs) {
       // Open managed flooding: forward the sealed, sender-anonymous packet
@@ -396,6 +418,25 @@ class MessageRouter {
     if (firstSeen) {
       onMessageReceived?.call(
           packet.packetId, senderPubkey, packet.payload, transport);
+      if (trace?.enabled ?? false) {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        // In the mesh the receiver sees how far a packet travelled: the sender
+        // starts at defaultTtl and each relay decrements, so hops = the drop.
+        final relayHops = GrassrootsPacket.defaultTtl - packet.ttl;
+        unawaited(trace!.log({
+          'type': 'message',
+          't': now,
+          'dir': 'recv',
+          'messageId': packet.packetId,
+          'peer': _pubkeyToHex(senderPubkey),
+          'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+          'payloadSize': packet.payload.length,
+          'receivedAt': now,
+          'relayHops': relayHops,
+          'deliveryMethod': relayHops <= 0 ? 'direct' : 'relayed',
+          'degreeAtEvent': _reachablePeerCount(),
+        }));
+      }
     } else {
       debugPrint(
         'Duplicate message ${packet.packetId.length >= 8 ? packet.packetId.substring(0, 8) : packet.packetId}; '

@@ -577,6 +577,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         identity: identity,
         store: appStore,
         sodium: appSodium,
+        trace: traceLogger,
       );
 
       grassroots.onMessageReceived =
@@ -2558,6 +2559,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       identity: newIdentity,
       store: appStore,
       sodium: appSodium,
+      trace: traceLogger,
     );
     newGrassroots.onMessageReceived =
         (messageId, senderPubkey, payload, transport) {

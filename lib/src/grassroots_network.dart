@@ -16,6 +16,7 @@ import 'transport/hole_punch_service.dart';
 import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
 import 'models/identity.dart';
+import 'trace/trace_logger.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
 import 'protocol/protocol_handler.dart';
@@ -338,6 +339,10 @@ class GrassrootsNetwork {
   /// here. SUMO is required for `crypto_sign_ed25519_*_to_curve25519`.
   final SodiumSumo sodium;
 
+  /// Optional opt-in trace logger. When present and enabled, message/transport
+  /// events are recorded for later upload. Null in tests / when logging is off.
+  final TraceLogger? trace;
+
   /// Subscription for listening to store changes
   StreamSubscription<AppState>? _storeSubscription;
 
@@ -575,6 +580,7 @@ class GrassrootsNetwork {
     this.config = const GrassrootsNetworkConfig(),
     required this.store,
     required this.sodium,
+    this.trace,
   }) {
     _protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
     _fragmentHandler = FragmentHandler();
@@ -584,6 +590,7 @@ class GrassrootsNetwork {
       store: store,
       protocolHandler: _protocolHandler,
       fragmentHandler: _fragmentHandler,
+      trace: trace,
     );
     _signalingService = SignalingService(store: store);
     _setupRouterCallbacks();
@@ -2207,6 +2214,11 @@ class GrassrootsNetwork {
 
   /// Dispatches `MessageSentAction` and registers the message in
   /// [_ackPendingMessages] with a fresh ack-timeout watchdog.
+  /// Number of currently-reachable peers — the temporal node degree recorded
+  /// on trace records at send/deliver time.
+  int _reachablePeerCount() =>
+      store.state.peers.peers.values.where((p) => p.isReachable).length;
+
   void _markSentAndTrackForAck({
     required String messageId,
     required Uint8List recipientPubkey,
@@ -2222,6 +2234,21 @@ class GrassrootsNetwork {
         payloadSize: payload.length,
       ),
     );
+    if (trace?.enabled ?? false) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      unawaited(trace!.log({
+        'type': 'message',
+        't': now,
+        'dir': 'sent',
+        'messageId': messageId,
+        'peer': _pubkeyToHex(recipientPubkey),
+        'transport': transport == MessageTransport.udp ? 'udp' : 'ble',
+        'payloadSize': payload.length,
+        'degreeAtEvent': _reachablePeerCount(),
+        'queueDepthAtSend': queuedMessageCountForPeer(recipientPubkey),
+        'sentAt': now,
+      }));
+    }
     _trackAckPending(
       messageId: messageId,
       recipientPubkey: recipientPubkey,
@@ -2280,6 +2307,15 @@ class GrassrootsNetwork {
       '[ack-timeout] No ACK for $messageId within '
       '${config.ackTimeout.inMilliseconds}ms; re-queueing.',
     );
+    if (trace?.enabled ?? false) {
+      unawaited(trace!.log({
+        'type': 'message',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'dir': 'ack_timeout',
+        'messageId': messageId,
+        'deliverySuccess': false,
+      }));
+    }
     _requeueAckPendingMessage(pending);
   }
 
@@ -3771,6 +3807,20 @@ class GrassrootsNetwork {
     // ACK received (UDP delivery confirmation)
     _messageRouter.onAckReceived = (messageId) {
       debugPrint('ACK received for message $messageId');
+      if (trace?.enabled ?? false) {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final sentAt = store.state.messages.outgoingMessages[messageId]?.sentAt;
+        unawaited(trace!.log({
+          'type': 'message',
+          't': now,
+          'dir': 'delivered',
+          'messageId': messageId,
+          'deliveredAt': now,
+          if (sentAt != null)
+            'e2eLatencyMs': now - sentAt.millisecondsSinceEpoch,
+          'deliverySuccess': true,
+        }));
+      }
       store.dispatch(MessageDeliveredAction(messageId: messageId));
       _clearAckPending(messageId);
     };

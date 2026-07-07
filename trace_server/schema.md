@@ -51,59 +51,67 @@ across devices.
 Every record has a `type` and (where it makes sense) an event time `t` in epoch
 **milliseconds**. All other keys are type-specific.
 
-### `message` — one per sent or received message
+### `message` — one record per message event
 Covers: *Message timestamp at sending/receiving, End-to-end latency, Message
-size, Delivery success, Transport method, Message type, Hop count, Delivery
-method, Message duplication count, DTN row.*
+size, Delivery success, Transport method, Hop count, Delivery method, Message
+duplication count.*
+
+Records are **append-only per event** (the client can't mutate a written line),
+so one logical message produces several records joined by `messageId`:
 
 ```jsonc
-{
-  "type": "message",
-  "t": 1750233671000,
-  "dir": "sent",                  // 'sent' | 'recv'
-  "messageId": "uuid",
-  "peer": "h:…",                  // counterpart pseudonym
-  "transport": "ble",            // ✅ 'ble' | 'udp'  (the real delivery axis)
-  "msgClass": "data",            // ✅ 'data' | 'control'  (data=text/picture, control=friendship/ack/read-receipt)
-  "blockType": "text",           // ✅ text|picture|friendshipOffer|friendshipAccept|friendshipRevoke
-  "payloadSize": 184,            // ✅ application payload bytes
-  "controlBytes": 282,           // ➕ on-wire framing+sig+AEAD overhead for this msg (header 154B/fragment + 64B sig + AEAD)
-  "sentAt": 1750233671000,       // ✅ sender wall-clock (dir=sent)
-  "receivedAt": 1750233671220,   // ✅ receiver wall-clock (dir=recv); cross-device one-way latency is COARSE (wire ts is whole-seconds, no clock sync)
-  "deliveredAt": 1750233671940,  // ✅ ack arrival (dir=sent); same-clock
-  "e2eLatencyMs": 940,           // ✅ deliveredAt - sentAt (RELIABLE round-trip; the only trustworthy latency)
-  "deliverySuccess": true,       // ✅ ack received before ack-timeout watchdog fired
-  "degreeAtEvent": 3,            // ✅ temporal node degree: reachable-peer count at this instant
-  "queueDepthAtSend": 0,         // ✅ sender-local outbound queue depth when this was sent (absolute, not a %)
-  "attempts": 1,                 // ✅ (re)send attempts for this messageId (ack-timeout / path-drop requeues)
-  "dupCount": 0,                 // ➕ duplicate copies of this messageId seen (REAL counter at the dedup point)
-  "hopCount": 1,                 // ⚪ always 1 — relaying/multi-hop is architecturally forbidden (direct-delivery is inviolable), so deliberately NOT built
-  "deliveryMethod": "direct",    // ⚪ always 'direct' — message payloads are never relayed (only signaling metadata is)
-  "dtnHop": 0,                   // ⚪ no store-carry-forward of other peers' traffic
-  "dtnTimeStoredMs": 0           // ✅ for dir=sent, time this msg sat in the sender's own outbound queue
-}
+// dir=sent (originator, at flood time)
+{ "type": "message", "t": 1750233671000, "dir": "sent", "messageId": "uuid",
+  "peer": "p0", "transport": "ble", "payloadSize": 184,
+  "degreeAtEvent": 3,           // temporal node degree: reachable-peer count now
+  "queueDepthAtSend": 0,        // sender-local outbound queue depth (absolute)
+  "sentAt": 1750233671000 }
+
+// dir=recv (recipient, first delivery) — the mesh UNLOCKED hops/method
+{ "type": "message", "t": 1750233671220, "dir": "recv", "messageId": "uuid",
+  "peer": "p0", "transport": "ble", "payloadSize": 184, "receivedAt": 1750233671220,
+  "relayHops": 2,               // REAL: defaultTtl - ttl-at-receipt = relays traversed
+  "deliveryMethod": "relayed",  // REAL: 'direct' (0 relays) | 'relayed' (mesh flood)
+  "degreeAtEvent": 4 }
+
+// dir=delivered (originator, on ACK) — trustworthy round-trip latency
+{ "type": "message", "t": 1750233671940, "dir": "delivered", "messageId": "uuid",
+  "deliveredAt": 1750233671940, "e2eLatencyMs": 940, "deliverySuccess": true }
+
+// dir=ack_timeout (originator watchdog fired, message re-queued)
+{ "type": "message", "t": ..., "dir": "ack_timeout", "messageId": "uuid",
+  "deliverySuccess": false }
+
+// dir=dup (recipient saw a duplicate flooded copy of a message addressed to it)
+{ "type": "message", "t": ..., "dir": "dup", "messageId": "uuid", "transport": "ble" }
 ```
+
+The migration to the opportunistic mesh made `relayHops` / `deliveryMethod` /
+duplication genuinely vary (in the old direct-delivery design they were constant).
+Deferred (not yet emitted): `msgClass`/`blockType` (data-vs-control typing),
+`controlBytes` (on-wire overhead ratio), per-message `attempts`.
 
 ### `contact` — one per contact session close
 Covers: *Inter-contact time, Contact duration, Link throughput, RSSI.*
 
+Emitted on a peer's consolidated-reachability close (a whole session, across
+transports — not per BLE leg):
+
 ```jsonc
 {
   "type": "contact",
-  "peer": "h:…",                 // pseudonym once known; else null (pre-ANNOUNCE)
-  "transport": "ble",            // ✅ 'ble' | 'udp'
-  "leg": "central",              // ✅ 'central'|'peripheral' (BLE); a pair may have two legs
-  "isIncoming": false,           // ✅ who dialed
-  "startedAt": 1750233600000,    // ➕ synthesized (no connectedAt is stored; tracer captures on open)
-  "endedAt":   1750233780000,    // ➕ on close event
-  "durationMs": 180000,          // ➕ Contact duration
-  "interContactMs": 540000,      // ➕ since previous session with same (peer,transport); tracer-maintained
-  "bytesSent": 4096,             // ➕ accumulated from send hooks
-  "bytesRecv": 8192,             // ➕ accumulated from dataStream (UDP excludes UDX overhead/retransmits)
-  "throughputBps": 553,          // ➕ 8*(bytesSent+bytesRecv)/durationSec
-  "rssi": -67                    // ✅ BLE; often null on the peripheral leg
+  "t": 1750233780000,
+  "peer": "p0",                 // per-upload alias
+  "startedAt": 1750233600000,   // reachability true (session open)
+  "endedAt":   1750233780000,   // reachability false (session close)
+  "durationMs": 180000,         // contact duration
+  "interContactMs": 540000,     // gap since the previous session with this peer (omitted on first)
+  "rssi": -67                   // last RSSI, if known
 }
 ```
+
+Deferred: per-leg detail, who-dialed, and byte counts / throughput (need
+per-connection data-stream accounting).
 
 ### `density` — periodic "user density" sample
 Covers the *User Density* row: *Timestamp | Lat | Lon | Device ID | RSSI |
@@ -113,15 +121,17 @@ Covers the *User Density* row: *Timestamp | Lat | Lon | Device ID | RSSI |
 {
   "type": "density",
   "t": 1750233671000,
-  "lat": 32.7766,                // 🔌 coarse fix from background GPS (geolocator), rounded to cell resolution
-  "lon": 35.0233,               // 🔌
-  "geocell": "sv8wr",           // 🔌 geohash (coarse zone tag) derived from the fix
-  "rssi": -67,                  // ✅ median/last RSSI of currently-connected BLE peers
-  "relationsEstablished": 12,   // ➕ cumulative distinct peers ever connected (tracer-accumulated counter)
-  "peersConnectedNow": 3,       // ✅ current reachable-peer count
-  "advertisements": 47          // ✅/➕ BLE advertisement/scan-result count in the window (needs discovery-event hook)
+  "peersConnectedNow": 3,       // reachable-peer count (temporal node degree)
+  "friends": 12,                // current accepted-friend count (proxy for #relations)
+  "rssi": -67,                  // mean RSSI of reachable BLE peers (omitted if none)
+  "lat": 32.776,                // coarse GPS fix, rounded ~3dp (present only with a fix + permission)
+  "lon": 35.023,
+  "geocell": "sv8wr"           // geohash-6 (~1 km) cell of the fix
 }
 ```
+
+Deferred: cumulative distinct-peers-ever (`relationsEstablished`) and
+advertisement/scan-result counts (need a discovery-event hook).
 
 ### `visit` — a stay at a "place"  (locked: background coarse GPS)
 Covers: *Return time, Frequency of visits, Visiting time, Coarse geolocation.*
@@ -141,43 +151,47 @@ time and visit count are accumulated on-device against the real geocell history.
 }
 ```
 
-### `device` — periodic device-constraint sample
-Covers: *Battery drain rate, OS throttling flag.*
+### `device` — device-constraint sample
+Covers: *Battery drain rate, OS throttling flag.* Two emit points:
 
 ```jsonc
-{
-  "type": "device",
-  "t": 1750233671000,
-  "batteryPct": 73,             // 🔌 needs battery_plus
-  "batteryDrainPctPerHr": 4.2,  // 🔌 derived from sampled batteryPct (mAh/hr not portably available — dropped)
-  "lifecycleState": "paused",   // ✅ resumed|inactive|paused|hidden|detached (WidgetsBindingObserver)
-  "osThrottled": true,          // ⚪ APPROXIMATION: "left foreground" (paused/hidden), NOT true Doze/standby (no native API in scope)
-  "bgDurationMs": 120000,       // ✅ time since app left foreground
-  "networkType": "wifi"         // ✅ connectivity_plus (already wired): wifi|mobile|none|…
-}
+// periodic sampler (foreground): battery + network
+{ "type": "device", "t": 1750233671000,
+  "batteryPct": 73,             // battery_plus level
+  "batteryDrainPctPerHr": 4.2,  // derived from successive samples (mAh not portable)
+  "lifecycleState": "resumed",  // the sampler only runs in the foreground
+  "networkType": "wifi" }       // connectivity_plus: wifi|mobile|ethernet|none
+
+// on app resume: how long we were backgrounded
+{ "type": "device", "t": ..., "lifecycleState": "resumed",
+  "bgDurationMs": 120000,       // time since the app left the foreground
+  "osThrottled": true }         // APPROXIMATION: bgDurationMs > 60s (a long gap
+                                // suggests OS suspension; true Doze/App-Standby
+                                // needs native APIs not in scope)
 ```
 
-### `buffer` — sender-local outbound-queue sample / drop event
-Covers: *Buffer occupancy rate, Buffer drop count.* (locked: build the machinery)
-A bounded outbound queue is introduced (cap + eviction). Occupancy is sampled on
-enqueue/drain; a record with `event:"drop"` is emitted whenever a message is
-evicted before delivery.
+### `buffer` — mesh buffer-occupancy sample
+Covers: *Buffer occupancy rate, Buffer drop count.* Sampled by the periodic
+timer. Occupancy is reported as absolute counts of the two bounded mesh buffers:
 
 ```jsonc
 {
   "type": "buffer",
   "t": 1750233671000,
-  "event": "sample",            // 'sample' | 'drop'
-  "depth": 7,                    // ➕ messages currently queued
-  "capacity": 64,                // ➕ configured queue cap (the new denominator)
-  "occupancyRate": 0.109,        // ➕ depth / capacity
-  "dropCountCumulative": 3       // ➕ total messages dropped due to exhaustion since launch (event='drop' increments it)
+  "event": "sample",
+  "outboundQueued": 2,          // sender-local outbound queue depth (un-flooded messages)
+  "dtnBuffered": 7              // sealed packets held in the DTN store-carry-forward cache (bounded)
 }
 ```
 
+Deferred: an `event:"drop"` record on DTN/queue eviction, and an `occupancyRate`
+(the DTN store cap is the natural denominator).
+
 ## Notes for the client implementer
 
-* **Control overhead** (the field) = aggregate `controlBytes` / aggregate
-  `payloadSize`; computed server-side or in analysis from `message` records, not
-  uploaded as a separate field.
-* Records should be batched and the body **gzipped**; traces compress ~10×.
+* **Records are append-only**; the client never rewrites a line, so join
+  `message` records by `messageId` and pair `visit`/`contact` opens with closes.
+* **Foreground sampling only** today — the density/buffer/device sampler is a
+  foreground timer; continuous background sampling (esp. for `visit` records) is
+  a follow-up that would drive the sampler from the transport foreground service.
+* Records are batched and the body **gzipped**; traces compress ~10×.

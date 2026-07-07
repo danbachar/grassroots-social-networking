@@ -53,6 +53,9 @@ dependencies:
   # Coarse (opt-in) geolocation for diagnostic traces.
   geolocator: ^13.0.0
 
+  # Battery level/state for diagnostic device traces.
+  battery_plus: ^6.0.0
+
   # Pictures: gallery/camera pickers, decode + recompress for BLE bandwidth,
   # and per-app document directory for media files.
   image_picker: ^1.0.7

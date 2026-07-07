@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
+import 'src/trace/trace_logger.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
@@ -32,6 +33,9 @@ late final Store<AppState> appStore;
 
 // Global persistence service
 late final PersistenceService persistenceService;
+
+// Global opt-in trace logger (enabled only after the user consents).
+late final TraceLogger traceLogger;
 
 // Global libsodium handle, initialized at app startup. Used by ProtocolHandler
 // for native Ed25519 sign on the main isolate; verifier worker isolates
@@ -282,6 +286,16 @@ void main() async {
   // Subscribe to persist changes (debounced)
   appStore.onChange.listen((state) => persistenceService.onStateChanged(state));
 
+  // Opt-in trace logger — enabled only while the user's consent is on. Keep
+  // its enabled state in sync with the (persisted) consent flag.
+  traceLogger = TraceLogger(
+    platform: defaultTargetPlatform == TargetPlatform.iOS ? 'ios' : 'android',
+  );
+  traceLogger.setEnabled(settings.traceLoggingConsent);
+  appStore.onChange.listen(
+    (state) => traceLogger.setEnabled(state.settings.traceLoggingConsent),
+  );
+
   // Initialize notifications
   const AndroidInitializationSettings initializationSettingsAndroid =
       AndroidInitializationSettings('@mipmap/ic_launcher');
@@ -396,6 +410,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         _checkPendingChat();
       }
     });
+    // First-frame trace prompts: one-time consent, then the once-per-day upload
+    // prompt (main() has no BuildContext, so these run here).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_runTracePrompts());
+    });
   }
 
   void _onConnectivityChanged(List<ConnectivityResult> results) {
@@ -420,6 +439,114 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     }
   }
 
+  // ===== Trace logging prompts =====
+
+  bool _tracePromptBusy = false;
+
+  String _localDateString(DateTime dt) =>
+      '${dt.year.toString().padLeft(4, '0')}-'
+      '${dt.month.toString().padLeft(2, '0')}-'
+      '${dt.day.toString().padLeft(2, '0')}';
+
+  /// One-time consent prompt, then the daily upload prompt (cold start).
+  Future<void> _runTracePrompts() async {
+    await _maybeConsentPrompt();
+    await _maybeDailyTracePrompt();
+  }
+
+  /// Ask once, ever, whether the user opts in to trace logging + upload.
+  Future<void> _maybeConsentPrompt() async {
+    // consentTimestamp is non-null once the user has answered (grant or decline).
+    if (appStore.state.settings.consentTimestamp != null) return;
+    if (!mounted) return;
+
+    final accepted = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Help improve the network?'),
+        content: const Text(
+          'You can opt in to collect anonymous diagnostic traces '
+          '(connectivity, message timing, coarse location) on this device. '
+          'Nothing is sent automatically — once a day the app will ask before '
+          'uploading to your configured research server. You can turn this off '
+          'any time in Settings.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('No thanks'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Opt in'),
+          ),
+        ],
+      ),
+    );
+
+    appStore.dispatch(SetTraceLoggingConsentAction(
+      accepted == true,
+      consentTimestamp: DateTime.now().toUtc().toIso8601String(),
+    ));
+  }
+
+  /// On the first open of a new calendar day, offer to upload traces that
+  /// haven't been uploaded yet.
+  Future<void> _maybeDailyTracePrompt() async {
+    if (_tracePromptBusy) return;
+    final settings = appStore.state.settings;
+    if (!settings.traceLoggingConsent) return;
+
+    final url = settings.traceServerUrl;
+    final token = settings.traceServerToken;
+    if (url == null || url.isEmpty || token == null || token.isEmpty) return;
+
+    final today = _localDateString(DateTime.now());
+    if (settings.lastTraceUploadDate == today) return; // already handled today
+    if (!await traceLogger.hasUnuploaded()) return;
+    if (!mounted) return;
+
+    _tracePromptBusy = true;
+    try {
+      final accepted = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Upload diagnostic traces?'),
+          content: const Text(
+            'Upload the diagnostic traces collected on this device to your '
+            'research server?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Not now'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Upload'),
+            ),
+          ],
+        ),
+      );
+
+      // Mark the day handled either way, so we prompt at most once per day.
+      appStore.dispatch(SetLastTraceUploadDateAction(today));
+
+      if (accepted == true) {
+        final ok = await traceLogger.uploadAll(url: url, token: token);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(ok ? 'Traces uploaded' : 'Trace upload failed'),
+            duration: const Duration(seconds: 2),
+          ));
+        }
+      }
+    } finally {
+      _tracePromptBusy = false;
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -437,6 +564,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     debugPrint('[lifecycle] App state -> $state');
     if (state == AppLifecycleState.resumed) {
       unawaited(_grassroots?.onAppResumed() ?? Future.value());
+      // First open of a new day → offer to upload not-yet-uploaded traces.
+      unawaited(_maybeDailyTracePrompt());
     }
   }
 

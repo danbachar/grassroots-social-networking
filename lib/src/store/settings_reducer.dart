@@ -102,8 +102,9 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
   if (action is SetTraceLoggingConsentAction) {
     return state.copyWith(
       traceLoggingConsent: action.consent,
-      // Stamp consent time on opt-in; clear it on opt-out.
-      consentTimestamp: action.consent ? action.consentTimestamp : null,
+      // Record the most recent decision time (grant OR decline). A non-null
+      // consentTimestamp means the user has been asked, so we don't re-prompt.
+      consentTimestamp: action.consentTimestamp ?? state.consentTimestamp,
     );
   }
 

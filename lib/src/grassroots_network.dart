@@ -2377,6 +2377,13 @@ class GrassrootsNetwork {
         (count, queue) => count + queue.length,
       );
 
+  /// Sealed packets currently held in the DTN store-carry-forward cache.
+  int get dtnBufferedCount => _messageRouter.dtnBufferedCount;
+
+  /// Messages waiting in the sender-local outbound queue (couldn't be flooded
+  /// yet). Public accessor for trace sampling.
+  int get outboundQueuedCount => queuedMessageCount;
+
   @visibleForTesting
   int get ackPendingMessageCount => _ackPendingMessages.length;
 

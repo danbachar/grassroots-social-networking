@@ -132,6 +132,10 @@ class MessageRouter {
   int _reachablePeerCount() =>
       _peersState.peers.values.where((p) => p.isReachable).length;
 
+  /// Number of sealed packets currently held in the DTN store-carry-forward
+  /// cache (buffer-occupancy trace field).
+  int get dtnBufferedCount => _dtnStore.totalCount;
+
   // ===== Unified Packet Processing =====
 
   /// Process an incoming packet from any transport.

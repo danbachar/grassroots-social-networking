@@ -63,7 +63,12 @@
 	<array>
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
+		<string>location</string>
 	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Grassroots can collect coarse location for opt-in diagnostic traces. This is off by default and only used if you turn on trace logging.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Grassroots can collect coarse location in the background for opt-in diagnostic traces. This is off by default and only used if you turn on trace logging.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

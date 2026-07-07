@@ -51,6 +51,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   late final TextEditingController _anchorAddressController;
   late final TextEditingController _anchorPubkeyController;
+  late final TextEditingController _traceUrlController;
+  late final TextEditingController _traceTokenController;
 
   @override
   void initState() {
@@ -60,6 +62,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     _anchorAddressController = TextEditingController();
     _anchorPubkeyController = TextEditingController();
+    _traceUrlController = TextEditingController(
+      text: widget.store.state.settings.traceServerUrl ?? '',
+    );
+    _traceTokenController = TextEditingController(
+      text: widget.store.state.settings.traceServerToken ?? '',
+    );
     _storeSubscription = widget.store.onChange.listen((state) {
       final settings = state.settings;
       if (_bluetoothEnabled != settings.bluetoothEnabled) {
@@ -79,6 +87,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _storeSubscription?.cancel();
     _anchorAddressController.dispose();
     _anchorPubkeyController.dispose();
+    _traceUrlController.dispose();
+    _traceTokenController.dispose();
     super.dispose();
   }
 
@@ -163,6 +173,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // Anchor Server Section
           _buildAnchorServerSection(),
+
+          const Divider(height: 32),
+
+          // Diagnostic traces (opt-in research telemetry)
+          _buildTraceLoggingSection(),
 
           const Divider(height: 32),
 
@@ -402,6 +417,95 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildTraceLoggingSection() {
+    final settings = widget.store.state.settings;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Row(
+            children: [
+              Icon(Icons.insights, color: Color(0xFFE8A33C)),
+              SizedBox(width: 8),
+              Text(
+                'Diagnostic Traces',
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFFE8A33C),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 16),
+          child: Text(
+            'Opt in to collect anonymous diagnostic traces on this device. '
+            'Once a day the app asks before uploading to your research server.',
+            style: TextStyle(color: Colors.grey, fontSize: 13),
+          ),
+        ),
+        SwitchListTile(
+          value: settings.traceLoggingConsent,
+          activeColor: const Color(0xFFE8A33C),
+          title: const Text('Collect diagnostic traces'),
+          subtitle: Text(settings.traceLoggingConsent ? 'On' : 'Off'),
+          onChanged: (value) => widget.store.dispatch(
+            SetTraceLoggingConsentAction(
+              value,
+              consentTimestamp: DateTime.now().toUtc().toIso8601String(),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: TextField(
+            controller: _traceUrlController,
+            keyboardType: TextInputType.url,
+            decoration: const InputDecoration(
+              labelText: 'Trace server URL',
+              hintText: 'https://host:8443',
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: TextField(
+            controller: _traceTokenController,
+            obscureText: true,
+            decoration: const InputDecoration(labelText: 'Upload token'),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: ElevatedButton(
+              onPressed: () {
+                final url = _traceUrlController.text.trim();
+                final token = _traceTokenController.text.trim();
+                widget.store.dispatch(SetTraceServerAction(
+                  url: url.isEmpty ? null : url,
+                  token: token.isEmpty ? null : token,
+                ));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Trace server saved'),
+                    duration: Duration(seconds: 2),
+                  ),
+                );
+              },
+              child: const Text('Save trace server'),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

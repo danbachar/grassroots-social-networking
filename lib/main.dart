@@ -6,6 +6,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
 import 'src/trace/trace_logger.dart';
+import 'src/trace/location_sampler.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
@@ -417,8 +418,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     });
     // Periodic trace sampler (density + buffer). Foreground-only; cheap no-op
     // when trace logging is disabled.
-    _traceSampleTimer =
-        Timer.periodic(const Duration(seconds: 60), (_) => _sampleTrace());
+    _traceSampleTimer = Timer.periodic(
+        const Duration(seconds: 60), (_) => unawaited(_sampleTrace()));
   }
 
   void _onConnectivityChanged(List<ConnectivityResult> results) {
@@ -452,6 +453,14 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   final Map<String, int> _lastContactEndedAt = {};
   // Periodic sampler for 'density' + 'buffer' records (foreground only).
   Timer? _traceSampleTimer;
+  final LocationSampler _locationSampler = LocationSampler();
+  bool _locationRequested = false;
+
+  Future<void> _ensureLocationPermission() async {
+    if (_locationRequested || !traceLogger.enabled) return;
+    _locationRequested = true;
+    await _locationSampler.ensurePermission();
+  }
 
   /// Log a `contact` record when a peer's consolidated reachability drops:
   /// session duration + inter-contact gap since the previous session.
@@ -477,8 +486,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   /// Periodic coarse sample of node density + buffer occupancy. Foreground-only
   /// (the timer doesn't run while backgrounded); lat/lon land in the geo stage.
-  void _sampleTrace() {
+  Future<void> _sampleTrace() async {
     if (!traceLogger.enabled) return;
+    await _ensureLocationPermission();
+
+    // Coarse location fix (emits 'visit' records via onVisit when leaving a
+    // cell); null when unavailable / permission denied.
+    final geo = await _locationSampler.sample(
+      onVisit: (v) => unawaited(traceLogger.log(v)),
+    );
+    if (!mounted) return;
+
     final now = DateTime.now().millisecondsSinceEpoch;
     final peers = appStore.state.peers.peers.values;
     final reachable = peers.where((p) => p.isReachable).toList();
@@ -490,6 +508,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       'friends': appStore.state.friendships.friends.length,
       if (rssis.isNotEmpty)
         'rssi': (rssis.reduce((a, b) => a + b) / rssis.length).round(),
+      ...?geo,
     }));
     final g = _grassroots;
     if (g != null) {
@@ -549,6 +568,14 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       accepted == true,
       consentTimestamp: DateTime.now().toUtc().toIso8601String(),
     ));
+
+    if (accepted == true) {
+      // Enable + request location now (don't wait for the store listener), so
+      // the OS location prompt follows the consent dialog immediately.
+      traceLogger.setEnabled(true);
+      _locationRequested = true;
+      unawaited(_locationSampler.ensurePermission());
+    }
   }
 
   /// On the first open of a new calendar day, offer to upload traces that

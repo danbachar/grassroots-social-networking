@@ -415,6 +415,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) unawaited(_runTracePrompts());
     });
+    // Periodic trace sampler (density + buffer). Foreground-only; cheap no-op
+    // when trace logging is disabled.
+    _traceSampleTimer =
+        Timer.periodic(const Duration(seconds: 60), (_) => _sampleTrace());
   }
 
   void _onConnectivityChanged(List<ConnectivityResult> results) {
@@ -442,6 +446,62 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   // ===== Trace logging prompts =====
 
   bool _tracePromptBusy = false;
+
+  // Contact-session bookkeeping for trace 'contact' records (pubkeyHex -> ms).
+  final Map<String, int> _contactStartedAt = {};
+  final Map<String, int> _lastContactEndedAt = {};
+  // Periodic sampler for 'density' + 'buffer' records (foreground only).
+  Timer? _traceSampleTimer;
+
+  /// Log a `contact` record when a peer's consolidated reachability drops:
+  /// session duration + inter-contact gap since the previous session.
+  void _logContactRecord(PeerState peer) {
+    if (!traceLogger.enabled) return;
+    final hex = peer.pubkeyHex;
+    final startedAt = _contactStartedAt.remove(hex);
+    if (startedAt == null) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final prevEnd = _lastContactEndedAt[hex];
+    _lastContactEndedAt[hex] = now;
+    unawaited(traceLogger.log({
+      'type': 'contact',
+      't': now,
+      'peer': hex,
+      'startedAt': startedAt,
+      'endedAt': now,
+      'durationMs': now - startedAt,
+      if (prevEnd != null) 'interContactMs': startedAt - prevEnd,
+      if (peer.rssi != null) 'rssi': peer.rssi,
+    }));
+  }
+
+  /// Periodic coarse sample of node density + buffer occupancy. Foreground-only
+  /// (the timer doesn't run while backgrounded); lat/lon land in the geo stage.
+  void _sampleTrace() {
+    if (!traceLogger.enabled) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final peers = appStore.state.peers.peers.values;
+    final reachable = peers.where((p) => p.isReachable).toList();
+    final rssis = reachable.map((p) => p.rssi).whereType<int>().toList();
+    unawaited(traceLogger.log({
+      'type': 'density',
+      't': now,
+      'peersConnectedNow': reachable.length,
+      'friends': appStore.state.friendships.friends.length,
+      if (rssis.isNotEmpty)
+        'rssi': (rssis.reduce((a, b) => a + b) / rssis.length).round(),
+    }));
+    final g = _grassroots;
+    if (g != null) {
+      unawaited(traceLogger.log({
+        'type': 'buffer',
+        't': now,
+        'event': 'sample',
+        'outboundQueued': g.outboundQueuedCount,
+        'dtnBuffered': g.dtnBufferedCount,
+      }));
+    }
+  }
 
   String _localDateString(DateTime dt) =>
       '${dt.year.toString().padLeft(4, '0')}-'
@@ -552,6 +612,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     WidgetsBinding.instance.removeObserver(this);
     _connectivitySubscription?.cancel();
     _refreshTimer?.cancel();
+    _traceSampleTimer?.cancel();
     _grassroots?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
@@ -584,6 +645,15 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           (messageId, senderPubkey, payload, transport) {
         _handleIncomingMessage(messageId, senderPubkey, payload, transport);
       };
+
+      // Trace: a contact session begins/ends (consolidated reachability edges).
+      grassroots.onPeerConnected = (peer) {
+        if (traceLogger.enabled) {
+          _contactStartedAt[peer.pubkeyHex] =
+              DateTime.now().millisecondsSinceEpoch;
+        }
+      };
+      grassroots.onPeerDisconnected = _logContactRecord;
 
       // Friend presence is handled at the transport layer; no app-layer
       // callback needed for UDP initialization.

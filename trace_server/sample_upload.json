@@ -14,51 +14,63 @@
       "messageId": "b1c2d3e4-0000-1111-2222-333344445555",
       "peer": "p0",
       "transport": "ble",
-      "msgClass": "data",
-      "blockType": "text",
       "payloadSize": 184,
-      "controlBytes": 282,
-      "sentAt": 1750233671000,
-      "deliveredAt": 1750233671940,
-      "e2eLatencyMs": 940,
-      "deliverySuccess": true,
       "degreeAtEvent": 3,
       "queueDepthAtSend": 0,
-      "attempts": 1,
-      "dupCount": 0,
-      "hopCount": 1,
-      "deliveryMethod": "direct",
-      "dtnHop": 0,
-      "dtnTimeStoredMs": 0
+      "sentAt": 1750233671000
+    },
+    {
+      "type": "message",
+      "t": 1750233671220,
+      "dir": "recv",
+      "messageId": "a9887766-1111-2222-3333-444455556666",
+      "peer": "p0",
+      "transport": "ble",
+      "payloadSize": 184,
+      "receivedAt": 1750233671220,
+      "relayHops": 2,
+      "deliveryMethod": "relayed",
+      "degreeAtEvent": 4
+    },
+    {
+      "type": "message",
+      "t": 1750233671940,
+      "dir": "delivered",
+      "messageId": "b1c2d3e4-0000-1111-2222-333344445555",
+      "deliveredAt": 1750233671940,
+      "e2eLatencyMs": 940,
+      "deliverySuccess": true
+    },
+    {
+      "type": "message",
+      "t": 1750233672000,
+      "dir": "dup",
+      "messageId": "a9887766-1111-2222-3333-444455556666",
+      "transport": "ble"
     },
     {
       "type": "contact",
+      "t": 1750233780000,
       "peer": "p0",
-      "transport": "ble",
-      "leg": "central",
-      "isIncoming": false,
       "startedAt": 1750233600000,
       "endedAt": 1750233780000,
       "durationMs": 180000,
       "interContactMs": 540000,
-      "bytesSent": 4096,
-      "bytesRecv": 8192,
-      "throughputBps": 553,
       "rssi": -67
     },
     {
       "type": "density",
       "t": 1750233671000,
-      "lat": 32.7766,
-      "lon": 35.0233,
-      "geocell": "sv8wr",
-      "rssi": -67,
-      "relationsEstablished": 12,
       "peersConnectedNow": 3,
-      "advertisements": 47
+      "friends": 12,
+      "rssi": -67,
+      "lat": 32.776,
+      "lon": 35.023,
+      "geocell": "sv8wr"
     },
     {
       "type": "visit",
+      "t": 1750210800000,
       "placeId": "sv8wr",
       "arrivedAt": 1750200000000,
       "leftAt": 1750210800000,
@@ -68,22 +80,25 @@
     },
     {
       "type": "buffer",
-      "t": 1750233670000,
-      "event": "drop",
-      "depth": 64,
-      "capacity": 64,
-      "occupancyRate": 1.0,
-      "dropCountCumulative": 3
+      "t": 1750233671000,
+      "event": "sample",
+      "outboundQueued": 2,
+      "dtnBuffered": 7
     },
     {
       "type": "device",
       "t": 1750233671000,
       "batteryPct": 73,
       "batteryDrainPctPerHr": 4.2,
-      "lifecycleState": "paused",
-      "osThrottled": true,
+      "lifecycleState": "resumed",
+      "networkType": "wifi"
+    },
+    {
+      "type": "device",
+      "t": 1750233700000,
+      "lifecycleState": "resumed",
       "bgDurationMs": 120000,
-      "networkType": "mobile"
+      "osThrottled": true
     }
   ]
 }

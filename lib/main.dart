@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:battery_plus/battery_plus.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'dart:async';
 import 'chat_screen.dart';
@@ -402,6 +403,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     // Subscribe to connectivity changes
     _connectivitySubscription =
         Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
+    unawaited(Connectivity().checkConnectivity().then((r) {
+      if (mounted) _connectivity = r;
+    }));
     _initialize();
     // Refresh UI every second to update "seconds ago" display
     _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -424,6 +428,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   void _onConnectivityChanged(List<ConnectivityResult> results) {
     debugPrint('🌐 Connectivity changed: $results');
+    _connectivity = results;
   }
 
   void _checkPendingChat() {
@@ -455,6 +460,13 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   Timer? _traceSampleTimer;
   final LocationSampler _locationSampler = LocationSampler();
   bool _locationRequested = false;
+
+  // Device-trace state.
+  final Battery _battery = Battery();
+  int? _lastBatteryLevel;
+  int? _lastBatteryAt;
+  List<ConnectivityResult> _connectivity = const [];
+  int? _backgroundedAt; // ms when the app last left the foreground
 
   Future<void> _ensureLocationPermission() async {
     if (_locationRequested || !traceLogger.enabled) return;
@@ -520,6 +532,49 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         'dtnBuffered': g.dtnBufferedCount,
       }));
     }
+
+    unawaited(_sampleDevice());
+  }
+
+  /// Battery + network sample -> 'device' record. Drain rate is derived from
+  /// successive level samples (mAh isn't portable across platforms).
+  Future<void> _sampleDevice() async {
+    if (!traceLogger.enabled) return;
+    int? level;
+    try {
+      level = await _battery.batteryLevel;
+    } catch (_) {}
+    final now = DateTime.now().millisecondsSinceEpoch;
+    double? drainPctPerHr;
+    if (level != null && _lastBatteryLevel != null && _lastBatteryAt != null) {
+      final dLevel = _lastBatteryLevel! - level; // positive = drained
+      final dHours = (now - _lastBatteryAt!) / 3600000.0;
+      if (dHours > 0) drainPctPerHr = dLevel / dHours;
+    }
+    if (level != null) {
+      _lastBatteryLevel = level;
+      _lastBatteryAt = now;
+    }
+    unawaited(traceLogger.log({
+      'type': 'device',
+      't': now,
+      if (level != null) 'batteryPct': level,
+      if (drainPctPerHr != null)
+        'batteryDrainPctPerHr': double.parse(drainPctPerHr.toStringAsFixed(2)),
+      'lifecycleState': 'resumed', // the sampler runs only in the foreground
+      'networkType': _networkTypeString(),
+    }));
+  }
+
+  String _networkTypeString() {
+    if (_connectivity.contains(ConnectivityResult.wifi)) return 'wifi';
+    if (_connectivity.contains(ConnectivityResult.mobile)) return 'mobile';
+    if (_connectivity.contains(ConnectivityResult.ethernet)) return 'ethernet';
+    if (_connectivity.isEmpty ||
+        _connectivity.contains(ConnectivityResult.none)) {
+      return 'none';
+    }
+    return _connectivity.first.name;
   }
 
   String _localDateString(DateTime dt) =>
@@ -650,7 +705,25 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     debugPrint('[lifecycle] App state -> $state');
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _backgroundedAt ??= now;
+    }
     if (state == AppLifecycleState.resumed) {
+      final bgMs = _backgroundedAt != null ? now - _backgroundedAt! : null;
+      _backgroundedAt = null;
+      if (traceLogger.enabled) {
+        unawaited(traceLogger.log({
+          'type': 'device',
+          't': now,
+          'lifecycleState': 'resumed',
+          if (bgMs != null) 'bgDurationMs': bgMs,
+          // OS-throttle proxy: a long background gap suggests the OS suspended
+          // us (true Doze / App-Standby needs native APIs we don't have).
+          if (bgMs != null) 'osThrottled': bgMs > 60000,
+        }));
+      }
       unawaited(_grassroots?.onAppResumed() ?? Future.value());
       // First open of a new day → offer to upload not-yet-uploaded traces.
       unawaited(_maybeDailyTracePrompt());

@@ -60,10 +60,12 @@ Well-connected friends play a special role: they act as **signaling relays** to 
 
 1. Each device registers its current address with its well-connected friends.
 2. When peer A wants to reach peer B, A asks a mutual well-connected friend for B's address.
-3. The friend coordinates a simultaneous hole-punch: it tells both A and B to send packets to each other at the same time, punching holes in both NATs.
-4. Once the holes are open, A and B communicate directly — the well-connected friend is no longer in the path.
+3. The friend sends each side a `PUNCH_INITIATE` carrying the other's observed address. Both peers begin spraying small UDP *punch* packets at that address, opening the outbound NAT mapping on each side.
+4. The connection is then opened by a **deterministic initiator** — the peer with the lexicographically smaller public key dials the UDX stream (by sending a signed ANNOUNCE to the punched address) while the other side keeps punching until the stream lands. This is an initiator/responder split, **not** a clock-synchronized simultaneous send. Once the path is open, A and B communicate directly and the well-connected friend leaves the path.
 
-**Important:** Well-connected friends relay *signaling metadata* (addresses, punch timing), never message content — the **UDP/Internet transport stays direct point-to-point**. Multi-hop content relay happens only on the BLE mesh (see Opportunistic Mesh), and even there relays carry sealed bytes, not readable content.
+> Implementation note: the burst-sending is `HolePunchService` (it only sprays `BCPU`+pubkey packets on a fixed interval/duration — no coordination logic of its own). Initiator selection, `PUNCH_INITIATE` handling, and the connect are owned by the coordinator (`GrassrootsNetwork`) and `SignalingService`. Keep this split in mind: no single class performs "the hole-punch."
+
+**Important:** Well-connected friends relay *signaling metadata* (addresses, punch coordination), never message content — the **UDP/Internet transport stays direct point-to-point**. Multi-hop content relay happens only on the BLE mesh (see Opportunistic Mesh), and even there relays carry sealed bytes, not readable content.
 
 **UDP signaling is friend-only.** This trust boundary is specific to Internet hole-punch coordination and is *separate* from the BLE mesh's open relay. A well-connected device only coordinates hole-punches between peers that are both its friends: it only registers friends' addresses in its address table, only responds to address queries for friends, and only sends PUNCH_INITIATE to friends. (The BLE mesh, by contrast, relays for arbitrary recipients — but it never exposes addresses or content, only forwards sealed packets by recipient ID.)
 

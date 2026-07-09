@@ -47,3 +47,10 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 node_modules/*
+# LaTeX build artifacts (keep .tex source and the built .pdf)
+docs/*.aux
+docs/*.fdb_latexmk
+docs/*.fls
+docs/*.out
+docs/*.synctex.gz
+docs/*.toc

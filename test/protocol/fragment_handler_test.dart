@@ -1,16 +1,16 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
-import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
+import 'package:uuid/uuid.dart';
 
 void main() {
   group('FragmentHandler', () {
     late FragmentHandler handler;
-    late Uint8List recipientPubkey;
+    const uuid = Uuid();
 
     setUp(() {
       handler = FragmentHandler();
-      recipientPubkey = Uint8List.fromList(List.generate(32, (i) => 100 + i));
     });
 
     tearDown(() {
@@ -34,13 +34,18 @@ void main() {
       });
     });
 
-    group('fragment', () {
-      test('throws for payload that does not need fragmentation', () {
+    group('framesFor', () {
+      test('yields a single frame for payload that need not fragment', () {
         final small = Uint8List(100);
-        expect(
-          () => handler.fragment(payload: small),
-          throwsArgumentError,
-        );
+        final id = uuid.v4();
+        final frames = handler.framesFor(payload: small, messageId: id);
+
+        expect(frames.length, equals(1));
+        expect(frames.single.isFragmented, isFalse);
+        expect(frames.single.fragCount, equals(1));
+        expect(frames.single.fragIndex, equals(0));
+        expect(frames.single.messageId, equals(id));
+        expect(frames.single.chunk, equals(small));
       });
 
       test('creates correct number of fragments for large payload', () {
@@ -49,95 +54,120 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final result = handler.fragment(
-          payload: payload,
-          recipientPubkey: recipientPubkey,
-        );
+        final id = uuid.v4();
+        final frames = handler.framesFor(payload: payload, messageId: id);
 
         final expectedFragments =
             (1000 / FragmentHandler.maxFragmentPayload).ceil();
-        expect(result.fragments.length, equals(expectedFragments));
-        expect(result.messageId, isNotEmpty);
+        expect(frames.length, equals(expectedFragments));
+        expect(id, isNotEmpty);
       });
 
-      test('first fragment has fragmentStart type', () {
+      test('first fragment has fragIndex 0', () {
         final payload = Uint8List(1000);
-        final result = handler.fragment(payload: payload);
+        final frames = handler.framesFor(payload: payload, messageId: uuid.v4());
 
-        expect(result.fragments.first.type, equals(PacketType.fragmentStart));
+        expect(frames.first.fragIndex, equals(0));
+        expect(frames.first.isFragmented, isTrue);
       });
 
-      test('last fragment has fragmentEnd type', () {
+      test('last fragment has fragIndex fragCount-1', () {
         final payload = Uint8List(1000);
-        final result = handler.fragment(payload: payload);
+        final frames = handler.framesFor(payload: payload, messageId: uuid.v4());
 
-        expect(result.fragments.last.type, equals(PacketType.fragmentEnd));
+        expect(frames.last.fragIndex, equals(frames.last.fragCount - 1));
+        expect(frames.last.fragIndex, equals(frames.length - 1));
       });
 
-      test('middle fragments have fragmentContinue type', () {
+      test('middle fragments have contiguous fragIndex values', () {
         // Need at least 3 fragments: payload > 2 * maxFragmentPayload
         final payload = Uint8List(FragmentHandler.maxFragmentPayload * 3);
-        final result = handler.fragment(payload: payload);
+        final frames = handler.framesFor(payload: payload, messageId: uuid.v4());
 
-        expect(result.fragments.length, greaterThanOrEqualTo(3));
-        for (var i = 1; i < result.fragments.length - 1; i++) {
-          expect(result.fragments[i].type, equals(PacketType.fragmentContinue));
+        expect(frames.length, greaterThanOrEqualTo(3));
+        for (var i = 1; i < frames.length - 1; i++) {
+          expect(frames[i].fragIndex, equals(i));
+          expect(frames[i].fragCount, equals(frames.length));
+          expect(frames[i].isFragmented, isTrue);
         }
       });
 
-      test('all fragments carry correct recipient pubkey', () {
+      test('all fragments carry the same messageId and contentType', () {
         final payload = Uint8List(1000);
-        final result = handler.fragment(
+        final id = uuid.v4();
+        final frames = handler.framesFor(
           payload: payload,
-          recipientPubkey: recipientPubkey,
+          messageId: id,
+          contentType: ContentType.message,
         );
 
-        for (final fragment in result.fragments) {
-          expect(fragment.recipientPubkey, equals(recipientPubkey));
+        for (final frame in frames) {
+          expect(frame.messageId, equals(id));
+          expect(frame.contentType, equals(ContentType.message));
+          expect(frame.fragCount, equals(frames.length));
         }
       });
 
-      test('fragments are broadcast when no recipient is given', () {
-        // The sender-anonymous envelope carries only the recipient; with none
-        // supplied the fragments default to broadcast (no recipient in header).
+      test('honors the requested contentType', () {
+        // A large signaling payload still fragments, tagged as signaling.
         final payload = Uint8List(1000);
-        final result = handler.fragment(payload: payload);
+        final frames = handler.framesFor(
+          payload: payload,
+          messageId: uuid.v4(),
+          contentType: ContentType.signaling,
+        );
 
-        for (final fragment in result.fragments) {
-          expect(fragment.recipientPubkey, isNull);
-          expect(fragment.isBroadcast, isTrue);
+        for (final frame in frames) {
+          expect(frame.contentType, equals(ContentType.signaling));
         }
       });
 
-      test('generates unique message IDs', () {
+      test('distinct caller message IDs produce distinct frame streams', () {
         final payload = Uint8List(1000);
-        final result1 = handler.fragment(payload: payload);
-        final result2 = handler.fragment(payload: payload);
+        final id1 = uuid.v4();
+        final id2 = uuid.v4();
+        final frames1 = handler.framesFor(payload: payload, messageId: id1);
+        final frames2 = handler.framesFor(payload: payload, messageId: id2);
 
-        expect(result1.messageId, isNot(equals(result2.messageId)));
+        expect(id1, isNot(equals(id2)));
+        expect(frames1.first.messageId, isNot(equals(frames2.first.messageId)));
       });
     });
 
-    group('processFragment - reassembly', () {
+    group('accept - reassembly', () {
+      test('returns chunk immediately for a single-fragment frame', () {
+        final payload = Uint8List(100);
+        for (var i = 0; i < payload.length; i++) {
+          payload[i] = i % 256;
+        }
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
+
+        final result = handler.accept(frames.single);
+        expect(result, isNotNull);
+        expect(result, equals(payload));
+      });
+
       test('reassembles complete message from in-order fragments', () {
         final payload = Uint8List(1000);
         for (var i = 0; i < payload.length; i++) {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         // Feed fragments to a separate handler (simulating the receiver)
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
-        ReassembledMessage? result;
-        for (final fragment in fragmented.fragments) {
-          result = receiver.processFragment(fragment);
+        Uint8List? result;
+        for (final frame in frames) {
+          result = receiver.accept(frame);
         }
 
         expect(result, isNotNull);
-        expect(result!.payload, equals(payload));
+        expect(result, equals(payload));
       });
 
       test('reassembles complete message from out-of-order fragments', () {
@@ -146,27 +176,27 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
-        // Send start first (required to create reassembly state)
-        receiver.processFragment(fragmented.fragments.first);
+        // Send first fragment
+        expect(receiver.accept(frames.first), isNull);
 
-        // Send end before middle fragments
-        final lastFragment = fragmented.fragments.last;
+        final lastFragment = frames.last;
 
-        // Send middle fragments
-        for (var i = 1; i < fragmented.fragments.length - 1; i++) {
-          final result = receiver.processFragment(fragmented.fragments[i]);
+        // Send middle fragments before the last one
+        for (var i = 1; i < frames.length - 1; i++) {
+          final result = receiver.accept(frames[i]);
           expect(result, isNull);
         }
 
-        // Send end last - should trigger reassembly
-        final result = receiver.processFragment(lastFragment);
+        // Send last fragment - should trigger reassembly
+        final result = receiver.accept(lastFragment);
         expect(result, isNotNull);
-        expect(result!.payload, equals(payload));
+        expect(result, equals(payload));
       });
 
       test('handles duplicate fragments idempotently', () {
@@ -175,73 +205,64 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
         // Send first fragment twice
-        receiver.processFragment(fragmented.fragments.first);
-        receiver.processFragment(fragmented.fragments.first);
+        receiver.accept(frames.first);
+        receiver.accept(frames.first);
 
         // Send remaining fragments
-        ReassembledMessage? result;
-        for (var i = 1; i < fragmented.fragments.length; i++) {
-          result = receiver.processFragment(fragmented.fragments[i]);
+        Uint8List? result;
+        for (var i = 1; i < frames.length; i++) {
+          result = receiver.accept(frames[i]);
         }
 
         expect(result, isNotNull);
-        expect(result!.payload, equals(payload));
+        expect(result, equals(payload));
       });
 
       test('returns null for incomplete fragments', () {
         final payload = Uint8List(1000);
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
         // Only send first fragment
-        final result = receiver.processFragment(fragmented.fragments.first);
+        final result = receiver.accept(frames.first);
         expect(result, isNull);
       });
 
-      test('returns null for continue fragment without start', () {
+      test('returns null for a middle fragment received first', () {
         final payload = Uint8List(1500);
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
-        // Skip start, send continue directly
-        expect(fragmented.fragments.length, greaterThan(2));
-        final result = receiver.processFragment(fragmented.fragments[1]);
+        // Send a middle fragment before any other - still incomplete
+        expect(frames.length, greaterThan(2));
+        final result = receiver.accept(frames[1]);
         expect(result, isNull);
       });
 
-      test('returns null for end fragment without start', () {
+      test('returns null for the final fragment received first', () {
         final payload = Uint8List(1000);
-        final fragmented = handler.fragment(payload: payload);
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4());
 
         final receiver = FragmentHandler();
         addTearDown(receiver.dispose);
 
-        // Only send last fragment (no start)
-        final result = receiver.processFragment(fragmented.fragments.last);
+        // Only send last fragment (rest outstanding)
+        final result = receiver.accept(frames.last);
         expect(result, isNull);
-      });
-
-      test('throws for non-fragment packet', () {
-        final packet = GrassrootsPacket(
-          type: PacketType.message,
-          recipientPubkey: recipientPubkey,
-          payload: Uint8List(10),
-        );
-
-        expect(
-          () => handler.processFragment(packet),
-          throwsArgumentError,
-        );
       });
     });
 
@@ -254,20 +275,44 @@ void main() {
             payload[i] = i % 256;
           }
 
-          final fragmented = handler.fragment(payload: payload);
+          final frames =
+              handler.framesFor(payload: payload, messageId: uuid.v4());
 
           final receiver = FragmentHandler();
-          ReassembledMessage? result;
-          for (final fragment in fragmented.fragments) {
-            result = receiver.processFragment(fragment);
+          Uint8List? result;
+          for (final frame in frames) {
+            result = receiver.accept(frame);
           }
           receiver.dispose();
 
           expect(result, isNotNull, reason: 'Failed for size=$size');
-          expect(result!.payload.length, equals(size),
+          expect(result!.length, equals(size),
               reason: 'Length mismatch for size=$size');
-          expect(result.payload, equals(payload),
+          expect(result, equals(payload),
               reason: 'Content mismatch for size=$size');
+        }
+      });
+
+      test('single-fragment payload round-trips via encode/decode', () {
+        // A payload that need not fragment still survives the SecureFrame
+        // wire encoding untouched.
+        for (final size in [1, 100, FragmentHandler.fragmentThreshold]) {
+          final payload = Uint8List(size);
+          for (var i = 0; i < size; i++) {
+            payload[i] = i % 256;
+          }
+          final frame = handler
+              .framesFor(payload: payload, messageId: uuid.v4())
+              .single;
+
+          final decoded = SecureFrame.decode(frame.encode());
+          expect(decoded.isFragmented, isFalse, reason: 'size=$size');
+
+          final receiver = FragmentHandler();
+          final result = receiver.accept(decoded);
+          receiver.dispose();
+
+          expect(result, equals(payload), reason: 'size=$size');
         }
       });
 
@@ -286,36 +331,39 @@ void main() {
           payload2[i] = (i * 7) % 256;
         }
 
-        final fragmented1 = handler.fragment(payload: payload1);
-        final fragmented2 = handler.fragment(payload: payload2);
+        final frames1 =
+            handler.framesFor(payload: payload1, messageId: uuid.v4());
+        final frames2 =
+            handler.framesFor(payload: payload2, messageId: uuid.v4());
 
-        // Interleave fragments: start1, start2, continue1, continue2, end1, end2
-        receiver.processFragment(fragmented1.fragments[0]);
-        receiver.processFragment(fragmented2.fragments[0]);
+        // Interleave fragments across the two logical messages.
+        receiver.accept(frames1[0]);
+        receiver.accept(frames2[0]);
 
         // Send middle fragments of both
-        for (var i = 1; i < fragmented1.fragments.length - 1; i++) {
-          receiver.processFragment(fragmented1.fragments[i]);
+        for (var i = 1; i < frames1.length - 1; i++) {
+          receiver.accept(frames1[i]);
         }
-        for (var i = 1; i < fragmented2.fragments.length - 1; i++) {
-          receiver.processFragment(fragmented2.fragments[i]);
+        for (var i = 1; i < frames2.length - 1; i++) {
+          receiver.accept(frames2[i]);
         }
 
-        // End fragments
-        final result1 = receiver.processFragment(fragmented1.fragments.last);
-        final result2 = receiver.processFragment(fragmented2.fragments.last);
+        // Final fragments
+        final result1 = receiver.accept(frames1.last);
+        final result2 = receiver.accept(frames2.last);
 
-        expect(result1?.payload, equals(payload1));
-        expect(result2?.payload, equals(payload2));
+        expect(result1, equals(payload1));
+        expect(result2, equals(payload2));
       });
     });
 
     group('dispose', () {
       test('cleans up without errors', () {
         final h = FragmentHandler();
-        // Fragment something to populate internal state
+        // Populate internal reassembly state with an outstanding fragment.
         final payload = Uint8List(1000);
-        h.fragment(payload: payload);
+        final frames = h.framesFor(payload: payload, messageId: uuid.v4());
+        h.accept(frames.first);
         expect(() => h.dispose(), returnsNormally);
       });
 

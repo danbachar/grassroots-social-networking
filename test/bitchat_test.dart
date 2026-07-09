@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:grassroots_networking/src/mesh/bloom_filter.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 
 void main() {
@@ -16,7 +17,7 @@ void main() {
       // Sender-anonymous envelope: no sender pubkey, no whole-packet signature.
       // A broadcast packet (no recipient) round-trips through the 58-byte header.
       final packet = GrassrootsPacket(
-        type: PacketType.message,
+        type: PacketType.secure,
         ttl: 5,
         payload: testPayload,
       );
@@ -38,7 +39,7 @@ void main() {
           Uint8List.fromList(List.generate(32, (i) => 32 + i));
 
       final packet = GrassrootsPacket(
-        type: PacketType.message,
+        type: PacketType.secure,
         ttl: 7,
         recipientPubkey: recipientPubkey,
         payload: testPayload,
@@ -53,7 +54,7 @@ void main() {
 
     test('decrements TTL correctly', () {
       final packet = GrassrootsPacket(
-        type: PacketType.message,
+        type: PacketType.secure,
         ttl: 5,
         payload: testPayload,
       );
@@ -65,7 +66,7 @@ void main() {
 
     test('throws on TTL below zero', () {
       final packet = GrassrootsPacket(
-        type: PacketType.message,
+        type: PacketType.secure,
         ttl: 0,
         payload: testPayload,
       );
@@ -76,7 +77,7 @@ void main() {
     test('throws on invalid recipient pubkey length', () {
       expect(
         () => GrassrootsPacket(
-          type: PacketType.message,
+          type: PacketType.secure,
           recipientPubkey: Uint8List(16), // Wrong length
           payload: testPayload,
         ),
@@ -88,7 +89,7 @@ void main() {
       // No sender pubkey and no whole-packet signature on the wire: an
       // empty-payload packet serializes to exactly the header size.
       final packet = GrassrootsPacket(
-        type: PacketType.message,
+        type: PacketType.secure,
         payload: Uint8List(0),
       );
       expect(GrassrootsPacket.headerSize, equals(58));
@@ -101,7 +102,7 @@ void main() {
       final recipientPubkey =
           Uint8List.fromList(List.generate(32, (i) => 100 + i));
       final original = GrassrootsPacket(
-        type: PacketType.secureMessage,
+        type: PacketType.secure,
         ttl: 7,
         recipientPubkey: recipientPubkey,
         payload: testPayload,
@@ -200,37 +201,69 @@ void main() {
     });
 
     test('fragments and reassembles correctly', () {
+      const messageId = '00000000-0000-4000-8000-000000000001';
       final payload = Uint8List.fromList(List.generate(1500, (i) => i % 256));
 
-      final fragmented = handler.fragment(
+      final frames = handler.framesFor(
         payload: payload,
+        messageId: messageId,
       );
 
-      expect(fragmented.fragments.length, greaterThan(1));
-      expect(fragmented.fragments.first.type, equals(PacketType.fragmentStart));
-      expect(fragmented.fragments.last.type, equals(PacketType.fragmentEnd));
-
-      // Process all fragments
-      ReassembledMessage? result;
-      for (final fragment in fragmented.fragments) {
-        result = handler.processFragment(fragment);
+      // Fragmentation is expressed inside each SecureFrame (fragCount > 1),
+      // chunked at maxFragmentPayload; no distinct start/end packet types.
+      final expectedCount =
+          (payload.length / FragmentHandler.maxFragmentPayload).ceil();
+      expect(frames.length, equals(expectedCount));
+      expect(frames.length, greaterThan(1));
+      expect(frames.first.fragIndex, equals(0));
+      expect(frames.last.fragIndex, equals(expectedCount - 1));
+      for (final frame in frames) {
+        expect(frame.contentType, equals(ContentType.message));
+        expect(frame.messageId, equals(messageId));
+        expect(frame.fragCount, equals(expectedCount));
+        expect(frame.isFragmented, isTrue);
       }
 
-      // Last fragment should trigger reassembly
+      // Feed every fragment; only the final one completes reassembly.
+      Uint8List? result;
+      for (final frame in frames) {
+        result = handler.accept(frame);
+      }
+
       expect(result, isNotNull);
-      expect(result!.payload, equals(payload));
+      expect(result, equals(payload));
     });
 
     test('returns null for incomplete fragments', () {
+      const messageId = '00000000-0000-4000-8000-000000000002';
       final payload = Uint8List.fromList(List.generate(1500, (i) => i % 256));
 
-      final fragmented = handler.fragment(
+      final frames = handler.framesFor(
         payload: payload,
+        messageId: messageId,
       );
 
-      // Process only first fragment
-      final result = handler.processFragment(fragmented.fragments.first);
+      // Accept only the first fragment — reassembly stays outstanding.
+      final result = handler.accept(frames.first);
       expect(result, isNull);
+    });
+
+    test('single frame for small payloads reassembles immediately', () {
+      const messageId = '00000000-0000-4000-8000-000000000003';
+      final payload = Uint8List.fromList(List.generate(200, (i) => i % 256));
+
+      final frames = handler.framesFor(
+        payload: payload,
+        messageId: messageId,
+      );
+
+      // A payload at or below fragmentThreshold is a single, unfragmented frame.
+      expect(frames.length, equals(1));
+      expect(frames.first.isFragmented, isFalse);
+      expect(frames.first.fragCount, equals(1));
+
+      // accept() returns the full payload immediately for a single frame.
+      expect(handler.accept(frames.first), equals(payload));
     });
   });
 

@@ -65,25 +65,82 @@ void main() {
       });
 
       test(
-          'UUID starts with Grassroots prefix and ends with SHA-256 pubkey suffix',
+          'UUID keeps the fixed Grassroots prefix and a rotating slot suffix',
           () {
-        final uuid = identity.bleServiceUuid;
+        final slot = GrassrootsIdentity.currentBleSlot();
+        final uuid = GrassrootsIdentity.deriveServiceUuidForSlot(
+            identity.publicKey, slot);
         final hexOnly = uuid.replaceAll('-', '');
 
         expect(hexOnly.substring(0, 16),
             equals(GrassrootsIdentity.grassrootsUuidPrefix));
 
-        final digest = const DartSha256().hashSync(identity.publicKey).bytes;
-        final expectedSuffix = digest
+        final input = <int>[
+          ...GrassrootsIdentity.bleSuffixLabel.codeUnits,
+          ...identity.publicKey,
+          for (var i = 7; i >= 0; i--) (slot >> (8 * i)) & 0xff,
+        ];
+        final expectedSuffix = const DartSha256()
+            .hashSync(input)
+            .bytes
             .sublist(0, 8)
             .map((b) => b.toRadixString(16).padLeft(2, '0'))
             .join();
         expect(hexOnly.substring(16), equals(expectedSuffix));
       });
 
-      test('deriveServiceUuid static method matches bleServiceUuid getter', () {
-        expect(GrassrootsIdentity.deriveServiceUuid(identity.publicKey),
-            equals(identity.bleServiceUuid));
+      test('bleServiceUuid getter matches the current-slot derivation', () {
+        final slot = GrassrootsIdentity.currentBleSlot();
+        // Allow for a slot tick between the two reads (both must land on the
+        // same slot; retried implicitly by using an explicit slot below).
+        expect(
+          identity.bleServiceUuid,
+          anyOf(
+            equals(GrassrootsIdentity.deriveServiceUuidForSlot(
+                identity.publicKey, slot)),
+            equals(GrassrootsIdentity.deriveServiceUuidForSlot(
+                identity.publicKey, slot + 1)),
+          ),
+        );
+      });
+
+      test('service UUID rotates every 15-minute slot; candidates cover '
+          'prev/current/next', () {
+        final t0 = DateTime.fromMillisecondsSinceEpoch(0);
+        final slot0 = GrassrootsIdentity.currentBleSlot(now: t0);
+        final uuid0 = GrassrootsIdentity.deriveServiceUuidForSlot(
+            identity.publicKey, slot0);
+
+        // Same slot within the 15-minute window => same UUID.
+        expect(
+            GrassrootsIdentity.currentBleSlot(
+                now: t0.add(const Duration(minutes: 14))),
+            equals(slot0));
+
+        // Crossing the boundary advances the slot and rotates the UUID.
+        final t1 = t0.add(const Duration(minutes: 15));
+        final slot1 = GrassrootsIdentity.currentBleSlot(now: t1);
+        expect(slot1, equals(slot0 + 1));
+        final uuid1 = GrassrootsIdentity.deriveServiceUuidForSlot(
+            identity.publicKey, slot1);
+        expect(uuid1, isNot(equals(uuid0)));
+
+        // The fixed prefix survives the rotation.
+        expect(uuid1.replaceAll('-', '').substring(0, 16),
+            equals(GrassrootsIdentity.grassrootsUuidPrefix));
+
+        // Recognition set covers previous, current, and next slot.
+        final candidates = GrassrootsIdentity.candidateServiceUuids(
+            identity.publicKey,
+            now: t1);
+        expect(candidates, contains(uuid0.toLowerCase())); // previous
+        expect(candidates, contains(uuid1.toLowerCase())); // current
+        expect(candidates.length, equals(3));
+        expect(
+            GrassrootsIdentity.serviceUuidMatchesPubkey(
+                uuid0, identity.publicKey,
+                now: t1),
+            isTrue);
       });
 
       test('different identities produce different UUIDs', () async {

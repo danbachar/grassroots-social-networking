@@ -4,13 +4,37 @@ import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
+import 'package:uuid/uuid.dart';
 
 import '../helpers/sodium_test_bootstrap.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  /// Builds an UNSEALED [PacketType.secure] content packet whose payload is a
+  /// [SecureFrame] carrying [content]. This is what an application hands the
+  /// session manager to seal (was: a clear `PacketType.message` packet).
+  GrassrootsPacket securePacket({
+    required Uint8List recipient,
+    required Uint8List content,
+    int ttl = 0,
+    ContentType contentType = ContentType.message,
+  }) {
+    final frame = SecureFrame(
+      contentType: contentType,
+      messageId: const Uuid().v4(),
+      chunk: content,
+    );
+    return GrassrootsPacket(
+      type: PacketType.secure,
+      ttl: ttl,
+      recipientPubkey: recipient,
+      payload: frame.encode(),
+    );
+  }
 
   late SodiumSumo sodium;
   setUpAll(() async {
@@ -84,25 +108,30 @@ void main() {
     expect(aliceSessions.hasSession(bob.publicKey), isTrue);
     expect(bobSessions.hasSession(alice.publicKey), isTrue);
 
-    final clear = GrassrootsPacket(
-      type: PacketType.message,
-      recipientPubkey: bob.publicKey,
-      payload: Uint8List.fromList([1, 2, 3, 4]),
+    final clear = securePacket(
+      recipient: bob.publicKey,
+      content: Uint8List.fromList([1, 2, 3, 4]),
     );
 
     final sealed = await aliceSessions.encryptPacket(
       clear,
       remotePubkey: bob.publicKey,
     );
-    expect(sealed.type, PacketType.secureMessage);
+    // The wire type stays `secure`; only the payload becomes ciphertext.
+    expect(sealed.type, PacketType.secure);
     expect(sealed.payload, isNot(equals(clear.payload)));
 
     // Bob has no sender field on the wire — he demultiplexes by trial-decrypt.
     final decrypted = await bobSessions.trialDecrypt(sealed);
     expect(decrypted, isNotNull);
     final (clearPacket, senderPubkey) = decrypted!;
-    expect(clearPacket.type, PacketType.message);
+    // The cleartext packet is still typed `secure`; the inner content type and
+    // body live in its decoded SecureFrame.
+    expect(clearPacket.type, PacketType.secure);
     expect(clearPacket.payload, clear.payload);
+    final frame = SecureFrame.decode(clearPacket.payload);
+    expect(frame.contentType, ContentType.message);
+    expect(frame.chunk, Uint8List.fromList([1, 2, 3, 4]));
     // The recovered sender is Alice, recovered from the session, not the header.
     expect(senderPubkey, equals(alice.publicKey));
   });
@@ -120,11 +149,10 @@ void main() {
       respPub: bob.publicKey,
     );
 
-    final clear = GrassrootsPacket(
-      type: PacketType.message,
+    final clear = securePacket(
+      recipient: bob.publicKey,
+      content: Uint8List.fromList([9, 8, 7, 6, 5]),
       ttl: 7,
-      recipientPubkey: bob.publicKey,
-      payload: Uint8List.fromList([9, 8, 7, 6, 5]),
     );
     final sealed = await aliceSessions.encryptPacket(
       clear,
@@ -139,6 +167,9 @@ void main() {
     final decrypted = await bobSessions.trialDecrypt(relayed);
     expect(decrypted, isNotNull);
     expect(decrypted!.$1.payload, clear.payload);
+    final frame = SecureFrame.decode(decrypted.$1.payload);
+    expect(frame.contentType, ContentType.message);
+    expect(frame.chunk, Uint8List.fromList([9, 8, 7, 6, 5]));
     expect(decrypted.$2, equals(alice.publicKey));
   });
 
@@ -157,10 +188,9 @@ void main() {
     );
 
     final sealed = await aliceSessions.encryptPacket(
-      GrassrootsPacket(
-        type: PacketType.message,
-        recipientPubkey: bob.publicKey,
-        payload: Uint8List.fromList([42]),
+      securePacket(
+        recipient: bob.publicKey,
+        content: Uint8List.fromList([42]),
       ),
       remotePubkey: bob.publicKey,
     );
@@ -190,10 +220,9 @@ void main() {
     expect(bobSessions.hasSession(alice.publicKey), isTrue);
 
     final sealed = await aliceSessions.encryptPacket(
-      GrassrootsPacket(
-        type: PacketType.message,
-        recipientPubkey: bob.publicKey,
-        payload: Uint8List.fromList([1, 1, 2, 3, 5]),
+      securePacket(
+        recipient: bob.publicKey,
+        content: Uint8List.fromList([1, 1, 2, 3, 5]),
       ),
       remotePubkey: bob.publicKey,
     );

@@ -4,12 +4,14 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
+import 'package:uuid/uuid.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
@@ -35,9 +37,10 @@ void main() {
 
     // Noise session managers for the two endpoints. The mesh envelope is
     // sender-anonymous, so a message addressed to us must arrive as a
-    // session-encrypted (`secureMessage`) packet and be opened by
-    // trial-decrypt. We wire [router.trialDecrypt] to our own manager and seal
-    // packets with the other peer's manager after a real handshake.
+    // session-encrypted `PacketType.secure` packet (whose plaintext is a
+    // SecureFrame) and be opened by trial-decrypt. We wire [router.trialDecrypt]
+    // to our own manager and seal packets with the other peer's manager after a
+    // real handshake.
     late NoiseSessionManager sessions;
     late NoiseSessionManager otherSessions;
 
@@ -132,19 +135,31 @@ void main() {
       expect(otherSessions.hasSession(identity.publicKey), isTrue);
     }
 
-    /// Seal a clear packet from the other peer to us. Requires a prior
+    /// Seal a content frame from the other peer to us. Requires a prior
     /// [establishSession].
+    ///
+    /// Content type + fragmentation now live *inside* the sealed payload as a
+    /// [SecureFrame]; the wire packet is always [PacketType.secure]. [chunk] is
+    /// the frame's chunk bytes (e.g. the message body, or the UTF-8 acked
+    /// messageId for ack/readReceipt). [frameMessageId] is the logical id echoed
+    /// in ACKs and must be a valid UUID.
     Future<GrassrootsPacket> sealedFromOther({
-      required PacketType type,
-      required Uint8List payload,
+      ContentType contentType = ContentType.message,
+      required Uint8List chunk,
+      String? frameMessageId,
       String? packetId,
       Uint8List? recipientPubkey,
     }) {
+      final frame = SecureFrame(
+        contentType: contentType,
+        messageId: frameMessageId ?? const Uuid().v4(),
+        chunk: chunk,
+      );
       final clear = GrassrootsPacket(
-        type: type,
+        type: PacketType.secure,
         packetId: packetId,
         recipientPubkey: recipientPubkey ?? identity.publicKey,
-        payload: payload,
+        payload: frame.encode(),
       );
       return otherSessions.encryptPacket(clear, remotePubkey: identity.publicKey);
     }
@@ -434,10 +449,12 @@ void main() {
           receivedTransport = transport;
         };
 
+        const messageId = '00000000-0000-4000-8000-000000000001';
         final msgPayload = Uint8List.fromList([1, 2, 3, 4, 5]);
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: msgPayload,
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: msgPayload,
         );
 
         await router.processPacket(
@@ -446,10 +463,52 @@ void main() {
           rssi: -60,
         );
 
-        expect(receivedId, isNotNull);
+        expect(receivedId, equals(messageId));
         expect(receivedPubkey, equals(otherPubkey));
         expect(receivedPayload, equals(msgPayload));
         expect(receivedTransport, equals(PeerTransport.bleDirect));
+      });
+
+      test(
+          'delivers a single-packet message whose outer packetId EQUALS its '
+          'frame messageId (production wire shape)', () async {
+        // Regression: ProtocolHandler.createMessagePacket sets the outer
+        // packetId equal to the frame's messageId for a non-fragmented message.
+        // The router deduplicates wire packets (packetId) and message delivery
+        // (messageId) in SEPARATE bloom filters; if they shared one, the
+        // relay/loop insert of packetId would poison the delivery check and the
+        // message would be dropped as a "duplicate" on first receipt — ACKed
+        // but never delivered. This asserts the first receipt is delivered.
+        await establishSession();
+
+        int deliveries = 0;
+        String? receivedId;
+        router.onMessageReceived = (id, _, __, ___) {
+          deliveries++;
+          receivedId = id;
+        };
+        final ackRequests = <String>[];
+        router.onAckRequested =
+            (_, messageId, __) => ackRequests.add(messageId);
+
+        const messageId = '00000000-0000-4000-8000-0000000000aa';
+        final sealed = await sealedFromOther(
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          packetId: messageId, // production: packetId == messageId
+          chunk: Uint8List.fromList([9, 9, 9]),
+        );
+
+        await router.processPacket(
+          sealed,
+          transport: PeerTransport.bleDirect,
+          rssi: -60,
+        );
+
+        expect(deliveries, equals(1),
+            reason: 'first receipt must be delivered, not treated as duplicate');
+        expect(receivedId, equals(messageId));
+        expect(ackRequests, equals([messageId]));
       });
 
       test('a relay-mutated ttl still trial-decrypts (AAD excludes ttl)',
@@ -463,8 +522,8 @@ void main() {
 
         final msgPayload = Uint8List.fromList([7, 7, 7]);
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: msgPayload,
+          contentType: ContentType.message,
+          chunk: msgPayload,
         );
 
         // A relay on the path decremented the TTL before it reached us. AAD
@@ -487,8 +546,8 @@ void main() {
         };
 
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: Uint8List.fromList([9, 9, 9]),
+          contentType: ContentType.message,
+          chunk: Uint8List.fromList([9, 9, 9]),
         );
 
         await router.processPacket(
@@ -514,8 +573,8 @@ void main() {
         router.onMessageReceived = (_, __, ___, ____) {};
 
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: Uint8List.fromList([42]),
+          contentType: ContentType.message,
+          chunk: Uint8List.fromList([42]),
         );
 
         await router.processPacket(
@@ -566,10 +625,15 @@ void main() {
 
         // Stranger seals a message to us — but we share no session with the
         // stranger, so our trial-decrypt cannot open it.
+        final frame = SecureFrame(
+          contentType: ContentType.message,
+          messageId: const Uuid().v4(),
+          chunk: Uint8List.fromList([1, 2, 3]),
+        );
         final clear = GrassrootsPacket(
-          type: PacketType.message,
+          type: PacketType.secure,
           recipientPubkey: identity.publicKey,
-          payload: Uint8List.fromList([1, 2, 3]),
+          payload: frame.encode(),
         );
         final sealed = await strangerSessions.encryptPacket(
           clear,
@@ -586,16 +650,25 @@ void main() {
         strangerSessions.dispose();
       });
 
-      test('drops cleartext (unsealed) message addressed to us', () async {
-        // A `message` (not `secureMessage`) addressed to us is unauthenticated
-        // cleartext — the router refuses to deliver it.
+      test('drops unsealed (unauthenticated) secure packet addressed to us',
+          () async {
+        // A `secure` packet whose payload is a plaintext SecureFrame that was
+        // never sealed under a Noise session is unauthenticated — trial-decrypt
+        // finds no session that opens it, so the router refuses to deliver it.
+        await establishSession();
+
         bool messageReceived = false;
         router.onMessageReceived = (_, __, ___, ____) => messageReceived = true;
 
+        final frame = SecureFrame(
+          contentType: ContentType.message,
+          messageId: const Uuid().v4(),
+          chunk: Uint8List.fromList([42]),
+        );
         final p = GrassrootsPacket(
-          type: PacketType.message,
+          type: PacketType.secure,
           recipientPubkey: identity.publicKey,
-          payload: Uint8List.fromList([42]),
+          payload: frame.encode(),
         );
 
         await router.processPacket(
@@ -627,7 +700,7 @@ void main() {
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
-          type: PacketType.secureMessage,
+          type: PacketType.secure,
           ttl: 5,
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([9, 9, 9]),
@@ -654,7 +727,7 @@ void main() {
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
-          type: PacketType.secureMessage,
+          type: PacketType.secure,
           ttl: 1,
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([1]),
@@ -677,7 +750,7 @@ void main() {
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
-          type: PacketType.secureMessage,
+          type: PacketType.secure,
           ttl: 5,
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([2]),
@@ -699,7 +772,7 @@ void main() {
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 7));
         final p = GrassrootsPacket(
-          type: PacketType.secureMessage,
+          type: PacketType.secure,
           ttl: 5,
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([3]),
@@ -730,9 +803,9 @@ void main() {
         router.onMessageReceived = (_, __, ___, ____) => messageCount++;
 
         final sealed = await sealedFromOther(
-          type: PacketType.message,
+          contentType: ContentType.message,
           packetId: '22222222-2222-2222-2222-222222222222',
-          payload: Uint8List.fromList([1]),
+          chunk: Uint8List.fromList([1]),
         );
 
         await router.processPacket(
@@ -759,7 +832,7 @@ void main() {
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 3));
         final p = GrassrootsPacket(
-          type: PacketType.secureMessage,
+          type: PacketType.secure,
           ttl: 5,
           packetId: '33333333-3333-3333-3333-333333333333',
           recipientPubkey: thirdParty,
@@ -797,24 +870,25 @@ void main() {
             (senderPubkey, messageId, _) => ackRequests.add(messageId);
 
         const messageId = '44444444-4444-4444-4444-444444444444';
-        // The recipient dedups deliveries on the message id. A relay re-floods
-        // the *same sealed bytes*, but the session rejects replayed nonces, so
-        // we model duplicate arrival by sealing the same clear payload under the
-        // same packetId twice (two distinct nonces, one logical message).
+        // The recipient dedups deliveries on the logical message id (the frame's
+        // messageId). Three *distinct wire copies* (distinct outer packetIds)
+        // carry the same logical frame.messageId — modelling one message
+        // re-flooded via three relay paths. Each is a fresh AEAD seal (distinct
+        // nonce) so all three trial-decrypt, but only the first is delivered.
         final first = await sealedFromOther(
-          type: PacketType.message,
-          packetId: messageId,
-          payload: Uint8List.fromList([1]),
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: Uint8List.fromList([1]),
         );
         final second = await sealedFromOther(
-          type: PacketType.message,
-          packetId: messageId,
-          payload: Uint8List.fromList([1]),
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: Uint8List.fromList([1]),
         );
         final third = await sealedFromOther(
-          type: PacketType.message,
-          packetId: messageId,
-          payload: Uint8List.fromList([1]),
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: Uint8List.fromList([1]),
         );
 
         await router.processPacket(first,
@@ -854,16 +928,26 @@ void main() {
           payload[i] = i % 256;
         }
 
-        final fragmented = fragmentHandler.fragment(
+        const messageId = '55555555-5555-4555-8555-555555555555';
+        // A >320-byte payload fragments into several SecureFrames sharing one
+        // logical messageId. Each is sealed into its own secure packet and
+        // trial-decrypted on our side before the router reassembles by
+        // frame.messageId.
+        final frames = fragmentHandler.framesFor(
           payload: payload,
-          recipientPubkey: identity.publicKey,
+          messageId: messageId,
         );
+        expect(frames.length, greaterThan(1),
+            reason: 'A 1000-byte payload must span multiple fragments.');
 
-        for (final fragment in fragmented.fragments) {
-          // Each fragment is session-sealed by the sender, then trial-decrypted
-          // on our side back to its clear fragment type before reassembly.
+        for (final frame in frames) {
+          final clear = GrassrootsPacket(
+            type: PacketType.secure,
+            recipientPubkey: identity.publicKey,
+            payload: frame.encode(),
+          );
           final sealed = await otherSessions.encryptPacket(
-            fragment,
+            clear,
             remotePubkey: identity.publicKey,
           );
           await router.processPacket(
@@ -880,10 +964,10 @@ void main() {
     });
 
     // =========================================================================
-    // Packet Processing - ACK/NACK
+    // Packet Processing - ACK / non-message content demux
     // =========================================================================
 
-    group('processPacket - ACK/NACK', () {
+    group('processPacket - ACK', () {
       test('routes ACK to onAckReceived callback', () async {
         await establishSession();
 
@@ -892,8 +976,8 @@ void main() {
 
         const messageId = 'acked-message-id';
         final sealed = await sealedFromOther(
-          type: PacketType.ack,
-          payload: Uint8List.fromList(utf8.encode(messageId)),
+          contentType: ContentType.ack,
+          chunk: Uint8List.fromList(utf8.encode(messageId)),
         );
 
         await router.processPacket(
@@ -905,17 +989,29 @@ void main() {
         expect(receivedMessageId, equals(messageId));
       });
 
-      test('NACK addressed to us is silently ignored', () async {
+      // NACK was removed from ContentType; the surviving non-message/non-ack/
+      // non-readReceipt content type is `signaling`. A signaling frame must be
+      // demuxed to onSignalingReceived only — it must NOT spuriously fire the
+      // message / ack / read-receipt handlers.
+      test('signaling content does not fire message/ack/readReceipt handlers',
+          () async {
         await establishSession();
 
-        bool anyCalled = false;
-        router.onMessageReceived = (_, __, ___, ____) => anyCalled = true;
-        router.onAckReceived = (_) => anyCalled = true;
-        router.onReadReceiptReceived = (_) => anyCalled = true;
+        bool wrongHandlerCalled = false;
+        router.onMessageReceived = (_, __, ___, ____) =>
+            wrongHandlerCalled = true;
+        router.onAckReceived = (_) => wrongHandlerCalled = true;
+        router.onReadReceiptReceived = (_) => wrongHandlerCalled = true;
 
+        Uint8List? signalingChunk;
+        router.onSignalingReceived =
+            (_, chunk, {String? observedIp, int? observedPort}) =>
+                signalingChunk = chunk;
+
+        final sig = Uint8List.fromList([0xAA, 0xBB, 0xCC]);
         final sealed = await sealedFromOther(
-          type: PacketType.nack,
-          payload: Uint8List(0),
+          contentType: ContentType.signaling,
+          chunk: sig,
         );
 
         await router.processPacket(
@@ -924,7 +1020,8 @@ void main() {
           rssi: -60,
         );
 
-        expect(anyCalled, isFalse);
+        expect(wrongHandlerCalled, isFalse);
+        expect(signalingChunk, equals(sig));
       });
     });
 
@@ -941,8 +1038,8 @@ void main() {
 
         const messageId = 'msg-to-read';
         final sealed = await sealedFromOther(
-          type: PacketType.readReceipt,
-          payload: Uint8List.fromList(utf8.encode(messageId)),
+          contentType: ContentType.readReceipt,
+          chunk: Uint8List.fromList(utf8.encode(messageId)),
         );
 
         await router.processPacket(
@@ -961,8 +1058,8 @@ void main() {
         router.onReadReceiptReceived = (id) => receivedMessageId = id;
 
         final sealed = await sealedFromOther(
-          type: PacketType.readReceipt,
-          payload: Uint8List(0),
+          contentType: ContentType.readReceipt,
+          chunk: Uint8List(0),
         );
 
         await router.processPacket(
@@ -1081,10 +1178,12 @@ void main() {
           receivedPayload = payload;
         };
 
+        const messageId = '66666666-6666-4666-8666-666666666666';
         final msgPayload = Uint8List.fromList([10, 20, 30]);
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: msgPayload,
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: msgPayload,
         );
 
         await router.processPacket(
@@ -1093,7 +1192,7 @@ void main() {
           udpPeerId: 'peer-789',
         );
 
-        expect(receivedId, isNotNull);
+        expect(receivedId, equals(messageId));
         expect(receivedPubkey, equals(otherPubkey));
         expect(receivedPayload, equals(msgPayload));
       });
@@ -1115,8 +1214,8 @@ void main() {
         };
 
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: Uint8List.fromList([9, 8, 7]),
+          contentType: ContentType.message,
+          chunk: Uint8List.fromList([9, 8, 7]),
         );
 
         await router.processPacket(
@@ -1148,9 +1247,11 @@ void main() {
           ackTransport = transport;
         };
 
+        const messageId = '77777777-7777-4777-8777-777777777777';
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: Uint8List.fromList([1, 2, 3]),
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: Uint8List.fromList([1, 2, 3]),
         );
 
         await router.processPacket(
@@ -1161,9 +1262,10 @@ void main() {
 
         // The ACK is addressed back to the recovered sender (recipient-anonymous
         // mesh: there is no inbound path to reply on), not to a transport peer
-        // id.
+        // id. The acked id is the frame's logical messageId, recovered on
+        // decrypt.
         expect(ackSender, equals(otherPubkey));
-        expect(ackMessageId, equals(sealed.packetId));
+        expect(ackMessageId, equals(messageId));
         expect(ackTransport, equals(PeerTransport.udp));
       });
 
@@ -1180,9 +1282,11 @@ void main() {
           ackTransport = transport;
         };
 
+        const messageId = '88888888-8888-4888-8888-888888888888';
         final sealed = await sealedFromOther(
-          type: PacketType.message,
-          payload: Uint8List.fromList([1, 2, 3]),
+          contentType: ContentType.message,
+          frameMessageId: messageId,
+          chunk: Uint8List.fromList([1, 2, 3]),
         );
 
         await router.processPacket(
@@ -1192,7 +1296,7 @@ void main() {
         );
 
         expect(ackSender, equals(otherPubkey));
-        expect(ackMessageId, equals(sealed.packetId));
+        expect(ackMessageId, equals(messageId));
         expect(ackTransport, equals(PeerTransport.bleDirect));
       });
     });
@@ -1210,8 +1314,8 @@ void main() {
 
         const messageId = 'ack-msg1';
         final sealed = await sealedFromOther(
-          type: PacketType.ack,
-          payload: Uint8List.fromList(utf8.encode(messageId)),
+          contentType: ContentType.ack,
+          chunk: Uint8List.fromList(utf8.encode(messageId)),
         );
 
         await router.processPacket(
@@ -1237,8 +1341,8 @@ void main() {
 
         const messageId = 'rr-msg-1';
         final sealed = await sealedFromOther(
-          type: PacketType.readReceipt,
-          payload: Uint8List.fromList(utf8.encode(messageId)),
+          contentType: ContentType.readReceipt,
+          chunk: Uint8List.fromList(utf8.encode(messageId)),
         );
 
         await router.processPacket(
@@ -1320,7 +1424,7 @@ void main() {
         // length invariant left is the 32-byte recipient pubkey.
         expect(
           () => GrassrootsPacket(
-            type: PacketType.message,
+            type: PacketType.secure,
             recipientPubkey: Uint8List(16), // too short
             payload: Uint8List.fromList([1]),
           ),

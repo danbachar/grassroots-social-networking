@@ -21,9 +21,6 @@ enum PeerTransport {
   /// Direct BLE connection (Central or Peripheral role)
   bleDirect,
 
-  /// WebRTC P2P connection
-  webrtc,
-
   /// UDP P2P connection
   udp,
 }
@@ -36,8 +33,6 @@ extension PeerTransportDisplay on PeerTransport {
       case PeerTransport.bleDirect:
         return const Icon(Icons.bluetooth_connected,
             size: 16, color: Colors.blue);
-      case PeerTransport.webrtc:
-        return const Icon(Icons.public, size: 16, color: Colors.blue);
       case PeerTransport.udp:
         return const Icon(Icons.public, size: 16, color: Colors.green);
     }
@@ -48,8 +43,6 @@ extension PeerTransportDisplay on PeerTransport {
     switch (this) {
       case PeerTransport.bleDirect:
         return 'Bluetooth';
-      case PeerTransport.webrtc:
-        return 'WebRTC';
       case PeerTransport.udp:
         return 'UDP';
     }
@@ -61,8 +54,6 @@ extension PeerTransportDisplay on PeerTransport {
     switch (type) {
       case TransportType.ble:
         return PeerTransport.bleDirect;
-      case TransportType.webrtc:
-        return PeerTransport.webrtc;
       case TransportType.udp:
         return PeerTransport.udp;
     }

@@ -19,7 +19,8 @@ import 'signaling_codec.dart';
 /// When agent A's IP changes, A and B reconnect through a rendezvous
 /// facilitator S as follows:
 /// - A sends RECONNECT(initiatorPubkey=A, peerPubkey=B) to S. S observes A's
-///   source address and verifies the initiator matches the signed packet sender.
+///   source address and verifies the initiator matches the sender authenticated
+///   by the enclosing Noise session (recovered via trial-decrypt).
 /// - B (on detecting A went silent) sends AVAILABLE(peerPubkey=A) to S. S
 ///   observes B's source address.
 /// - S matches the pair and sends each side a PUNCH_INITIATE carrying the

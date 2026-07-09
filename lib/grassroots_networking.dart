@@ -61,7 +61,7 @@
 /// The transport layer is abstracted via the `TransportService` interface,
 /// allowing multiple transport implementations:
 /// - `BleTransportService` - Bluetooth Low Energy mesh (default)
-/// - Future: WebRTC transport (STUN/TURN/TURNS)
+/// - `UdpTransportService` - Internet transport over UDX (NAT hole-punching)
 library grassroots_networking;
 
 // Main API

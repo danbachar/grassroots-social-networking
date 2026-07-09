@@ -41,7 +41,7 @@ class NoiseHandshakeResult {
   });
 }
 
-/// Owns Noise XX session state, keyed by transport medium plus peer identity.
+/// Owns Noise XX session state, keyed by peer identity.
 ///
 /// The Noise static key is the X25519 form of the local Ed25519 transport
 /// identity, derived via the standard birational map (libsodium
@@ -50,7 +50,8 @@ class NoiseHandshakeResult {
 /// from the counterpart's known identity and verifies the Noise-delivered static
 /// against it, aborting on mismatch (see [_verifyRemoteStatic]) — the key check
 /// in `docs/GLP_Networking_API/sections/ip.tex` §IP Connection. Handshake
-/// packets are additionally Ed25519-signed at the transport layer.
+/// authenticity rests solely on the Noise transcript plus this static-key
+/// check; the sender-anonymous mesh envelope carries no per-packet signature.
 class NoiseSessionManager {
   final GrassrootsIdentity identity;
 
@@ -147,7 +148,7 @@ class NoiseSessionManager {
     GrassrootsPacket packet, {
     required Uint8List remotePubkey,
   }) async {
-    if (!packet.type.usesSessionSecurity) return packet;
+    if (packet.type != PacketType.secure) return packet;
 
     final session = _entries[_hex(remotePubkey)]?.session;
     if (session == null) {
@@ -156,33 +157,27 @@ class NoiseSessionManager {
 
     final encryptedPayload =
         await session.encryptPayload(packet, identity.publicKey);
-    return packet.copyWith(
-      type: packet.type.secureVariant,
-      payload: encryptedPayload,
-    );
+    // The wire type stays `secure`; only the payload becomes ciphertext.
+    return packet.copyWith(payload: encryptedPayload);
   }
 
-  /// Decrypt a sender-anonymous session-encrypted packet by trial-decrypting
+  /// Decrypt a sender-anonymous [PacketType.secure] packet by trial-decrypting
   /// against every active session — the AEAD tag identifies the right one (the
   /// outer envelope has no sender to look it up by). Returns the cleartext
-  /// packet plus the recovered sender pubkey, or null if no session opens it.
+  /// packet (still typed `secure`; the caller decodes its [SecureFrame]) plus
+  /// the recovered sender pubkey, or null if no session opens it.
   Future<(GrassrootsPacket, Uint8List)?> trialDecrypt(
     GrassrootsPacket packet,
   ) async {
-    if (!packet.type.isSessionEncrypted) return null;
+    if (packet.type != PacketType.secure) return null;
 
-    final clearType = packet.type.clearVariant;
     for (final entry in _entries.values) {
       final session = entry.session;
       final peer = entry.remotePubkey;
       if (session == null || peer == null) continue;
       try {
-        final clearPayload =
-            await session.decryptPayload(packet, clearType, peer);
-        return (
-          packet.copyWith(type: clearType, payload: clearPayload),
-          peer,
-        );
+        final clearPayload = await session.decryptPayload(packet, peer);
+        return (packet.copyWith(payload: clearPayload), peer);
       } catch (_) {
         // Wrong session (AEAD tag mismatch) or replay — try the next.
         continue;
@@ -633,7 +628,7 @@ class _NoiseTransportSession {
       packet.payload,
       secretKey: SecretKey(sendKey),
       nonce: _aeadNonce(nonce),
-      aad: _applicationAad(packet, packet.type, senderPubkey),
+      aad: _applicationAad(packet, senderPubkey),
     );
     return Uint8List.fromList([
       _applicationPayloadVersion,
@@ -644,7 +639,6 @@ class _NoiseTransportSession {
 
   Future<Uint8List> decryptPayload(
     GrassrootsPacket packet,
-    PacketType clearType,
     Uint8List senderPubkey,
   ) async {
     final payload = packet.payload;
@@ -669,7 +663,7 @@ class _NoiseTransportSession {
     final clear = await _cipher.decrypt(
       secretBox,
       secretKey: SecretKey(receiveKey),
-      aad: _applicationAad(packet, clearType, senderPubkey),
+      aad: _applicationAad(packet, senderPubkey),
     );
     _rememberReceivedNonce(nonce);
     return Uint8List.fromList(clear);
@@ -771,14 +765,13 @@ int _nonceFromBytes(Uint8List nonceBytes) {
 /// local identity on encrypt, the session peer on (trial-)decrypt.
 Uint8List _applicationAad(
   GrassrootsPacket packet,
-  PacketType clearType,
   Uint8List senderPubkey,
 ) {
   final recipient = packet.recipientPubkey ?? Uint8List(32);
   final packetId = _uuidToBytes(packet.packetId);
   final data = ByteData(1 + 32 + 32 + 16);
   var offset = 0;
-  data.setUint8(offset++, clearType.value);
+  data.setUint8(offset++, packet.type.value);
   final bytes = data.buffer.asUint8List();
   bytes.setRange(offset, offset + 32, senderPubkey);
   offset += 32;

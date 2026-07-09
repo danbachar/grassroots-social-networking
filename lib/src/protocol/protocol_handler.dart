@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:sodium_libs/sodium_libs.dart';
 
 /// Handles Grassroots protocol logic: packet encoding/decoding,
@@ -83,29 +84,47 @@ class ProtocolHandler {
   /// back in its ACK. Pass the same id you stored in `MessageSendingAction`
   /// so `MessageDeliveredAction` (dispatched on ACK receipt) can match the
   /// outgoing message in the Redux store and flip ✓ → ✓✓.
+  /// Build a single (non-fragmented) secure MESSAGE packet: the payload is
+  /// wrapped in a [SecureFrame] and carried inside a [PacketType.secure]
+  /// envelope. Larger payloads are fragmented by the caller (via
+  /// `FragmentHandler.framesFor`) into several secure frames instead.
+  ///
+  /// The outer packetId is set equal to [messageId] so a single-packet message
+  /// keeps one stable dedup id; the recipient recovers [messageId] from the
+  /// decrypted frame and echoes it in its ACK.
   GrassrootsPacket createMessagePacket({
     required Uint8List payload,
+    required String messageId,
     Uint8List? recipientPubkey,
-    String? packetId,
   }) {
+    final frame = SecureFrame(
+      contentType: ContentType.message,
+      messageId: messageId,
+      chunk: payload,
+    );
     return GrassrootsPacket(
-      type: PacketType.message,
+      type: PacketType.secure,
       recipientPubkey: recipientPubkey,
-      payload: payload,
-      packetId: packetId,
+      payload: frame.encode(),
+      packetId: messageId,
     );
   }
 
-  /// Create READ_RECEIPT packet
+  /// Create a READ_RECEIPT secure packet. The read messageId travels as the
+  /// frame chunk (and as the frame's messageId).
   GrassrootsPacket createReadReceiptPacket({
     required String messageId,
     required Uint8List recipientPubkey,
   }) {
-    final payload = utf8.encode(messageId);
+    final frame = SecureFrame(
+      contentType: ContentType.readReceipt,
+      messageId: messageId,
+      chunk: utf8.encode(messageId),
+    );
     return GrassrootsPacket(
-      type: PacketType.readReceipt,
+      type: PacketType.secure,
       recipientPubkey: recipientPubkey,
-      payload: payload,
+      payload: frame.encode(),
     );
   }
 
@@ -194,16 +213,21 @@ class ProtocolHandler {
     return utf8.decode(payload);
   }
 
-  /// Create ACK packet (for delivery confirmation)
+  /// Create an ACK secure packet. The acked messageId travels as the frame
+  /// chunk (and as the frame's messageId).
   GrassrootsPacket createAckPacket({
     required String messageId,
     Uint8List? recipientPubkey,
   }) {
-    final payload = utf8.encode(messageId);
+    final frame = SecureFrame(
+      contentType: ContentType.ack,
+      messageId: messageId,
+      chunk: utf8.encode(messageId),
+    );
     return GrassrootsPacket(
-      type: PacketType.ack,
+      type: PacketType.secure,
       recipientPubkey: recipientPubkey,
-      payload: payload,
+      payload: frame.encode(),
     );
   }
 

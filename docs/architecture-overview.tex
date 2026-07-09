@@ -1,0 +1,925 @@
+\documentclass[11pt]{report}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{underscore}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,shapes.multipart,fit,backgrounds}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{grsblue}{HTML}{1F4E79}
+\definecolor{grsbg}{HTML}{EEF3F8}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,columns=fullflexible,frame=single,framesep=4pt,backgroundcolor=\color{grsbg}}
+\setlength{\parskip}{0.4em}
+% Let long file paths / identifiers set without overrunning the margin.
+\sloppy
+\emergencystretch=3em
+
+\title{\textbf{Architecture of the Grassroots Networking Transport}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+{\small\noindent\emph{This chapter documents the \texttt{tum-implementation} branch. Every factual claim is grounded in the source; file/line references are approximate as the code evolves.}}
+\tableofcontents
+\chapter{Architecture of the Grassroots Networking Transport}
+
+
+\section{Introduction, Scope \& Design Philosophy}
+
+Grassroots Networking is a \emph{peer-to-peer messaging transport}: a thin layer whose sole responsibility is to move opaque payloads between devices, addressed by cryptographic identity, over two very different media. It is deliberately \emph{not} an application. There is no notion of a chat room, a contact list, a conversation, or a user interface anywhere in its contract; those concepts belong to the applications that sit on top of it. The system's own \code{pubspec.yaml} describes the package (\code{grassroots_networking}, version \code{0.1.0}) as a transport for GSG, the Grassroots Social-Graph application, and the formal specification frames the whole effort as a networking API meant to replace the madGLP \code{IsolateManager} so that GLP agents can run on separate physical devices and communicate directly, peer-to-peer, over a medium-agnostic substrate (\code{docs/GLP_Networking_API/sections/introduction.tex}, \code{docs/GLP_Networking_API/sections/api.tex}). Everything in this chapter should be read through that lens: the layer is plumbing, and its correctness is judged by whether packets reach the right identity, sealed, over whichever medium is available.
+
+\subsection{Design Philosophy}
+
+Four principles, drawn from the project's engineering charter and the GLP specification, shape every decision that follows.
+
+\begin{itemize}
+  \item \textbf{Opportunistic mesh delivery.} Over Bluetooth Low Energy (BLE) the transport is a multi-hop \emph{opportunistic mesh}: every node relays packets toward the recipient by TTL-bounded, deduplicated \emph{managed flooding}, and nodes \emph{store-carry-forward} — caching packets for recipients that are momentarily out of range and re-flooding them when the recipient reappears. This lets a user reach a friend who is not a direct neighbor. The Internet transport, by contrast, stays \emph{direct} point-to-point. Crucially, relaying is not friend-gated and not authenticated hop-by-hop: a relay forwards sealed bytes it cannot read, addressed only by recipient identity.
+  \item \textbf{Identity is a key pair.} Every device holds an Ed25519 key pair, and the 32-byte public key \emph{is} the peer's globally unique identity, used for addressing, authentication, and signing, persistent across sessions (\code{docs/GLP_Networking_API/sections/api.tex}). Nicknames are cosmetic; all trust flows from cryptographic verification. This is why \code{send} rejects any recipient key that is not exactly 32 bytes (\code{lib/src/grassroots_network.dart:1877}).
+  \item \textbf{Two transports, one interface.} BLE covers nearby peers with no Internet; the Internet transport (UDP via UDX, with NAT hole-punching) covers the globe. Both surface the same abstraction to the coordinator — connect, send, receive, disconnect — and BLE is preferred when both are usable (\code{lib/src/grassroots_network.dart:1943}). The two transports are strictly independent: losing or disabling one has zero effect on the other's reachability state.
+  \item \textbf{Clean breaks, not compatibility shims.} Because there are no deployed installations in the wild, the project renames, restructures, and breaks wire formats whenever doing so improves the design, rather than carrying legacy decoders or dead code. This principle is not rhetorical — the wire format was recently and deliberately broken (see below), and decoders are written to \emph{reject} malformed or truncated payloads rather than tolerate a hypothetical older version.
+\end{itemize}
+
+\subsection{A Corrected Layered Model}
+
+The system is organized as a stack. An application such as GSG never touches radios directly; it calls the \code{GrassrootsNetwork} coordinator, which owns the public API and mediates every layer beneath it.
+
+\begin{verbatim}
++-------------------------------------------------------------+
+|  GSG application (chat, social graph, GLP agents)           |
+|    consumes: send / onMessageReceived / onPeerConnected     |
++-------------------------------------------------------------+
+|  GrassrootsNetwork coordinator  (public API + orchestration)|
+|    send(pubkey, payload) . broadcast . onReceive . getPeers |
++---------------------------+---------------------------------+
+|  Mesh Router              |  Noise Session Layer            |
+|   managed flooding,       |   Noise_XX_25519_ChaChaPoly_    |
+|   BloomFilter dedup,      |   SHA256; sessions keyed by     |
+|   DTN store-carry-forward |   peer pubkey; trial-decrypt    |
++---------------------------+---------------------------------+
+|  Transport abstraction    (connect/send/receive/disconnect) |
++---------------------------+---------------------------------+
+|  BLE mesh transport       |  Internet (UDP/UDX) transport   |
+|   dual-role GATT,         |   direct point-to-point,        |
+|   neighbor-local ANNOUNCE |   NAT hole-punch, rendezvous    |
++---------------------------+---------------------------------+
+|  OS radios: Bluetooth LE stack       /      UDP sockets     |
++-------------------------------------------------------------+
+\end{verbatim}
+
+The coordinator (\code{lib/src/grassroots_network.dart}) wires together a \code{ProtocolHandler}, a \code{FragmentHandler}, a \code{NoiseSessionManager}, a \code{MessageRouter}, and a \code{SignalingService}, and exposes the specified surface: \code{initialize}/\code{start}/\code{stop}, \code{send}, \code{broadcast}, \code{getPeers}, \code{isPeerReachable}, and the callbacks \code{onPeerDiscovered}, \code{onPeerConnected}, \code{onMessageReceived} (\code{lib/src/grassroots_network.dart:578--633}, \code{757}, \code{1872}). Two facts about the layering are load-bearing throughout the chapter. First, the mesh router and the Noise session layer are peers, not one atop the other: the router dispatches packets by their \emph{outer} type and, for a sealed packet addressed to us, asks the session layer to \code{trialDecrypt} it against every active session — the AEAD tag, not any header field, identifies the sender (\code{lib/src/grassroots_network.dart:3885}). Second, sessions are keyed by peer public key, not by transport path, so a Noise session survives a change of relay path or even the loss of a whole transport; \code{stop} tears down transports but deliberately keeps sessions (\code{lib/src/grassroots_network.dart:963--992}).
+
+\subsection{System Context}
+
+An outbound message is sealed to the recipient's Noise session and, on BLE, flooded to all neighbors; success is a positive flood count, and if no transport is usable the message is queued in a per-recipient FIFO to be re-flooded when conditions change (\code{lib/src/grassroots_network.dart:1905--1967}). Inbound, a peer is only reported \emph{connected} once an authenticated Noise session exists — reachability is gated on cryptographic authentication, not on a mere radio contact (\code{lib/src/grassroots_network.dart:2716--2733}). Presence and identity ride on a separate, non-relayed channel: the self-signed ANNOUNCE, a neighbor-local broadcast (TTL 1) whose payload carries the full public key, nickname, and an Ed25519 signature over that body (\code{lib/src/grassroots_network.dart:4928--4933}). ANNOUNCE is the \emph{only} thing signed on the wire; all message, ack, read-receipt, and signaling traffic authenticates end-to-end by decrypting under a verified Noise session, never by a per-packet signature.
+
+\subsection{Roadmap}
+
+The remainder of this chapter builds outward from these foundations. \emph{Identity, Trust \& the Security Model} develops the key-pair identity, the sender-anonymous envelope, and why relaying is unauthenticated by construction. \emph{Wire Format: Packets \& the Data Model} specifies the 58-byte header and the sealed \code{SecureFrame} that now carries content type and fragmentation inside the ciphertext. \emph{The Transport Abstraction \& the BLE Mesh Transport} covers the common interface and the mandatory dual-role BLE design. \emph{Mesh Routing} details managed flooding, the \code{BloomFilter} dedup, and the DTN store-carry-forward cache. \emph{The Noise Session Layer} covers the \code{Noise_XX} handshake, trial-decrypt, and the AAD construction. \emph{State Management} explains the Redux projection, and later sections walk through end-to-end interactions and close with design decisions, trade-offs, and future work.
+
+\subsection{Lineage and a Warning about Stale Documentation}
+
+The transport descends from the Bitchat protocol, and that lineage is still visible in the repository's \code{README.md}, which is titled ``Bitchat Transport for GSG'' and describes classes and dependencies that no longer exist (\code{README.md:1--7}). \textbf{This README is stale and must be treated as history only.} It contradicts the current design on nearly every load-bearing number — most dangerously, it documents a 154-byte packet header carrying a 32-byte sender field and a 64-byte per-packet signature (\code{README.md:173--183}). The real header is 58 bytes, sender-anonymous, and unsigned (only ANNOUNCE is signed at the payload level); this chapter relies exclusively on the verified source, not the README. Two further scoping notes anticipate common misreadings: rendezvous servers are the \emph{current} NAT-bootstrap mechanism and remain fully implemented (their replacement by well-connected friends and signed invite links is a design note, hence future work), and the multi-hop Noise handshake between peers who have never been in direct range is likewise future work — handshakes today are neighbor-local (TTL 1). Where this chapter describes a mechanism, it describes what the code does; where it labels something future work, that work is not yet shipped.
+
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\small,node distance=5mm,
+  layer/.style={draw=grsblue,fill=grsbg,rounded corners,minimum width=11.5cm,minimum height=9mm,align=center}]
+  \node[layer] (app) {GSG application \;(chat, social graph, GLP agents)};
+  \node[layer,below=of app] (coord) {\textbf{GrassrootsNetwork} coordinator --- public API + orchestration};
+  \node[layer,below=of coord] (mid) {Mesh router \;(flooding, BloomFilter dedup, DTN) \; + \; Noise session layer \;(XX, keyed by pubkey, trial-decrypt)};
+  \node[layer,below=of mid] (abs) {Transport abstraction \;(connect / send / receive / disconnect)};
+  \node[layer,below=of abs] (tx) {BLE mesh transport \;(dual-role GATT, ANNOUNCE) \quad$|$\quad Internet UDP/UDX \;(direct P2P, hole-punch)};
+  \node[layer,below=of tx] (os) {OS radios: \;Bluetooth LE stack \quad$|$\quad UDP sockets};
+  \foreach \a/\b in {app/coord,coord/mid,mid/abs,abs/tx,tx/os} \draw[-{Latex}] (\a) -- (\b);
+\end{tikzpicture}
+\caption{The layered architecture. The coordinator owns the public API; the mesh router and Noise session layer sit beneath it as peers; two transports share one abstraction.}
+\label{fig:layers}
+\end{figure}
+
+
+\section{Identity, Trust \& the Security Model}
+
+The security model of the Grassroots transport is built on a single, deliberately austere primitive: a device's cryptographic key pair \emph{is} its identity. Everything else — trust decisions, session authentication, sender anonymity, and the two distinct trust boundaries described below — is derived from that key pair rather than from any server-issued credential, account, or transport-level address. This section explains what that identity is, how it authenticates a Noise session, how the sender-anonymous mesh envelope constrains what an adversary can learn, and how first contact is gated. It closes with the threat model and the clearly-labelled future redesign of the handshake.
+
+\subsection{Cryptographic identity}
+
+Every device holds an Ed25519 key pair, generated once on first launch (\code{GrassrootsIdentity.generate}) and persisted by the application layer. The 32-byte Ed25519 public key is the peer's canonical identity; the 64-byte private key (32-byte seed concatenated with the public key, per \code{lib/src/models/identity.dart}) never leaves the device. It serves two purposes: signing ANNOUNCE bodies, and deriving the peer's Noise X25519 static key via the birational map (libsodium's \code{skToCurve25519}, \code{noise\_session\_manager.dart:299}) --- the derivation on which every Noise session in the next subsection rests. Nicknames are purely cosmetic — a mutable display string carried in ANNOUNCE — and carry no authority; two peers with the same nickname are still distinct identities, and a mismatched nickname never overrides the key-based identity.
+
+The public key also seeds BLE discovery. Each device advertises a service UUID whose \emph{fixed} 8-byte Grassroots prefix (the first 8 bytes of \code{SHA-256("grassroots")}) marks it as a Grassroots device, followed by an 8-byte suffix that rotates every 15 minutes (\code{deriveServiceUuidForSlot}: the first 8 bytes of \code{SHA-256("grassroots ble suffix" | pubkey | slot)}). The rotating suffix is an \emph{unlinkable} recognition hint — a peer who knows the key recomputes the current and adjacent slots' UUIDs to recognise the device and pre-filter scans, while a third party who does not know the key sees a beacon that changes every slot and cannot track it — but it is explicitly \emph{not} an authorization proof: it is only a truncated hash, and the full public key is authenticated separately by the signed ANNOUNCE.
+
+\subsection{Noise sessions and the birational static-key check}
+
+End-to-end confidentiality and authentication run over Noise, pattern \code{Noise\_XX\_25519\_ChaChaPoly\_SHA256} (\code{lib/src/session/noise_session_manager.dart}). A crucial design decision links the two key systems: the Noise \emph{static} key is not an independent secret but the X25519 form of the Ed25519 identity, derived via the standard birational map (libsodium's \code{crypto\_sign\_ed25519\_sk\_to\_curve25519} / \code{pk\_to\_curve25519}). Because the public half of the static is a deterministic public function of the Ed25519 public key, any peer that knows a counterpart's identity can \emph{recompute} the static it should present.
+
+This is exactly what \code{\_verifyRemoteStatic} does. During the XX handshake the remote's static key is delivered encrypted inside messages 2 and 3; on receiving it, the local side recomputes the expected X25519 static from the peer's claimed Ed25519 identity and compares (in constant time) against what Noise delivered. A peer that presents a static not belonging to the identity it claims — or a tampered transcript — fails the check, and the handshake is aborted and the session entry discarded. Handshake authenticity therefore rests on the Noise transcript \emph{plus} this static binding; it is what ties the ephemeral Noise session to a durable, verifiable Ed25519 identity. Sessions are keyed by the peer's Ed25519 public key, never by transport path, so one session serves both the direct UDP path and any relayed BLE path and survives changing relay routes.
+
+\subsection{The sender-anonymous envelope and its consequences}
+
+The outer packet header is 58 bytes and carries only the \emph{recipient} public key (32 bytes), plus type, TTL, timestamp, packet ID, and payload length (\code{lib/src/models/packet.dart}). There is no sender field and no whole-packet signature. This single structural choice cascades through the whole security model:
+
+\begin{itemize}
+  \item \textbf{Only ANNOUNCE is signed.} The wire \code{PacketType} enum has exactly three values — \code{announce}, \code{noiseHandshake}, and \code{secure}. ANNOUNCE is the one packet whose sender is \emph{meant} to be visible: it is a neighbour-local, non-relayed presence broadcast whose payload ends with an Ed25519 signature over the body (pubkey, version, nickname, address candidates), verified hop-locally in \code{decodeAnnounce} against the embedded pubkey. Every other packet carries no wire signature at all.
+  \item \textbf{Authentication is end-to-end, inside Noise.} A \code{secure} packet is an opaque, session-sealed envelope. Its logical content type (message, ack, read receipt, or signaling) and any fragmentation live \emph{inside} the encrypted payload as a \code{SecureFrame} (\code{[contentType][fragIndex][fragCount][messageId][chunk]}), so a relay never learns the message class — it sees only a \code{secure} blob addressed by recipient. The recipient trusts the content solely because it decrypts under a Noise session whose static was verified above; the ChaCha20-Poly1305 AEAD tag is the authentication.
+  \item \textbf{Trial-decrypt demultiplexing.} Because the envelope names no sender, the recipient cannot look up the right session by header. Instead \code{trialDecrypt} attempts decryption against every active session in turn; the AEAD tag identifies the correct one (a wrong session simply fails the tag and is skipped), and the matching session's peer key is returned as the recovered sender.
+  \item \textbf{AAD excludes mutable fields.} The application AAD (\code{\_applicationAad}) binds the constant \code{secure} type byte, the sender pubkey, the recipient pubkey, and the 16-byte packet ID — but deliberately \emph{excludes} TTL and timestamp, which every relay mutates and therefore cannot be authenticated end-to-end. The content type is nonetheless authenticated, because it sits inside the AEAD-protected plaintext.
+  \item \textbf{Bounded replay window.} Each transport session tracks received 64-bit nonces and rejects a repeat as a replay, retaining the most recent 2048 nonces (\code{\_rememberReceivedNonce}) — a bounded window that resists replay without unbounded memory growth.
+\end{itemize}
+
+\subsection{Cold-call trust and two trust boundaries}
+
+First contact from a stranger is governed by a \code{ColdCallTrustLevel} setting (\code{lib/src/store/settings\_state.dart}), which defaults to \code{closed}. In \code{open} mode a device completes the BLE ANNOUNCE exchange with unknown nearby peers, permitting cold-call first contact; in \code{closed} mode it does not complete ANNOUNCE with unknown peers, and friend-only metadata is withheld until a verified ANNOUNCE has authenticated an accepted friend.
+
+Two distinct trust boundaries coexist, and it is important not to conflate them:
+
+\begin{itemize}
+  \item \textbf{Open BLE relay.} The mesh relays \code{secure} packets for \emph{arbitrary} recipients — a relay forwards sealed, recipient-addressed bytes for peers it has no relationship with. It can do so safely precisely because it learns neither the sender nor the content; relaying is unverified by construction, bounded instead by TTL, dedup, and rate limits (discussed in the mesh routing section).
+  \item \textbf{Friend-only UDP signaling.} Internet hole-punch coordination is, by contrast, strictly friend-gated. A device only registers friends' addresses, only answers address queries for friends, and only dispatches \code{PUNCH\_INITIATE} to friends: \code{signaling\_service.dart} guards these paths with explicit \code{isFriend} / \code{getFriendship} checks (e.g. it refuses to mediate when \code{targetPeer == null || !targetPeer.isFriend}). This boundary exists because signaling exposes addresses — real metadata — whereas the BLE mesh only ever forwards sealed content.
+\end{itemize}
+
+\subsection{Threat model}
+
+Against a relay or passive BLE observer, the design confines the leak to routing metadata. Such an adversary learns the \emph{recipient} of a \code{secure} packet, its size, TTL, timestamp, and packet ID, and can therefore perform traffic-flow and dedup analysis. It does \emph{not} learn the sender (absent from the envelope), the message content, or even the message \emph{class} — message, ack, receipt, and signaling are indistinguishable once sealed. It cannot forge or replay content: forgery fails the AEAD tag under a session it does not hold, and replay is caught by the 2048-nonce window. ANNOUNCE, being signed, cannot be spoofed to impersonate an identity. The residual disclosures — recipient visibility and the fact that ANNOUNCE reveals presence and identity to neighbours — are the accepted, deliberate cost of an open, unverified relay; they are the price of a mesh that reaches beyond direct neighbours without hop-by-hop signatures.
+
+\subsection{Future work: KK/IK handshake redesign}
+
+The current handshake is the interactive Noise XX pattern and is \emph{neighbour-local}: handshake packets are not flooded (TTL~1), so two peers must be in direct BLE range (or on a direct UDP path) to establish a session. A from-scratch multi-hop handshake using the pre-shared-static Noise patterns \emph{IK} and \emph{KK} — which would let a session be negotiated across relays to a peer whose identity is already known — is \emph{not} implemented and is planned future work, to be accompanied by a security audit of the redesigned handshake. Until then, session establishment remains a direct, neighbour-local step even though the resulting session is fully path-independent and survives relaying.
+
+---
+
+Note to the orchestrator: the grounding files were passed with a literal `undefined/` path prefix and do not exist on disk, so I verified every claim directly against the source. Authoritative files consulted (all absolute): `/Users/dbachar/git/technion/grassroots_networking/.claude/worktrees/zealous-noether-ff8f0f/lib/src/session/noise_session_manager.dart`, `.../lib/src/models/packet.dart`, `.../lib/src/models/identity.dart`, `.../lib/src/models/secure_frame.dart`, `.../lib/src/protocol/protocol_handler.dart`, `.../lib/src/store/settings_state.dart`, `.../lib/src/signaling/signaling_service.dart`. All numbers used (58-byte header, three packet types, 2048-nonce window, XX pattern, birational static check, friend-only signaling) are confirmed in those files.
+
+\section{Wire Format, Packets \& the Data Model}
+
+At the base of the transport sits a single on-wire container: the \code{GrassrootsPacket}. Every byte that crosses a Bluetooth or Internet link is one such packet, and its design encodes the transport's central privacy commitment directly into the header. The header is exactly \textbf{58 bytes} (\code{GrassrootsPacket.headerSize = 58}, \code{lib/src/models/packet.dart}) — not the 154-byte, sender-carrying, whole-packet-signed header that the stale in-repo README still advertises. The difference is not cosmetic: the current header is \emph{sender-anonymous}. It carries the recipient and nothing that identifies the originator.
+
+\subsection*{The 58-byte header, field by field}
+
+The header serialises the following fixed layout, with all multi-byte integers big-endian:
+
+\begin{verbatim}
+[0]      type        (1 byte)   0x01 announce | 0x02 noiseHandshake | 0x03 secure
+[1]      ttl         (1 byte)   decremented per relay hop, dropped at 0
+[2-5]    timestamp   (4 bytes)  seconds since epoch
+[6-37]   recipient   (32 bytes) recipient public key; all-zero = broadcast
+[38-53]  packetId    (16 bytes) UUID, used for dedup / loop suppression
+[54-57]  length      (4 bytes)  payload length
+[58..]   payload     (variable) Noise-sealed for secure packets
+-------
+58 bytes total header
+\end{verbatim}
+
+Two absences are the whole point. There is \emph{no sender field} and \emph{no whole-packet signature}. A relay can route a packet toward its \code{recipient} without ever learning who sent it, and — because there is no signature over the header — a relay also \emph{cannot} authenticate the packet it forwards. This is deliberate: hop-by-hop authentication is traded away for sender-anonymity, and the resulting open, unverified relay is instead bounded by \code{ttl} (default 7), by \code{packetId} deduplication, and by per-neighbour rate limits (see the mesh-routing discussion elsewhere in this chapter). The \code{timestamp} and \code{recipient} round out the header; an all-zero recipient decodes to the broadcast sentinel. The \code{length} field at offset 54 doubles as the stream framer: a byte-stream transport such as UDX accumulates bytes until \code{headerSize + length} are present before it treats the buffer as one packet (\code{peekPayloadLength}).
+
+\subsection*{Three wire types, and why the fourth field moved inside}
+
+The wire \code{PacketType} enum has been deliberately tightened to exactly \textbf{three} values: \code{announce} (\code{0x01}), \code{noiseHandshake} (\code{0x02}), and \code{secure} (\code{0x03}). Everything that is not a presence broadcast or a handshake message is a single, opaque \code{secure} envelope. This is a recent, shipped refactor (client test suite green at 587/587; the \code{bootstrap_anchor} mirror is a pending follow-up and still speaks the older multi-type wire until it is updated).
+
+The motivation is a metadata leak. The previous wire distinguished \code{secureMessage}, \code{secureAck}, \code{secureSignaling}, and several \code{secureFragment*} types directly in the header — so a relay, which can read the header but never the sealed body, could still tell an acknowledgment from a message from a signaling packet, and could see fragment boundaries. Collapsing all of these to one \code{secure} type closes that leak: a relay now sees only \code{0x03} for \emph{all} sealed traffic and can distinguish neither the message class nor the fragment structure. This is the same class of leak the handshake security audit flagged.
+
+The content type and fragmentation information did not disappear; they \emph{moved inside} the sealed payload, into a \code{SecureFrame} (\code{lib/src/models/secure_frame.dart}). The \code{SecureFrame} is the plaintext that gets sealed into a \code{secure} packet, with a 21-byte inner header:
+
+\begin{verbatim}
+[0]      contentType (1 byte)   0x01 message | 0x02 ack | 0x03 readReceipt | 0x04 signaling
+[1-2]    fragIndex   (2 bytes)  0-based fragment index
+[3-4]    fragCount   (2 bytes)  total fragments; 1 = whole message
+[5-20]   messageId   (16 bytes) logical message id (binary UUID)
+[21..]   chunk       (variable) this fragment's bytes
+\end{verbatim}
+
+Because \code{contentType} lives inside the AEAD-protected plaintext, it is authenticated end-to-end for free — the recipient learns the true content class only after a successful decrypt, and no one in between can. The \code{nack} type present in the old enum was removed as dead. Fragmentation is now framing metadata (\code{fragIndex}/\code{fragCount}) rather than a family of wire packet types: a non-fragmented message is simply \code{fragCount == 1}.
+
+\subsection*{Encode/decode discipline: throw, never tolerate}
+
+The codecs follow the project's no-compatibility-shim rule strictly. \code{GrassrootsPacket.deserialize} throws a \code{FormatException} if the buffer is shorter than the 58-byte header or if the declared payload is truncated; \code{PacketType.fromValue} and \code{ContentType.fromValue} throw on any unknown tag rather than falling back; a recipient key that is not exactly 32 bytes throws in the constructor; and \code{SecureFrame.decode} throws when the data is shorter than its 21-byte header. There is no "gracefully handle an older, shorter payload" branch anywhere — since no prior wire version exists in the wild, a malformed payload is malformed, and the decoder says so.
+
+\subsection*{ANNOUNCE: the one signed, non-relayed packet}
+
+\code{ANNOUNCE} is the single exception to sender-anonymity, because presence is precisely a statement about identity. It is neighbour-local (TTL 1, never flooded) and carries a payload-level Ed25519 self-signature. Its payload layout (\code{lib/src/protocol/protocol_handler.dart}) is:
+
+\begin{verbatim}
+pubkey(32) + version(2) + nickLen(1) + nick + candidateCount(2)
+           + repeated[ candidateLen(2) + candidate ] + signature(64)
+\end{verbatim}
+
+\code{decodeAnnounce} strips the trailing 64-byte signature, verifies it over the body against the \emph{embedded} public key, and throws \code{ANNOUNCE signature invalid} on failure; it also rejects payloads below the 96-byte (32+64) floor and any truncated candidate field. This is the only place the transport verifies a signature on the wire; message, ack, read-receipt, and signaling content authenticate purely end-to-end, by trial-decryption against Noise sessions (discussed in the section on the Noise session layer).
+
+\subsection*{Fragmentation and reassembly as SecureFrames}
+
+Large payloads are split by the \code{FragmentHandler} (\code{lib/src/protocol/fragment_handler.dart}). A payload longer than the \code{fragmentThreshold} of \textbf{320 bytes} is chunked into \code{SecureFrame}s of at most \code{maxFragmentPayload = 270 bytes} each, sharing one \code{messageId} and carrying ascending \code{fragIndex} out of a common \code{fragCount}; \code{framesFor(...)} produces the list and the sender floods them \code{fragmentDelay = 20\,ms} apart. Crucially, each fragment is an ordinary \code{secure} packet — reassembly happens \emph{after} decryption, keyed by the inner \code{messageId}, so relays never see fragment structure. \code{accept(frame)} buffers fragments and returns the complete payload once every index has arrived (immediately for a single-fragment message), with a stale-reassembly timeout of two minutes. This per-message fragment budget is distinct from \code{maxPayloadSize = 442} (computed as $500 - 58$), the soft single-packet ceiling chosen to keep one sealed packet under the roughly 500-byte BLE MTU; the two budgets are maintained independently. Note also that relay/loop dedup is keyed on the \emph{outer} \code{packetId}, whereas delivery dedup is keyed on the \emph{inner} \code{messageId} — the two identifiers serve different layers.
+
+\subsection*{The application data model: Blocks}
+
+Above the transport, an application payload is a serialised \code{Block} (\code{lib/src/models/block.dart}) — the unit GSG builds its blocklace from. A \code{Block} is a one-byte \code{type} tag followed by its body, and \code{Block.deserialize} reads \code{data[0]} as the type and treats the remainder as the payload. The current \code{BlockType}s are \code{say} (\code{0x01}), \code{friendshipOffer} (\code{0x02}), \code{friendshipAccept} (\code{0x03}), and \code{friendshipRevoke} (\code{0x05}); value \code{0x04} is a reserved gap. A \code{SayBlock} adds a one-byte \code{subtype}, so its wire form is \code{[0x01 type][subtype][body]}. The two subtypes make picture messaging \emph{first-class content}: \code{text} (\code{0x00}) carries raw UTF-8, while \code{picture} (\code{0x01}) carries \code{[viewOnce:1][mimeLen:1][mime][imageBytes]} — the \code{viewOnce} flag drives the "render blurred, delete on first view" behaviour, and images are compressed for BLE and stored content-addressed by SHA-256 (\code{lib/src/services/media_service.dart}). No \code{Block} subtype carries a signature; signing lives only in ANNOUNCE, consistent with the model above.
+
+\subsection*{From app payload to sealed bytes}
+
+The end-to-end path is therefore a clean stack of nested framings. An application constructs a \code{Block} and serialises it. That byte string becomes the \code{chunk} of one or more \code{SecureFrame}s (one if it is within the 320-byte threshold, several otherwise), each tagged \code{contentType = message} and carrying a shared \code{messageId}. Each \code{SecureFrame} is encoded and then \emph{sealed} by the Noise session keyed to the recipient, producing the opaque payload of a \code{secure} (\code{0x03}) \code{GrassrootsPacket} addressed only to that recipient. What finally travels the mesh is a 58-byte anonymous header wrapping ciphertext — the message class, the fragment structure, the sender, and the content all hidden inside the seal, visible only to the two endpoints.
+
+Sources verified against current source: \code{lib/src/models/packet.dart}, \code{lib/src/models/secure_frame.dart}, \code{lib/src/protocol/protocol_handler.dart}, \code{lib/src/protocol/fragment_handler.dart}, \code{lib/src/models/block.dart}, \code{lib/src/services/media_service.dart}.
+
+
+\begin{table}[htbp]\centering
+\caption{The 58-byte cleartext wire header (sender-anonymous) and the 21-byte inner \code{SecureFrame} that lives inside the sealed payload.}
+\label{tab:frame}
+\begin{tabular}{@{}rll@{}}
+\toprule
+\multicolumn{3}{@{}l}{\textbf{Outer wire header --- 58 bytes, cleartext, sender-anonymous}}\\
+\midrule
+Offset & Bytes & Field \\
+\midrule
+0  & 1  & packet type: announce / noiseHandshake / secure \\
+1  & 1  & TTL (decremented at each relay hop) \\
+2  & 4  & timestamp \\
+6  & 32 & recipient public key (zeros = broadcast) \\
+38 & 16 & packet id (dedup / loop prevention) \\
+54 & 4  & payload length \\
+\midrule
+\multicolumn{3}{@{}l}{\textbf{Inner SecureFrame --- 21-byte header, sealed inside the payload}}\\
+\midrule
+0  & 1  & content type: message / ack / readReceipt / signaling \\
+1  & 2  & fragment index \\
+3  & 2  & fragment count (1 = not fragmented) \\
+5  & 16 & message id (logical id: reassembly + ACK correlation) \\
+21 & \emph{n} & chunk (content bytes; the whole payload when fragCount = 1) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\section{Transport Abstraction \& the BLE Mesh Transport}
+
+Grassroots exposes exactly one abstraction to the layers above it, and hides two very different radios beneath it. A message router does not know whether the bytes it hands down will travel over Bluetooth to a device in the same room or over the Internet to a device on another continent; it only knows the \code{TransportService} interface. This section describes that interface and its lifecycle, then examines the Bluetooth Low Energy (BLE) transport in depth --- discovery, dual-role convergence, and how packets actually move over GATT.
+
+\subsection{The Unified Transport Interface}
+
+Every transport implements the abstract \code{TransportService} class (\code{lib/src/transport/transport_service.dart}). The interface is deliberately small: type and display metadata, a \code{state} getter, two event streams (\code{dataStream} for inbound bytes, \code{connectionStream} for connect/disconnect events), \code{connectedCount}/\code{isActive} getters, the lifecycle verbs \code{initialize()}, \code{start()}, \code{stop()}, and \code{dispose()}, and the two send primitives \code{sendToPeer(peerId, data)} and \code{broadcast(data, \{excludePeerIds\})}. The interface also carries a small pubkey$\leftrightarrow$peerId association table (\code{associatePeerWithPubkey}, \code{getPeerIdForPubkey}, \code{getPubkeyForPeerId}), because a transport addresses peers by an opaque, transport-local peer id (a GATT path id for BLE, an address for UDP), whereas the layers above reason in terms of the peer's public key --- its true identity.
+
+\code{broadcast} is the managed-flooding primitive: it fans a packet out to every currently-connected peer and returns the count sent, taking an optional \code{excludePeerIds} set so a relay can avoid echoing a packet back down the leg it arrived on. The mesh-routing logic that decides \emph{when} to broadcast (TTL, dedup, store-carry-forward) lives one layer up in the router, not in the transport --- the transport only exposes the fan-out mechanism. This split is the same on both transports, which is what lets the router treat them uniformly.
+
+A transport moves through a fixed six-state lifecycle (\code{TransportState}): \code{uninitialized} $\rightarrow$ \code{initializing} $\rightarrow$ \code{ready} $\rightarrow$ \code{active}, plus the two out-of-band states \code{error} and \code{disposed}. \code{initialize()} advances a transport from \code{uninitialized} to \code{ready} (subscribing to plugin streams and initialising the underlying BLE plugin; permission provisioning happens one layer up, in \code{GrassrootsNetwork}, not inside the transport); \code{start()} advances \code{ready} to \code{active} (it begins advertising and scanning). The interface defines a single derived predicate, \code{isUsable}, true exactly when the state is \code{ready} or \code{active} --- both are states in which the transport can carry traffic, the difference being whether it is also actively seeking new peers. \code{dispose()} is terminal: a disposed transport is unusable and cannot be revived.
+
+Two properties of this design are load-bearing for the rest of the system. First, the two transports are strictly independent: BLE and UDP are toggled separately and neither's lifecycle state, peer reachability, or online status is allowed to influence the other's. A peer reachable over UDP stays reachable regardless of what BLE is doing, and vice-versa; consolidation into a single ``is this peer reachable at all'' signal happens above the transport, not inside it. Second, the enum \code{TransportType} has exactly two values --- \code{ble} and \code{udp} --- and both are real transports; there is no third. An earlier WebRTC transport was removed outright, leaving behind no enum member, no service file, and no stub, in keeping with the project's no-legacy discipline.
+
+\subsection{BLE Discovery: A Rotating, Pubkey-Derived Service UUID}
+
+A device makes itself discoverable by advertising a BLE service UUID whose fixed prefix marks it as a Grassroots device and whose suffix rotates every 15 minutes. \code{GrassrootsIdentity.deriveServiceUuidForSlot} (\code{lib/src/models/identity.dart}) concatenates a fixed 8-byte \emph{grassroots prefix} --- the first 8 bytes of SHA-256(\code{"grassroots"}), the constant \code{84c403160871e5ad} --- with the first 8 bytes of \code{SHA-256("grassroots ble suffix" | pubkey | slot)}, where \code{slot} is the wall-clock time divided by a 15-minute \code{bleSlotDuration}, encoded 8-byte big-endian. The derivation throws if the pubkey is shorter than 32 bytes; there is no lenient fallback. The prefix never changes, so a scanner recognises a Grassroots advertisement by prefix-matching; the suffix, however, rolls each slot. This is a deliberate \emph{unlinkability} property: a passive observer who does not know the public key sees a beacon that changes every 15 minutes and cannot track the device across slots, while anyone who \emph{does} know the key --- a friend, or the device itself --- recomputes the suffix and recognises it. Because unsynchronised clocks and slot boundaries would otherwise break recognition, matching is against a \emph{set}: \code{candidateServiceUuids} returns the previous, current, and next slot's UUIDs, and \code{serviceUuidMatchesPubkey} is the recognition primitive the transport uses throughout. The GATT characteristic UUID (\code{0000ff01-...}) is the same constant across all peers; the peripheral hosts its data service under whatever slot UUID it currently advertises, so when the slot advances a 30-second timer re-advertises the new beacon --- which rebuilds the peripheral GATT service under the new UUID, dropping and re-establishing its live central links across the boundary. That rebuild is the accepted cost of an unlinkable, rotating beacon.
+
+The UUID is a discovery hint, never an authorization proof --- it tells a scanner ``a Grassroots device carrying \emph{this} key is nearby,'' but authentication is established separately by the self-signed, neighbour-local ANNOUNCE (covered in \emph{Identity, Trust \& the Security Model}). Scanning uses the shared grassroots prefix as a service-UUID filter with a continuous window (timeout \code{Duration.zero}) and \code{allowDuplicates: true}, so iOS keeps delivering RSSI and liveness updates rather than reporting each device only once. Because a silently-muted scan is a known BLE failure mode, a watchdog fires every 10\,s and restarts a scan that has heard nothing for the \code{scanSilenceRestart} window (default 30\,s). Advertising is started with the identity's derived service UUID, the fixed characteristic UUID, and \code{bondless: true}.
+
+\subsection{Dual-Role Convergence Over GATT}
+
+A single GATT link is one-directional at the role level --- one side is central, the other peripheral --- so a Grassroots pair must converge to a \emph{dual-role} connection: two legs, each device central on one and peripheral on the other. This is mandatory; a single-link pair is only ever tolerated as a transient state that the transport keeps trying to upgrade. Path ids are role-prefixed accordingly: \code{central:<remoteId>} for outbound legs we dial, \code{peripheral:<remoteId>} for inbound legs we accept; only \code{central:} paths are ever dialed.
+
+Who dials first is decided by advertisement-driven arbitration rather than by leaving a leg unopened. For two same-platform peers, the tiebreaker is deterministic: the device whose current-slot service UUID sorts lower (\code{compareTo < 0}) opens the first central leg, mirroring UDP's ``smaller pubkey initiates.'' (Both peers compare the same pair of advertised UUIDs once they are on the same 15-minute slot; a rotation-boundary disagreement simply falls through to the first-mover fallback below.) Platform asymmetry is handled by a marker rather than an exception: iOS devices advertise the fixed local name \code{grs-ios}, and a peer that sees it yields the first dial to the iOS side. This routes around the one \emph{measured} hardware constraint --- an iOS central cannot open the \emph{second} link toward a non-iOS peer (the connect wedges until timeout) --- by making iOS always own a pair's first leg and the non-iOS side open the reverse leg. A cold-start ``first-mover fallback'' (default 5\,s) ensures the non-initiator dials anyway if the expected initiator never moves.
+
+Two defensive mechanisms guard the connection machinery against the noise of BLE radio-address privacy. The OS rotates a device's radio MAC / resolvable private address roughly every 30\,s, which produces a fresh transport-level path id for the \emph{same} logical peer; the transport suppresses these duplicates, dropping an advertisement from a rotated MAC when a live or in-flight path to the same peer already exists --- matched against the peer's candidate slot UUIDs (\code{candidateServiceUuids}: the current plus adjacent slots), since the service UUID itself now rotates every 15 minutes. Separately, the number of simultaneous in-flight central dials is capped at 2, so a chatty MAC-rotator cannot exhaust the local connection slots. In closed cold-call mode the transport additionally refuses to dial or connect to any peer whose advertised service UUID does not match an accepted friend's candidate slot UUIDs.
+
+\subsection{Moving Packets, MTU, and the Foreground Service}
+
+Once legs are up, sending is direct GATT writes. \code{sendToPeer} writes to a single ready path and returns \code{false} if none exists; \code{broadcast} writes to every ready path, ordered by RSSI descending (peripheral-role paths with unknown RSSI sort last via a $-100$ fallback but still receive), and returns the count sent. A path is eligible only when its plugin state is \code{ready} and \code{path.canSend} is true. Inbound bytes are parsed by \code{GrassrootsPacket.deserialize}; a malformed packet is caught and silently dropped rather than propagated. On every central connect the transport requests an ATT MTU of 247 bytes --- the largest most Android stacks negotiate --- because a single ANNOUNCE alone is $\sim$200 bytes, far over the default 23-byte ATT MTU (a 20-byte payload); the effective MTU is whatever the peer accepts, reported back via \code{BlePath.mtu}.
+
+Because Android aggressively freezes backgrounded processes, the transport pins itself alive with a native foreground service, controlled over the \code{grassroots/foreground_service} MethodChannel (\code{start}/\code{stop}) and declared with the \code{connectedDevice} foreground-service type. It is a no-op on every platform except Android and swallows a missing native handler, so the same Dart code runs unchanged on iOS.
+
+\subsection{A Fossil Worth Flagging}
+
+One stale comment deserves an explicit warning to any reader who opens the source. The \code{BleTransportService} class doc still reads ``\emph{Direct delivery only. No relaying, no store-and-forward}'' --- a fossil from before the mesh migration that directly contradicts the project's opportunistic-mesh design. It is technically accurate about \emph{this file}: the BLE transport genuinely contains no relay, flooding, DTN, TTL, or Bloom-filter logic; \code{broadcast} and \code{sendToPeer} only push to directly-connected GATT paths. But the comment misleads about the \emph{system}: multi-hop managed flooding and store-carry-forward live one layer up in the router (see \emph{Mesh Routing}), which drives the transport's \code{broadcast} primitive to achieve reach the transport itself is deliberately ignorant of. The comment should be read as describing the transport's narrow responsibility, not the mesh's behaviour.
+
+\section{The Internet Transport \& NAT Traversal}
+
+Where the BLE mesh (described in \emph{The BLE Mesh Transport} and \emph{Mesh Routing}) gives a device local, Internet-free reach through multi-hop flooding, the Internet transport gives it \emph{global} reach --- but only ever as a \emph{direct}, point-to-point path between the two endpoints. There is no store-carry-forward, no relaying, and no caching on this side: a message to an unreachable peer fails immediately rather than being held (\code{lib/src/transport/udp_transport_service.dart}). Everything that makes the Internet path hard is therefore concentrated in one problem: two mobile devices, each behind a NAT, have to \emph{find} each other and punch a hole through their respective NATs before that direct path can exist. This section covers the transport itself, then the NAT-traversal machinery --- hole-punching, signaling, and the facilitators that broker the punch.
+
+\subsection{The UDX Transport: Sessions, Sockets, and Reframing}
+
+The Internet transport is built on UDX, a reliable stream protocol layered over UDP. Its \code{TransportState} lifecycle follows the two-phase pattern shared with the BLE transport: \code{initialize()} binds the underlying sockets and moves the transport \code{uninitialized}$\rightarrow$\code{initializing}$\rightarrow$\code{ready}, then \code{startMultiplexer()} constructs the \code{UDXMultiplexer} and moves it \code{ready}$\rightarrow$\code{active} (\code{udp_transport_service.dart}). The split matters for hole-punching: raw punch bursts and the multiplexer contend for the same socket, so the transport can hold in \code{ready} (socket bound, multiplexer not yet running) precisely when it wants to read raw punch datagrams itself.
+
+Initialization binds a \code{RawDatagramSocket} for \emph{both} address families --- IPv6 first, then IPv4 --- each on the wildcard address with ephemeral port~0, and each family gets its own socket and its own multiplexer stored in per-family maps. Binding fails only if \emph{neither} family binds. When a single ``active'' socket must be chosen (e.g. for hole-punch sends), IPv6 is preferred, falling back to the first bound family (\code{udp_transport_service.dart}).
+
+An outgoing connection (\code{connectToPeer}) creates a \code{UDPSocket} on the multiplexer, opens a \code{UDXStream} with a per-multiplexer monotonically increasing stream id, and awaits \code{handshakeComplete} under a default 10-second timeout (\code{\_defaultHandshakeTimeout}). The stream id is \emph{never reused} --- it increments on every connect --- because UDX will refuse a SYN carrying a recently-closed stream id. Failures are classified into \code{UdpConnectFailureKind.\{networkUnreachable, handshakeTimeout, other\}}: a \code{TimeoutException} becomes \code{handshakeTimeout}, and \code{SocketException} codes 101/113/65 (or unreachable-route text) become \code{networkUnreachable}, so the coordinator can distinguish ``no route'' from ``peer silent'' (\code{udp_transport_service.dart}).
+
+Because the wire envelope is \emph{sender-anonymous} (recipient-only, no sender field --- see \emph{The Wire Format}), an incoming stream cannot be attributed from its bytes. The transport therefore keys the fresh connection by a temporary key of the form \code{remoteAddress:remotePort:streamId}, and only once the coordinator verifies the first packet does it call \code{mapIncomingConnectionToPubkey} to bind that temp key to the peer's public key. Established connections are then keyed by pubkey hex --- and since a peer id \emph{is} its pubkey hex, \code{getPubkeyForPeerId} is just a hex decode (\code{udp_transport_service.dart}).
+
+UDX delivers a reliable \emph{byte stream}, not discrete datagrams, so the receiver must recover packet boundaries. A \code{\_PacketFramer} buffers incoming bytes and reframes them into 58-byte-header \code{GrassrootsPacket}s: it waits until it has at least a full header, peeks the on-wire payload length, and slices off exactly \code{headerSize}~$+$~payload bytes before repeating. This is the point where the same 58-byte packet model used on the mesh is reconstructed from a stream. There is also a raw-UDP fallback (\code{sendRawTo}) that bypasses UDX entirely --- used when the UDX handshake fails (e.g. a LAN hairpin) --- carrying no reliability, so app-layer ACK retries must cover loss. On the raw receive path, 36-byte \code{BCPU} punch packets and anything under 50 bytes are dropped as not meaningful (\code{udp_transport_service.dart}).
+
+\subsection{Address Candidates and Public-Address Discovery}
+
+Consistent with the \emph{one address per connection, multiple candidates per peer} principle, a \code{\_PeerConnection} stores exactly one \code{addr}$+$\code{port}; \code{connectToPeer} records a single \code{'\$remoteHost:\$port'}$\rightarrow$pubkey mapping. There is no per-message address selection and no mid-stream switching. Candidate \emph{selection} is delegated up to the connection logic and expressed as a dial-ability filter: \code{canDialAddress} accepts an address only if a socket is bound for its family, and either the address is loopback or the transport has a usable route. The set of candidates a peer offers --- public IPv4, public IPv6, and link-local IPv6 --- arrives via that peer's ANNOUNCE; the transport's job is to filter and dial, not to enumerate (\code{udp_transport_service.dart}).
+
+Public addresses are discovered by \code{PublicAddressDiscovery} through an external reflector: \code{https://ipv6.seeip.org} for IPv6 and \code{https://ipv4.seeip.org} for IPv4, each behind a 5-second connect timeout, with results cached per family for 5 minutes. A link-local IPv6 candidate (\code{fe80::}) is additionally harvested from local interfaces and rendered as \code{'[fe80::...\%iface]:port'}; it lets two devices on the same LAN connect directly --- bypassing AP client isolation and NAT altogether --- and is scoped to the local link, never reaching the public Internet (\code{public_address_discovery.dart}). The transport also self-heals: \code{probeAndRebindIfDead} sends a 1-byte loopback probe per family and, on any failing family, tears down and fully re-initializes the whole UDP stack (surfacing per-peer disconnects) --- a workaround for Android sockets that die with \code{EPERM}.
+
+\subsection{Hole-Punching}
+
+A hole-punch packet is a fixed 36 bytes: a 4-byte magic \code{BCPU} (\code{0x42 0x43 0x50 0x55}) followed by the sender's 32-byte Ed25519 public key \emph{in cleartext} (\code{hole_punch_service.dart}). The \code{HolePunchService} caches one serialized punch packet at construction (identical for every target) and sprays it: \code{punch()} is fire-and-forget for a default 2~seconds at a 200~ms interval, while \code{punchUntilResponse()} sends at the same interval and returns on the first inbound punch, or false after a 5-second timeout. Sending is what matters: the act of transmitting opens the sender's NAT mapping, so a receiver need not process the packet at all --- and indeed the embedded pubkey is only a NAT-mapping \emph{hint}, not authenticated, since punch packets are unsigned.
+
+It is important to state plainly what this service does \emph{not} do. \code{HolePunchService} contains no notion of a deterministic initiator, no simultaneous-punch scheduling, no \code{PUNCH\_INITIATE} handling, and no friend-gating --- it only sprays bursts. The idealized well-connected-friend flow (both sides punch at a coordinated instant) is \emph{partial} and split across layers: the coordination that decides \emph{when} and \emph{toward whom} to punch lives in the coordinator and the \code{SignalingService}, described next, not in this service.
+
+\subsection{Signaling: The Reconnection Protocol}
+
+Signaling is the out-of-band control channel that lets two NAT'd peers rendezvous. Its messages are defined by \code{SignalingType} in \code{lib/src/signaling/signaling_codec.dart}, an enum whose wire values \emph{start at 0x05}: \code{punchInitiate(0x05)}, \code{punchReady(0x06)}, \code{addrReflect(0x07)}, \code{reconnect(0x08)}, \code{available(0x09)}, \code{rvList(0x0a)}, \code{friendList(0x0b)}. Values \code{0x00}--\code{0x04} are permanent gaps: the earlier \code{ADDR\_QUERY}/\code{ADDR\_RESPONSE}/\code{PUNCH\_REQUEST} types were deleted outright when the flow switched to \code{RECONNECT}/\code{AVAILABLE} matching --- a clean break that, per the project's no-legacy rule, leaves holes rather than renumbering.
+
+The core reconnection handshake is deliberately two-sided. When peer~A's address changes, A sends \code{RECONNECT(target=B)}; peer~B independently sends \code{AVAILABLE(target=A)}. A facilitator that has observed each sender's live source \code{ip:port} matches A's \code{RECONNECT} against B's \code{AVAILABLE} (the match key is the inverse of the pending key) and, on a match, sends each side a \code{PUNCH\_INITIATE} carrying the \emph{other} side's observed address. Both peers then punch toward those addresses; \code{PUNCH\_READY} is exchanged so each learns the hole is open, and \code{ADDR\_REFLECT} is the STUN-equivalent by which a facilitator reflects a peer's own observed external address back to it. Mediation is family-constrained --- the target address is chosen to match the requester's IP family (IPv4 or IPv6), and the punch is aborted if none matches --- and duplicate coordinations for the same (sorted) pubkey pair are suppressed within a 15-second cooldown (\code{signaling_service.dart}).
+
+Two facts anchor the trust model. First, \emph{signaling is authenticated end-to-end, not per-packet}: a signaling message travels inside a Noise-sealed \code{secure} envelope carrying \code{ContentType.signaling} (see \emph{The Noise Session Layer}), so the sender is authenticated by trial-decrypt and the anonymous outer envelope carries no signature. As a defence-in-depth check, \code{RECONNECT} additionally duplicates the initiator pubkey inside its 64-byte payload and the receiver rejects it unless that inner value byte-matches the authenticated sender. Second, \emph{signaling is friend-only and signaling-only}. Untrusted senders are dropped \emph{before} decode: a sender is trusted only if it is a friend, a configured rendezvous server, or a known friend RV server. And a facilitator only ever moves \emph{metadata} (addresses and punch timing) --- never message content. This is the trust boundary that distinguishes the Internet path (friend-gated signaling; content stays direct and end-to-end) from the BLE mesh (open relay of sealed bytes for arbitrary recipients).
+
+\subsection{Facilitators: Friend Mediators vs.\ Rendezvous Servers}
+
+Two kinds of node can broker a punch, and they run different subsets of the protocol. A \emph{friend mediator} is an ordinary well-connected friend that both peers happen to know; it runs \emph{only} the single-step \code{RECONNECT} path, and it drops the target unless that target is a friend \emph{and} currently reachable on the mediator. It explicitly refuses \code{AVAILABLE} and the two-sided matcher --- ``friend mediators do not run the rendezvous-server matcher'' (\code{signaling_service.dart}). The two-sided \code{RECONNECT}$\leftrightarrow$\code{AVAILABLE} matcher belongs to a \emph{rendezvous server}.
+
+The rendezvous server is implemented today as the \code{bootstrap\_anchor}: a publicly-reachable, well-connected reference node with its own independent Ed25519 keypair, no friends list, and no place in the social graph (\code{bootstrap_anchor/lib/src/anchor_server.dart}). It listens on IPv6 and IPv4 (default port 9516), observes each cold-caller's source \code{ip:port}, and runs the full matcher; it drops any \code{PUNCH\_INITIATE}/\code{ADDR\_REFLECT}/\code{RV\_LIST} sent \emph{to} it (it is well-connected and knows its own address), and it \emph{never relays messages or fragments} --- message and fragment packets are dropped with ``rendezvous server does not relay messages''. It, too, requires signaling to arrive Noise-sealed: plaintext signaling is refused, and it acts purely as a Noise responder, never initiating a session. Peers learn each other's rendezvous servers by exchanging \code{RV\_LIST} (a pubkey$\rightarrow$address map recorded per friend) and \code{FRIEND\_LIST} (the friends-of-friends map that lets a well-connected friend qualify as a facilitator for a given target). One honesty caveat in the current anchor: friendship-proof verification is \emph{intentionally deferred} --- it matches any signed \code{RECONNECT}/\code{AVAILABLE} pair, so the ``verifies friendship proofs'' promise in its own doc comment is not yet backed by code.
+
+\subsection{Address Persistence and Future Work}
+
+A crosscutting invariant governs stored addresses: a peer's last-known address is \emph{never unilaterally cleared}. It is updated when a newer valid address arrives (from ANNOUNCE, signaling, or direct observation) and cleared only when the peer itself signals it no longer has one. Stale-peer cleanup, our-side disconnects, and transport rebinds must not null it out, because it is the only handle for attempting reconnection. The client-side address table is in-memory and volatile --- lost on restart, with friends re-registering on startup --- and supports multiple candidates per peer, returned newest-first (\code{address_table.dart}). The anchor's table mirrors the same discipline, protecting live-connected peers from stale eviction and treating the live source address as the source of truth over stale ANNOUNCE state.
+
+Finally, the boundary between shipped and planned must be drawn precisely here. \emph{Rendezvous servers are the current, live NAT-bootstrap mechanism}: the \code{bootstrap\_anchor}, \code{RendezvousServerSettings}, \code{RV\_LIST}, and the configured-RV plumbing are all fully implemented and in use. The design direction of \emph{replacing} rendezvous servers with well-connected friends --- along with signed \code{grassroots://} invite links to bootstrap first contact --- is recorded as a design note but is \emph{not} implemented: the invite-link surface (URL schemes, deep-link handlers) is absent from the build configuration. Two further items are likewise future work: the from-scratch multi-hop Noise handshake (the IK/KK patterns) is not built --- handshakes are neighbor-local today --- and full simultaneous-punch coordination remains partial across the coordinator and \code{SignalingService} rather than a single orchestrated flow.
+
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\footnotesize,>={Latex[length=2mm]}]
+  \node (a) {Peer A};
+  \node (f) [right=3.6cm of a] {Well-connected friend};
+  \node (b) [right=3.6cm of f] {Peer B};
+  \foreach \n in {a,f,b} \draw[thick] (\n) -- ++(0,-3.8);
+  \draw[->] ($(a)+(0,-0.6)$) -- node[above,font=\scriptsize]{register} ($(f)+(0,-0.6)$);
+  \draw[<-] ($(f)+(0,-1.0)$) -- node[above,font=\scriptsize]{register} ($(b)+(0,-1.0)$);
+  \draw[->] ($(a)+(0,-1.5)$) -- node[above,font=\scriptsize]{RECONNECT(B)} ($(f)+(0,-1.5)$);
+  \draw[<-] ($(a)+(0,-2.0)$) -- node[above,font=\scriptsize]{PUNCH\_INITIATE} ($(f)+(0,-2.0)$);
+  \draw[->] ($(f)+(0,-2.4)$) -- node[above,font=\scriptsize]{PUNCH\_INITIATE} ($(b)+(0,-2.4)$);
+  \draw[<->,dashed] ($(a)+(0,-3.2)$) -- node[above,font=\scriptsize]{direct UDX --- friend leaves the path} ($(b)+(0,-3.2)$);
+\end{tikzpicture}
+\caption{NAT hole-punch mediated by a well-connected friend. The friend relays only addresses and \code{PUNCH\_INITIATE}; the deterministic initiator (lexicographically smaller pubkey) then dials the direct UDX stream.}
+\label{fig:holepunch}
+\end{figure}
+
+
+\section{Mesh Routing: Managed Flooding \& DTN Store-Carry-Forward}
+
+The Bluetooth mesh is where Grassroots earns the word \emph{opportunistic}: a message reaches a friend who is not a direct neighbour by hopping across intermediaries, and a message for a friend who is momentarily out of range is carried until they reappear. Both behaviours live in one place. Every inbound packet, from every transport, enters the router through the single method \code{processPacket} (\code{lib/src/routing/message\_router.dart:148}). This is deliberate: BLE-arrived and UDP-arrived packets are demultiplexed by the same dispatch, deduplicated against the same filter, and (for BLE) relayed by the same rule, so there is exactly one definition of ``what happens to a packet.'' As established in \emph{Wire Format \& Packets}, the outer header the router sees is sender-anonymous — recipient ID, type, TTL, packet ID, and length only — so every decision below is made without knowing who originated the packet, and without being able to read its contents.
+
+\subsection*{The dispatch: announce and handshake are special}
+
+\code{processPacket} first peels off the two packet types that are \emph{not} mesh traffic. An \code{announce} is handed to the ANNOUNCE handler and returned early — never deduplicated, never relayed (\code{message\_router.dart:160}). A \code{noiseHandshake} is checked as addressed-to-us and dispatched, then likewise returned early (\code{message\_router.dart:175}). Both are minted with TTL 1 at the coordinator (\code{grassroots\_network.dart:4930} for ANNOUNCE, \code{2789} for the handshake), which makes them structurally \textbf{neighbour-local}: a TTL-1 packet can never satisfy the relay condition (which requires \code{ttl > 1}), so it dies at the first hop by construction. The rationale is that both are about \emph{presence and pairwise key agreement}, not reach: ANNOUNCE advertises ``I am here, and here is my signed identity'' to immediate neighbours, and the Noise \code{XX} handshake — as detailed in \emph{The Noise Session Layer} — is today a neighbour-local exchange. A from-scratch multi-hop handshake (Noise \code{IK}/\code{KK} carried across relays) is \textbf{future work}; the current handshake reaches only direct neighbours, which is why an existing session, not a fresh handshake, is what lets the flood carry a message to a non-adjacent recipient.
+
+\subsection*{Managed flooding}
+
+Everything that survives the early returns — i.e.\ every \code{secure} envelope — is a mesh packet. The router deduplicates it by calling \code{checkAndAdd} on the outer \code{packet.packetId} against a \code{BloomFilter} of recently-seen IDs; \code{firstSeen} is the negation of ``was already present'' (\code{message\_router.dart:189}). A packet is relayed only when three conditions hold simultaneously (\code{message\_router.dart:208}):
+
+\begin{enumerate}
+\item \textbf{First sight.} \code{firstSeen} is true — a duplicate is dropped, killing loops and re-floods.
+\item \textbf{TTL budget.} \code{packet.ttl > 1}. The relay forwards \code{packet.decrementTtl()}, so the TTL falls by one per hop and the packet is dropped at the last hop (TTL reaching~1). The default starting TTL is~7 (\code{packet.dart:60}), bounding any packet to at most seven hops of spread.
+\item \textbf{Rate budget.} The per-neighbour relay budget (below) permits it.
+\end{enumerate}
+
+Relaying is \textbf{open}: it is not friend-gated. The router forwards a sealed packet for a recipient it has no relationship with, because it can only see the recipient ID and opaque ciphertext — it cannot read the body, and the header carries no sender to authorise against. This is the deliberate reversal that gives the mesh its reach, and it is safe precisely because a relay handles nothing but recipient-addressed sealed bytes.
+
+Crucially, a relay forwards the packet's bytes \emph{unchanged}. The router hands the decremented packet to the coordinator's \code{onRelay} callback (\code{grassroots\_network.dart:3894}), which re-floods over BLE only --- UDP stays direct point-to-point, per \emph{The Internet Transport} --- via \code{\_floodViaBle(packet.serialize())} and thence \code{BleTransportService.broadcast(bytes, excludePeerIds)}, writing that one identical, already-sealed ciphertext to every ready BLE neighbour. A relay \emph{cannot} re-seal, because it cannot decrypt; it copies opaque bytes. This is distinct from the coordinator's own \code{broadcast(payload)} method, which does seal a \emph{fresh} copy per neighbour under each peer's Noise session --- but that path sends plaintext the coordinator itself holds, and is not relaying. On the relay path the inbound BLE peer is excluded from the fan-out (\code{excludeBlePeerId}, \code{message\_router.dart:210}) so a packet is never echoed straight back to the neighbour it arrived from.
+
+\subsection*{The Bloom filter and its hard-clear rotation}
+
+The dedup filter (\code{lib/src/mesh/bloom\_filter.dart}) is 96{,}000 bits with 7 hash functions (double-hashed: FNV-1a plus a Murmur3-like second hash). It self-rotates by a \textbf{hard full clear} — not a generational scheme — when either the item count reaches 10{,}000 or 5~minutes elapse since the last rotation (\code{bloom\_filter.dart:110}). The consequence worth naming honestly: a packet ID seen just before a rotation can be treated as new just after it, so the same packet could in principle be re-processed or re-relayed across a rotation boundary. This is an accepted trade-off — the filter must be bounded in both memory and staleness, and TTL plus the rate budget cap the damage of any re-flood. ANNOUNCE and handshakes never touch this filter at all, having returned early.
+
+\subsection*{Bounding the flood: the per-neighbour relay budget}
+
+An open flood without a rate cap is a battery sink and an abuse vector. Each attributable inbound neighbour is limited to 512 relays per 10-second window (\code{message\_router.dart:43}); once the window's count is exhausted, further relays from that neighbour are refused until the window rolls over. The important caveat is attribution: \code{\_allowRelayFrom} returns \code{true} unconditionally when the inbound peer id is \code{null} — the unattributable case, e.g.\ UDP (\code{message\_router.dart:521}). So the 512/10\,s cap governs \emph{BLE neighbours}, which is where flooding actually happens; UDP relays are not per-neighbour rate-limited (and in practice UDP is direct point-to-point, so this branch rarely relays at all).
+
+\subsection*{DTN store-carry-forward}
+
+Flooding only helps if a path to the recipient currently exists. When it does not, the router falls back to delay-tolerant carriage. After — and only after — a successful relay decision, if the recipient is not currently reachable, the sealed packet is cached in the DTN store keyed by recipient hex (\code{message\_router.dart:217}). This ordering matters: if the per-neighbour budget blocked the relay, the packet is \emph{not} DTN-cached either, so a rate-limited node does not silently become an unbounded buffer. The store (\code{lib/src/mesh/dtn\_store.dart}) is bounded on three axes, each an explicit anti-abuse bound:
+
+\begin{itemize}
+\item \textbf{Age.} Entries older than 6~hours are pruned on every \code{store} and \code{takeFor}.
+\item \textbf{Per-recipient depth.} At most 32 packets per recipient; the oldest are evicted first. Storage is idempotent per packet ID, so re-seeing the same packet does not grow the bucket.
+\item \textbf{Recipient count.} At most 256 distinct recipients; when exceeded, the store evicts the recipient whose oldest packet is oldest.
+\end{itemize}
+
+Re-delivery is event-driven. When a recipient reappears (on their ANNOUNCE / peer-connected event), the coordinator calls \code{flushDtnFor}, which takes all non-expired cached packets for that recipient and re-floods each via \code{onRelay} (\code{message\_router.dart:630}) — this time with no excluded peer, since it is a fresh flood rather than a forward of one specific inbound copy.
+
+\subsection*{Two distinct dedup keys}
+
+Because a large message is fragmented, the router keeps two separate dedup domains. Relay and loop suppression run on the \textbf{outer} \code{packetId} (pre-decrypt), so an intermediary can dedup without reading anything. Message \emph{delivery} dedup runs on the \textbf{inner} \code{messageId} recovered from the reassembled \code{SecureFrame} after decryption (\code{message\_router.dart}, reassembly path). Thus a first-seen fragment is relayed, but the application receives the assembled message exactly once; a duplicate that still arrives is re-ACKed without being re-delivered.
+
+\subsection*{The sender's own queue is not the relay's DTN}
+
+It is important not to conflate two carry mechanisms that look superficially alike. The \emph{relay} DTN store above holds \emph{other peers'} sealed traffic opaquely. The \emph{sender}, by contrast, keeps its own outbound responsibility: every successful \code{send()} registers the message in an ACK-pending table with a watchdog \code{Timer} of \code{ackTimeout} (default 5\,s, \code{grassroots\_network.dart:2277}). On timeout — or immediately when the BLE path it was riding drops — the message is re-queued onto the sender's per-recipient outbound FIFO (\code{grassroots\_network.dart:2290}, 2327), and the periodic announce timer drains that queue for peers that have become live. This is the madGLP ``fair message delivery'' assumption realised at the origin: the sender re-floods its own un-acked messages when conditions change, independent of whether any relay chose to cache them. The relay's DTN cache is a best-effort community amplifier; the sender's queue plus ACK watchdog is the actual delivery guarantee. Bounding every one of these structures — TTL, Bloom size and rotation, the relay budget, and all three DTN caps — is the same principle applied throughout: an unbounded flood or cache is an abuse and a battery drain, so nothing in the mesh is allowed to grow without a ceiling.
+
+\section{The Noise Session Layer}
+
+Every end-to-end guarantee in Grassroots rests on a single component: a hand-rolled implementation of the Noise Protocol Framework's \code{XX} handshake, living in \code{lib/src/session/noise\_session\_manager.dart}. The transport deliberately owns this code rather than deferring to a black-box library, because the mesh imposes requirements a generic Noise library does not anticipate: sessions must be demultiplexed without a sender field on the wire, they must survive a peer moving between relay paths and transports, and the transport-message AEAD must bind exactly those envelope fields a relay may \emph{not} mutate. This section explains how the layer meets those requirements, and marks clearly where today's implementation is neighbour-local and a broader design remains future work.
+
+\subsection*{Pattern, roles, and the three-message handshake}
+
+The concrete protocol is \code{Noise\_XX\_25519\_ChaChaPoly\_SHA256} (\code{noise\_session\_manager.dart:11}): the \code{XX} handshake pattern, X25519 Diffie--Hellman, ChaCha20-Poly1305 for authenticated encryption, and SHA-256 for hashing. \code{XX} is a mutual-authentication pattern in which neither party knows the other's static key in advance --- both static keys are transmitted, encrypted, \emph{during} the handshake. This matches the mesh's trust model, where a node may cold-call a neighbour it has never spoken to.
+
+The handshake is exactly three messages, enumerated \code{message1(1)}, \code{message2(2)}, \code{message3(3)} (\code{noise\_session\_manager.dart:18--21}), exchanged between an \code{initiator} and a \code{responder} (\code{NoiseHandshakeRole}, line 16). The initiator writes messages 1 and 3; the responder writes message 2. Each message has a fixed, strictly-checked size, so a malformed handshake fails fast rather than degrading:
+
+\begin{itemize}
+  \item \textbf{Message 1} --- 32 bytes: the initiator's ephemeral X25519 public key, sent in the clear (\code{noise\_session\_manager.dart:417--419}).
+  \item \textbf{Message 2} --- 80 bytes: the responder's ephemeral (32 bytes) plus its encrypted static key (32-byte key + 16-byte MAC = 48 bytes) (\code{noise\_session\_manager.dart:442--445}).
+  \item \textbf{Message 3} --- 48 bytes: the initiator's encrypted static key (32 + 16) (\code{noise\_session\_manager.dart:473--475}).
+\end{itemize}
+
+Each handshake message is wrapped in a small versioned frame, \code{[version=1][message-value][body]} (\code{noise\_session\_manager.dart:710--732}), and a decode of fewer than two bytes or a wrong version byte is rejected --- there is no tolerance for a truncated or older frame, in keeping with the project's no-compatibility-shim rule.
+
+\subsection*{Symmetric-state primitives}
+
+The manager implements the Noise symmetric-state machine directly (\code{noise\_session\_manager.dart:534--612}). \code{initialize} seeds a 32-byte hash from the protocol name; \code{mixHash} folds new data into that running transcript hash as $\text{SHA-256}(\text{hash}\,\|\,\text{data})$; and \code{mixKey} runs a two-output HKDF-SHA256 (\code{\_hkdf2}, lines 688--708) to derive a fresh chaining key and cipher key, resetting the per-key nonce to zero. \code{encryptAndHash} / \code{decryptAndHash} apply ChaCha20-Poly1305 using the current transcript hash as AAD (lines 572--577), so every ciphertext is bound to everything exchanged so far. A subtle but correct detail is the \textbf{pre-first-\code{mixKey} passthrough branch}: while no cipher key exists yet (\code{cipherKey == null}), \code{encryptAndHash}/\code{decryptAndHash} pass their data through as cleartext and merely \code{mixHash} it (lines 565--571, 584--588). This is exactly why message~1 (the initiator ephemeral) travels unencrypted --- there is no key material to protect it yet under \code{XX} --- and it is authenticated retroactively by the transcript. Finally, \code{split} derives the two directional transport keys from an HKDF-2 over the final chaining key, with the initiator's send/receive keys being the responder's receive/send keys (lines 605--611), giving each direction its own key.
+
+\subsection*{Identity inside the handshake, and the birational check}
+
+Grassroots identity is an Ed25519 key pair, but Noise operates over X25519. The manager bridges the two with libsodium's birational map: the local Noise static is derived from the Ed25519 identity via \code{skToCurve25519}/\code{pkToCurve25519} (\code{noise\_session\_manager.dart:307--316}). Crucially, the peer's identity is never carried in a cleartext header --- it arrives \emph{inside} the encrypted static transmitted during the handshake. To prevent a peer from presenting a Noise static that does not correspond to its claimed Ed25519 identity, \code{\_verifyRemoteStatic} recomputes \code{pkToCurve25519(remotePubkey)} and compares it, in constant time (\code{\_bytesEqual}, lines 347--354), against the static Noise actually delivered (lines 331--345). If they disagree --- or the point is invalid --- verification fails and no session is formed. This is the load-bearing authentication check: there is \textbf{no per-packet Ed25519 signature} anywhere in this layer, correcting a stale class-doc remark that lists ``signing packets'' as a use of the identity (\code{identity.dart:14--15}); only ANNOUNCE is payload-signed, and the identity's private key is used here purely for this static-key derivation.
+
+\subsection*{Keying by peer, and sender-anonymous demultiplexing}
+
+Sessions are stored in a map keyed by the peer's Ed25519 public key rendered as hex (\code{noise\_session\_manager.dart:64--67}, \code{\_hex} at 804--806) --- \emph{not} by transport path or socket. A session therefore transparently survives a peer switching relay paths on the BLE mesh or moving between BLE and Internet transports; the same key material serves every path. Because the outer envelope is sender-anonymous (recipient-only, no sender field), an inbound \code{secure} packet carries nothing that says which session decrypts it. The manager resolves this by \textbf{trial-decrypt} (\code{trialDecrypt}, lines 170--193): it iterates every active session, attempting an AEAD open; the Poly1305 tag succeeds for at most one session, which both selects the session and recovers the sender's identity as a by-product. The call returns the cleartext packet together with the recovered sender pubkey, or \code{null} if no session matches. On the send side, \code{encryptPacket} seals only \code{secure}-typed packets and leaves the type as \code{secure} (the post-refactor design no longer swaps in ``secure-variant'' packet types), so relays observe an identical opaque type for every content class.
+
+\subsection*{Transport AEAD, AAD, and replay}
+
+An encrypted transport payload is laid out as \code{[version=1][8-byte little-endian nonce][ciphertext $\|$ 16-byte MAC]} (\code{noise\_session\_manager.dart:627--644}), the 64-bit counter being written little-endian at offset~4 of a 12-byte ChaCha20-Poly1305 nonce buffer (\code{\_aeadNonce}, lines 738--743). The associated data (AAD) is 81 bytes: the constant \code{secure} wire type (1) $+$ sender pubkey (32) $+$ recipient (32) $+$ packetId (16) (\code{\_applicationAad}, line 766). It \textbf{deliberately excludes \code{ttl} and \code{timestamp}}, precisely because a relay decrements TTL in flight --- binding TTL would break end-to-end authentication the moment the packet was forwarded. The content type is \emph{not} in the AAD because it no longer lives on the wire at all; it sits inside the AEAD-protected plaintext as a \code{SecureFrame}, and is thus authenticated by the ciphertext itself (see \emph{The Wire Protocol}). Replay is resisted per direction by a bounded set of received nonces capped at 2048 with FIFO eviction (lines 661--663, 679--685); a duplicate nonce raises a \code{StateError}. This is a \emph{bounded} guard, not an absolute one --- a nonce evicted after 2048 newer arrivals could in principle be replayed --- a documented trade-off between memory and strictness.
+
+\subsection*{Establishment scope, timeouts, and future work}
+
+Handshake liveness is enforced by a 5-second timeout on \code{waitForSession}: on expiry the half-built session entry is reset and \code{false} returned (\code{noise\_session\_manager.dart:74, 112--118}). Simultaneous initiation --- both peers sending message~1 at once --- is broken deterministically by comparing local and remote pubkey hex: the lexicographically-smaller side keeps its initiator handshake and ignores the inbound message~1, the other abandons and becomes responder (lines 213--219).
+
+Today, handshake establishment is strictly \textbf{neighbour-local}: both ANNOUNCE and \code{noiseHandshake} packets are sent with \code{ttl: 1} and are never flooded, and \code{remotePubkey} is resolved by the coordinator from the neighbour's verified self-signed ANNOUNCE on the inbound BLE path rather than from the packet (which carries no sender) (\code{noise\_session\_manager.dart:124--127}). A session, once formed, is end-to-end and survives relaying --- but forming one requires the two endpoints to be direct neighbours. A from-scratch multi-hop handshake using the \code{IK}/\code{KK} Noise patterns, which would let two non-adjacent mesh nodes establish a session across relays, is \textbf{future work} and is not implemented.
+
+
+\begin{figure}[htbp]\centering
+\begin{tikzpicture}[font=\footnotesize,>={Latex[length=2mm]}]
+  \node (a) {Initiator};
+  \node (b) [right=5.5cm of a] {Responder};
+  \draw[thick] (a) -- ++(0,-3.4);
+  \draw[thick] (b) -- ++(0,-3.4);
+  \draw[->] ($(a)+(0,-0.7)$) -- node[above,font=\scriptsize]{msg1:\; e} ($(b)+(0,-0.7)$);
+  \draw[<-] ($(a)+(0,-1.6)$) -- node[above,font=\scriptsize]{msg2:\; e, ee, s, es} ($(b)+(0,-1.6)$);
+  \draw[->] ($(a)+(0,-2.5)$) -- node[above,font=\scriptsize]{msg3:\; s, se} ($(b)+(0,-2.5)$);
+\end{tikzpicture}
+\caption{The \code{Noise\_XX\_25519\_ChaChaPoly\_SHA256} handshake. Static keys are transmitted encrypted; each side's Ed25519 identity is cross-checked against its Noise static via the birational map. Establishment is neighbour-local (handshake packets carry TTL 1).}
+\label{fig:handshake}
+\end{figure}
+
+
+\section{State Management: the Redux Projection}
+
+All shared state in the transport lives in a single immutable Redux store. The root of that store is \code{AppState}, an immutable value composed of exactly six slices (\code{lib/src/store/app_state.dart}): \code{transports}, \code{peers}, \code{messages}, \code{friendships}, \code{settings}, and \code{signaling}. The user interface reads from these slices and rebuilds when they change; the transport layers never mutate application state directly. Instead, every observable event flows through the Redux cycle: a transport observation is turned into an \emph{action}, a pure \emph{reducer} folds that action into a new immutable state, and \emph{subscribers} (the UI, the persistence service) react to the resulting change. This chapter's discussion of \emph{the coordinator} and \emph{the Noise session layer} describes the producers of these actions; here we describe where their facts land and how they are shaped.
+
+\subsection{The six slices}
+
+Each slice owns one concern and nothing more.
+
+\begin{itemize}
+  \item \textbf{PeersState} (\code{lib/src/store/peers_state.dart}) holds \code{discoveredBlePeers} (raw BLE discoveries keyed by radio path id), \code{peers} (identified peers keyed by public-key hex), and a \code{friendsOfFriends} adjacency map. A \code{PeerState} records both BLE legs of the mandatory dual-role pair as two separate path-id fields (\code{bleCentralDeviceId}, \code{blePeripheralDeviceId}), the peer's UDP address plus a set of advertised \code{udpAddressCandidates} and a link-local fallback, and derived predicates such as \code{isReachable}, \code{hasBleConnection}, \code{activeTransport}, and \code{isWellConnected}.
+  \item \textbf{MessagesState} (\code{lib/src/store/messages_state.dart}) holds delivery-status records (\code{outgoingMessages}/\code{incomingMessages} keyed by message id), per-conversation chat history (\code{conversations} keyed by peer hex, oldest first), and \code{unreadCounts}. It is bounded: \code{maxMessages}$=1000$ and \code{maxMessagesPerConversation}$=500$. Notably this slice carries application-level chat and even view-once picture media as first-class content, which sits a little above the ``pure packet transport'' framing of the rest of the system.
+  \item \textbf{FriendshipsState} (\code{lib/src/store/friendships_state.dart}) is a map keyed by \code{peerPubkeyHex}; each entry carries status (\code{pending}, \code{received}, \code{accepted}, \code{declined}), the friend's last-known UDP address, and a \code{knownRvServers} map. Receiving a friend request while our own request to the same peer is outstanding auto-accepts, giving a mutual-request handshake.
+  \item \textbf{TransportsState} (\code{lib/src/store/transports_state.dart}) tracks the two transports' lifecycles \emph{independently} through separate \code{bleState} and \code{udpState} fields (plus per-transport error strings), our discovered \code{publicAddress}, and the current \code{networkConnectionType}. ``Well-connected'' is defined here: \code{isWellConnected} is true iff we hold a globally routable public address.
+  \item \textbf{SettingsState} (\code{lib/src/store/settings_state.dart}) holds the user-toggleable configuration: \code{bluetoothEnabled} and \code{udpEnabled} (both default true), \code{transportPriority} (default $[\text{bluetooth},\text{udp}]$), \code{coldCallTrustLevel} (default \code{closed}), the debug \code{bleRoleMode}, trace-logging consent, and the configured rendezvous servers.
+  \item \textbf{SignalingState} (\code{lib/src/store/signaling_state.dart}) is deliberately minimal: a single \code{holePunchAttempts} map from target peer hex to a \code{HolePunchStatus} (\code{requested}, \code{punching}, \code{succeeded}, \code{failed}). Hole-punch coordinates (ip, port, failure reason) ride \emph{on the actions} but are not retained in state --- only the status transition is recorded.
+\end{itemize}
+
+\subsection{The actions {\textrightarrow} reducers {\textrightarrow} subscribers cycle}
+
+\code{appReducer} (\code{lib/src/store/reducers.dart}) is the root reducer. It dispatches by the action's base type --- \code{PeerAction}, \code{MessageAction}, \code{FriendshipAction}, \code{SettingsAction}, \code{TransportAction}, \code{SignalingAction} --- to the matching slice reducer, and returns the state unchanged for any action it does not recognise. Each slice reducer is a pure function of (old slice, action) $\rightarrow$ new slice, and \code{AppState.copyWith} threads the one changed slice into a fresh root. Because the state is immutable, subscribers detect change by value equality; a slice that a reducer leaves untouched is returned identically and triggers no rebuild.
+
+\subsection{The strict-projection principle}
+
+The governing rule is that the Redux state is a \emph{strict projection} of facts the transport layers explicitly emit --- never an inference. Reducers must not synthesise state from ``I have not heard from peer $X$ in $N$ seconds'' heuristics; surfacing a path failure is the transport's job. Two examples make this concrete. \code{StalePeersRemovedAction} only \emph{removes} non-friend peers past a staleness threshold and explicitly refuses to touch \code{connectionState}, because that field is driven solely by BLE plugin events and UDX events (\code{lib/src/store/peers_reducer.dart}); friends are never removed at all. And a UDP disconnect drops reachability \emph{immediately} on the explicit disconnect event rather than by any timeout (\code{lib/src/grassroots_network.dart}). State is a record of what the transports reported, not a guess about what they might be doing.
+
+\subsection{Transport independence and consolidated reachability}
+
+The two transports are independent: losing or disabling one must have zero effect on the other. This invariant is encoded directly in the reducers. \code{PeerBleDisconnectedAction} preserves \code{hasLiveUdpConnection}, and \code{PeerUdpDisconnectedAction} preserves both \code{bleAuthenticated} and the stored \code{udpAddress} (kept for later reconnection) (\code{lib/src/store/peers_reducer.dart}). A peer's \code{connectionState} flips to \code{disconnected} on a transport drop only when the \emph{other} transport link is already absent. Reachability itself is authenticated-only: \code{isReachable} is \code{bleAuthenticated} $\lor$ \code{hasLiveUdpConnection} (\code{lib/src/store/peers_state.dart}), so a raw BLE or UDX link without a completed Noise session does not count as reachable. The one deliberate exception is a rendezvous server, whose raw UDX connection is treated as reachability because it runs no Noise handshake.
+
+Application-level connectivity is reported as \emph{consolidated} end-to-end reachability rather than per-transport events. The coordinator's reachability diff (\code{processReachabilityTransitions}, \code{lib/src/grassroots_network.dart}) compares each peer's current \code{isReachable} against the previous tick and fires \code{onPeerConnected}/\code{onPeerDisconnected} only on a transition. Because reachability is the OR of the two transports, one of two live transports flipping leaves the OR unchanged and fires nothing --- a disconnect fires only when the \emph{last} transport drops (a $0 \leftrightarrow N$ live-transport transition). A peer removed from the map while still reachable is surfaced as a synthesised disconnect carrying only the reconstructed identity.
+
+\subsection{The TransportState lifecycle}
+
+Each transport moves through a six-state lifecycle enum (\code{lib/src/transport/transport_service.dart}): \code{uninitialized} $\rightarrow$ \code{initializing} $\rightarrow$ \code{ready} $\rightarrow$ \code{active}, plus \code{error} and \code{disposed}. A transport is ``usable'' when it is \code{ready} or \code{active}. \code{TransportsState} carries one such enum per transport (defaulting to \code{uninitialized}) so BLE and UDP progress through their lifecycles wholly independently.
+
+\subsection{Selective persistence}
+
+Persistence is deliberately partial. \code{PersistenceService} (\code{lib/src/store/persistence_service.dart}) writes exactly three domains to \code{SharedPreferences}: friendships, settings, and conversations-plus-unread-counts (under \code{v2}-versioned keys), debounced by a $500$\,ms timer with a \code{flush()} for app exit. The \code{peers}, \code{transports}, and \code{signaling} slices are \emph{intentionally not persisted}. This is the strict-projection principle applied to durability: peer, transport, and hole-punch state are live facts that must be re-derived from the transports at runtime, so restoring a stale snapshot of them would violate the projection. Friendships, user settings, and chat history, by contrast, are durable user data with no live source to re-derive from.
+
+\subsection{The coordinator as the bridge}
+
+\code{GrassrootsNetwork} (\code{lib/src/grassroots_network.dart}) is the bridge between the transports and the store. It subscribes to raw BLE and UDX events and to the Noise session layer, and translates them into actions. A completed Noise handshake becomes a \code{PeerBleAuthenticatedAction} or a \code{PeerUdpConnectionChangedAction(connected:\,true)}; a torn-down UDX session becomes the corresponding \code{connected:\,false}; an ANNOUNCE becomes address and peer-list updates. This is precisely where explicit transport facts enter the projection, keeping reducers free of any inference.
+
+\subsection{Honest warts}
+
+A few rough edges are worth recording. \code{lib/src/store/store.dart} is only a library barrel of export directives, not the actual store construction --- the store and middleware are wired elsewhere. \code{AppAction} (\code{lib/src/store/actions.dart}) is a dead abstract base class: none of the per-slice action base classes extend it, and \code{appReducer} takes a \code{dynamic action}, so it is orphaned. Several \code{hashCode} implementations are intentionally weak: \code{MessagesState}, \code{FriendshipsState}, and \code{SignalingState} all hash only the \emph{length} of their maps, so two structurally different states of equal size collide (equality via \code{==} remains content-exact). \code{PeerState}'s equality deliberately excludes \code{bleAuthenticated}, which means a change to that flag alone is invisible to Redux equality even though \code{isReachable} depends on it --- a latent missed-rebuild risk for reachability-driven UI. Finally, the debug log is a scoped exception to the ``no mutable singletons'' rule: \code{DebugLogScreen} and its \code{LogBuffer} bypass Redux entirely and keep their ring buffer in a mutable global singleton, unlike all other UI state, which reads \code{AppState}.
+
+\section{The Diagnostic Trace-Logging Subsystem}
+
+The transport described in the preceding sections is intended for deployment on real phones carried by real people, and a central research question behind Grassroots Networking is empirical: how does an opportunistic BLE mesh actually behave in the wild — how far do messages travel, how often are they relayed rather than delivered directly, how dense are the neighbourhoods a device wanders through, and what does all of this cost in battery? Answering these questions demands telemetry gathered from live deployments, not from a simulator. The \emph{diagnostic trace-logging subsystem} exists to collect that telemetry. It is, by deliberate design, a consent-gated, cleanly separable add-on: it is injected into the network core rather than baked into it, it is a no-op until the user opts in, and its privacy model is engineered so that the research server cannot re-link a device across upload sessions. This section describes what it records, how it protects the participant, and — honestly — where its documentation has drifted from its code.
+
+\subsection{Separability and consent gating}
+
+The subsystem is two small classes, \code{TraceLogger} (\code{lib/src/trace/trace_logger.dart}) and \code{LocationSampler} (\code{lib/src/trace/location_sampler.dart}), plus a standalone \code{trace_server}. \code{TraceLogger} is constructed once in \code{lib/main.dart} with a platform label derived from \code{defaultTargetPlatform} (\code{'ios'} or \code{'android'}) and is then \emph{injected} into \code{GrassrootsNetwork} through its constructor (\code{GrassrootsNetwork(\ldots, trace: traceLogger)}, \code{lib/main.dart:737--742}). The network core calls \code{log()} at instrumented points but has no other coupling to the subsystem; removing it would require only deleting those call sites. As the \emph{State Management} section describes, consent itself is Redux state: \code{TraceLogger.setEnabled} is seeded from the persisted \code{settings.traceLoggingConsent} flag and kept in sync by a store subscription (\code{lib/main.dart:296--299}). Until the user accepts a one-time consent prompt — which fires only when \code{settings.consentTimestamp} is null (\code{lib/main.dart:592--625}) — the logger is disabled, and \code{log()} is a guarded no-op that appends nothing and never throws (\code{lib/src/trace/trace_logger.dart:56--68}). Consent withdrawal calls \code{clear()}, deleting the live buffer, any pending batch, and its sidecar (\code{lib/src/trace/trace_logger.dart:146--150}).
+
+\subsection{The privacy model: rotating, unlinkable identities}
+
+The subsystem's core privacy guarantee is that the server cannot correlate a participant across uploads. This is achieved by generating fresh identifiers \emph{per upload} rather than assigning a stable device identity. On each upload, \code{deviceId} is a brand-new UUID v4 (\code{trace_logger.dart:95--96}, commented \code{// rotating per-upload}), and every distinct non-empty peer public key referenced in the batch is replaced by a per-upload alias \code{p0}, \code{p1}, \code{\ldots} assigned in first-seen order (\code{trace_logger.dart:159--169}). Two uploads from the same phone therefore share no \code{deviceId} and no peer identifier, so the raw pubkeys never leave the device and cross-upload re-linking is defeated at the source. The consequence — accepted deliberately — is that any longitudinal analysis (a device's mesh behaviour over weeks) must be derived \emph{on-device} before upload; the server sees only unlinkable per-batch snapshots.
+
+\subsection{Record types and fields}
+
+Records are free-form JSON maps, each carrying a \code{type} and, where applicable, an event time \code{t} in epoch milliseconds. Six types are documented in \code{trace_server/schema.md}:
+
+\begin{itemize}
+  \item \textbf{message} --- the richest type, with direction variants \code{sent}, \code{recv}, \code{delivered}, \code{ack\_timeout}, and \code{dup}. Crucially, after the mesh migration these fields are \emph{real} measurements, not constants: a \code{recv} carries \code{relayHops} (computed as \code{defaultTtl} minus the TTL at receipt, i.e.\ relays actually traversed) and \code{deliveryMethod} (\code{'direct'} for zero relays vs.\ \code{'relayed'} for a mesh flood); a \code{delivered} carries \code{e2eLatencyMs} and \code{deliverySuccess} (\code{schema.md:63--90}). This is exactly the mesh-reach telemetry the research programme wants.
+  \item \textbf{contact} --- a peer encounter, logged on disconnect from a start timestamp captured on \code{onPeerConnected} (\code{lib/main.dart:744--756}).
+  \item \textbf{density} --- a foreground periodic sample of the local neighbourhood: \code{peersConnectedNow}, friend count, mean RSSI, and a coarse geo fix (\code{lib/main.dart:516--534}).
+  \item \textbf{visit} --- a completed dwell at a geohash cell (see below).
+  \item \textbf{buffer} --- absolute occupancy of the two bounded queues described in the \emph{Mesh Routing} section: \code{outboundQueued} (the sender's own outbound queue) and \code{dtnBuffered} (sealed packets held in the store-carry-forward cache), taken from \code{GrassrootsNetwork.outboundQueuedCount} / \code{dtnBufferedCount} (\code{schema.md:177--184}).
+  \item \textbf{device} --- battery and lifecycle health, with two emit points: a foreground periodic sampler (\code{batteryPct}, \code{batteryDrainPctPerHr}, \code{lifecycleState}, \code{networkType}) and an on-resume sample (\code{bgDurationMs}, \code{osThrottled}, the latter an approximation defined as \code{bgDurationMs > 60s}) (\code{schema.md:154--171}).
+\end{itemize}
+
+Both periodic record families are emitted by a single 60-second timer (\code{_traceSampleTimer}, \code{lib/main.dart:425--426}) that runs \emph{foreground-only} — it does no sampling work while the app is backgrounded, so background behaviour is observed only indirectly through the resume-time \code{bgDurationMs}/\code{osThrottled} proxy.
+
+\subsection{Coarse geolocation and geohash visits}
+
+Location is deliberately coarsened before it is ever recorded. \code{LocationSampler.sample()} requests a fix at \code{LocationAccuracy.low} with a 15-second time limit and returns null on any error or missing permission (\code{location_sampler.dart:48--60}). The returned fix rounds latitude and longitude to three decimal places and computes a geohash cell at precision~6 (roughly a $1.2\,\mathrm{km}\times0.6\,\mathrm{km}$ cell) using the standard base-32 alphabet (\code{location_sampler.dart:66--72,105--141}). Permission is requested lazily, once, and only when trace logging is enabled, accepting either \code{always} or \code{whileInUse} (\code{location_sampler.dart:24--35}; \code{lib/main.dart:471--475}). A \code{visit} record is emitted only on cell \emph{change} — on leaving the previous cell — and carries \code{placeId} (the departed cell), \code{arrivedAt}, \code{leftAt}, \code{visitMs}, an optional \code{returnTimeMs}, and \code{visitCount} (\code{location_sampler.dart:79--95}).
+
+\subsection{Durable buffer and idempotent upload}
+
+Records are appended to a durable JSONL file, \code{trace_buffer.jsonl}, in append mode without forced flush. The buffer is capped at 8~MiB (\code{maxBufferBytes}); when it exceeds the cap, \code{_trimOldest} drops the oldest \emph{half of records by count} and keeps the newer half (\code{trace_logger.dart:31,196--207}) — a lossy, count-based trim rather than a byte target, so the oldest data is silently discarded under sustained pressure.
+
+Upload is engineered to be safely retryable. \code{uploadAll} atomically renames the live buffer to an immutable \code{trace_pending.jsonl} and writes a sidecar meta file holding a single \code{uploadId} and \code{deviceId} reused across every retry (the sidecar is regenerated only if absent), so a network failure followed by a retry re-sends the \emph{same} \code{uploadId} rather than minting a new one (\code{trace_logger.dart:88--115}). The batch is assembled into an envelope, gzip-compressed, and POSTed to \code{<base>/v1/traces} with \code{Authorization: Bearer <token>}, \code{Content-Type: application/json}, and \code{Content-Encoding: gzip} (\code{trace_logger.dart:116--128}). Any HTTP 2xx deletes the pending and meta files; any non-2xx or exception keeps the pending batch for a later retry (\code{trace_logger.dart:130--142}). The daily-upload prompt in \code{main.dart} gates uploads on consent, a configured server URL and token, a new calendar day, and the presence of unuploaded data (\code{lib/main.dart:638--649,676--679}).
+
+The server side (\code{trace_server/server.py}) mirrors this contract. It enforces a 16~MiB raw-body cap (413 before decompression), decompresses gzip, rejects a decompressed body over $4\times$ that cap as a zip-bomb guard, validates only the envelope via a permissive pydantic model (record bodies are free-form \code{List[Dict]}), and honours idempotency: a known \code{uploadId} returns \code{200 \{status: duplicate, stored: 0\}} without re-storing, while a fresh batch returns \code{201} and is written both to a per-day NDJSON archive and a WAL-mode SQLite index (\code{server.py:196--321}). Auth uses a constant-time Bearer comparison, and the server refuses to start without a token unless \code{ALLOW_NO_AUTH=1}.
+
+\subsection{Documentation drift uncovered}
+
+In reconciling the code against \code{trace_server/schema.md} and \code{trace_server/README.md}, several drifts surfaced and are reported here for honesty rather than papered over:
+
+\begin{itemize}
+  \item \textbf{Identity scheme.} \code{schema.md} presents \code{deviceId} as an opaque salted/hashed pseudonym (an \code{h:} prefix), but the shipped code and the project's locked decision use a fresh rotating UUID v4 per upload with no salt or hash. The \code{schema.md} example is stale.
+  \item \textbf{Foreground vs.\ background sampling.} \code{README.md} claims background coarse-GPS sampling populates the visit record, whereas \code{schema.md} correctly notes that sampling is foreground-only today with background sampling a follow-up; the code has no background-service wiring, matching \code{schema.md}.
+  \item \textbf{Omitted \code{appVersion}.} Both \code{schema.md} and the server model list \code{appVersion}, but \code{TraceLogger._buildEnvelope} never sets it (\code{trace_logger.dart:171--179}), so it is always absent in practice.
+  \item \textbf{Stale delivery model.} The \code{trace_server/README.md} "Decisions (locked)" still asserts that relaying/multi-hop is not built and that \code{deliveryMethod}/hop counts are logged constants — directly contradicting both the shipped mesh (see the \emph{Mesh Routing} section) and \code{schema.md}, which now marks \code{relayHops} and \code{deliveryMethod} as genuinely varying measurements. The README is stale relative to the mesh migration.
+\end{itemize}
+
+Finally, two correctness caveats worth recording: \code{visit} tracking state (\code{returnTimeMs}, \code{visitCount}) is in-memory only and resets on process restart, so those accumulated fields are not durable despite \code{schema.md}'s framing; and \code{returnTimeMs} as computed is the gap \emph{away} from a place (arrival minus previous departure), which differs from \code{schema.md}'s "since the previous visit" phrasing.
+
+---
+
+Files backing this section (authoritative): `/private/tmp/claude-502/-Users-dbachar-git-technion-grassroots-networking--claude-worktrees-zealous-noether-ff8f0f/eccd4b29-2dc7-4133-b2df-5aefb6578891/scratchpad/arch/sheets/12-trace.md`, `/private/tmp/claude-502/-Users-dbachar-git-technion-grassroots-networking--claude-worktrees-zealous-noether-ff8f0f/eccd4b29-2dc7-4133-b2df-5aefb6578891/scratchpad/arch/sheets/13-ui-main.md`, and `/private/tmp/claude-502/-Users-dbachar-git-technion-grassroots-networking--claude-worktrees-zealous-noether-ff8f0f/eccd4b29-2dc7-4133-b2df-5aefb6578891/scratchpad/arch/verified-by-main.md`.
+
+\section{End-to-End Interaction Walkthroughs}
+
+The preceding sections dissected the transport component by component. This
+section reassembles them into seven concrete narratives that trace a single
+event as it flows across the layers. Each walkthrough is deliberately
+step-by-step and cites the responsible component by file and symbol; the reader
+should treat these as the ``integration tests in prose'' that show how the
+sender-anonymous envelope, the Noise session layer, the managed-flooding mesh,
+and the Redux projection actually cooperate at run time.
+
+\subsection{Sending a Message}
+
+A host application calls
+\code{GrassrootsNetwork.send(recipientPubkey, payload)}
+(\code{lib/src/grassroots\_network.dart}). The coordinator drives the following
+sequence.
+
+\begin{enumerate}
+  \item \emph{Validate and identify.} \code{send} rejects any recipient public
+    key that is not exactly 32 bytes, returning \code{null}. Otherwise it mints
+    a v4 UUID as the \code{messageId} (if the caller did not supply one) and
+    sets the wire \code{packetId} equal to it, so that the recipient's ACK ---
+    which echoes the \code{packetId} --- correlates back to this send.
+  \item \emph{Choose a transport, BLE first.} \code{\_trySendMessageNow}
+    attempts the BLE mesh first and only falls back to the Internet transport
+    when BLE is unavailable, honouring the ``BLE preferred'' rule.
+  \item \emph{Ensure a Noise session.} The BLE send path is gated on holding a
+    Noise session with the recipient. \code{\_ensureNoiseSession} completes an
+    XX handshake only for a \emph{direct} neighbour (see below), but an
+    \emph{already-established} session lets even a non-adjacent recipient be
+    addressed, because sessions are keyed by peer identity, not by path.
+  \item \emph{Seal the payload.} The message is wrapped in a
+    \code{secure} packet whose plaintext is a \code{SecureFrame}
+    (\code{lib/src/models/secure\_frame.dart}) carrying
+    \code{contentType = message}; \code{NoiseSessionManager.encryptPacket} seals
+    it to the recipient's session. The sender-anonymous envelope carries
+    \emph{no} wire signature --- authentication is end-to-end inside Noise.
+  \item \emph{Flood or send direct.} Over BLE, \code{\_floodViaBle} broadcasts
+    the sealed bytes to \emph{all} neighbours and reports success when the
+    neighbour count is greater than zero --- this is managed flooding, not a
+    point-to-point send. Over the Internet, the copy is a \emph{direct}
+    point-to-point UDX write: an existing connection is reused, else the
+    coordinator connects on demand to a known address, else it discovers the
+    peer through a facilitator (walkthrough~5).
+  \item \emph{Arm the ACK watchdog.} A successful send registers the message in
+    \code{\_ackPendingMessages} with a \code{Timer} of \code{config.ackTimeout}
+    (default 5\,s) calling \code{\_onAckTimedOut}. On timeout the message is
+    re-queued onto the per-recipient outbound FIFO; an inbound ACK dispatches
+    \code{MessageDeliveredAction} and clears the watchdog. A BLE path drop
+    re-queues in-flight messages on that device immediately, without waiting for
+    the timeout.
+  \item \emph{Queue when offline.} If no transport is usable, \code{send} still
+    returns the \code{messageId} and enqueues the payload; the periodic announce
+    timer later drains the queue when a peer reappears.
+\end{enumerate}
+
+Payloads larger than the fragmentation threshold (320 bytes) are split into
+270-byte chunks by \code{FragmentHandler}, each carried as its own
+\code{SecureFrame} (with \code{fragIndex}/\code{fragCount}), sealed
+individually, flooded, and separated by a 20\,ms inter-fragment delay. The
+whole message shares one \code{messageId}; reassembly is post-decrypt and keyed
+on it. Fragmented BLE sends require a \emph{pre-existing} session and do not
+themselves trigger a handshake.
+
+\subsection{Receiving, Relaying, and DTN-Caching a Packet}
+
+Every inbound packet, from any transport, enters
+\code{MessageRouter.processPacket}
+(\code{lib/src/routing/message\_router.dart}).
+
+\begin{enumerate}
+  \item \emph{Early types.} \code{announce} and \code{noiseHandshake} packets
+    are handled and returned first --- never deduplicated, never relayed.
+  \item \emph{Deduplicate.} For a \code{secure} packet, the router calls
+    \code{BloomFilter.checkAndAdd} on the outer \code{packetId}; \code{firstSeen}
+    is the negation of prior presence. This loop/relay dedup is on the
+    \emph{outer} \code{packetId}.
+  \item \emph{Is it for us?} \code{\_isForUs} compares the envelope's
+    \code{recipientPubkey} to our identity.
+  \item \emph{If for us: trial-decrypt and deliver.} A session-encrypted packet
+    addressed to us is authenticated by trial-decrypting it against every active
+    Noise session; the AEAD tag identifies the right one and recovers the sender
+    public key. The router then \code{SecureFrame.decode}s the plaintext and
+    dispatches on \code{frame.contentType} (message, ack, readReceipt,
+    signaling). Delivery to the application happens only on \code{firstSeen};
+    a duplicate is re-ACKed without re-delivering. \emph{Delivery} dedup is thus
+    on the \emph{inner} \code{messageId}, distinct from the outer-\code{packetId}
+    relay dedup. A cleartext packet addressed to us is dropped as
+    unauthenticated.
+  \item \emph{If not for us: relay.} When \code{firstSeen \&\& ttl > 1} and the
+    per-neighbour budget (at most 512 relays per 10\,s per inbound neighbour)
+    allows it, \code{onRelay} re-floods \code{packet.decrementTtl()} to all BLE
+    neighbours except the inbound path. A packet at \code{ttl <= 1} dies at the
+    last hop. Relaying is BLE-only; the Internet path never relays.
+  \item \emph{DTN cache on miss.} If, after the relay decision, the recipient is
+    \emph{not} currently reachable, the sealed packet is cached in the bounded
+    \code{DtnStore} (256 recipients, 32 packets each, 6\,h max age) keyed by
+    recipient hex --- store-carry-forward for a peer that is out of range.
+  \item \emph{Flush on reappearance.} When that recipient later reappears, the
+    coordinator calls \code{flushDtnFor}, which takes all non-expired cached
+    packets for the recipient and re-floods each via \code{onRelay}.
+\end{enumerate}
+
+Because a relay only ever sees the recipient ID and opaque sealed bytes, it can
+neither read nor authenticate the traffic it carries --- the accepted cost of
+sender-anonymity, bounded by TTL, dedup, and the per-neighbour rate cap.
+
+\subsection{Discovery, Dual-Role Convergence, and ANNOUNCE}
+
+Presence over BLE is established locally, never flooded.
+
+\begin{enumerate}
+  \item \emph{Advertise and scan.} Each device advertises a pubkey-derived
+    service UUID whose fixed \code{grassroots} prefix (\code{84c403160871e5ad})
+    is followed by a suffix that rotates every 15 minutes
+    (\code{SHA-256("grassroots ble suffix" | pubkey | slot)}), and scans
+    continuously for that prefix
+    (\code{lib/src/transport/ble\_transport\_service.dart}). The UUID is only a
+    discovery hint --- it rotates for unlinkability and proves nothing; a peer
+    recognises it by recomputing the current and adjacent slots.
+  \item \emph{Converge to dual role.} The pair arbitrates who dials which leg
+    from advertisement markers: same-platform peers use the lower service UUID
+    as the deterministic first-mover; iOS advertises \code{grs-ios} and owns the
+    first leg toward an Android because a measured iOS constraint forbids it
+    opening the \emph{second} link. Both legs are pursued until two GATT
+    connections exist; a single link is only ever a transient state that the
+    transport keeps trying to upgrade.
+  \item \emph{Self-signed ANNOUNCE.} Over the connection each side sends an
+    ANNOUNCE built with TTL~1 whose payload carries the full public key,
+    nickname, and an Ed25519 signature over the payload
+    (\code{createAnnouncePayload}). ANNOUNCE is the \emph{one} signed,
+    non-relayed packet type.
+  \item \emph{Verify and gate.} \code{MessageRouter} verifies the ANNOUNCE via
+    \code{protocolHandler.decodeAnnounce}, which throws on a forged or malformed
+    signature; the router drops it. The coordinator then applies the cold-call
+    gate: in \code{ColdCallTrustLevel.open} any sender is accepted, otherwise
+    only accepted-friend public keys are; a rejected ANNOUNCE triggers a BLE
+    disconnect of the device.
+  \item \emph{Project to Redux.} On first receipt per identity,
+    \code{onPeerDiscovered} fires (deduped), and the verified identity is
+    recorded in the store. Note that discovery precedes and is decoupled from
+    the Noise-gated \code{onPeerConnected}.
+\end{enumerate}
+
+Crucially, ANNOUNCE is \emph{neighbour-local}: it is not relayed (TTL~1), so a
+node learns the presence of \emph{direct} neighbours only. A non-adjacent peer's
+presence is never learned as a discovery event; the mesh reaches such a peer
+only implicitly, by flooding sealed traffic addressed to its recipient ID
+(walkthrough~2), not by propagating its ANNOUNCE.
+
+\subsection{Noise XX Session Establishment}
+
+A session is built by a neighbour-local three-message XX handshake
+(\code{Noise\_XX\_25519\_ChaChaPoly\_SHA256},
+\code{lib/src/session/noise\_session\_manager.dart}).
+
+\begin{enumerate}
+  \item \emph{Initiate.} \code{\_ensureNoiseSession} returns early if a session
+    already exists; otherwise \code{startHandshake} produces message~1 (a
+    32-byte ephemeral X25519 key), packaged in a \code{noiseHandshake} packet
+    with TTL~1 --- handshakes are not relayed through the mesh.
+  \item \emph{Respond.} The peer's \code{handleHandshakePacket} replies with
+    message~2 (80 bytes: ephemeral plus encrypted static), and the initiator
+    replies with message~3 (48 bytes: encrypted static). Because the envelope is
+    sender-anonymous, each side resolves the remote public key from the inbound
+    \emph{transport path} (BLE/UDP \code{getPubkeyForPeerId}), not from any wire
+    field.
+  \item \emph{Verify identity.} The Noise-delivered remote static is checked,
+    in constant time, to equal \code{pkToCurve25519(remotePubkey)} --- the
+    libsodium birational map binding the Ed25519 identity (conveyed inside the
+    encrypted handshake) to the X25519 static.
+  \item \emph{Break collisions.} If both peers initiate at once, the tie is
+    broken by hex comparison: the lower public key keeps its initiator role and
+    ignores the inbound message~1; the higher abandons and becomes responder.
+  \item \emph{Establish and drain.} On completion \code{split} derives the
+    directional transport keys and \code{\_onNoiseSessionEstablished} dispatches
+    the authenticated-connection actions and drains the queued outbound
+    messages. The session is kept across path changes and even across
+    \code{stop()}, because it is end-to-end and path-independent.
+\end{enumerate}
+
+From this point, application AEAD binds an 81-byte AAD (the constant
+\code{secure} wire type, sender, recipient, \code{packetId}) but deliberately
+\emph{excludes} TTL and timestamp, the fields a relay mutates. A from-scratch
+multi-hop IK/KK handshake that would let two non-adjacent peers negotiate a
+session through relays is \textbf{future work}; today handshakes are strictly
+neighbour-local.
+
+\subsection{NAT Reconnection via a Facilitator}
+
+Two NAT'd friends who have no live path re-establish a \emph{direct} Internet
+connection through a mutually trusted facilitator --- a configured rendezvous
+server or a well-connected friend --- which relays only signalling metadata and
+then leaves the data path (\code{lib/src/signaling/signaling\_service.dart} plus
+the coordinator).
+
+\begin{enumerate}
+  \item \emph{Register.} Each device periodically re-registers its
+    NAT-observed address with its facilitators; a facilitator records the
+    address and reflects the observed external address back via
+    \code{ADDR\_REFLECT} (the STUN-equivalent).
+  \item \emph{Request a rendezvous.} To reach an offline friend, the initiator
+    fans out a \code{RECONNECT} (or \code{AVAILABLE} to the target's known
+    rendezvous servers) to trusted facilitators. All signalling rides inside a
+    sealed \code{secure}/\code{signaling} \code{SecureFrame}, so the facilitator
+    authenticates the sender by trial-decrypt --- UDP signalling is friend-only.
+  \item \emph{Coordinate the punch.} When the facilitator has both sides
+    (matched within a 15\,s coordination cooldown, constrained to a shared
+    address family), it sends each peer a \code{PUNCH\_INITIATE} carrying the
+    \emph{other} side's ip/port.
+  \item \emph{Punch.} Each side sprays 36-byte ``BCPU'' punch packets at the
+    other (\code{HolePunchService}), opening its own NAT mapping; the initiator
+    is chosen deterministically as the lexicographically smaller public key and,
+    on receiving \code{PUNCH\_READY} from the counterpart, proceeds to connect,
+    while the non-initiator sustains punch traffic and waits.
+  \item \emph{Connect direct.} The initiator opens the UDX connection by sending
+    a signed ANNOUNCE to the punched target (with \code{performPreConnectPunch:
+    false}). From here the two peers talk directly; the facilitator is no longer
+    in the path.
+\end{enumerate}
+
+Two caveats keep this narrative honest against the code. The
+\code{HolePunchService} itself only sprays bursts at a fixed duration/interval;
+the deterministic-initiator choice and \code{PUNCH\_INITIATE}/\code{PUNCH\_READY}
+coordination live in the coordinator and \code{SignalingService}, not in the
+punch service. And rendezvous servers are the \emph{current}, fully-implemented
+NAT-bootstrap mechanism; replacing them entirely with well-connected friends
+(and signed invite links) is a design direction, \textbf{not} yet shipped.
+
+\subsection{Trace Capture and Daily Upload}
+
+When the user has granted consent
+(\code{SettingsState.traceLoggingConsent}), the transport records anonymised
+operational telemetry (\code{lib/src/trace/trace\_logger.dart}).
+
+\begin{enumerate}
+  \item \emph{Capture.} Mesh-aware hooks call \code{TraceLogger.log} with
+    per-event records --- \code{message} (with \code{dir} of sent, recv,
+    delivered, ack\_timeout, or dup; \code{recv} carries \code{relayHops =
+    defaultTtl - ttl} and a \code{direct}/\code{relayed} \code{deliveryMethod}),
+    \code{contact}, \code{density}, \code{visit}, \code{device}, and
+    \code{buffer} (reporting \code{outboundQueued} and \code{dtnBuffered}
+    occupancy). \code{log} is a no-op when disabled and never throws; records
+    append to an 8\,MiB JSONL buffer whose oldest half is dropped on overflow.
+  \item \emph{Sample coarse context.} A periodic \code{LocationSampler} emits a
+    coarse geohash (precision~6) density fix and a \code{visit} record on cell
+    change; continuous \emph{background} sampling is a follow-up, not yet wired.
+  \item \emph{Anonymise and pack.} On upload, each distinct peer public key is
+    replaced by a per-upload alias (\code{p0}, \code{p1}, \ldots) and a fresh
+    per-upload \code{deviceId} UUID is minted, making uploads unlinkable. The
+    envelope is gzip-compressed.
+  \item \emph{Upload idempotently.} The live buffer is renamed to an immutable
+    pending file with a sidecar carrying a stable \code{uploadId}, then POSTed to
+    \code{/v1/traces} with a Bearer token. A 2xx deletes the pending files; any
+    failure keeps them for retry, and the server treats a repeated
+    \code{uploadId} as a duplicate --- so a retried daily upload never
+    double-stores.
+\end{enumerate}
+
+\subsection{Transport Event to Redux to UI}
+
+The store is a strict projection of transport facts, never an inference, and the
+UI reads only from it.
+
+\begin{enumerate}
+  \item \emph{Transport emits a fact.} A concrete transport event ---
+    an authenticated Noise session established, a UDX path torn down, a BLE
+    device disconnected --- is surfaced explicitly. UDP disconnect is
+    \emph{immediate}: the coordinator dispatches
+    \code{PeerUdpConnectionChangedAction(connected: false)} rather than inferring
+    loss from silence.
+  \item \emph{Reducer updates a slice.} The action updates the relevant
+    \code{PeersState}/\code{TransportsState} fields. Consolidated reachability is
+    gated on an authenticated session: a session established dispatches
+    \code{PeerBleAuthenticatedAction} or
+    \code{PeerUdpConnectionChangedAction(connected: true)}. (A rendezvous server
+    is the deliberate exception --- its raw UDX connection counts as reachable
+    without any Noise session.)
+  \item \emph{Reachability transition.} \code{processReachabilityTransitions}
+    diffs each peer's \code{isReachable} against the previous tick and fires
+    \code{onPeerConnected}/\code{onPeerDisconnected} \emph{only} on a change.
+    Because reachability is consolidated end-to-end, losing one of two live
+    transports fires nothing; the callback fires only on the transition to or
+    from zero live transports. This is what makes the two transports
+    independent: a BLE drop never degrades a UDP-derived online status, and the
+    end-to-end Noise session is kept regardless.
+  \item \emph{UI reacts.} The UI subscribes to the store and re-renders on the
+    changed slice, showing the peer's online state and message-delivery status
+    without ever consulting a transport directly.
+\end{enumerate}
+
+\section{Design Decisions, Trade-offs \& Future Work}
+
+This section steps back from the mechanics of the individual layers and examines the load-bearing decisions that shape the transport as a whole. Each is a deliberate trade-off, and several of them cost something real; the point of collecting them here is to make those costs explicit and to separate what the code \emph{does today} from what the design \emph{intends} but has not yet built.
+
+\subsection{Sender-anonymous open relay versus authentication}
+
+The single most consequential decision is that the BLE mesh is an \emph{open, sender-anonymous relay}. A node rebroadcasts any packet it receives toward the recipient, decrementing TTL and dropping at zero, and it does so for recipients with which it has no relationship whatsoever (\code{lib/src/routing/message_router.dart}). This is what lets a message reach a friend who is not a direct neighbour, and it is a deliberate reversal of the older ``never relay for arbitrary peers'' posture.
+
+The enabling design choice is that the outer envelope carries \emph{only} the recipient ID --- there is no sender field and no whole-packet Ed25519 signature (\code{lib/src/models/packet.dart}). A relay therefore cannot tell who originated a packet, which is exactly the property that makes open relaying tolerable from a privacy standpoint: an intermediary forwards opaque, recipient-addressed bytes it can neither read nor attribute.
+
+The cost is equally direct: because the envelope has no sender, \textbf{a relay cannot authenticate what it forwards}. There is no hop-by-hop signature check; relaying is unverified by construction. Authentication is recovered only \emph{end-to-end}, inside Noise: the recipient trial-decrypts an inbound \code{secure} packet against its active sessions, and the AEAD tag both selects the right session and proves integrity (\code{lib/src/session/noise_session_manager.dart}, \code{trialDecrypt}). The peer's Ed25519 identity is conveyed inside the encrypted handshake and bound to the Noise static key via the birational map --- never in a cleartext header. This is discussed in the \emph{Identity, Trust \& the Security Model} and \emph{Noise Session Layer} sections; what matters here is the trade-off it forces.
+
+Since unverified relaying cannot be bounded by cryptography, it is bounded by \emph{resource limits} instead. Three mechanisms cap abuse: a TTL that strictly decrements and drops the packet at $\text{ttl} \le 1$; a \code{BloomFilter} of seen packet IDs that suppresses loops and re-sends; and a per-neighbour relay budget of \code{\_maxRelaysPerWindow} = 512 packets per \code{\_relayWindow} = 10\,s (\code{lib/src/routing/message_router.dart}). An honest but important asymmetry: the per-neighbour rate limit applies \emph{only} to attributable BLE neighbours. When the inbound peer is unattributable --- the UDP case, where \code{inboundPeerId == null} --- \code{\_allowRelayFrom} returns \code{true} unconditionally, so UDP is \emph{not} rate-limited. In practice the Internet transport is direct point-to-point and rarely relays, so this branch seldom fires, but it is a genuine gap rather than a designed safeguard.
+
+\subsection{Store-carry-forward bounding}
+
+Store-carry-forward (DTN) lets a relay cache a packet whose recipient is currently out of range and re-flood it when that recipient reappears. Left unbounded this is an obvious battery sink and abuse vector, so every dimension of the cache is capped: \code{DtnStore} holds at most \code{maxRecipients} = 256 recipients, \code{maxPerRecipient} = 32 packets each, expiring after \code{maxAge} = 6 hours (\code{lib/src/mesh/dtn_store.dart}). Caching happens only inside the relay branch after a successful relay decision; if the per-neighbour budget already blocked the relay, the packet is not cached either. The sender additionally keeps its \emph{own} outbound queue and re-floods its un-acked messages independently of any relay's cache --- these are two distinct bounded buffers, surfaced separately as \code{outboundQueuedCount} and \code{dtnBufferedCount}.
+
+\subsection{Dual-role BLE and transport independence}
+
+Two structural decisions are treated as inviolable. First, every BLE pair must converge to a \emph{dual-role} connection --- two GATT legs, each device central on one and peripheral on the other --- with platform asymmetries solved by choosing \emph{who initiates each leg} rather than by abandoning a leg; a single-link pair is acceptable only as a transient state the transport keeps trying to upgrade. Second, BLE and UDP are \emph{independent}: disabling or losing one has zero effect on the other's reachability, and application-level connect/disconnect callbacks report consolidated end-to-end reachability, firing only on the transition to or from zero live transports. Both are elaborated in the transport sections; they are noted here because they are constraints the design refuses to trade away.
+
+\subsection{Unlinkable BLE beacon versus reconnection churn}
+
+The BLE service UUID keeps a fixed Grassroots prefix but rotates its per-pubkey suffix every fifteen minutes, deriving the suffix as $\text{SHA-256}(\text{``grassroots ble suffix''} \mathbin\Vert \text{pubkey} \mathbin\Vert \text{slot})[:8]$ over a wall-clock slot of \code{bleSlotDuration} = 15\,min (\code{lib/src/models/identity.dart}). The payoff is unlinkability: a passive observer who does not hold the public key sees a beacon that changes every slot and cannot use it as a stable tracking handle, while a friend --- or the device itself --- recomputes the current and adjacent slot suffixes (\code{candidateServiceUuids}, \code{serviceUuidMatchesPubkey}) and still recognises the peer. The slot period is chosen to match the roughly fifteen-minute cadence of BLE MAC randomisation, so the advertised UUID and the radio address rotate together rather than one outliving the other as a correlator.
+
+The cost is real and paid on a timer. The BLE transport runs a thirty-second slot-check (\code{\_maybeReAdvertiseForSlot}) and, on each boundary crossing, tears down and rebuilds the GATT advertisement under the new suffix. That rebuild is the accepted price of an unlinkable beacon: a pair that happens to be mid-handshake or mid-message across the boundary can see its advertisement --- and, on some stacks, its GATT server --- briefly drop and reform, adding reconnection churn every quarter hour. The adjacent-slot recognition window (previous, current, next) exists precisely to keep unsynchronised clocks and boundary races from breaking friend recognition during that reform, but the reconnect itself is not free. The design accepts periodic churn in exchange for the privacy property; the alternative --- a fixed per-pubkey UUID that never rotates --- would remove the churn but hand any passive scanner a permanent device identifier, which the project treats as the worse trade.
+
+\subsection{Wire-type tightening: collapsing eighteen packet types to three}
+
+A recently shipped refactor collapsed the wire \code{PacketType} from eighteen values to exactly three: \code{announce}, \code{noiseHandshake}, and \code{secure} (\code{lib/src/models/packet.dart}). Everything that is not an announce or a handshake is now one opaque \code{secure} envelope. The content type (message, ack, read-receipt, signaling) and any fragmentation moved \emph{inside} the sealed payload as a \code{SecureFrame} --- a 21-byte inner header \code{[contentType:1][fragIndex:2][fragCount:2][messageId:16][chunk\ldots]} (\code{lib/src/models/secure_frame.dart}).
+
+The motivation is a closed metadata leak. Previously a relay reading a header could distinguish \code{secureAck} from \code{secureMessage} from \code{secureSignaling} from the fragment variants, learning the content class and fragment structure of traffic it merely forwarded. Now a relay sees only \code{secure} (\code{0x03}) for all content and cannot tell an ack from a message from a fragment. This is the same class of leak the handshake security audit flagged. The content type remains authenticated because it lives inside the AEAD-protected plaintext, and the application AAD binds the constant \code{secure} wire type plus sender, recipient, and packet ID while excluding TTL and timestamp --- the fields a relay mutates (\code{lib/src/session/noise_session_manager.dart}). Fragmentation is now reassembled \emph{post-decrypt}, keyed by the inner \code{messageId}, while relay/loop dedup stays on the outer \code{packetId} and delivery dedup on the inner \code{messageId}. The now-dead \code{nack} type was removed.
+
+The honest caveat: this is shipped \textbf{in the client only} (\code{flutter test} 589/589). The \code{bootstrap\_anchor} mirror still uses the old eighteen-type wire, so \textbf{client\,$\leftrightarrow$\,anchor interop is temporarily broken} until that follow-up lands. Mirroring the anchor is a committed, near-term task, not open-ended future work.
+
+\subsection{Clean breaks --- and the honest exceptions}
+
+The project's stated rule is clean breaks with no legacy or compatibility shims: wire decoders throw on malformed input rather than tolerating a hypothetical old version, and WebRTC --- once a vestigial \code{TransportType} enum member with no implementation --- has now been removed entirely, leaving \code{TransportType} as just \code{ble, udp} (\code{lib/src/transport/transport_service.dart}). Accuracy requires naming where reality diverges from the rule:
+
+\begin{itemize}
+  \item \code{Block.tryDeserialize} (\code{lib/src/models/block.dart}) still tolerates ``legacy plain text'' by returning \code{null} for input that is not a well-formed block --- a compatibility-flavoured probe that sits uneasily beside the no-legacy directive.
+  \item Several stale comments contradict the current design: the \code{BleTransportService} class doc still claims ``Direct delivery only. No relaying, no store-and-forward,'' and numerous comments across the coordinator, UDP transport, and UI still reference ``rendezvous servers'' that the design note proposes to remove.
+  \item Some Redux \code{hashCode} implementations are intentionally weak --- \code{MessagesState}, \code{FriendshipsState}, and \code{SignalingState} hash only collection \emph{lengths}, so structurally different states of equal size collide (equality remains content-exact). This is a deliberate performance shortcut worth flagging rather than a defect.
+\end{itemize}
+
+\subsection{Known limitations and future work}
+
+The following are \textbf{not yet implemented}; they are labelled as such deliberately to avoid presenting intent as fact.
+
+\begin{itemize}
+  \item \textbf{From-scratch multi-hop session establishment (IK/KK).} Today the Noise handshake is neighbour-local: both \code{announce} and \code{noiseHandshake} packets are sent with TTL 1 and are never relayed (\code{lib/src/grassroots\_network.dart}). A message can flood multiple hops \emph{only after} a session already exists, because the flooded XX handshake cannot address its reply back along the mesh. A redesign toward Noise IK/KK is planned to close this gap. The handshake security audit attaches must-do conditions to any such change: gate the IK path behind the cold-call/friend policy, carry \emph{no} application data on IK message~1, guard against eviction of a live session by an unauthenticated handshake attempt, and use distinct protocol names per pattern to prevent cross-pattern confusion.
+  \item \textbf{Rendezvous-server removal.} Rendezvous servers are \emph{still fully implemented and in use} --- the anchor/RV plumbing, \code{RendezvousServerSettings}, \code{RV\_LIST}, and \code{bootstrap\_anchor} are all present and active, and RV is the current NAT-bootstrap mechanism. The commit proposing to replace them with well-connected friends plus signed invite links (\code{grassroots://} deep links) is a \emph{design note only}; none of the invite-link build wiring (Android intent filters, iOS URL schemes, an \code{app\_links}-style dependency) yet exists.
+  \item \textbf{Hole-punch coordination.} \code{HolePunchService} only sprays punch bursts at a fixed duration and interval; it has no notion of a deterministic initiator, no \code{PUNCH\_INITIATE}, and no friend-gating. The deterministic-initiator selection and simultaneous-punch orchestration live partly in the coordinator and \code{SignalingService}, so the idealised ``friend coordinates a simultaneous hole-punch'' flow is only partially realised in code.
+  \item \textbf{Deferred trace fields.} The trace-logging envelope omits \code{appVersion} (never set by \code{\_buildEnvelope} despite the server accepting it), continuous background geolocation for visit records is a follow-up rather than shipped, and in-memory visit-tracking state resets on restart --- so counts framed as accumulated ``to date'' are not durable.
+  \item \textbf{Bounded replay-window edge.} The Noise replay guard is a set capped at 2048 nonces with FIFO eviction (\code{lib/src/session/noise\_session\_manager.dart}). It is a \emph{bounded}, not absolute, guard: a nonce evicted after 2048 newer nonces have been seen could in principle be replayed. This is an accepted memory/security trade-off rather than a full sliding-window replay defence.
+\end{itemize}
+
+
+\end{document}

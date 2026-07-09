@@ -19,6 +19,7 @@ import 'models/identity.dart';
 import 'trace/trace_logger.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
+import 'models/secure_frame.dart';
 import 'protocol/protocol_handler.dart';
 import 'protocol/fragment_handler.dart';
 import 'routing/message_router.dart';
@@ -1921,8 +1922,9 @@ class GrassrootsNetwork {
       return false;
     }
 
-    // Create the message packet. It is signed after optional session
-    // encryption because the signature covers the final wire payload.
+    // Create the message packet. Its payload is sealed to the recipient's Noise
+    // session before flooding; the sender-anonymous envelope carries no wire
+    // signature (authentication is end-to-end inside Noise).
     // packetId == messageId so the recipient's ACK (which echoes the
     // packetId back) matches the entry we just stored under `messageId`
     // in `MessageSendingAction`. Otherwise `MessageDeliveredAction` would
@@ -1930,7 +1932,7 @@ class GrassrootsNetwork {
     final packet = _protocolHandler.createMessagePacket(
       payload: payload,
       recipientPubkey: recipientPubkey,
-      packetId: messageId,
+      messageId: messageId,
     );
 
     // --- BLE mesh: seal to the recipient's session and flood ---
@@ -2396,8 +2398,8 @@ class GrassrootsNetwork {
   }) async {
     final peer = _peersState.getPeerByPubkey(senderPubkey);
 
-    // Create read receipt packet at coordinator level. Signing happens after
-    // session encryption, if available.
+    // Create read receipt packet at coordinator level. Its payload is sealed to
+    // the recipient's Noise session before sending; there is no wire signature.
     final packet = _protocolHandler.createReadReceiptPacket(
       messageId: messageId,
       recipientPubkey: senderPubkey,
@@ -2458,6 +2460,7 @@ class GrassrootsNetwork {
             final packet = _protocolHandler.createMessagePacket(
               payload: payload,
               recipientPubkey: pubkey,
+              messageId: _uuid.v4(),
             );
             final bytes = await _sealedPacketBytesForTransport(
               packet: packet,
@@ -2484,6 +2487,7 @@ class GrassrootsNetwork {
           final packet = _protocolHandler.createMessagePacket(
             payload: payload,
             recipientPubkey: peer.publicKey,
+            messageId: _uuid.v4(),
           );
           final bytes = await _sealedPacketBytesForTransport(
             packet: packet,
@@ -2725,8 +2729,6 @@ class GrassrootsNetwork {
       case PeerTransport.bleDirect:
         store.dispatch(PeerBleAuthenticatedAction(pubkey));
         break;
-      case PeerTransport.webrtc:
-        break;
     }
     _drainQueuedMessagesForPeer(pubkey);
   }
@@ -2821,8 +2823,6 @@ class GrassrootsNetwork {
         return _bleService?.getPubkeyForPeerId(peerId);
       case PeerTransport.udp:
         return _udpService?.getPubkeyForPeerId(peerId);
-      case PeerTransport.webrtc:
-        return null;
     }
   }
 
@@ -2833,7 +2833,7 @@ class GrassrootsNetwork {
     String? peerId,
   }) async {
     var outgoing = packet;
-    if (packet.type.usesSessionSecurity) {
+    if (packet.type == PacketType.secure) {
       final ready = await _ensureNoiseSession(
         transport: transport,
         recipientPubkey: recipientPubkey,
@@ -2908,10 +2908,15 @@ class GrassrootsNetwork {
     Uint8List recipientPubkey,
     Uint8List signalingPayload,
   ) {
+    final frame = SecureFrame(
+      contentType: ContentType.signaling,
+      messageId: _uuid.v4(),
+      chunk: signalingPayload,
+    );
     return GrassrootsPacket(
-      type: PacketType.signaling,
+      type: PacketType.secure,
       recipientPubkey: recipientPubkey,
-      payload: signalingPayload,
+      payload: frame.encode(),
     );
   }
 
@@ -5090,16 +5095,20 @@ class GrassrootsNetwork {
     // is sealed individually and flooded into the BLE mesh.
     if (!_noiseSessions.hasSession(recipientPubkey)) return false;
 
-    final fragmented = _fragmentHandler.fragment(
+    final frames = _fragmentHandler.framesFor(
       payload: payload,
-      recipientPubkey: recipientPubkey,
       messageId: messageId,
     );
 
     var anySent = false;
-    for (final fragment in fragmented.fragments) {
+    for (final frame in frames) {
+      final packet = GrassrootsPacket(
+        type: PacketType.secure,
+        recipientPubkey: recipientPubkey,
+        payload: frame.encode(),
+      );
       final sealed = await _noiseSessions.encryptPacket(
-        fragment,
+        packet,
         remotePubkey: recipientPubkey,
       );
       if (await _floodViaBle(sealed.serialize()) == 0) return false;

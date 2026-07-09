@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:sodium_libs/sodium_libs.dart';
 
@@ -212,21 +213,38 @@ void main() {
     });
 
     group('createMessagePacket', () {
-      test('creates packet with correct type (no cleartext sender)', () {
-        final testPayload = utf8.encode('Hello, World!');
-        final packet = handler.createMessagePacket(payload: testPayload);
+      // A message is now carried as a SecureFrame(ContentType.message) sealed
+      // inside a single PacketType.secure envelope. The outer packetId equals
+      // the logical messageId; the original bytes are the frame's chunk.
+      const msgId = '00000000-0000-4000-8000-000000000001';
 
-        expect(packet.type, equals(PacketType.message));
-        expect(packet.payload, equals(testPayload));
+      test('creates secure packet wrapping the payload (no cleartext sender)',
+          () {
+        final testPayload = utf8.encode('Hello, World!');
+        final packet = handler.createMessagePacket(
+          payload: testPayload,
+          messageId: msgId,
+        );
+
+        expect(packet.type, equals(PacketType.secure));
         expect(packet.recipientPubkey, isNull); // Broadcast
+
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.message));
+        expect(frame.chunk, equals(testPayload));
       });
 
-      test('carries a packetId for ACK matching', () {
+      test('outer packetId equals the messageId for ACK matching', () {
+        const fixedId = '11111111-1111-4111-8111-111111111111';
         final packet = handler.createMessagePacket(
           payload: utf8.encode('Hello'),
-          packetId: 'fixed-id-123',
+          messageId: fixedId,
         );
-        expect(packet.packetId, equals('fixed-id-123'));
+        expect(packet.packetId, equals(fixedId));
+
+        // The logical id also round-trips through the sealed frame.
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.messageId, equals(fixedId));
       });
 
       test('creates packet with specific recipient', () {
@@ -235,20 +253,28 @@ void main() {
             Uint8List.fromList(List.generate(32, (i) => 100 + i));
         final packet = handler.createMessagePacket(
           payload: testPayload,
+          messageId: msgId,
           recipientPubkey: recipientPubkey,
         );
 
-        expect(packet.type, equals(PacketType.message));
-        expect(packet.payload, equals(testPayload));
+        expect(packet.type, equals(PacketType.secure));
         expect(packet.recipientPubkey, equals(recipientPubkey));
         expect(packet.isBroadcast, isFalse);
+
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.message));
+        expect(frame.chunk, equals(testPayload));
       });
 
       test('creates packet with empty payload', () {
-        final packet = handler.createMessagePacket(payload: Uint8List(0));
+        final packet = handler.createMessagePacket(
+          payload: Uint8List(0),
+          messageId: msgId,
+        );
 
-        expect(packet.payload.length, equals(0));
-        expect(packet.type, equals(PacketType.message));
+        expect(packet.type, equals(PacketType.secure));
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.chunk.length, equals(0));
       });
 
       test('creates packet with large payload', () {
@@ -257,16 +283,24 @@ void main() {
           largePayload[i] = i % 256;
         }
 
-        final packet = handler.createMessagePacket(payload: largePayload);
+        final packet = handler.createMessagePacket(
+          payload: largePayload,
+          messageId: msgId,
+        );
 
-        expect(packet.payload.length, equals(1000));
-        expect(packet.payload, equals(largePayload));
+        expect(packet.type, equals(PacketType.secure));
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.chunk.length, equals(1000));
+        expect(frame.chunk, equals(largePayload));
       });
     });
 
     group('createReadReceiptPacket', () {
+      // A read receipt is a SecureFrame(ContentType.readReceipt) sealed inside a
+      // PacketType.secure envelope; the read messageId travels as the frame's
+      // utf-8 chunk (and as the frame's messageId).
       test('creates read receipt with message ID', () {
-        const messageId = 'test-message-id-12345';
+        const messageId = '22222222-2222-4222-8222-222222222222';
         final recipientPubkey =
             Uint8List.fromList(List.generate(32, (i) => 50 + i));
         final packet = handler.createReadReceiptPacket(
@@ -274,9 +308,12 @@ void main() {
           recipientPubkey: recipientPubkey,
         );
 
-        expect(packet.type, equals(PacketType.readReceipt));
+        expect(packet.type, equals(PacketType.secure));
         expect(packet.recipientPubkey, equals(recipientPubkey));
-        expect(utf8.decode(packet.payload), equals(messageId));
+
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.readReceipt));
+        expect(utf8.decode(frame.chunk), equals(messageId));
       });
 
       test('handles UUID message IDs', () {
@@ -287,8 +324,10 @@ void main() {
           recipientPubkey: recipientPubkey,
         );
 
-        final decodedId = utf8.decode(packet.payload);
-        expect(decodedId, equals(messageId));
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.readReceipt));
+        expect(utf8.decode(frame.chunk), equals(messageId));
+        expect(frame.messageId, equals(messageId));
       });
     });
 
@@ -310,8 +349,11 @@ void main() {
     });
 
     group('createAckPacket', () {
+      // An ACK is a SecureFrame(ContentType.ack) sealed inside a
+      // PacketType.secure envelope; the acked messageId is the frame's utf-8
+      // chunk (and the frame's messageId).
       test('creates ACK with message ID', () {
-        const messageId = 'ack-msg-1';
+        const messageId = '33333333-3333-4333-8333-333333333333';
         final recipientPubkey =
             Uint8List.fromList(List.generate(32, (i) => 50 + i));
         final packet = handler.createAckPacket(
@@ -319,16 +361,23 @@ void main() {
           recipientPubkey: recipientPubkey,
         );
 
-        expect(packet.type, equals(PacketType.ack));
+        expect(packet.type, equals(PacketType.secure));
         expect(packet.recipientPubkey, equals(recipientPubkey));
-        expect(utf8.decode(packet.payload), equals(messageId));
+
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.ack));
+        expect(utf8.decode(frame.chunk), equals(messageId));
       });
 
       test('creates broadcast ACK when no recipient', () {
-        final packet = handler.createAckPacket(messageId: 'ack-bcast');
+        const messageId = '44444444-4444-4444-8444-444444444444';
+        final packet = handler.createAckPacket(messageId: messageId);
 
-        expect(packet.type, equals(PacketType.ack));
+        expect(packet.type, equals(PacketType.secure));
         expect(packet.isBroadcast, isTrue);
+
+        final frame = SecureFrame.decode(packet.payload);
+        expect(frame.contentType, equals(ContentType.ack));
       });
     });
 

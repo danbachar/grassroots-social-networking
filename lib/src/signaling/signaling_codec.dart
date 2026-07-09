@@ -2,8 +2,10 @@ import 'dart:typed_data';
 
 /// Signaling message types for the rendezvous reconnection protocol.
 ///
-/// These ride inside [GrassrootsPacket] payloads with [PacketType.signaling].
-/// Authentication is handled by the outer GrassrootsPacket's Ed25519 signature.
+/// These ride inside a [SecureFrame] with [ContentType.signaling], sealed in a
+/// [PacketType.secure] packet. Authentication is end-to-end: the frame is
+/// session-encrypted, so the sender is recovered and authenticated by
+/// trial-decrypt — the sender-anonymous envelope carries no packet signature.
 ///
 /// Wire byte values are stable; gaps reflect deprecated message types
 /// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the rendezvous

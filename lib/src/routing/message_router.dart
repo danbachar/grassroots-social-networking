@@ -6,6 +6,7 @@ import '../trace/trace_logger.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
+import '../models/secure_frame.dart';
 import '../protocol/fragment_handler.dart';
 import '../protocol/protocol_handler.dart';
 import '../store/app_state.dart';
@@ -17,7 +18,8 @@ import 'package:flutter/foundation.dart';
 /// Routes incoming packets from all transports to the appropriate handlers.
 ///
 /// Responsibilities:
-/// - Signature verification (drops invalid packets)
+/// - ANNOUNCE self-signature verification (all other packets carry no wire
+///   signature and authenticate end-to-end via Noise/trial-decrypt)
 /// - Packet deduplication (via BloomFilter)
 /// - ANNOUNCE decoding and Redux dispatch
 /// - MESSAGE targeting (is-for-us check)
@@ -30,7 +32,19 @@ class MessageRouter {
   final Store<AppState> store;
   final ProtocolHandler protocolHandler;
   final FragmentHandler fragmentHandler;
+
+  /// Wire-packet dedup: "have I already seen this exact wire packet?" — gates
+  /// relay/loop prevention, keyed on the outer `packetId`.
   final BloomFilter _seenPackets = BloomFilter();
+
+  /// Delivery dedup: "have I already delivered this logical message to the
+  /// app?" — keyed on the inner frame `messageId`. This MUST be a separate set
+  /// from [_seenPackets]: a single-packet message is sent with
+  /// `packetId == messageId` (see `ProtocolHandler.createMessagePacket`), so
+  /// sharing one filter would let the relay-dedup insert of `packetId` poison
+  /// the delivery check and the message would be dropped as a "duplicate" on
+  /// its very first receipt (ACKed but never shown).
+  final BloomFilter _deliveredMessages = BloomFilter();
 
   /// Store-carry-forward cache: packets relayed for recipients not currently in
   /// range, re-flooded when they reappear (see [flushDtnFor]).
@@ -95,7 +109,7 @@ class MessageRouter {
   /// identification that previously required ANNOUNCE as the first message).
   void Function(Uint8List senderPubkey, String udpPeerId)? onUdpPeerIdentified;
 
-  /// Called when a signed Noise handshake packet arrives. The coordinator owns
+  /// Called when a Noise handshake packet arrives. The coordinator owns
   /// session state and sends any handshake response over the same medium.
   Future<void> Function(
     GrassrootsPacket packet,
@@ -140,9 +154,10 @@ class MessageRouter {
 
   /// Process an incoming packet from any transport.
   ///
-  /// All packets are signature-verified before processing.
-  /// Invalid signatures are dropped immediately.
-  /// ANNOUNCE packets bypass deduplication (always processed).
+  /// ANNOUNCE packets self-authenticate (their payload signature is verified in
+  /// [ProtocolHandler.decodeAnnounce]) and bypass deduplication; every other
+  /// packet carries no wire signature and is authenticated end-to-end by
+  /// trial-decrypt against the active Noise sessions.
   Future<void> processPacket(
     GrassrootsPacket packet, {
     required PeerTransport transport,
@@ -222,7 +237,7 @@ class MessageRouter {
 
     // Addressed to us. Everything besides ANNOUNCE/handshake (handled above) is
     // session-encrypted; trial-decrypt to recover the sender + cleartext.
-    if (!packet.type.isSessionEncrypted) {
+    if (packet.type != PacketType.secure) {
       debugPrint(
           'Dropping unauthenticated cleartext ${packet.type} addressed to us');
       return;
@@ -248,45 +263,36 @@ class MessageRouter {
           PeerRssiUpdatedAction(publicKey: senderPubkey, rssi: rssi));
     }
 
-    switch (clear.type) {
-      case PacketType.message:
-        _handleMessage(
-          clear,
+    // The decrypted plaintext is a SecureFrame: it carries the content type and
+    // any fragmentation, which the sender-anonymous wire header deliberately
+    // does not expose to relays.
+    final SecureFrame frame;
+    try {
+      frame = SecureFrame.decode(clear.payload);
+    } on FormatException catch (e) {
+      debugPrint('Dropping secure packet with malformed frame: $e');
+      return;
+    }
+
+    switch (frame.contentType) {
+      case ContentType.message:
+        _handleMessageFrame(
+          frame,
+          packet: clear,
           senderPubkey: senderPubkey,
           transport: transport,
-          firstSeen: firstSeen,
         );
-      case PacketType.fragmentStart:
-      case PacketType.fragmentContinue:
-      case PacketType.fragmentEnd:
-        _handleFragment(
-          clear,
-          senderPubkey: senderPubkey,
-          transport: transport,
-        );
-      case PacketType.ack:
-        _handleAck(clear);
-      case PacketType.readReceipt:
-        _handleReadReceipt(clear);
-      case PacketType.signaling:
+      case ContentType.ack:
+        _handleAck(frame.chunk);
+      case ContentType.readReceipt:
+        _handleReadReceipt(frame.chunk);
+      case ContentType.signaling:
         _handleSignaling(
-          clear,
+          frame.chunk,
           senderPubkey,
           observedIp: observedIp,
           observedPort: observedPort,
         );
-      case PacketType.nack:
-      case PacketType.announce:
-      case PacketType.noiseHandshake:
-      case PacketType.secureMessage:
-      case PacketType.secureFragmentStart:
-      case PacketType.secureFragmentContinue:
-      case PacketType.secureFragmentEnd:
-      case PacketType.secureAck:
-      case PacketType.secureNack:
-      case PacketType.secureReadReceipt:
-      case PacketType.secureSignaling:
-        break;
     }
   }
 
@@ -411,30 +417,38 @@ class MessageRouter {
     onPeerAnnounced?.call(data, transport, isNew: isNew, udpPeerId: udpPeerId);
   }
 
-  void _handleMessage(
-    GrassrootsPacket packet, {
+  void _handleMessageFrame(
+    SecureFrame frame, {
+    required GrassrootsPacket packet,
     required Uint8List senderPubkey,
     required PeerTransport transport,
-    required bool firstSeen,
   }) {
-    // Deliver to the app once. [firstSeen] is keyed on the message id (the
-    // packetId for single packets, the reassembled id for fragments).
+    // Reassemble if fragmented; a single-fragment frame yields its payload
+    // immediately. Nothing is delivered until the whole message is present.
+    final payload = fragmentHandler.accept(frame);
+    if (payload == null) return;
+
+    final messageId = frame.messageId;
+    // Deliver each logical message once, keyed on its message id in a dedicated
+    // filter. Individual wire packets are deduped separately on their packetId
+    // (in [_seenPackets]) for loop/relay prevention — the two namespaces must
+    // not share bits, since a single-packet message uses packetId == messageId.
+    final firstSeen = !_deliveredMessages.checkAndAdd(messageId);
     if (firstSeen) {
-      onMessageReceived?.call(
-          packet.packetId, senderPubkey, packet.payload, transport);
+      onMessageReceived?.call(messageId, senderPubkey, payload, transport);
       if (trace?.enabled ?? false) {
         final now = DateTime.now().millisecondsSinceEpoch;
-        // In the mesh the receiver sees how far a packet travelled: the sender
-        // starts at defaultTtl and each relay decrements, so hops = the drop.
+        // The receiver sees how far the packet travelled: the sender starts at
+        // defaultTtl and each relay decrements, so hops = the drop.
         final relayHops = GrassrootsPacket.defaultTtl - packet.ttl;
         unawaited(trace!.log({
           'type': 'message',
           't': now,
           'dir': 'recv',
-          'messageId': packet.packetId,
+          'messageId': messageId,
           'peer': _pubkeyToHex(senderPubkey),
           'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
-          'payloadSize': packet.payload.length,
+          'payloadSize': payload.length,
           'receivedAt': now,
           'relayHops': relayHops,
           'deliveryMethod': relayHops <= 0 ? 'direct' : 'relayed',
@@ -442,52 +456,20 @@ class MessageRouter {
         }));
       }
     } else {
-      debugPrint(
-        'Duplicate message ${packet.packetId.length >= 8 ? packet.packetId.substring(0, 8) : packet.packetId}; '
-        're-ACKing without re-delivering.',
-      );
+      debugPrint('Duplicate message $messageId; re-ACKing without re-delivering.');
     }
 
     // ACK back to the original sender (a recipient-addressed packet flooded
-    // through the mesh). The sender flips ✓ → ✓✓ on receipt; re-ACKing a
-    // duplicate lets a sender whose first ACK was lost stop retrying.
-    onAckRequested?.call(senderPubkey, packet.packetId, transport);
+    // through the mesh). Re-ACKing a duplicate lets a sender whose first ACK
+    // was lost stop retrying.
+    onAckRequested?.call(senderPubkey, messageId, transport);
   }
 
-  void _handleFragment(
-    GrassrootsPacket packet, {
-    required Uint8List senderPubkey,
-    required PeerTransport transport,
-  }) {
-    final reassembled = fragmentHandler.processFragment(packet);
-    if (reassembled == null) return;
-
-    // Reassembly produced the original message payload. Route it through the
-    // same delivery pipeline as single-packet messages. Delivery is deduped by
-    // the reassembled message id (individual fragment packetIds are deduped
-    // separately for relay/loop-prevention).
-    final firstSeen = !_seenPackets.checkAndAdd(reassembled.messageId);
-    final logical = GrassrootsPacket(
-      type: PacketType.message,
-      ttl: packet.ttl,
-      timestamp: packet.timestamp,
-      recipientPubkey: packet.recipientPubkey,
-      payload: reassembled.payload,
-      packetId: reassembled.messageId,
-    );
-    _handleMessage(
-      logical,
-      senderPubkey: senderPubkey,
-      transport: transport,
-      firstSeen: firstSeen,
-    );
-  }
-
-  void _handleAck(GrassrootsPacket packet) {
-    if (packet.payload.isEmpty) return;
+  void _handleAck(Uint8List chunk) {
+    if (chunk.isEmpty) return;
     try {
-      final messageId = String.fromCharCodes(packet.payload);
-      // Validate: message IDs are short alphanumeric strings (UUID v4 prefix)
+      final messageId = String.fromCharCodes(chunk);
+      // Validate: message IDs are UUID strings (<= 36 chars).
       if (messageId.length > 36) {
         debugPrint(
             'Ignoring ACK with invalid message ID length: ${messageId.length}');
@@ -500,23 +482,23 @@ class MessageRouter {
   }
 
   void _handleSignaling(
-    GrassrootsPacket packet,
+    Uint8List chunk,
     Uint8List senderPubkey, {
     String? observedIp,
     int? observedPort,
   }) {
     onSignalingReceived?.call(
       senderPubkey,
-      packet.payload,
+      chunk,
       observedIp: observedIp,
       observedPort: observedPort,
     );
   }
 
-  void _handleReadReceipt(GrassrootsPacket packet) {
-    if (packet.payload.isEmpty) return;
+  void _handleReadReceipt(Uint8List chunk) {
+    if (chunk.isEmpty) return;
     try {
-      final messageId = String.fromCharCodes(packet.payload);
+      final messageId = String.fromCharCodes(chunk);
       if (messageId.length > 36) {
         debugPrint(
             'Ignoring read receipt with invalid message ID length: ${messageId.length}');
@@ -637,6 +619,7 @@ class MessageRouter {
   /// Clean up resources
   void dispose() {
     _seenPackets.clear();
+    _deliveredMessages.clear();
     _dtnStore.clear();
     _relayBudgets.clear();
   }

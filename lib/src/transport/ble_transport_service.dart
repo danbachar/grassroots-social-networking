@@ -24,12 +24,6 @@ const _defaultBleDisplayInfo = TransportDisplayInfo(
 const String _grassrootsCharacteristicUuid =
     '0000ff01-0000-1000-8000-00805f9b34fb';
 
-/// Fixed local name advertised by iOS devices. The iOS-central → non-iOS
-/// second link is measurably broken (see CLAUDE.md, "Dual-Role BLE Is
-/// Mandatory"), so peers that see this marker in an advertisement yield the
-/// pair's first dial to the iOS device and open the reverse leg themselves.
-const String grassrootsIosLocalName = 'grs-ios';
-
 /// MTU we request from the peer on every central connect. ANNOUNCE alone is
 /// ~200 bytes, far over the default ATT MTU of 23 (20-byte payload). 247 is
 /// the largest most Android stacks negotiate; the actual value is whatever
@@ -94,7 +88,7 @@ class BleTransportService extends TransportService {
   final Map<String, ble.BlePath> _paths = {};
 
   /// Derived service UUIDs (lowercase) whose advertisements have carried the
-  /// iOS platform marker ([grassrootsIosLocalName]) this session. Like
+  /// iOS platform marker ([ble.grassrootsIosLocalName]) this session. Like
   /// [_paths] this is a cache of transport facts, not consumer state: a
   /// peer's platform never changes, but the marker is only present while the
   /// iOS app is foregrounded, so we remember every sighting. Used to scope
@@ -121,6 +115,18 @@ class BleTransportService extends TransportService {
   Timer? _scanWatchdog;
   DateTime _lastAdvertisementAt = DateTime.now();
   static const Duration _scanWatchdogInterval = Duration(seconds: 10);
+
+  /// Rolls the advertised beacon each 15-minute BLE slot. The advertised
+  /// service UUID's suffix rotates ([GrassrootsIdentity.deriveServiceUuidForSlot]),
+  /// so we must re-advertise the new-slot beacon when the slot advances. Checked
+  /// frequently but only acts when [GrassrootsIdentity.currentBleSlot] moves past
+  /// [_advertisedSlot]. Re-advertising rebuilds the peripheral GATT service under
+  /// the new UUID (requires plugin >= 0.3.0, which restarts advertising after the
+  /// rebuild); live links drop and re-establish across the boundary.
+  Timer? _slotTimer;
+  int? _advertisedSlot;
+  String? _advertiseLocalName;
+  static const Duration _slotCheckInterval = Duration(seconds: 30);
 
   /// True after [stop] is called. Drops in-flight payloads and prevents
   /// adapter-on auto-restart.
@@ -282,12 +288,17 @@ class BleTransportService extends TransportService {
             bondless: true,
           );
           anyStarted = true;
+          _advertisedSlot = GrassrootsIdentity.currentBleSlot();
+          _advertiseLocalName = localName;
+          _startSlotTimer();
         } catch (e) {
           debugPrint('Failed to start advertising: $e');
         }
       } else {
         // Make sure we aren't lingering as an advertiser from a previous
         // mode — explicitly tear down.
+        _stopSlotTimer();
+        _advertisedSlot = null;
         try {
           await _ble.stopAdvertising();
         } catch (_) {}
@@ -333,6 +344,48 @@ class BleTransportService extends TransportService {
       _scanWatchdogInterval,
       (_) => unawaited(checkScanLiveness()),
     );
+  }
+
+  void _startSlotTimer() {
+    _slotTimer?.cancel();
+    _slotTimer = Timer.periodic(
+      _slotCheckInterval,
+      (_) => unawaited(_maybeReAdvertiseForSlot()),
+    );
+  }
+
+  void _stopSlotTimer() {
+    _slotTimer?.cancel();
+    _slotTimer = null;
+  }
+
+  /// Re-advertise the current slot's beacon when the 15-minute BLE slot has
+  /// advanced past the slot we last advertised. The advertised service UUID's
+  /// suffix is a function of the slot, so a new slot is a new beacon; the
+  /// re-advertise rebuilds the peripheral GATT service under the new UUID
+  /// (plugin >= 0.3.0 restarts advertising after that rebuild). Live peripheral
+  /// links drop and re-establish across the boundary — the accepted cost of an
+  /// unlinkable, rotating beacon.
+  @visibleForTesting
+  Future<void> maybeReAdvertiseForSlot() => _maybeReAdvertiseForSlot();
+
+  Future<void> _maybeReAdvertiseForSlot() async {
+    if (_stopped) return;
+    final slot = GrassrootsIdentity.currentBleSlot();
+    if (slot == _advertisedSlot) return;
+    try {
+      await _ble.startAdvertising(
+        serviceUuid: identity.bleServiceUuid,
+        characteristicUuid: _grassrootsCharacteristicUuid,
+        localName: _advertiseLocalName,
+        bondless: true,
+      );
+      _advertisedSlot = slot;
+      debugPrint('[ble] rotated advertised beacon to slot $slot');
+    } catch (e) {
+      // Leave _advertisedSlot unchanged so the next tick retries.
+      debugPrint('[ble] slot re-advertise failed (will retry): $e');
+    }
   }
 
   /// Restart the continuous scan if the airwaves have been silent past
@@ -392,6 +445,8 @@ class BleTransportService extends TransportService {
     _stopped = true;
     _scanWatchdog?.cancel();
     _scanWatchdog = null;
+    _stopSlotTimer();
+    _advertisedSlot = null;
     try {
       await _ble.stopScan();
     } catch (_) {}
@@ -488,9 +543,8 @@ class BleTransportService extends TransportService {
     // we know the peer's pubkey, so we can derive their service UUID and
     // correlate it with discovery state.
     if (role == BleRole.peripheral) {
-      final peerIsIos = _isIosPeerServiceUuid(
-        GrassrootsIdentity.deriveServiceUuid(pubkey),
-      );
+      final peerIsIos = GrassrootsIdentity.candidateServiceUuids(pubkey)
+          .any(_isIosPeerServiceUuid);
       if (defaultTargetPlatform == TargetPlatform.iOS && !peerIsIos) {
         // The reverse leg toward a non-iOS peer is the pair's SECOND link,
         // which an iOS central cannot open (hardware-measured; see
@@ -513,13 +567,15 @@ class BleTransportService extends TransportService {
   /// doomed second link (it can never reach `didConnect`) and would hold a
   /// dial slot for the full connect timeout.
   void _cancelDoomedCentralDialsForPubkey(Uint8List pubkey) {
-    final serviceUuid =
-        GrassrootsIdentity.deriveServiceUuid(pubkey).toLowerCase();
+    final candidates = GrassrootsIdentity.candidateServiceUuids(pubkey);
     for (final p in _paths.values.toList(growable: false)) {
       if (p.role != ble.BleRole.central) continue;
       if (p.state != ble.BlePathState.connecting) continue;
       final discovered = _peersState.getDiscoveredBlePeer(p.pathId);
-      if (discovered?.serviceUuid?.toLowerCase() != serviceUuid) continue;
+      final discoveredUuid = discovered?.serviceUuid?.toLowerCase();
+      if (discoveredUuid == null || !candidates.contains(discoveredUuid)) {
+        continue;
+      }
       debugPrint(
         '[ble] aborting central dial ${p.pathId}: peer just authenticated an '
         'inbound peripheral leg, and an iOS central cannot open a second '
@@ -875,10 +931,9 @@ class BleTransportService extends TransportService {
   /// The live central pathId attached to the identified peer whose pubkey
   /// derives [serviceUuid], or null when none is connected.
   String? _liveCentralPathIdForServiceUuid(String serviceUuid) {
-    final normalized = serviceUuid.toLowerCase();
     for (final peer in _peersState.peersList) {
-      if (GrassrootsIdentity.deriveServiceUuid(peer.publicKey).toLowerCase() !=
-          normalized) {
+      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(
+          serviceUuid, peer.publicKey)) {
         continue;
       }
       final centralId = peer.bleCentralDeviceId;
@@ -925,7 +980,7 @@ class BleTransportService extends TransportService {
   ///
   /// So for mixed pairs iOS must own the first link and the non-iOS side the
   /// reverse leg. iOS peers are recognized by the fixed `grs-ios` local name
-  /// their advertisements carry (see [grassrootsIosLocalName]); among
+  /// their advertisements carry (see [ble.grassrootsIosLocalName]); among
   /// same-platform peers the deterministic service-UUID tiebreaker (mirroring
   /// the UDP "smaller pubkey initiates" convention) avoids the mutual-dial
   /// collision. Every waiting branch is backstopped by [firstMoverFallback]
@@ -987,14 +1042,14 @@ class BleTransportService extends TransportService {
       _iosMarkedServiceUuids.contains(serviceUuid.toLowerCase());
 
   /// Whether [adv] carries the fixed iOS platform marker
-  /// ([grassrootsIosLocalName]) in its local name. iOS surfaces a scanned
+  /// ([ble.grassrootsIosLocalName]) in its local name. iOS surfaces a scanned
   /// local name as `advertisedName`; Android surfaces the scan-response name
   /// there too, with the GAP-cached name in `platformName` — check both.
   /// Absence proves nothing (backgrounded iOS drops the name), which is why
   /// every marker-dependent branch in [_shouldOpenCentralLeg] has a fallback.
   bool _advertisementCarriesIosMarker(ble.BleAdvertisement adv) {
-    return adv.advertisedName == grassrootsIosLocalName ||
-        adv.platformName == grassrootsIosLocalName;
+    return adv.advertisedName == ble.grassrootsIosLocalName ||
+        adv.platformName == ble.grassrootsIosLocalName;
   }
 
   /// Cold-start tie-breaker between same-platform peers: the one whose
@@ -1028,10 +1083,9 @@ class BleTransportService extends TransportService {
   /// being held back by the first-mover gate. Companion to
   /// [_hasLiveCentralPathForServiceUuid].
   bool _hasLivePeripheralPathForServiceUuid(String serviceUuid) {
-    final normalized = serviceUuid.toLowerCase();
     for (final peer in _peersState.peersList) {
-      if (GrassrootsIdentity.deriveServiceUuid(peer.publicKey).toLowerCase() !=
-          normalized) {
+      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(
+          serviceUuid, peer.publicKey)) {
         continue;
       }
       final peripheralId = peer.blePeripheralDeviceId;
@@ -1116,7 +1170,8 @@ class BleTransportService extends TransportService {
     // [_shouldOpenCentralLeg]). Toward iOS peers we attempt it — dual-role
     // mandate.
     if (defaultTargetPlatform == TargetPlatform.iOS &&
-        !_isIosPeerServiceUuid(GrassrootsIdentity.deriveServiceUuid(pubkey))) {
+        !GrassrootsIdentity.candidateServiceUuids(pubkey)
+            .any(_isIosPeerServiceUuid)) {
       return;
     }
 
@@ -1128,10 +1183,11 @@ class BleTransportService extends TransportService {
     if (peer.bleCentralDeviceId != null) return;
     if (peer.blePeripheralDeviceId == null) return; // not actually peripheral-attached
 
-    final serviceUuid =
-        GrassrootsIdentity.deriveServiceUuid(pubkey).toLowerCase();
+    // A peer may currently be advertising under its current or an adjacent
+    // slot's UUID; match against the whole candidate set.
+    final candidates = GrassrootsIdentity.candidateServiceUuids(pubkey);
 
-    // Skip if any central pathId for this service UUID is mid-handshake.
+    // Skip if any central pathId for this identity is mid-handshake.
     // (Across-MAC, since the discovery map can hold multiple rotated MACs.)
     final alreadyDialing = _paths.values.any((p) {
       if (p.role != ble.BleRole.central) return false;
@@ -1142,18 +1198,19 @@ class BleTransportService extends TransportService {
         return false;
       }
       final discovered = _peersState.getDiscoveredBlePeer(p.pathId);
-      return discovered?.serviceUuid?.toLowerCase() == serviceUuid;
+      final du = discovered?.serviceUuid?.toLowerCase();
+      return du != null && candidates.contains(du);
     });
     if (alreadyDialing) return;
 
     if (_inFlightCentralDials() >= _maxInFlightCentralDials) return;
 
-    // Pick any discovered advertising MAC that hashes to this peer's
-    // identity and isn't itself in a connecting/connected state. If none
-    // exist yet we bail — the next advertisement that lands for this peer
-    // will re-trigger us (`_onAdvertisement` calls back into here).
-    final candidate = _peersState
-        .getDiscoveredBlePeersByServiceUuid(serviceUuid)
+    // Pick any discovered advertising MAC that hashes to this peer's identity
+    // (under any candidate slot) and isn't itself in a connecting/connected
+    // state. If none exist yet we bail — the next advertisement that lands for
+    // this peer will re-trigger us (`_onAdvertisement` calls back into here).
+    final candidate = candidates
+        .expand((u) => _peersState.getDiscoveredBlePeersByServiceUuid(u))
         .firstWhere(
           (dp) => !dp.isConnected && !dp.isConnecting,
           orElse: () => _noCandidate,
@@ -1305,10 +1362,9 @@ class BleTransportService extends TransportService {
   Iterable<ble.BlePath> get _readyPaths => _paths.values.where(_isReady);
 
   Uint8List? _friendPubkeyForDerivedServiceUuid(String serviceUuid) {
-    final normalized = serviceUuid.toLowerCase();
     for (final peer in _peersState.friends) {
-      if (GrassrootsIdentity.deriveServiceUuid(peer.publicKey).toLowerCase() ==
-          normalized) {
+      if (GrassrootsIdentity.serviceUuidMatchesPubkey(
+          serviceUuid, peer.publicKey)) {
         return peer.publicKey;
       }
     }

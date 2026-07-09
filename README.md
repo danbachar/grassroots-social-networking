@@ -215,8 +215,6 @@ Inter-fragment delay: 20ms
 
 The Nostr bridge from original Bitchat has been removed. See `TODO_TRANSPORT.md` for plans to implement:
 
-- WebRTC for internet-based P2P
-- STUN/TURN for NAT traversal
 - Other transport options
 
 ## Dependencies

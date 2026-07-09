@@ -6,6 +6,7 @@ import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
@@ -13,6 +14,28 @@ import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
 import '../helpers/sodium_test_bootstrap.dart';
+
+/// Build an UNSEALED secure MESSAGE packet whose sealed frame carries
+/// [messageId] as its logical id. The outer wire [packetId] is a *separate*
+/// random id (as a real transport assigns it) — the router dedups the wire
+/// packet on packetId and the logical message on the frame's messageId, so the
+/// two must differ for delivery to fire.
+GrassrootsPacket messagePacket({
+  required Uint8List payload,
+  required String messageId,
+  required Uint8List recipientPubkey,
+}) {
+  final frame = SecureFrame(
+    contentType: ContentType.message,
+    messageId: messageId,
+    chunk: payload,
+  );
+  return GrassrootsPacket(
+    type: PacketType.secure,
+    recipientPubkey: recipientPubkey,
+    payload: frame.encode(),
+  );
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -236,18 +259,22 @@ void main() {
       );
 
       final messagePayload = Uint8List.fromList([10, 20, 30, 40, 50]);
+      const messageId = '00000000-0000-4000-8000-000000000001';
 
       // Alice creates a message packet targeted at Bob and seals it under the
       // Noise session (the wire packet is sender-anonymous + encrypted).
-      final clear = aliceProtocol.createMessagePacket(
+      final clear = messagePacket(
         payload: messagePayload,
+        messageId: messageId,
         recipientPubkey: bobIdentity.publicKey,
       );
       final sealed = await aliceSessions.encryptPacket(
         clear,
         remotePubkey: bobIdentity.publicKey,
       );
-      expect(sealed.type, equals(PacketType.secureMessage));
+      // Content type + fragmentation now live inside the sealed frame; the wire
+      // type is the single opaque PacketType.secure.
+      expect(sealed.type, equals(PacketType.secure));
       expect(sealed.payload, isNot(equals(messagePayload)));
 
       // Bob's router processes the sealed bytes: it trial-decrypts, delivers,
@@ -273,13 +300,15 @@ void main() {
         rssi: -70,
       );
 
-      expect(receivedId, equals(sealed.packetId));
+      // The delivered id is the frame's logical messageId, recovered from the
+      // decrypted frame (distinct from the sender-anonymous outer packetId).
+      expect(receivedId, equals(messageId));
       expect(receivedPayload, equals(messagePayload));
       expect(receivedSender, equals(aliceIdentity.publicKey));
 
-      // ACK requested back to the original sender, keyed on the packet id.
+      // ACK requested back to the original sender, keyed on the message id.
       expect(ackSender, equals(aliceIdentity.publicKey));
-      expect(ackMessageId, equals(sealed.packetId));
+      expect(ackMessageId, equals(messageId));
     });
 
     test('a relay that decrements TTL does not break end-to-end decryption',
@@ -293,8 +322,9 @@ void main() {
       );
 
       final messagePayload = Uint8List.fromList([7, 7, 7]);
-      final clear = aliceProtocol.createMessagePacket(
+      final clear = messagePacket(
         payload: messagePayload,
+        messageId: '00000000-0000-4000-8000-000000000002',
         recipientPubkey: bobIdentity.publicKey,
       );
       final sealed = await aliceSessions.encryptPacket(
@@ -334,8 +364,9 @@ void main() {
       // Alice sends to someone other than Bob. Even though Bob holds a session
       // with Alice, the packet is not addressed to Bob, so Bob must NOT deliver
       // it — it gets relayed (managed flooding) instead.
-      final clear = aliceProtocol.createMessagePacket(
+      final clear = messagePacket(
         payload: messagePayload,
+        messageId: '00000000-0000-4000-8000-000000000003',
         recipientPubkey: otherPub,
       );
       final sealed = await aliceSessions.encryptPacket(
@@ -376,7 +407,7 @@ void main() {
         bobIdentity.publicKey,
       );
 
-      const messageId = 'msg-12345678';
+      const messageId = '00000000-0000-4000-8000-0000000000aa';
 
       final clear = aliceProtocol.createReadReceiptPacket(
         messageId: messageId,
@@ -386,7 +417,9 @@ void main() {
         clear,
         remotePubkey: bobIdentity.publicKey,
       );
-      expect(sealed.type, equals(PacketType.secureReadReceipt));
+      // Read-receipt content type is now sealed inside the frame; the wire type
+      // is the opaque PacketType.secure.
+      expect(sealed.type, equals(PacketType.secure));
 
       String? receivedMessageId;
       bobRouter.onReadReceiptReceived = (id) {
@@ -467,8 +500,9 @@ void main() {
 
       final messagePayload = Uint8List.fromList([99, 88, 77]);
 
-      final clear = aliceProtocol.createMessagePacket(
+      final clear = messagePacket(
         payload: messagePayload,
+        messageId: '00000000-0000-4000-8000-000000000004',
         recipientPubkey: bobIdentity.publicKey,
       );
       final sealed = await aliceSessions.encryptPacket(
@@ -506,7 +540,7 @@ void main() {
         bobIdentity.publicKey,
       );
 
-      const messageId = 'ack12345';
+      const messageId = '00000000-0000-4000-8000-0000000000bb';
 
       final clear = aliceProtocol.createAckPacket(
         messageId: messageId,
@@ -516,7 +550,8 @@ void main() {
         clear,
         remotePubkey: bobIdentity.publicKey,
       );
-      expect(sealed.type, equals(PacketType.secureAck));
+      // ACK content type is sealed inside the frame; wire type is opaque secure.
+      expect(sealed.type, equals(PacketType.secure));
 
       String? receivedMessageId;
       bobRouter.onAckReceived = (id) {
@@ -542,7 +577,7 @@ void main() {
         bobIdentity.publicKey,
       );
 
-      const messageId = 'rcpt1234';
+      const messageId = '00000000-0000-4000-8000-0000000000cc';
 
       final clear = aliceProtocol.createReadReceiptPacket(
         messageId: messageId,
@@ -579,8 +614,9 @@ void main() {
       );
 
       final messagePayload = Uint8List.fromList([1, 2, 3]);
-      final clear = aliceProtocol.createMessagePacket(
+      final clear = messagePacket(
         payload: messagePayload,
+        messageId: '00000000-0000-4000-8000-000000000005',
         recipientPubkey: bobIdentity.publicKey,
       );
       final sealed = await aliceSessions.encryptPacket(
@@ -709,8 +745,9 @@ void main() {
       // Alice sends a sealed message to Bob.
       final helloPayload = Uint8List.fromList('hello bob'.codeUnits);
       final aliceMsg = await aliceSessions.encryptPacket(
-        aliceProtocol.createMessagePacket(
+        messagePacket(
           payload: helloPayload,
+          messageId: '00000000-0000-4000-8000-000000000006',
           recipientPubkey: bobIdentity.publicKey,
         ),
         remotePubkey: bobIdentity.publicKey,
@@ -733,8 +770,9 @@ void main() {
       // Bob sends a sealed reply to Alice.
       final replyPayload = Uint8List.fromList('hi alice'.codeUnits);
       final bobMsg = await bobSessions.encryptPacket(
-        bobProtocol.createMessagePacket(
+        messagePacket(
           payload: replyPayload,
+          messageId: '00000000-0000-4000-8000-000000000007',
           recipientPubkey: aliceIdentity.publicKey,
         ),
         remotePubkey: aliceIdentity.publicKey,

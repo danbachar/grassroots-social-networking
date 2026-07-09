@@ -3,59 +3,18 @@ import 'package:uuid/uuid.dart';
 
 /// Packet types matching Grassroots protocol
 enum PacketType {
-  /// Peer identity announcement (sent periodically)
+  /// Neighbor-local, self-signed presence broadcast — the one clear packet whose
+  /// sender is *meant* to be visible. Never relayed.
   announce(0x01),
 
-  /// Application message (GSG blocks go here)
-  message(0x02),
+  /// Noise XX handshake message (neighbor-local, not relayed).
+  noiseHandshake(0x02),
 
-  /// Start of fragmented message
-  fragmentStart(0x03),
-
-  /// Continuation fragment
-  fragmentContinue(0x04),
-
-  /// Final fragment
-  fragmentEnd(0x05),
-
-  /// Delivery acknowledgment (for UDP transport)
-  ack(0x06),
-
-  /// Negative acknowledgment / request for data
-  nack(0x07),
-
-  /// Read receipt (recipient has read the message)
-  readReceipt(0x08),
-
-  /// Signaling (address registration, query, hole-punch coordination)
-  signaling(0x09),
-
-  /// Noise XX handshake message.
-  noiseHandshake(0x0A),
-
-  /// Session-encrypted application message.
-  secureMessage(0x0B),
-
-  /// Session-encrypted start of fragmented message.
-  secureFragmentStart(0x0C),
-
-  /// Session-encrypted continuation fragment.
-  secureFragmentContinue(0x0D),
-
-  /// Session-encrypted final fragment.
-  secureFragmentEnd(0x0E),
-
-  /// Session-encrypted delivery acknowledgment.
-  secureAck(0x0F),
-
-  /// Session-encrypted negative acknowledgment.
-  secureNack(0x10),
-
-  /// Session-encrypted read receipt.
-  secureReadReceipt(0x11),
-
-  /// Session-encrypted signaling packet.
-  secureSignaling(0x12);
+  /// Session-sealed envelope. Everything that is not an ANNOUNCE or a handshake
+  /// is one opaque `secure` packet: the content type and any fragmentation live
+  /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
+  /// an opaque, recipient-addressed blob — never the message class.
+  secure(0x03);
 
   final int value;
   const PacketType(this.value);
@@ -65,125 +24,6 @@ enum PacketType {
       (t) => t.value == value,
       orElse: () => throw ArgumentError('Unknown packet type: $value'),
     );
-  }
-}
-
-extension PacketTypeSessionSecurity on PacketType {
-  /// Whether this packet type should be payload-encrypted once a Noise session
-  /// exists. ANNOUNCE and Noise handshake packets intentionally stay clear so
-  /// peers can identify each other and bootstrap the session.
-  bool get usesSessionSecurity {
-    switch (this) {
-      case PacketType.message:
-      case PacketType.fragmentStart:
-      case PacketType.fragmentContinue:
-      case PacketType.fragmentEnd:
-      case PacketType.ack:
-      case PacketType.nack:
-      case PacketType.readReceipt:
-      case PacketType.signaling:
-        return true;
-      case PacketType.announce:
-      case PacketType.noiseHandshake:
-      case PacketType.secureMessage:
-      case PacketType.secureFragmentStart:
-      case PacketType.secureFragmentContinue:
-      case PacketType.secureFragmentEnd:
-      case PacketType.secureAck:
-      case PacketType.secureNack:
-      case PacketType.secureReadReceipt:
-      case PacketType.secureSignaling:
-        return false;
-    }
-  }
-
-  bool get isSessionEncrypted {
-    switch (this) {
-      case PacketType.secureMessage:
-      case PacketType.secureFragmentStart:
-      case PacketType.secureFragmentContinue:
-      case PacketType.secureFragmentEnd:
-      case PacketType.secureAck:
-      case PacketType.secureNack:
-      case PacketType.secureReadReceipt:
-      case PacketType.secureSignaling:
-        return true;
-      case PacketType.announce:
-      case PacketType.message:
-      case PacketType.fragmentStart:
-      case PacketType.fragmentContinue:
-      case PacketType.fragmentEnd:
-      case PacketType.ack:
-      case PacketType.nack:
-      case PacketType.readReceipt:
-      case PacketType.signaling:
-      case PacketType.noiseHandshake:
-        return false;
-    }
-  }
-
-  PacketType get secureVariant {
-    switch (this) {
-      case PacketType.message:
-        return PacketType.secureMessage;
-      case PacketType.fragmentStart:
-        return PacketType.secureFragmentStart;
-      case PacketType.fragmentContinue:
-        return PacketType.secureFragmentContinue;
-      case PacketType.fragmentEnd:
-        return PacketType.secureFragmentEnd;
-      case PacketType.ack:
-        return PacketType.secureAck;
-      case PacketType.nack:
-        return PacketType.secureNack;
-      case PacketType.readReceipt:
-        return PacketType.secureReadReceipt;
-      case PacketType.signaling:
-        return PacketType.secureSignaling;
-      case PacketType.announce:
-      case PacketType.noiseHandshake:
-      case PacketType.secureMessage:
-      case PacketType.secureFragmentStart:
-      case PacketType.secureFragmentContinue:
-      case PacketType.secureFragmentEnd:
-      case PacketType.secureAck:
-      case PacketType.secureNack:
-      case PacketType.secureReadReceipt:
-      case PacketType.secureSignaling:
-        throw StateError('Packet type $this has no secure variant');
-    }
-  }
-
-  PacketType get clearVariant {
-    switch (this) {
-      case PacketType.secureMessage:
-        return PacketType.message;
-      case PacketType.secureFragmentStart:
-        return PacketType.fragmentStart;
-      case PacketType.secureFragmentContinue:
-        return PacketType.fragmentContinue;
-      case PacketType.secureFragmentEnd:
-        return PacketType.fragmentEnd;
-      case PacketType.secureAck:
-        return PacketType.ack;
-      case PacketType.secureNack:
-        return PacketType.nack;
-      case PacketType.secureReadReceipt:
-        return PacketType.readReceipt;
-      case PacketType.secureSignaling:
-        return PacketType.signaling;
-      case PacketType.announce:
-      case PacketType.message:
-      case PacketType.fragmentStart:
-      case PacketType.fragmentContinue:
-      case PacketType.fragmentEnd:
-      case PacketType.ack:
-      case PacketType.nack:
-      case PacketType.readReceipt:
-      case PacketType.signaling:
-      case PacketType.noiseHandshake:
-        throw StateError('Packet type $this is not session encrypted');
-    }
   }
 }
 

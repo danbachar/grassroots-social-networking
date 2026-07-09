@@ -422,6 +422,7 @@ void main() {
         final testPayload = Uint8List.fromList(List.generate(100, (i) => i));
         final packet = aliceProto.createMessagePacket(
           payload: testPayload,
+          messageId: '00000000-0000-4000-8000-000000000001',
           recipientPubkey: bobIdentity.publicKey,
         );
         final testData = packet.serialize();
@@ -490,6 +491,7 @@ void main() {
         // payload-length field).
         final packet = aliceProto.createMessagePacket(
           payload: Uint8List.fromList([4, 3, 2, 1]),
+          messageId: '00000000-0000-4000-8000-000000000002',
           recipientPubkey: bobIdentity.publicKey,
         );
         final testData = packet.serialize();
@@ -631,6 +633,7 @@ void main() {
         // emit it cleanly.
         final packet = aliceProto.createMessagePacket(
           payload: Uint8List.fromList([1, 2, 3, 4, 5]),
+          messageId: '00000000-0000-4000-8000-000000000003',
           recipientPubkey: bobIdentity.publicKey,
         );
         final testData = packet.serialize();

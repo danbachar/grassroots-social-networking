@@ -1639,6 +1639,82 @@ void main() {
     });
 
     test(
+        'after a reform yield the first-mover fallback is held so the '
+        'iPhone can open the first leg', () async {
+      final iosPeer = await _makeIdentity('iPhone');
+      final (hostApi, callbacks, store, _) = await build(
+        await _makeIdentity('Android'),
+        firstMoverFallback: Duration.zero,
+      );
+
+      // Wrong-order central-only pair, as in the reform test above.
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'IPHONE_ADV',
+        serviceUuids: [iosPeer.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'central:IPHONE_ADV',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: iosPeer.publicKey,
+        nickname: 'iPhone',
+        protocolVersion: 1,
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: 'central:IPHONE_ADV',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // Marker advertisement triggers the reform teardown, and the plugin
+      // completes the disconnect round-trip.
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'IPHONE_ADV',
+        advertisedName: grassrootsIosLocalName,
+        serviceUuids: [iosPeer.bleServiceUuid],
+        rssi: -54,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'central:IPHONE_ADV',
+        role: BleRole.central,
+        state: BlePathState.disconnected,
+        rssi: null,
+        mtu: 247,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+
+      // The iPhone keeps advertising while it observes its side of the drop
+      // and redials — seconds. An elapsed first-mover fallback must NOT
+      // recreate the wrong-order central leg in that window, or the iPhone's
+      // live-peripheral gate blocks its dial again and the pair flaps
+      // reform↔redial forever.
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'IPHONE_ADV',
+        advertisedName: grassrootsIosLocalName,
+        serviceUuids: [iosPeer.bleServiceUuid],
+        rssi: -54,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'The yield grace holds our fallback dial so the iPhone '
+              'gets to open the first leg.');
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'No central leg is live — nothing to reform.');
+    });
+
+    test(
         'a dual-role mixed pair does NOT reform on marker sightings',
         () async {
       final iosPeer = await _makeIdentity('iPhone');

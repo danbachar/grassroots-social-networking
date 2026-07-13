@@ -105,6 +105,28 @@ class BleTransportService extends TransportService {
   /// state in [_onPathChanged].
   final Set<String> _reformingCentralPathIds = {};
 
+  /// When we last yielded our central leg to the iOS-marked identity behind
+  /// each derived service UUID (lowercase) for a wrong-order pair reform.
+  /// Read at two horizons: [_reformYieldGrace] holds our first-mover fallback
+  /// so the iPhone gets the first leg, and [_reformRetryInterval] spaces out
+  /// repeat reforms of a pair the iPhone never rebuilt.
+  final Map<String, DateTime> _reformYieldedAtByUuid = {};
+
+  /// How long after a reform yield we refuse to fallback-dial the same
+  /// identity. The iPhone needs to observe its peripheral-side disconnect,
+  /// re-sight our advertisement, and connect — seconds. Re-dialing on the
+  /// next advertisement (tens of ms) recreates the wrong-order central-only
+  /// pair before the iPhone ever sees the drop, and its live-peripheral gate
+  /// then blocks its dial again: an endless reform↔redial flap.
+  static const Duration _reformYieldGrace = Duration(seconds: 12);
+
+  /// Minimum spacing between reform teardowns toward the same identity. A
+  /// yield the iPhone never answers ends with our fallback re-dial restoring
+  /// the central-only link; tearing that working link down again on the next
+  /// marker advertisement would flap the connection forever. Retrying on
+  /// this interval keeps the dual-role upgrade pressure without the flap.
+  static const Duration _reformRetryInterval = Duration(minutes: 2);
+
   /// True while a `start()` call is in flight. Prevents re-entrant `start()`
   /// from `_onAdapterStateChanged` running concurrently with the original.
   bool _starting = false;
@@ -825,8 +847,11 @@ class BleTransportService extends TransportService {
           store.state.settings.bleRoleMode == BleRoleMode.auto &&
           !_hasLivePeripheralPathForServiceUuid(serviceUuid)) {
         final centralId = _liveCentralPathIdForServiceUuid(serviceUuid);
-        if (centralId != null && !_reformingCentralPathIds.contains(centralId)) {
+        if (centralId != null &&
+            !_reformingCentralPathIds.contains(centralId) &&
+            !_withinReformWindow(serviceUuid, _reformRetryInterval)) {
           _reformingCentralPathIds.add(centralId);
+          _reformYieldedAtByUuid[serviceUuid.toLowerCase()] = DateTime.now();
           debugPrint(
             '[ble] reforming wrong-order pair: dropping our central leg '
             '$centralId so the (foregrounded) iOS peer can open the first '
@@ -1023,8 +1048,14 @@ class BleTransportService extends TransportService {
     // reverse leg (fact 2); the fallback covers an iOS peer that never
     // dials, where a single us-central first link still beats no link.
     if (peerIsIos) {
-      return _hasLivePeripheralPathForServiceUuid(serviceUuid) ||
-          _firstMoverFallbackElapsed(existing);
+      if (_hasLivePeripheralPathForServiceUuid(serviceUuid)) return true;
+      // We just yielded a wrong-order central leg so this iOS peer can open
+      // the first leg. `existing.discoveredAt` is minutes old by now, so the
+      // fallback below would re-dial on the next advertisement — before the
+      // iPhone even observes the drop — recreating the same wrong-order
+      // pair. Hold the fallback until the yield grace passes.
+      if (_withinReformWindow(serviceUuid, _reformYieldGrace)) return false;
+      return _firstMoverFallbackElapsed(existing);
     }
 
     // Same-platform (non-iOS) pair: deterministic first-mover; the
@@ -1032,6 +1063,14 @@ class BleTransportService extends TransportService {
     return _isBleDialInitiator(serviceUuid) ||
         _hasLivePeripheralPathForServiceUuid(serviceUuid) ||
         _firstMoverFallbackElapsed(existing);
+  }
+
+  /// Whether the last reform yield toward the identity behind [serviceUuid]
+  /// happened less than [window] ago. See [_reformYieldedAtByUuid].
+  bool _withinReformWindow(String serviceUuid, Duration window) {
+    final yieldedAt = _reformYieldedAtByUuid[serviceUuid.toLowerCase()];
+    return yieldedAt != null &&
+        DateTime.now().difference(yieldedAt) < window;
   }
 
   /// Whether the peer behind [serviceUuid] has been seen advertising the iOS

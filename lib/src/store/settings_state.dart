@@ -136,16 +136,6 @@ class SettingsState {
   /// site — reducers are pure and must not synthesize time).
   final String? consentTimestamp;
 
-  /// Local calendar date (yyyy-MM-dd) of the last successful trace upload, used
-  /// to drive the once-per-day upload prompt.
-  final String? lastTraceUploadDate;
-
-  /// Trace-upload server base URL (e.g. `https://host:8443`).
-  final String? traceServerUrl;
-
-  /// Bearer token for the trace-upload server.
-  final String? traceServerToken;
-
   const SettingsState({
     this.bluetoothEnabled = true,
     this.udpEnabled = true,
@@ -160,9 +150,6 @@ class SettingsState {
     this.coldCallTrustLevel = ColdCallTrustLevel.closed,
     this.traceLoggingConsent = false,
     this.consentTimestamp,
-    this.lastTraceUploadDate,
-    this.traceServerUrl,
-    this.traceServerToken,
   });
 
   static const SettingsState initial = SettingsState();
@@ -228,9 +215,6 @@ class SettingsState {
     Object? anchorAddress = _sentinel,
     Object? anchorPubkeyHex = _sentinel,
     Object? consentTimestamp = _sentinel,
-    Object? lastTraceUploadDate = _sentinel,
-    Object? traceServerUrl = _sentinel,
-    Object? traceServerToken = _sentinel,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -249,15 +233,6 @@ class SettingsState {
       consentTimestamp: identical(consentTimestamp, _sentinel)
           ? this.consentTimestamp
           : consentTimestamp as String?,
-      lastTraceUploadDate: identical(lastTraceUploadDate, _sentinel)
-          ? this.lastTraceUploadDate
-          : lastTraceUploadDate as String?,
-      traceServerUrl: identical(traceServerUrl, _sentinel)
-          ? this.traceServerUrl
-          : traceServerUrl as String?,
-      traceServerToken: identical(traceServerToken, _sentinel)
-          ? this.traceServerToken
-          : traceServerToken as String?,
     );
   }
 
@@ -273,9 +248,6 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'traceLoggingConsent': traceLoggingConsent,
         'consentTimestamp': consentTimestamp,
-        'lastTraceUploadDate': lastTraceUploadDate,
-        'traceServerUrl': traceServerUrl,
-        'traceServerToken': traceServerToken,
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -313,9 +285,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       traceLoggingConsent: json['traceLoggingConsent'] as bool? ?? false,
       consentTimestamp: json['consentTimestamp'] as String?,
-      lastTraceUploadDate: json['lastTraceUploadDate'] as String?,
-      traceServerUrl: json['traceServerUrl'] as String?,
-      traceServerToken: json['traceServerToken'] as String?,
     );
   }
 
@@ -333,10 +302,7 @@ class SettingsState {
           bleRoleMode == other.bleRoleMode &&
           coldCallTrustLevel == other.coldCallTrustLevel &&
           traceLoggingConsent == other.traceLoggingConsent &&
-          consentTimestamp == other.consentTimestamp &&
-          lastTraceUploadDate == other.lastTraceUploadDate &&
-          traceServerUrl == other.traceServerUrl &&
-          traceServerToken == other.traceServerToken;
+          consentTimestamp == other.consentTimestamp;
 
   @override
   int get hashCode => Object.hash(
@@ -350,9 +316,6 @@ class SettingsState {
         coldCallTrustLevel,
         traceLoggingConsent,
         consentTimestamp,
-        lastTraceUploadDate,
-        traceServerUrl,
-        traceServerToken,
       );
 
   @override

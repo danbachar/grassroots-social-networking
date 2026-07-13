@@ -28,6 +28,10 @@ class SettingsScreen extends StatefulWidget {
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
 
+  /// Upload not-yet-uploaded diagnostic traces on demand ("Upload now").
+  /// Returns a short user-facing status message to surface in a snackbar.
+  final Future<String> Function()? onUploadTracesNow;
+
   const SettingsScreen({
     super.key,
     required this.store,
@@ -36,6 +40,7 @@ class SettingsScreen extends StatefulWidget {
     this.onRemoveRendezvousServer,
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
+    this.onUploadTracesNow,
   });
 
   @override
@@ -51,8 +56,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   late final TextEditingController _anchorAddressController;
   late final TextEditingController _anchorPubkeyController;
-  late final TextEditingController _traceUrlController;
-  late final TextEditingController _traceTokenController;
+
+  /// True while a manual "Upload now" is in flight (disables the button).
+  bool _uploadingTraces = false;
 
   @override
   void initState() {
@@ -62,12 +68,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     _anchorAddressController = TextEditingController();
     _anchorPubkeyController = TextEditingController();
-    _traceUrlController = TextEditingController(
-      text: widget.store.state.settings.traceServerUrl ?? '',
-    );
-    _traceTokenController = TextEditingController(
-      text: widget.store.state.settings.traceServerToken ?? '',
-    );
     _storeSubscription = widget.store.onChange.listen((state) {
       final settings = state.settings;
       if (_bluetoothEnabled != settings.bluetoothEnabled) {
@@ -87,8 +87,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _storeSubscription?.cancel();
     _anchorAddressController.dispose();
     _anchorPubkeyController.dispose();
-    _traceUrlController.dispose();
-    _traceTokenController.dispose();
     super.dispose();
   }
 
@@ -446,7 +444,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           padding: EdgeInsets.symmetric(horizontal: 16),
           child: Text(
             'Opt in to collect anonymous diagnostic traces on this device. '
-            'Once a day the app asks before uploading to your research server.',
+            'The app asks on every start before uploading, or upload manually '
+            'below.',
             style: TextStyle(color: Colors.grey, fontSize: 13),
           ),
         ),
@@ -462,51 +461,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _traceUrlController,
-            keyboardType: TextInputType.url,
-            decoration: const InputDecoration(
-              labelText: 'Trace server URL',
-              hintText: 'https://host:8443',
+        if (settings.traceLoggingConsent && widget.onUploadTracesNow != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: ElevatedButton.icon(
+                onPressed: _uploadingTraces ? null : _handleUploadNow,
+                icon: _uploadingTraces
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.upload),
+                label: Text(_uploadingTraces ? 'Uploading…' : 'Upload now'),
+              ),
             ),
           ),
-        ),
-        const SizedBox(height: 8),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _traceTokenController,
-            obscureText: true,
-            decoration: const InputDecoration(labelText: 'Upload token'),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: ElevatedButton(
-              onPressed: () {
-                final url = _traceUrlController.text.trim();
-                final token = _traceTokenController.text.trim();
-                widget.store.dispatch(SetTraceServerAction(
-                  url: url.isEmpty ? null : url,
-                  token: token.isEmpty ? null : token,
-                ));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Trace server saved'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-              },
-              child: const Text('Save trace server'),
-            ),
-          ),
-        ),
       ],
     );
+  }
+
+  /// Run the manual trace upload and surface its status in a snackbar.
+  Future<void> _handleUploadNow() async {
+    final upload = widget.onUploadTracesNow;
+    if (upload == null) return;
+    setState(() => _uploadingTraces = true);
+    String message;
+    try {
+      message = await upload();
+    } catch (_) {
+      message = 'Trace upload failed';
+    }
+    if (!mounted) return;
+    setState(() => _uploadingTraces = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      duration: const Duration(seconds: 2),
+    ));
   }
 
   Widget _buildColdCallTrustSelector() {

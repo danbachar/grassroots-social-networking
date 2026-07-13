@@ -108,16 +108,5 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     );
   }
 
-  if (action is SetTraceServerAction) {
-    return state.copyWith(
-      traceServerUrl: action.url,
-      traceServerToken: action.token,
-    );
-  }
-
-  if (action is SetLastTraceUploadDateAction) {
-    return state.copyWith(lastTraceUploadDate: action.date);
-  }
-
   return state;
 }

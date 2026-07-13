@@ -6,6 +6,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
 import 'src/trace/trace_logger.dart';
+import 'src/trace/trace_config.dart';
 import 'src/trace/location_sampler.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
@@ -577,15 +578,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     return _connectivity.first.name;
   }
 
-  String _localDateString(DateTime dt) =>
-      '${dt.year.toString().padLeft(4, '0')}-'
-      '${dt.month.toString().padLeft(2, '0')}-'
-      '${dt.day.toString().padLeft(2, '0')}';
-
-  /// One-time consent prompt, then the daily upload prompt (cold start).
+  /// One-time consent prompt, then the upload prompt — run once per app start.
   Future<void> _runTracePrompts() async {
     await _maybeConsentPrompt();
-    await _maybeDailyTracePrompt();
+    await _maybeTraceUploadPrompt();
+  }
+
+  /// Manual "Upload now" from settings. Uploads immediately (no prompt) and
+  /// returns a short user-facing status message for the caller to surface.
+  Future<String> _uploadTracesNow() async {
+    if (!TraceConfig.isConfigured) return 'Trace uploads are not configured';
+    if (!await traceLogger.hasUnuploaded()) return 'Nothing to upload';
+    final ok = await traceLogger.uploadAll(
+      url: TraceConfig.serverUrl,
+      token: TraceConfig.serverToken,
+    );
+    return ok ? 'Traces uploaded' : 'Trace upload failed';
   }
 
   /// Ask once, ever, whether the user opts in to trace logging + upload.
@@ -633,19 +641,18 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     }
   }
 
-  /// On the first open of a new calendar day, offer to upload traces that
-  /// haven't been uploaded yet.
-  Future<void> _maybeDailyTracePrompt() async {
+  /// On every app start, offer to upload any traces not yet uploaded since the
+  /// last successful upload. Fires only when the user has opted in, a
+  /// destination is baked in, and there is actually something pending.
+  Future<void> _maybeTraceUploadPrompt() async {
     if (_tracePromptBusy) return;
     final settings = appStore.state.settings;
     if (!settings.traceLoggingConsent) return;
 
-    final url = settings.traceServerUrl;
-    final token = settings.traceServerToken;
-    if (url == null || url.isEmpty || token == null || token.isEmpty) return;
+    // Destination is baked in (not user-configurable). A build shipped without
+    // a token stays inert.
+    if (!TraceConfig.isConfigured) return;
 
-    final today = _localDateString(DateTime.now());
-    if (settings.lastTraceUploadDate == today) return; // already handled today
     if (!await traceLogger.hasUnuploaded()) return;
     if (!mounted) return;
 
@@ -672,11 +679,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         ),
       );
 
-      // Mark the day handled either way, so we prompt at most once per day.
-      appStore.dispatch(SetLastTraceUploadDateAction(today));
-
       if (accepted == true) {
-        final ok = await traceLogger.uploadAll(url: url, token: token);
+        final ok = await traceLogger.uploadAll(
+          url: TraceConfig.serverUrl,
+          token: TraceConfig.serverToken,
+        );
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(ok ? 'Traces uploaded' : 'Trace upload failed'),
@@ -725,8 +732,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         }));
       }
       unawaited(_grassroots?.onAppResumed() ?? Future.value());
-      // First open of a new day → offer to upload not-yet-uploaded traces.
-      unawaited(_maybeDailyTracePrompt());
     }
   }
 
@@ -2560,6 +2565,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
+          onUploadTracesNow: _uploadTracesNow,
         ),
       ),
     );

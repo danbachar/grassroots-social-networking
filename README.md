@@ -1,231 +1,95 @@
-# Bitchat Transport for GSG
+# Grassroots Networking
 
-A Flutter/Dart implementation of the Bitchat BLE mesh transport layer, designed for use with the Grassroots Social Graph (GSG) protocol.
+A peer-to-peer messaging **transport** for mobile devices, written in Flutter/Dart. It moves end-to-end-encrypted packets between phones over two independent paths — **Bluetooth Low Energy** (an opportunistic multi-hop mesh, no infrastructure required) and the **Internet** (direct UDP with NAT hole-punching) — behind one connect/send/receive interface. It is not an application; it is the plumbing that applications like GSG build on top of. A demo chat app is included for development and field testing.
 
-## Overview
+## Core ideas
 
-This package provides a BLE mesh networking layer based on the [Bitchat protocol](https://github.com/permissionlesstech/bitchat). It enables peer-to-peer communication between nearby devices without requiring internet connectivity.
+**Identity is a key pair.** Every device holds an Ed25519 key pair; the public key *is* the peer's identity. Nicknames are cosmetic. All trust decisions flow from cryptographic verification, and message content only ever exists in the clear on the two endpoints.
 
-### Features
+**Two transports, one interface.** BLE covers nearby peers without Internet; UDP covers the globe. Both surface the same abstraction to the coordinator, and each can be toggled independently. Losing one transport has zero effect on the other — a peer stays reachable as long as any transport is live.
 
-- **Dual-mode BLE**: Operates as both Central (scanner) and Peripheral (advertiser) simultaneously
-- **Mesh Routing**: Multi-hop message relay (up to 7 hops)
-- **Fragmentation**: Automatic chunking and reassembly of large messages
-- **Deduplication**: Bloom filter prevents duplicate packet processing
-- **Store-and-Forward**: Caches messages for offline peers (12hr retention)
-- **Protocol Compatible**: Works with other Bitchat implementations
+**Opportunistic BLE mesh.** Over Bluetooth, delivery is multi-hop *managed flooding*: every node relays packets toward the recipient, TTL-bounded and deduplicated by a Bloom filter. Nodes also *store-carry-forward*: a bounded, age-expiring DTN cache holds packets for recipients currently out of range and re-floods them when the recipient reappears. Relays are open (not friend-gated) but blind — the outer envelope carries only the recipient ID; the sender's identity and the message body are sealed inside a Noise session that only the recipient can open. There is no cleartext sender and no per-packet signature on the wire: authentication is end-to-end, inside Noise, and the recipient demultiplexes inbound packets by trial decryption.
 
-### Architecture
+**Direct Internet transport with friend-assisted hole-punching.** UDP (via [UDX](https://pub.dev/packages/grassroots_dart_udx)) stays strictly point-to-point — no content relays. Since most phones sit behind NAT, *well-connected* friends (devices with a globally routable address) act as signaling relays: they hand both NAT'd peers each other's observed address and coordinate a punch, after which the deterministic initiator (lexicographically smaller public key) opens the stream and the friend leaves the path. Signaling is friend-only; content never touches the relay.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      GSG Layer                          │
-│   (Blocklace, Friendship Protocol, Cordial Dissem.)    │
-├─────────────────────────────────────────────────────────┤
-│                   Bitchat API                           │
-│         (send, broadcast, onMessageReceived)            │
-├─────────────────────────────────────────────────────────┤
-│                   Mesh Router                           │
-│   (Routing, Relay, Fragmentation, Store-and-Forward)   │
-├─────────────────────────────────────────────────────────┤
-│                   BLE Manager                           │
-│           (Central + Peripheral Services)               │
-├─────────────────────────────────────────────────────────┤
-│              BLE Hardware (iOS/Android)                 │
-└─────────────────────────────────────────────────────────┘
-```
+**Dual-role BLE.** Every BLE pair converges to two GATT legs, each device central on one and peripheral on the other. Platform asymmetries (notably iOS↔Android link ordering) are solved by choosing who initiates each leg, never by settling for a single link.
 
-## Installation
+**Redux state.** All peer and transport state lives in an immutable Redux store (`AppState`) — a strict projection of facts emitted by the transport layers, never an inference. UI subscribes to the store; no mutable singletons.
 
-Add to your `pubspec.yaml`:
+See [CLAUDE.md](CLAUDE.md) for the full set of design rules and invariants, and [docs/](docs/) for the protocol specification and design notes.
 
-```yaml
-dependencies:
-  bitchat_transport:
-    path: ../bitchat_transport  # Or publish to pub.dev
-```
-
-### Platform Setup
-
-#### Android
-
-Add to `android/app/src/main/AndroidManifest.xml`:
-
-```xml
-<!-- Bluetooth permissions (Android 12+) -->
-<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-<uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-
-<!-- Location (required for BLE scanning) -->
-<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-
-<!-- Required features -->
-<uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
-```
-
-#### iOS
-
-Add to `ios/Runner/Info.plist`:
-
-```xml
-<key>NSBluetoothAlwaysUsageDescription</key>
-<string>This app uses Bluetooth to communicate with nearby devices.</string>
-<key>NSBluetoothPeripheralUsageDescription</key>
-<string>This app uses Bluetooth to communicate with nearby devices.</string>
-<key>NSLocationWhenInUseUsageDescription</key>
-<string>Location is used to improve Bluetooth connectivity.</string>
-<key>UIBackgroundModes</key>
-<array>
-    <string>bluetooth-central</string>
-    <string>bluetooth-peripheral</string>
-</array>
-```
-
-## Usage
-
-### Basic Setup
-
-```dart
-import 'package:bitchat_transport/bitchat_transport.dart';
-
-// Identity is provided by GSG layer
-final identity = BitchatIdentity(
-  publicKey: myEd25519PublicKey,   // 32 bytes
-  privateKey: myEd25519PrivateKey, // 64 bytes
-  nickname: 'Alice',
-);
-
-// Create Bitchat instance
-final bitchat = Bitchat(identity: identity);
-
-// Set up callbacks
-bitchat.onMessageReceived = (senderPubkey, payload) {
-  print('Received ${payload.length} bytes from ${senderPubkey}');
-  // Handle GSG block
-};
-
-bitchat.onPeerConnected = (peer) {
-  print('Peer connected: ${peer.displayName}');
-  // Start cordial dissemination
-};
-
-bitchat.onPeerDisconnected = (peer) {
-  print('Peer disconnected: ${peer.displayName}');
-};
-
-// Initialize (requests permissions, starts BLE)
-final success = await bitchat.initialize();
-if (!success) {
-  print('Failed to initialize: ${bitchat.status}');
-  return;
-}
-
-// Transport is now active and will auto-discover peers
-```
-
-### Sending Messages
-
-```dart
-// Send to specific peer
-final sent = await bitchat.send(recipientPubkey, gsgBlockData);
-
-// Broadcast to all peers
-await bitchat.broadcast(gsgBlockData);
-```
-
-### Peer Management
-
-```dart
-// Get all known peers
-final peers = bitchat.peers;
-
-// Get connected peers only
-final connected = bitchat.connectedPeers;
-
-// Check if a peer is reachable
-final reachable = bitchat.isPeerReachable(pubkey);
-
-// Get specific peer
-final peer = bitchat.getPeer(pubkey);
-```
-
-### Lifecycle
-
-```dart
-// Stop BLE activity (saves battery)
-await bitchat.stop();
-
-// Resume
-await bitchat.start();
-
-// Trigger new scan
-await bitchat.scan(timeout: Duration(seconds: 30));
-
-// Clean up
-await bitchat.dispose();
-```
-
-## Protocol Details
-
-### Packet Format
+## Repository layout
 
 ```
-[0]      : Packet type (1 byte)
-[1]      : TTL (1 byte, max 7)
-[2-5]    : Timestamp (4 bytes)
-[6-37]   : Sender public key (32 bytes)
-[38-69]  : Recipient public key (32 bytes, zeros for broadcast)
-[70-71]  : Payload length (2 bytes)
-[72-87]  : Packet ID (16 bytes, UUID)
-[88-151] : Signature (64 bytes)
-[152-N]  : Payload (variable)
+lib/
+  main.dart, chat_screen.dart, ...   Demo chat app (UI reads the Redux store)
+  src/
+    grassroots_network.dart          Coordinator: transports, sessions, reachability
+    transport/                       BLE + UDP transport services, hole punching,
+                                     public-address discovery
+    mesh/                            Bloom-filter dedup, DTN store-carry-forward cache
+    session/                         Noise session management (end-to-end encryption)
+    signaling/                       Friend-assisted address exchange & punch coordination
+    routing/                         Packet routing between transports and the app
+    protocol/, proto/                Wire formats
+    store/                           Redux state, actions, reducers
+    trace/                           Opt-in diagnostic traces (contacts, density, battery,
+                                     coarse location) for field experiments
+docs/                                Protocol spec (GLP Networking API), design documents
+test/                                Unit and integration tests
+trace_server/                        Self-hosted trace-upload server (Python + Caddy)
+tools/                               Debugging utilities
 ```
 
-### Packet Types
+The BLE plumbing itself (dual-role GATT, advertising, scanning) lives in a separate plugin, [grassroots-bluetooth-layer](https://github.com/danbachar/grassroots-bluetooth-layer), pulled in as a git dependency.
 
-| Type | Value | Description |
-|------|-------|-------------|
-| ANNOUNCE | 0x01 | Peer identity exchange |
-| MESSAGE | 0x02 | Application data (GSG blocks) |
-| FRAGMENT_START | 0x03 | Start of fragmented message |
-| FRAGMENT_CONTINUE | 0x04 | Continuation fragment |
-| FRAGMENT_END | 0x05 | Final fragment |
-| ACK | 0x06 | Delivery acknowledgment |
-| NACK | 0x07 | Request for data (GSG-level) |
+## Getting started
 
-### Fragmentation
+Prerequisites:
 
-Messages > 500 bytes are automatically fragmented:
+- Flutter ≥ 3.10, Dart ≥ 3.0
+- Git SSH access to [grassroots-bluetooth-layer](https://github.com/danbachar/grassroots-bluetooth-layer) (git dependency in `pubspec.yaml`)
+- A **physical device** for anything involving BLE — emulators and simulators have no usable BLE stack. The UDP transport works anywhere.
 
-1. `FRAGMENT_START`: Contains metadata (total size, count) + first chunk
-2. `FRAGMENT_CONTINUE`: Intermediate chunks
-3. `FRAGMENT_END`: Final chunk, triggers reassembly
+```bash
+flutter pub get
+flutter run            # debug build on a connected device
+```
 
-Inter-fragment delay: 20ms
+On first launch the app generates an Ed25519 identity, stores it in platform secure storage, and starts advertising/scanning (BLE) and binding sockets (UDP). Two devices running the app near each other discover and connect automatically, subject to the trust setting (open cold-call vs. closed/friends-only).
 
-### Mesh Routing
+### Tests
 
-- TTL starts at 7, decremented at each hop
-- Bloom filter prevents duplicate processing
-- Packets with TTL=0 are not relayed
-- ANNOUNCE packets are not relayed (direct only)
+```bash
+flutter test
+```
 
-## Future Transport Layers
+Transport logic (BLE pair arbitration, UDP hole-punching, mesh relay, reducers) is covered by unit tests with a fake BLE host; `test/integration/` exercises multi-node scenarios.
 
-The Nostr bridge from original Bitchat has been removed. See `TODO_TRANSPORT.md` for plans to implement:
+## Release builds (Android APK)
 
-- Other transport options
+Release signing is read from `android/key.properties` — copy [android/key.properties.example](android/key.properties.example), generate a keystore once with the `keytool` command in its comments, and fill in your values. Without the file, release builds fall back to the debug key (fine for `flutter run --release`, not for distribution).
 
-## Dependencies
+```bash
+flutter build apk --release
+# → build/app/outputs/flutter-apk/app-release.apk
+```
 
-- `flutter_blue_plus` - BLE Central mode
-- `ble_peripheral` - BLE Peripheral mode
-- `permission_handler` - Runtime permissions
-- `cryptography` - Ed25519 signing
-- `uuid` - Packet ID generation
-- `logger` - Logging
+To enable diagnostic-trace uploads in a build, inject the (secret) upload token
+at build time — it is deliberately not committed to source:
+
+```bash
+flutter build apk --release --dart-define=TRACE_TOKEN=<token>
+```
+
+Without the define, trace uploads stay inert (see [trace_config.dart](lib/src/trace/trace_config.dart)).
+
+Host the APK on any HTTPS server and install it by opening the URL on the phone (Android will ask to allow installs from the browser). Updates install over the top as long as the signing key and `applicationId` stay the same — keep the keystore safe and backed up. Bump `version:` in `pubspec.yaml` for each release; Android refuses downgrades.
+
+## Diagnostic traces
+
+For field experiments the app can record opt-in traces — contact events, peer density, buffer/battery state, coarse background location — and upload them to a self-hosted collector. See [trace_server/README.md](trace_server/README.md) for deployment and [trace_server/schema.md](trace_server/schema.md) for the record schema.
 
 ## License
 
-MIT License - see LICENSE file
+[MIT](LICENSE)

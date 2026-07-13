@@ -1,0 +1,16 @@
+trace-upload.bachar.co {
+	encode gzip
+
+	# Cap the proxied upload body; matches the server's own 16 MiB limit so
+	# oversized requests are rejected at the edge.
+	request_body {
+		max_size 16MB
+	}
+
+	reverse_proxy trace:8443
+
+	log {
+		output stdout
+		format console
+	}
+}

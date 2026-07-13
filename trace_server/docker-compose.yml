@@ -1,0 +1,24 @@
+services:
+  trace:
+    build: .
+    environment:
+      TRACE_UPLOAD_TOKEN: ${TRACE_UPLOAD_TOKEN:?set TRACE_UPLOAD_TOKEN in the environment}
+      TRACE_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - trace
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:

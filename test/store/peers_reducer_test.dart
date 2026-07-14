@@ -624,9 +624,6 @@ void main() {
 
       expect(result.peers[hex]!.lastUdpSeen, equals(udpSeenAt));
     });
-
-    // The "preserve RV servers across ANNOUNCE updates" invariant moved with
-    // knownRvServers to the friendship record — see friendships_reducer_test.
   });
 
   // =========================================================================
@@ -1477,7 +1474,7 @@ void main() {
     });
   });
 
-  group('PeersState rendezvous server getters', () {
+  group('PeersState well-connected friend getters', () {
     test(
       'wellConnectedFriends accepts public-address friends without proof',
       () {
@@ -1506,9 +1503,6 @@ void main() {
         );
       },
     );
-
-    // friendRvServers aggregation moved to FriendshipsState (knownRvServers
-    // is now friendship-scoped). Covered by friendships_state_test.
 
     test('stores FRIEND_LIST updates from direct friends only', () {
       final friendPubkey = _testPubkey(20);

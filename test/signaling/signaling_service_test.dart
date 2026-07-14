@@ -25,11 +25,9 @@ Store<AppState> _storeWithPeers(
   Map<String, PeerState> peers, {
   Map<String, Set<String>> friendsOfFriends = const {},
   SettingsState settings = const SettingsState(),
-  Map<String, Map<String, String>> friendRvServers = const {},
 }) {
   // Synthesize accepted FriendshipState entries for any PeerState marked
-  // isFriend, attaching RV-list data from [friendRvServers] when provided.
-  // RV-list data lives on the friendship record (friendship-scoped + persisted).
+  // isFriend.
   final now = DateTime.now();
   final friendships = <String, FriendshipState>{};
   for (final entry in peers.entries) {
@@ -41,7 +39,6 @@ Store<AppState> _storeWithPeers(
       status: FriendshipStatus.accepted,
       createdAt: now,
       updatedAt: now,
-      knownRvServers: friendRvServers[entry.key] ?? const {},
     );
   }
   return Store<AppState>(
@@ -88,16 +85,10 @@ void main() {
   final bobKey = _testPubkey(2);
   final friendKey = _testPubkey(3);
   final friend2Key = _testPubkey(4);
-  final anchorKey = _testPubkey(5);
-  final anchor2Key = _testPubkey(6);
   final aliceHex = _pubkeyHex(aliceKey);
   final bobHex = _pubkeyHex(bobKey);
   final friendHex = _pubkeyHex(friendKey);
   final friend2Hex = _pubkeyHex(friend2Key);
-  final anchorHex = _pubkeyHex(anchorKey);
-  final anchor2Hex = _pubkeyHex(anchor2Key);
-  const anchorAddress = '[2001:db8:ffff::1]:9514';
-  const anchor2Address = '198.51.100.44:9514';
   const reflectedIp = '2400::12';
   const directPunchIp = '2400::13';
   const codec = SignalingCodec();
@@ -154,42 +145,6 @@ void main() {
         );
       }
     });
-
-    test(
-      'sends RECONNECT to configured rendezvous servers when no friends exist',
-      () async {
-        service = SignalingService(
-          store: _storeWithPeers(
-            {},
-            settings: SettingsState(
-              rendezvousServers: [
-                RendezvousServerSettings(
-                  pubkeyHex: anchorHex,
-                  address: anchorAddress,
-                ),
-              ],
-            ),
-          ),
-        );
-        service.sendSignaling = (recipient, payload) async {
-          sentMessages.add((recipient, payload));
-          return true;
-        };
-
-        final sent = await service.fanOutReconnect(
-          bobKey,
-          initiatorPubkey: aliceKey,
-        );
-
-        expect(sent, equals(1));
-        expect(sentMessages, hasLength(1));
-        expect(_pubkeyHex(sentMessages.single.$1), equals(anchorHex));
-        final decoded =
-            codec.decode(sentMessages.single.$2) as ReconnectMessage;
-        expect(decoded.initiatorPubkey, equals(aliceKey));
-        expect(decoded.peerPubkey, equals(bobKey));
-      },
-    );
 
     test('returns 0 when there are no facilitators', () async {
       service = SignalingService(store: _storeWithPeers({}));
@@ -260,24 +215,19 @@ void main() {
     });
 
     test('orders facilitators lexicographically by pubkey hex', () async {
-      // Configure two rendezvous servers — pubkeys are seed=5 and seed=6, so
-      // anchorHex < anchor2Hex. The fan-out must hit them in that order.
+      // Two well-connected friends of the target — pubkeys are seed=3 and
+      // seed=4, so friendHex < friend2Hex. They are intentionally inserted in
+      // reverse lexicographic order; the fan-out must still hit them sorted.
       service = SignalingService(
         store: _storeWithPeers(
-          {},
-          settings: SettingsState(
-            rendezvousServers: [
-              // intentionally listed in reverse lexicographic order
-              RendezvousServerSettings(
-                pubkeyHex: anchor2Hex,
-                address: anchor2Address,
-              ),
-              RendezvousServerSettings(
-                pubkeyHex: anchorHex,
-                address: anchorAddress,
-              ),
-            ],
-          ),
+          {
+            friend2Hex: _wellConnectedFriend(friend2Key),
+            friendHex: _wellConnectedFriend(friendKey),
+          },
+          friendsOfFriends: {
+            friend2Hex: {bobHex},
+            friendHex: {bobHex},
+          },
         ),
       );
       service.sendSignaling = (recipient, payload) async {
@@ -290,7 +240,7 @@ void main() {
       expect(sentMessages, hasLength(2));
       expect(
         sentMessages.map((m) => _pubkeyHex(m.$1)).toList(),
-        equals([anchorHex, anchor2Hex]),
+        equals([friendHex, friend2Hex]),
         reason: 'facilitators must be visited in lexicographic order',
       );
     });
@@ -307,110 +257,47 @@ void main() {
     tearDown(() => service.dispose());
 
     test(
-      "sends AVAILABLE to target's known RVs at the advertised address",
+      'sends AVAILABLE via sendSignaling to every trusted friend facilitator',
       () async {
-        // Bob has previously told us he uses anchor as his RV at anchorAddress.
-        // AVAILABLE should target Bob's RV at exactly that address.
-        service = SignalingService(
-          store: _storeWithPeers(
-            {
-              bobHex: PeerState(
-                publicKey: bobKey,
-                nickname: 'Bob',
-                connectionState: PeerConnectionState.connected,
-                isFriend: true,
-              ),
-            },
-            friendRvServers: {
-              bobHex: {anchorHex: anchorAddress},
-            },
-          ),
-        );
-        final addressSends = <(Uint8List, String, Uint8List)>[];
-        service.sendSignaling = (recipient, payload) async {
-          sentMessages.add((recipient, payload));
-          return true;
-        };
-        service.sendSignalingToAddress = (recipient, address, payload) async {
-          addressSends.add((recipient, address, payload));
-          return true;
-        };
-
-        final sent = await service.fanOutAvailable(bobKey);
-
-        expect(sent, equals(1));
-        expect(addressSends, hasLength(1));
-        expect(_pubkeyHex(addressSends.single.$1), equals(anchorHex));
-        expect(addressSends.single.$2, equals(anchorAddress));
-        final decoded =
-            codec.decode(addressSends.single.$3) as AvailableMessage;
-        expect(decoded.peerPubkey, equals(bobKey));
-      },
-    );
-
-    test('does not send AVAILABLE to well-connected friends', () async {
-      service = SignalingService(
-        store: _storeWithPeers({
-          friendHex: _wellConnectedFriend(friendKey),
-          bobHex: _regularFriend(bobKey),
-        }),
-      );
-      service.sendSignaling = (recipient, payload) async {
-        sentMessages.add((recipient, payload));
-        return true;
-      };
-
-      final sent = await service.fanOutAvailable(bobKey);
-
-      expect(sent, equals(0));
-      expect(sentMessages, isEmpty);
-    });
-
-    test(
-      'targets only the target RVs, even with WC friends available',
-      () async {
+        // AVAILABLE now routes through the same trusted-friend facilitator
+        // fan-out as RECONNECT: it is delivered to each well-connected friend
+        // of the target via the sendSignaling callback (no RV addresses).
         service = SignalingService(
           store: _storeWithPeers(
             {
               friendHex: _wellConnectedFriend(friendKey),
-              bobHex: PeerState(
-                publicKey: bobKey,
-                nickname: 'Bob',
-                connectionState: PeerConnectionState.connected,
-                isFriend: true,
-              ),
+              friend2Hex: _wellConnectedFriend(friend2Key),
             },
-            friendRvServers: {
-              bobHex: {
-                anchorHex: anchorAddress,
-                anchor2Hex: anchor2Address,
-              },
+            friendsOfFriends: {
+              friendHex: {bobHex},
+              friend2Hex: {bobHex},
             },
           ),
         );
-        final addressSends = <(Uint8List, String, Uint8List)>[];
         service.sendSignaling = (recipient, payload) async {
           sentMessages.add((recipient, payload));
-          return true;
-        };
-        service.sendSignalingToAddress = (recipient, address, payload) async {
-          addressSends.add((recipient, address, payload));
           return true;
         };
 
         final sent = await service.fanOutAvailable(bobKey);
 
         expect(sent, equals(2));
-        expect(addressSends, hasLength(2));
-        expect(sentMessages, isEmpty);
-        expect(
-          addressSends.map((s) => _pubkeyHex(s.$1)).toSet(),
-          equals({anchorHex, anchor2Hex}),
-        );
+        expect(sentMessages, hasLength(2));
+        for (final (recipient, payload) in sentMessages) {
+          final decoded = codec.decode(payload) as AvailableMessage;
+          expect(decoded.peerPubkey, equals(bobKey));
+          expect(
+            [
+              friendKey,
+              friend2Key,
+            ].any((k) => _pubkeyHex(k) == _pubkeyHex(recipient)),
+            isTrue,
+          );
+        }
       },
     );
 
-    test('returns 0 when the target has no known RVs', () async {
+    test('returns 0 when there are no facilitators', () async {
       service = SignalingService(
         store: _storeWithPeers({bobHex: _regularFriend(bobKey)}),
       );
@@ -575,7 +462,7 @@ void main() {
 
     tearDown(() => service.dispose());
 
-    test('drops signaling from a non-friend, non-rendezvous sender', () {
+    test('drops signaling from a non-friend sender', () {
       service.processSignaling(
         bobKey,
         codec.encode(AddrReflectMessage(ip: reflectedIp, port: 7000)),
@@ -589,89 +476,6 @@ void main() {
         codec.encode(AddrReflectMessage(ip: reflectedIp, port: 7000)),
       );
       expect(lastReflectIp, isNotNull);
-    });
-
-    test("accepts signaling from a friend's advertised rendezvous server", () {
-      final service2 = SignalingService(
-        store: _storeWithPeers(
-          {
-            bobHex: PeerState(
-              publicKey: bobKey,
-              nickname: 'Bob',
-              connectionState: PeerConnectionState.connected,
-              isFriend: true,
-            ),
-          },
-          friendRvServers: {
-            bobHex: {anchorHex: anchorAddress},
-          },
-        ),
-      );
-      Uint8List? gotPeer;
-      String? gotIp;
-      int? gotPort;
-      Uint8List? gotReadyRecipient;
-      service2.onPunchInitiate = (peer, ip, port, readyRecipient) {
-        gotPeer = peer;
-        gotIp = ip;
-        gotPort = port;
-        gotReadyRecipient = readyRecipient;
-      };
-
-      service2.processSignaling(
-        anchorKey,
-        codec.encode(
-          PunchInitiateMessage(
-            peerPubkey: bobKey,
-            ip: directPunchIp,
-            port: 7000,
-          ),
-        ),
-      );
-
-      expect(_pubkeyHex(gotPeer!), equals(bobHex));
-      expect(gotIp, equals(directPunchIp));
-      expect(gotPort, equals(7000));
-      expect(_pubkeyHex(gotReadyRecipient!), equals(anchorHex));
-
-      service2.dispose();
-    });
-
-    test("does not trust rendezvous servers advertised by non-friends", () {
-      // Non-friends can't even have a known-RV record under the
-      // friendship-scoped model (RV_LIST is only ever processed for
-      // accepted friends in the reducer). The setup below intentionally
-      // omits friendRvServers so the trust gate has no friend-vouched RV
-      // for anchorKey — anchorKey should still be rejected.
-      final service2 = SignalingService(
-        store: _storeWithPeers({
-          bobHex: PeerState(
-            publicKey: bobKey,
-            nickname: 'Bob',
-            connectionState: PeerConnectionState.connected,
-            isFriend: false,
-          ),
-        }),
-      );
-      Uint8List? gotPeer;
-      service2.onPunchInitiate = (peer, ip, port, readyRecipient) {
-        gotPeer = peer;
-      };
-
-      service2.processSignaling(
-        anchorKey,
-        codec.encode(
-          PunchInitiateMessage(
-            peerPubkey: bobKey,
-            ip: directPunchIp,
-            port: 7000,
-          ),
-        ),
-      );
-
-      expect(gotPeer, isNull);
-
-      service2.dispose();
     });
   });
 
@@ -775,34 +579,6 @@ void main() {
       expect(gotIp, equals(reflectedIp));
       expect(gotPort, equals(7000));
     });
-
-    test('accepts reflection from the configured rendezvous server', () {
-      final service2 = SignalingService(
-        store: _storeWithPeers(
-          {},
-          settings: SettingsState(
-            rendezvousServers: [
-              RendezvousServerSettings(
-                pubkeyHex: anchorHex,
-                address: anchorAddress,
-              ),
-            ],
-          ),
-        ),
-      );
-      service2.sendSignaling = (recipient, payload) async => true;
-
-      String? gotIp;
-      service2.onAddrReflected = (senderPubkey, ip, port) => gotIp = ip;
-
-      service2.processSignaling(
-        anchorKey,
-        codec.encode(AddrReflectMessage(ip: reflectedIp, port: 7000)),
-      );
-
-      expect(gotIp, equals(reflectedIp));
-      service2.dispose();
-    });
   });
 
   // ==========================================================================
@@ -832,15 +608,51 @@ void main() {
 
     tearDown(() => service.dispose());
 
-    test('ignores AVAILABLE instead of running a two-sided matcher', () {
+    test('coordinates a punch on AVAILABLE when the target is live', () {
+      // AVAILABLE(peerPubkey=alice) from bob: bob announces it is available to
+      // be reached by alice. This mediator is connected to alice (the live
+      // target), so it coordinates a single-step punch between bob and alice —
+      // identical handling to RECONNECT.
+      service.dispose();
+      sentMessages = [];
+      service = SignalingService(
+        store: _storeWithPeers({
+          aliceHex: PeerState(
+            publicKey: aliceKey,
+            nickname: 'Alice',
+            connectionState: PeerConnectionState.connected,
+            isFriend: true,
+            udpAddress: '[2606:4700::10]:7000',
+            hasLiveUdpConnection: true,
+          ),
+          bobHex: _regularFriend(bobKey, udpAddress: '[2606:4700::20]:9001'),
+        }),
+      );
+      service.sendSignaling = (recipient, payload) async {
+        sentMessages.add((recipient, payload));
+        return true;
+      };
+
       service.processSignaling(
         bobKey,
         codec.encode(AvailableMessage(peerPubkey: aliceKey)),
-        observedIp: '203.0.113.20',
+        observedIp: '2606:4700::20',
         observedPort: 9001,
       );
 
-      expect(sentMessages, isEmpty);
+      expect(sentMessages, hasLength(2));
+      final toBob = sentMessages.firstWhere((m) => _pubkeyHex(m.$1) == bobHex);
+      final initiateToBob = codec.decode(toBob.$2) as PunchInitiateMessage;
+      expect(_pubkeyHex(initiateToBob.peerPubkey), equals(aliceHex));
+      expect(initiateToBob.ip, equals('2606:4700::10'));
+      expect(initiateToBob.port, equals(7000));
+
+      final toAlice = sentMessages
+          .firstWhere((m) => _pubkeyHex(m.$1) == aliceHex);
+      final initiateToAlice = codec.decode(toAlice.$2) as PunchInitiateMessage;
+      expect(_pubkeyHex(initiateToAlice.peerPubkey), equals(bobHex));
+      expect(initiateToAlice.ip, equals('2606:4700::20'));
+      expect(initiateToAlice.port, equals(9001));
     });
 
     test(
@@ -967,82 +779,7 @@ void main() {
         observedPort: 7000,
       );
 
-      service.processSignaling(
-        bobKey,
-        codec.encode(AvailableMessage(peerPubkey: aliceKey)),
-        observedIp: '203.0.113.20',
-        observedPort: 9001,
-      );
-
       expect(sentMessages, isEmpty);
-    });
-  });
-
-  // ==========================================================================
-  // Incoming: RV_LIST stores per-peer rendezvous server pubkeys
-  // ==========================================================================
-
-  group('RV_LIST handling', () {
-    test("updates the friend's knownRvServers on receive", () {
-      final store = _storeWithPeers({bobHex: _regularFriend(bobKey)});
-      final service = SignalingService(store: store);
-      service.sendSignaling = (recipient, payload) async => true;
-
-      service.processSignaling(
-        bobKey,
-        codec.encode(
-          RvListMessage(
-            entries: [
-              RvServerEntry(pubkey: anchorKey, address: anchorAddress),
-              RvServerEntry(pubkey: anchor2Key, address: anchor2Address),
-            ],
-          ),
-        ),
-      );
-
-      // knownRvServers moved to the friendship record (friendship-scoped,
-      // persisted). PeerState no longer owns it.
-      final updated = store.state.friendships.getFriendship(bobHex);
-      expect(updated, isNotNull);
-      expect(
-        updated!.knownRvServers,
-        equals({anchorHex: anchorAddress, anchor2Hex: anchor2Address}),
-      );
-
-      service.dispose();
-    });
-
-    test("subsequent fanOutAvailable targets the friend's advertised RVs at "
-        'their advertised address', () async {
-      final store = _storeWithPeers({bobHex: _regularFriend(bobKey)});
-      final service = SignalingService(store: store);
-      final addressSends = <(Uint8List, String, Uint8List)>[];
-      service.sendSignaling = (recipient, payload) async => true;
-      service.sendSignalingToAddress = (recipient, address, payload) async {
-        addressSends.add((recipient, address, payload));
-        return true;
-      };
-
-      // Bob tells us about his RV server.
-      service.processSignaling(
-        bobKey,
-        codec.encode(
-          RvListMessage(
-            entries: [RvServerEntry(pubkey: anchorKey, address: anchorAddress)],
-          ),
-        ),
-      );
-
-      // Now we detect Bob went silent; AVAILABLE should target anchorKey
-      // at anchorAddress.
-      final sent = await service.fanOutAvailable(bobKey);
-
-      expect(sent, equals(1));
-      expect(addressSends, hasLength(1));
-      expect(_pubkeyHex(addressSends.single.$1), equals(anchorHex));
-      expect(addressSends.single.$2, equals(anchorAddress));
-
-      service.dispose();
     });
   });
 

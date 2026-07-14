@@ -38,15 +38,6 @@ enum SignalingType {
   /// RECONNECT from peer X.
   available(0x09),
 
-  /// "Here is my list of rendezvous server pubkeys" — agent → friend
-  ///
-  /// Sent after friendship establishment, on new live connection to a friend,
-  /// and whenever the agent's RV settings change. The recipient stores the
-  /// list per-friend so that on detecting the friend went silent, it fans
-  /// out AVAILABLE to those exact servers (per the spec: B contacts A's
-  /// known rendezvous agents).
-  rvList(0x0a),
-
   /// "Here is my current accepted friend set" — agent → friend.
   ///
   /// Used to maintain the friends-of-friends map that drives friend-mediated
@@ -179,42 +170,6 @@ class AvailableMessage extends SignalingMessage {
       'Available(peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
 }
 
-/// One rendezvous server's identity: pubkey + reachable address.
-class RvServerEntry {
-  /// 32-byte Ed25519 public key of the rendezvous server.
-  final Uint8List pubkey;
-
-  /// "ip:port" address where the rendezvous server can be reached.
-  final String address;
-
-  const RvServerEntry({required this.pubkey, required this.address});
-
-  String get pubkeyHex =>
-      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-
-  @override
-  String toString() =>
-      'RvServerEntry($address, ${pubkeyHex.substring(0, 8)}...)';
-}
-
-/// Agent informs a friend about its configured rendezvous servers.
-///
-/// The friend stores this list keyed by the sender's pubkey so that, on
-/// detecting the sender went silent, it can send AVAILABLE to these exact
-/// servers — matching the sender's RECONNECT (which goes to the same set).
-class RvListMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.rvList;
-
-  /// Rendezvous server entries (pubkey + address pairs).
-  final List<RvServerEntry> entries;
-
-  RvListMessage({required this.entries});
-
-  @override
-  String toString() => 'RvList(count: ${entries.length})';
-}
-
 /// Agent informs a friend about its current accepted friends.
 class FriendListMessage extends SignalingMessage {
   @override
@@ -241,8 +196,6 @@ class FriendListMessage extends SignalingMessage {
 /// ADDR_REFLECT   : type(1) + ipLen(2) + ipBytes + port(2)
 /// RECONNECT      : type(1) + initiatorPubkey(32) + peerPubkey(32)
 /// AVAILABLE      : type(1) + peerPubkey(32)
-/// RV_LIST        : type(1) + count(2) +
-///                  repeated(pubkey(32) + addrLen(2) + addrBytes)
 /// FRIEND_LIST    : type(1) + count(2) + repeated(pubkey(32))
 /// ```
 class SignalingCodec {
@@ -257,7 +210,6 @@ class SignalingCodec {
       AddrReflectMessage() => _encodeAddrReflect(msg),
       ReconnectMessage() => _encodeReconnect(msg),
       AvailableMessage() => _encodeAvailable(msg),
-      RvListMessage() => _encodeRvList(msg),
       FriendListMessage() => _encodeFriendList(msg),
     };
   }
@@ -305,19 +257,6 @@ class SignalingCodec {
     return buffer.toBytes();
   }
 
-  Uint8List _encodeRvList(RvListMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.rvList.value);
-    _writeUint16(buffer, msg.entries.length);
-    for (final entry in msg.entries) {
-      buffer.add(entry.pubkey);
-      final addrBytes = Uint8List.fromList(entry.address.codeUnits);
-      _writeUint16(buffer, addrBytes.length);
-      buffer.add(addrBytes);
-    }
-    return buffer.toBytes();
-  }
-
   Uint8List _encodeFriendList(FriendListMessage msg) {
     final buffer = BytesBuilder();
     buffer.addByte(SignalingType.friendList.value);
@@ -350,7 +289,6 @@ class SignalingCodec {
       SignalingType.addrReflect => _decodeAddrReflect(payload),
       SignalingType.reconnect => _decodeReconnect(payload),
       SignalingType.available => _decodeAvailable(payload),
-      SignalingType.rvList => _decodeRvList(payload),
       SignalingType.friendList => _decodeFriendList(payload),
     };
   }
@@ -406,33 +344,6 @@ class SignalingCodec {
     return AvailableMessage(
       peerPubkey: Uint8List.fromList(data.sublist(0, 32)),
     );
-  }
-
-  RvListMessage _decodeRvList(Uint8List data) {
-    if (data.length < 2) {
-      throw const FormatException('RvList payload too short');
-    }
-    final count = _readUint16(data, 0);
-    var offset = 2;
-    final entries = <RvServerEntry>[];
-    for (var i = 0; i < count; i++) {
-      if (offset + 34 > data.length) {
-        throw const FormatException('RvList entry truncated');
-      }
-      final pubkey = Uint8List.fromList(data.sublist(offset, offset + 32));
-      offset += 32;
-      final addrLen = _readUint16(data, offset);
-      offset += 2;
-      if (offset + addrLen > data.length) {
-        throw const FormatException('RvList address truncated');
-      }
-      final address = String.fromCharCodes(
-        data.sublist(offset, offset + addrLen),
-      );
-      offset += addrLen;
-      entries.add(RvServerEntry(pubkey: pubkey, address: address));
-    }
-    return RvListMessage(entries: entries);
   }
 
   FriendListMessage _decodeFriendList(Uint8List data) {

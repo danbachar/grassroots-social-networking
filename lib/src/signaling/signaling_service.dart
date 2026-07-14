@@ -6,37 +6,35 @@ import 'package:redux/redux.dart';
 import 'package:flutter/foundation.dart';
 
 import '../store/app_state.dart';
-import '../store/friendships_actions.dart';
 import '../store/peers_actions.dart';
 import '../transport/address_utils.dart';
 import 'address_table.dart';
 import 'signaling_codec.dart';
 
-/// Orchestrates signaling between peers via trusted rendezvous facilitators.
+/// Orchestrates signaling between peers via trusted friend facilitators.
 ///
 /// ## Reconnection protocol (matches the algorithm in the design spec)
 ///
-/// When agent A's IP changes, A and B reconnect through a rendezvous
-/// facilitator S as follows:
+/// When agent A's IP changes, A and B reconnect through a mutual friend
+/// mediator S (a well-connected friend of both, currently connected to the
+/// target) as follows:
 /// - A sends RECONNECT(initiatorPubkey=A, peerPubkey=B) to S. S observes A's
 ///   source address and verifies the initiator matches the sender authenticated
 ///   by the enclosing Noise session (recovered via trial-decrypt).
-/// - B (on detecting A went silent) sends AVAILABLE(peerPubkey=A) to S. S
-///   observes B's source address.
-/// - S matches the pair and sends each side a PUNCH_INITIATE carrying the
-///   other side's observed address.
+/// - Alternatively, when B's path to A drops, B sends AVAILABLE(peerPubkey=A)
+///   to its mutual facilitators — the mirror image of RECONNECT.
+/// - S looks up the target's registered address, and sends each side a
+///   PUNCH_INITIATE carrying the other side's address.
 /// - Both sides punch their NATs; the deterministic UDX initiator opens the
 ///   stream once the path is open.
 ///
-/// ## Facilitator roles
+/// ## Facilitator role
 ///
-/// - **Rendezvous server** (bootstrap_anchor): runs the RECONNECT/AVAILABLE
-///   matcher. The canonical facilitator implementation lives in
-///   `bootstrap_anchor/lib/src/signaling_handler.dart`.
 /// - **Friend mediator** (this client, when connected to both peers): handles
-///   an explicit RECONNECT-style mediation request by looking up both friends'
-///   addresses and sending each side a PUNCH_INITIATE. This matches the
-///   friends-based rendezvous step in the GLP spec.
+///   a RECONNECT- or AVAILABLE-style mediation request by looking up both
+///   friends' addresses and sending each side a PUNCH_INITIATE. This matches
+///   the friends-based rendezvous step in the GLP spec. Only mutual friends
+///   mediate — there is no non-friend infrastructure in the path.
 ///
 /// ## Integration
 ///
@@ -79,17 +77,6 @@ class SignalingService {
   Future<bool> Function(Uint8List recipientPubkey, Uint8List signalingPayload)?
   sendDirectSignaling;
 
-  /// Send a signaling payload to a specific UDP address — used when fanning
-  /// out RECONNECT/AVAILABLE to rendezvous servers we've learned about from
-  /// a friend (via RV_LIST) but haven't otherwise registered. The coordinator
-  /// resolves the address via [_sendViaUdp].
-  Future<bool> Function(
-    Uint8List recipientPubkey,
-    String address,
-    Uint8List signalingPayload,
-  )?
-  sendSignalingToAddress;
-
   /// Fired when a rendezvous facilitator (or direct peer) tells us to start
   /// hole-punching. [readyRecipientPubkey] is where we should send PUNCH_READY
   /// after finishing our local punch — either the facilitator or the peer.
@@ -124,8 +111,7 @@ class SignalingService {
   /// Send RECONNECT(peerPubkey=target) to every trusted facilitator.
   ///
   /// Called when this agent's connectivity changed (new public IP) and it
-  /// wants to reach [targetPubkey]. Rendezvous servers match this against
-  /// the target's AVAILABLE. Friend mediators handle it only when they are
+  /// wants to reach [targetPubkey]. Friend mediators handle it when they are
   /// already connected to the target and can look up both addresses.
   ///
   /// Returns the number of facilitators the request was sent to.
@@ -173,72 +159,20 @@ class SignalingService {
     );
   }
 
-  /// Send AVAILABLE(peerPubkey=target) to the rendezvous facilitators that
-  /// the target is known to use.
+  /// Send AVAILABLE(peerPubkey=target) to every trusted facilitator.
   ///
-  /// Spec §3.5: when B detects A went silent, B contacts *A's* known
-  /// rendezvous agents — not B's own. We learn the target's RV list (pubkey
-  /// + address) via the RV_LIST signaling exchange. If the target hasn't
-  /// told us their list yet, there is no rendezvous-server AVAILABLE target.
-  /// Friends-based mediation is driven by RECONNECT-style mediation requests,
-  /// not by the rendezvous server's two-sided AVAILABLE matcher.
+  /// Called when a UDP path to [targetPubkey] drops: we announce to our
+  /// mutual facilitators that we are available to be reached by the target.
+  /// A facilitator currently connected to the target coordinates a punch
+  /// between the two of us — the mirror image of [fanOutReconnect].
   ///
   /// Returns the number of facilitators the message was sent to.
   Future<int> fanOutAvailable(Uint8List targetPubkey) async {
-    final targetHex = _pubkeyToHex(targetPubkey);
-    // RV lists are friendship-scoped (we only ever receive an RV_LIST from a
-    // friend) and persisted with the friendship record, so they survive app
-    // restart and are available before the friend's first reconnect.
-    final friendship = store.state.friendships.getFriendship(targetHex);
-
-    final payload = codec.encode(AvailableMessage(peerPubkey: targetPubkey));
-    var sent = 0;
-
-    // Primary: target's known rendezvous servers (spec-compliant). Send via
-    // the address the friend told us — needed for RVs we don't ourselves
-    // have configured.
-    final rvHexes = <String>[];
-    if (friendship != null) {
-      for (final entry in friendship.knownRvServers.entries) {
-        final hex = entry.key.toLowerCase();
-        if (hex.isEmpty || hex == targetHex) continue;
-        rvHexes.add(hex);
-      }
-      rvHexes.sort();
-      for (final hex in rvHexes) {
-        final address = friendship.knownRvServers[hex]!;
-        Uint8List rvPubkey;
-        try {
-          rvPubkey = _hexToBytes(hex);
-        } catch (_) {
-          continue;
-        }
-        final ok =
-            await sendSignalingToAddress?.call(rvPubkey, address, payload) ??
-            false;
-        if (ok) {
-          sent++;
-        } else {
-          debugPrint(
-            '[AVAILABLE] Could not reach RV ${hex.substring(0, 8)}... at '
-            '$address',
-          );
-        }
-      }
-    }
-
-    if (sent == 0) {
-      debugPrint(
-        '[AVAILABLE] No facilitators reached for ${targetHex.substring(0, 8)}'
-        ' (target RV count=${rvHexes.length})',
-      );
-    } else {
-      debugPrint(
-        '[AVAILABLE] Sent for ${targetHex.substring(0, 8)} to '
-        '${rvHexes.length} target RV(s)',
-      );
-    }
-    return sent;
+    return _fanOutCold(
+      targetPubkey,
+      AvailableMessage(peerPubkey: targetPubkey),
+      intent: 'AVAILABLE',
+    );
   }
 
   Future<int> _fanOutCold(
@@ -277,17 +211,6 @@ class SignalingService {
       }
     }
     return sent;
-  }
-
-  /// Send our configured rendezvous server list to a friend so they can
-  /// target AVAILABLE at exactly those servers when they detect us silent.
-  Future<bool> sendRvList(
-    Uint8List recipientPubkey,
-    List<RvServerEntry> ownRvServers,
-  ) async {
-    final msg = RvListMessage(entries: ownRvServers);
-    return await sendSignaling?.call(recipientPubkey, codec.encode(msg)) ??
-        false;
   }
 
   /// Send our current accepted friend set to a friend.
@@ -359,14 +282,6 @@ class SignalingService {
     return await sendFn?.call(recipientPubkey, payload) ?? false;
   }
 
-  static Uint8List _hexToBytes(String hex) {
-    final bytes = <int>[];
-    for (var i = 0; i < hex.length; i += 2) {
-      bytes.add(int.parse(hex.substring(i, i + 2), radix: 16));
-    }
-    return Uint8List.fromList(bytes);
-  }
-
   // ===== Incoming processing (called by MessageRouter via coordinator) =====
 
   /// Process an incoming signaling packet.
@@ -436,35 +351,9 @@ class SignalingService {
           observedPort: observedPort,
           intent: 'AVAILABLE',
         );
-      case RvListMessage():
-        _handleRvList(senderPubkey, msg);
       case FriendListMessage():
         _handleFriendList(senderPubkey, msg);
     }
-  }
-
-  void _handleRvList(Uint8List senderPubkey, RvListMessage msg) {
-    final servers = <String, String>{};
-    for (final entry in msg.entries) {
-      if (entry.pubkey.length != 32) continue;
-      if (entry.address.trim().isEmpty) continue;
-      servers[_pubkeyToHex(entry.pubkey)] = entry.address;
-    }
-    final senderHex8 = _pubkeyToHex(senderPubkey).substring(0, 8);
-    debugPrint(
-      '[rv-list] $senderHex8 advertises ${servers.length} rendezvous server(s)',
-    );
-    final entries = servers.entries.toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
-    for (final e in entries) {
-      debugPrint('[rv-list]   ${e.key.substring(0, 8)} -> ${e.value}');
-    }
-    store.dispatch(
-      FriendKnownRvServersUpdatedAction(
-        publicKey: senderPubkey,
-        rvServers: servers,
-      ),
-    );
   }
 
   void _handleFriendList(Uint8List senderPubkey, FriendListMessage msg) {
@@ -485,13 +374,14 @@ class SignalingService {
     );
   }
 
-  /// Handle a RECONNECT-style friend mediation request by looking up both
-  /// friends' addresses and dispatching PUNCH_INITIATE to both sides.
+  /// Handle a RECONNECT- or AVAILABLE-style friend mediation request by
+  /// looking up both friends' addresses and dispatching PUNCH_INITIATE to both
+  /// sides.
   ///
-  /// The two-sided RECONNECT/AVAILABLE matcher belongs to rendezvous servers.
   /// A friend mediator follows the GLP friends-based rendezvous step: it must
   /// already be connected to the target friend, and it uses its friend address
-  /// table rather than waiting for an AVAILABLE counterpart.
+  /// table (plus the sender's observed address) to pair the two peers. Both
+  /// intents coordinate the same single-step punch between sender and target.
   void _handleRendezvous({
     required Uint8List senderPubkey,
     required String senderHex,
@@ -501,14 +391,6 @@ class SignalingService {
     required String intent,
   }) {
     final targetHex = _pubkeyToHex(targetPubkey);
-
-    if (intent != 'RECONNECT') {
-      debugPrint(
-        'Dropping $intent from ${senderHex.substring(0, 8)}... — friend '
-        'mediators do not run the rendezvous-server matcher',
-      );
-      return;
-    }
 
     if (senderHex == targetHex) {
       debugPrint(
@@ -557,7 +439,7 @@ class SignalingService {
 
     if (!targetPeer.isReachable) {
       debugPrint(
-        'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — target '
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — target '
         '${targetHex.substring(0, 8)} is not live on this mediator',
       );
       return;
@@ -578,7 +460,7 @@ class SignalingService {
     );
     if (targetAddress == null) {
       debugPrint(
-        'Dropping RECONNECT from ${senderHex.substring(0, 8)}... — no UDP '
+        'Dropping $intent from ${senderHex.substring(0, 8)}... — no UDP '
         'address for target ${targetHex.substring(0, 8)} in the same '
         'address family ($senderFamily) as the sender '
         '(${senderAddress.ip})',
@@ -828,29 +710,14 @@ class SignalingService {
 
   bool _isTrustedSignalingSender(String senderHex) {
     final senderPeer = store.state.peers.getPeerByPubkeyHex(senderHex);
-    if (senderPeer != null && senderPeer.isFriend) {
-      return true;
-    }
-
-    for (final server in store.state.settings.configuredRendezvousServers) {
-      if (server.pubkeyHex.isNotEmpty &&
-          server.pubkeyHex.toLowerCase() == senderHex) {
-        return true;
-      }
-    }
-
-    if (store.state.friendships.friendRvServers.containsKey(senderHex)) {
-      return true;
-    }
-
-    return false;
+    return senderPeer != null && senderPeer.isFriend;
   }
 
   /// Trusted facilitators in deterministic lexicographic order by pubkey hex.
   ///
-  /// Both well-connected friends and configured rendezvous servers count as
-  /// facilitators. Rendezvous servers run the two-sided matcher; friends run
-  /// only the single-step friend mediation path when connected to the target.
+  /// Facilitators are well-connected friends that are also friends of the
+  /// target (so we know they can reach it). Each runs the single-step friend
+  /// mediation path when connected to the target.
   List<Uint8List> _trustedFacilitatorPubkeys({
     required String targetPubkeyHex,
     String? excludePubkeyHex,
@@ -867,22 +734,6 @@ class SignalingService {
         continue;
       }
       facilitators[friendHex] = friend.publicKey;
-    }
-
-    for (final server in store.state.settings.configuredRendezvousServers) {
-      final normalizedHex = server.pubkeyHex.toLowerCase();
-      if (normalizedHex.isEmpty || normalizedHex == excludePubkeyHex) {
-        continue;
-      }
-
-      try {
-        facilitators.putIfAbsent(
-          normalizedHex,
-          () => _hexToBytes(normalizedHex),
-        );
-      } catch (e) {
-        debugPrint('Ignoring invalid rendezvous pubkey in settings: $e');
-      }
     }
 
     final orderedHexes = facilitators.keys.toList()..sort();

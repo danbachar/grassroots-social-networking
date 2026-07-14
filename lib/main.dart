@@ -118,15 +118,14 @@ Map<String, dynamic> _serializeAppState(AppState state) {
 
 /// Set up debug log capture by intercepting debugPrint.
 ///
-/// Adds a `[HH:MM:SS.fff]` timestamp to every console line (matching the
-/// rendezvous-server format so client/server logs can be cross-referenced),
-/// and feeds the in-memory LogBuffer that drives the Debug Logs screen.
+/// Adds a `[HH:MM:SS.fff]` timestamp to every console line, and feeds the
+/// in-memory LogBuffer that drives the Debug Logs screen.
 void _setupDebugLogCapture() {
   final originalDebugPrint = debugPrint;
   debugPrint = (String? message, {int? wrapWidth}) {
-    // Prepend a wall-clock timestamp so console output is correlatable with
-    // the rendezvous-server logs. The LogBuffer entry below uses its own
-    // structured timestamp; only the console line gets the prefix.
+    // Prepend a wall-clock timestamp so console output is correlatable across
+    // devices. The LogBuffer entry below uses its own structured timestamp;
+    // only the console line gets the prefix.
     final stamped = message == null ? null : '[${_logTimestamp()}] $message';
     originalDebugPrint(stamped, wrapWidth: wrapWidth);
 
@@ -2547,18 +2546,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onSettingsChanged: () {
             setState(() {});
           },
-          onAddRendezvousServer: _grassroots == null
-              ? null
-              : (address, pubkeyHex) => _grassroots!.addRendezvousServer(
-                    address: address,
-                    pubkeyHex: pubkeyHex,
-                  ),
-          onRemoveRendezvousServer: _grassroots == null
-              ? null
-              : (address, pubkeyHex) => _grassroots!.removeRendezvousServer(
-                    address: address,
-                    pubkeyHex: pubkeyHex,
-                  ),
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),

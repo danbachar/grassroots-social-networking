@@ -800,14 +800,8 @@ class _ChatScreenState extends State<ChatScreen> {
   void _showPeerInfo() {
     // Refresh from store so the dialog reflects the latest udpAddress /
     // connection state, not just the snapshot widget.peer was built with.
-    // RV-list lives on the friendship record (persisted, friendship-scoped).
     final peer =
         widget.store.state.peers.getPeerByPubkeyHex(_peerHex) ?? widget.peer;
-    final friendship = widget.store.state.friendships.getFriendship(_peerHex);
-    final knownRvServers =
-        friendship?.knownRvServers ?? const <String, String>{};
-    final rvEntries = knownRvServers.entries.toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
 
     showDialog(
       context: context,
@@ -832,22 +826,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 const SizedBox(height: 8),
                 _buildInfoRow('Friendship', 'Friends ✓'),
               ],
-              const SizedBox(height: 16),
-              Text(
-                'Rendezvous Servers',
-                style: Theme.of(context).textTheme.titleSmall,
-              ),
-              const SizedBox(height: 4),
-              if (rvEntries.isEmpty)
-                const Text(
-                  'None advertised by this peer yet.',
-                  style: TextStyle(color: Colors.grey, fontSize: 12),
-                )
-              else
-                ...rvEntries.map((entry) => _buildRvServerRow(
-                      address: entry.value,
-                      pubkeyHex: entry.key,
-                    )),
             ],
           ),
         ),
@@ -864,77 +842,6 @@ class _ChatScreenState extends State<ChatScreen> {
               );
             },
             child: const Text('Copy Key'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildRvServerRow({
-    required String address,
-    required String pubkeyHex,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const SizedBox(
-                width: 80,
-                child: Text('Address:',
-                    style: TextStyle(color: Colors.grey, fontSize: 12)),
-              ),
-              Expanded(
-                child: Text(
-                  address,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.copy, size: 16),
-                tooltip: 'Copy address',
-                visualDensity: VisualDensity.compact,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: address));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('Address copied: $address')),
-                  );
-                },
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              const SizedBox(
-                width: 80,
-                child: Text('Pubkey:',
-                    style: TextStyle(color: Colors.grey, fontSize: 12)),
-              ),
-              Expanded(
-                child: Text(
-                  pubkeyHex,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.copy, size: 16),
-                tooltip: 'Copy pubkey',
-                visualDensity: VisualDensity.compact,
-                padding: EdgeInsets.zero,
-                constraints: const BoxConstraints(),
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: pubkeyHex));
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Rendezvous pubkey copied')),
-                  );
-                },
-              ),
-            ],
           ),
         ],
       ),

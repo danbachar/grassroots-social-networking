@@ -18,6 +18,7 @@ import 'dart:async';
 import 'chat_screen.dart';
 import 'chat_models.dart';
 import 'settings_screen.dart';
+import 'testbed_screen.dart';
 import 'theme/grasslink_theme.dart';
 import 'theme/grasslink_tokens.dart';
 import 'theme/grasslink_widgets.dart';
@@ -257,8 +258,10 @@ void _mediaCleanupMiddleware(
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Capture all Flutter print output (including Logger) into the debug log buffer.
-  // This feeds the Debug Logs screen in Settings.
+  // Load persisted logs from prior runs, then capture all Flutter print output
+  // (including Logger) into the debug log buffer. init() first so a crash from
+  // the setup below still leaves the previous session's logs on screen/disk.
+  await LogBuffer.instance.init();
   _setupDebugLogCapture();
 
   // Initialize libsodium (SUMO) once for the main isolate. SUMO is required for
@@ -719,6 +722,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _backgroundedAt ??= now;
+      // Persist the log tail before a possible background kill.
+      unawaited(LogBuffer.instance.flushNow());
     }
     if (state == AppLifecycleState.resumed) {
       final bgMs = _backgroundedAt != null ? now - _backgroundedAt! : null;
@@ -870,6 +875,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               '📷 [$transportName] Picture from $senderName (${sayBlock.imageBytes.length} bytes, viewOnce=${sayBlock.viewOnce})');
           await _handlePictureMessage(
               senderHex, myHex, sayBlock, messageId, senderPubkey);
+        } else if (sayBlock is FileSayBlock) {
+          debugPrint(
+              '📎 [$transportName] File "${sayBlock.fileName}" from $senderName '
+              '(${sayBlock.bytes.length} bytes)');
+          await _handleFileMessage(
+              senderHex, myHex, sayBlock, messageId, senderPubkey);
         }
 
       case BlockType.friendshipOffer:
@@ -942,6 +953,34 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       senderHex,
       senderName,
       block.viewOnce ? '🔥 Sent a 1-time photo' : '📷 Sent a photo',
+    );
+  }
+
+  Future<void> _handleFileMessage(String senderHex, String myHex,
+      FileSayBlock block, String messageId, Uint8List senderPubkey) async {
+    // Persist under the original file name so open/share works by extension.
+    final file = await writeNamedMediaFile(block.bytes, block.fileName);
+
+    appStore.dispatch(SaveChatMessageAction(
+      senderPubkeyHex: senderHex,
+      recipientPubkeyHex: myHex,
+      // The original file name rides in `content` for file messages.
+      content: block.fileName,
+      isOutgoing: false,
+      messageId: messageId,
+      messageType: ChatMessageType.file.index,
+      mediaPath: file.path,
+      mediaMime: block.mime,
+    ));
+
+    final peer = _peers.values
+        .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == senderHex)
+        .firstOrNull;
+    final senderName = peer?.displayName ?? 'Unknown';
+    await _showMessageNotification(
+      senderHex,
+      senderName,
+      '📎 Sent a file: ${block.fileName}',
     );
   }
 
@@ -2676,6 +2715,24 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
           onUploadTracesNow: _uploadTracesNow,
+          myPubkeyHex: _grassroots?.identity.publicKey
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(),
+          onStartWorkload: _grassroots == null
+              ? null
+              : () async => _grassroots!.startWorkload(),
+          onStopWorkload:
+              _grassroots == null ? null : () => _grassroots!.stopWorkload(),
+          workloadStatus: _grassroots == null
+              ? null
+              : () {
+                  final d = _grassroots!.workloadDriver;
+                  return WorkloadStatus(
+                    running: d.isRunning,
+                    scheduled: d.scheduledCount,
+                    sent: d.sentCount,
+                  );
+                },
         ),
       ),
     );

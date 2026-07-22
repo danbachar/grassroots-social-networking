@@ -328,6 +328,19 @@ PeersState peersReducer(PeersState state, dynamic action) {
     return state;
   }
 
+  if (action is PeerBleSeenAction) {
+    final pubkeyHex = _pubkeyToHex(action.publicKey);
+    final existing = state.peers[pubkeyHex];
+    if (existing != null) {
+      final now = DateTime.now();
+      final updated = existing.copyWith(lastSeen: now, lastBleSeen: now);
+      return state.copyWith(
+        peers: Map.from(state.peers)..[pubkeyHex] = updated,
+      );
+    }
+    return state;
+  }
+
   if (action is PeerUdpSeenAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];

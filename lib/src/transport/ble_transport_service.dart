@@ -809,6 +809,17 @@ class BleTransportService extends TransportService {
       debugPrint('Skipping $pathId: closed trust and unknown service UUID');
       return false;
     }
+    // TESTBED Layer 1 (software-defined topology): refuse the dial when the
+    // allowlist is active and this peer's derived service UUID is not an
+    // allowed neighbour. This is the cleanest enforcement point — it never
+    // opens the leg, so there is no flapping. Off in production.
+    final allowlist = store.state.settings.neighborAllowlist;
+    if (allowlist != null &&
+        allowlist.enabled &&
+        !allowlist.allowsServiceUuid(serviceUuid)) {
+      debugPrint('Skipping $pathId: neighbor allowlist excludes this peer');
+      return false;
+    }
     // BLE address rotation produces a fresh pathId every ~30s for the same
     // peer. Cap the number of in-flight central dials so a chatty rotator
     // can't exhaust the BLE stack's connection slots.

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:collection/collection.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -19,6 +20,7 @@ import 'transport/hole_punch_service.dart';
 import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
 import 'models/identity.dart';
+import 'testbed/workload_driver.dart';
 import 'trace/trace_logger.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
@@ -1691,7 +1693,7 @@ class GrassrootsNetwork {
     final queuedPeerHexes = List<String>.from(_outboundMessageQueue.keys);
     for (final pubkeyHex in queuedPeerHexes) {
       final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
-      if (peer == null || !_hasLiveSendPath(peer)) continue;
+      if (peer == null || !_canAttemptSend(peer)) continue;
       _drainQueuedMessagesForPeer(peer.publicKey);
     }
   }
@@ -1874,6 +1876,32 @@ class GrassrootsNetwork {
       messageId: pending.messageId,
     );
   }
+
+  // ===== Testbed workload driver (debug-only; inert until started) =====
+
+  WorkloadDriver? _workloadDriver;
+
+  /// DEBUG/TESTBED ONLY. The offered-load driver, lazily bound to [send]. It
+  /// does nothing until [startWorkload] is called from a debug screen.
+  WorkloadDriver get workloadDriver => _workloadDriver ??= WorkloadDriver(
+        send: send,
+        log: (m) => debugPrint(m),
+      );
+
+  /// DEBUG/TESTBED ONLY. Begin executing the workload config stored in
+  /// settings. No-op if no config is set or the driver is already running.
+  void startWorkload() {
+    final config = store.state.settings.workloadConfig;
+    if (config == null) {
+      debugPrint('[workload] no config set — nothing to start');
+      return;
+    }
+    final myPubkeyHex = _pubkeyToHex(identity.publicKey);
+    workloadDriver.start(config: config, myPubkeyHex: myPubkeyHex);
+  }
+
+  /// DEBUG/TESTBED ONLY. Stop the workload driver.
+  void stopWorkload() => _workloadDriver?.stop();
 
   @visibleForTesting
   int queuedMessageCountForPeer(Uint8List pubkey) =>
@@ -2208,6 +2236,21 @@ class GrassrootsNetwork {
     return _udpService?.getPeerIdForPubkey(peer.publicKey) != null;
   }
 
+  /// Any path — direct (BLE/UDP) or BLE **mesh** — over which a queued message
+  /// could plausibly be sent right now. The mesh case is what fixes the
+  /// "queued message waits for a direct link" bug: a fresh `send()` floods to
+  /// any recipient we hold a Noise session with (reaching them via relays), so
+  /// a queued message must be allowed to ride that same relay path rather than
+  /// sitting until the recipient itself reconnects directly.
+  bool _canAttemptSend(PeerState? peer) {
+    if (peer == null) return false;
+    return canAttemptQueuedSend(
+      hasDirectSendPath: _hasLiveSendPath(peer),
+      bleUsable: _isBleEnabledInSettings && _bleAvailable && _bleService != null,
+      hasNoiseSession: _noiseSessions.hasSession(peer.publicKey),
+    );
+  }
+
   static String _pubkeyToHex(Uint8List pubkey) =>
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
@@ -2216,6 +2259,21 @@ class GrassrootsNetwork {
     final peer = _peersState.getPeerByPubkeyHex(hex);
     if (peer?.isFriend == true) return true;
     return store.state.friendships.isFriend(hex);
+  }
+
+  /// TESTBED ONLY. Whether the neighbour behind [bleDeviceId] is identified and
+  /// excluded by an active neighbour allowlist. Returns false (allow) when the
+  /// allowlist is off, or when we cannot yet resolve the neighbour's identity
+  /// (Layer 2 gates its ANNOUNCE). Never true in production (allowlist null).
+  bool _neighborBlockedByAllowlist(String bleDeviceId) {
+    final allowlist = store.state.settings.neighborAllowlist;
+    if (allowlist == null || !allowlist.enabled) return false;
+    final neighbor = _peersState.peersList.firstWhereOrNull((p) =>
+        p.bleCentralDeviceId == bleDeviceId ||
+        p.blePeripheralDeviceId == bleDeviceId);
+    final pubkey = neighbor?.publicKey;
+    if (pubkey == null) return false; // not yet identified — let Layer 2 decide
+    return !allowlist.allowsPubkey(pubkey);
   }
 
   /// Whether [pubkey] is currently authorized by an invite we issued — an
@@ -3420,6 +3478,14 @@ class GrassrootsNetwork {
       ));
     };
 
+    // Sync-on-connect: directed (never flooded) send of an offer/request/
+    // conveyed custody packet to one specific neighbor.
+    _messageRouter.onSyncSend = (packet, bleDeviceId) {
+      final ble = _bleService;
+      if (ble == null) return;
+      unawaited(ble.sendToPeer(bleDeviceId, packet.serialize()));
+    };
+
     // Peer ANNOUNCE processed
     _messageRouter.onPeerAnnounced =
         (data, transport, {bool isNew = false, String? udpPeerId}) {
@@ -3747,6 +3813,17 @@ class GrassrootsNetwork {
     // Forward BLE packets to the MessageRouter for processing
     _bleService!.onBlePacketReceived =
         (packet, {String? bleDeviceId, int? rssi, BleRole? bleRole}) {
+      // TESTBED Layer 3 (software-defined topology, ingress hard-drop): a
+      // backstop against BLE re-discovery churn slipping a link past Layer 1.
+      // The wire envelope is sender-anonymous, so we can only key on the
+      // IMMEDIATE neighbour we received from — which is exactly the topology
+      // edge. Drop + tear down if that neighbour is identified and not
+      // allowed. Unidentified neighbours pass through; their ANNOUNCE is
+      // gated by Layer 2. Off in production.
+      if (bleDeviceId != null && _neighborBlockedByAllowlist(bleDeviceId)) {
+        unawaited(_bleService?.disconnectDevice(bleDeviceId));
+        return;
+      }
       _messageRouter.processPacket(
         packet,
         transport: PeerTransport.bleDirect,
@@ -3758,6 +3835,13 @@ class GrassrootsNetwork {
 
     _messageRouter.shouldAcceptBleAnnounce =
         (senderPubkey, {String? bleDeviceId, BleRole? bleRole}) {
+      // TESTBED Layer 2 (software-defined topology): the allowlist overrides
+      // the cold-call posture entirely — an ANNOUNCE from a non-allowed
+      // neighbour is refused even in open mode. Off in production.
+      final allowlist = store.state.settings.neighborAllowlist;
+      if (allowlist != null && allowlist.enabled) {
+        return allowlist.allowsPubkey(senderPubkey);
+      }
       if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.open) {
         return true;
       }
@@ -3799,6 +3883,14 @@ class GrassrootsNetwork {
     _bleService!.connectionStream.listen((event) {
       if (event.connected) {
         unawaited(_sendAnnounceToDevice(event.peerId));
+        // A new neighbor is a new mesh relay: any queued message for a
+        // recipient we hold a Noise session with can now ride this path,
+        // even if that recipient never links to us directly. Drain across
+        // all mesh-reachable recipients, not just the one that connected.
+        _drainQueuedMessagesForLivePeers();
+        // Sync-on-connect: offer this neighbor the packetIds our DTN store
+        // carries so custody spreads epidemically through mobile relays.
+        _sendSyncOffers(event.peerId);
       } else {
         debugPrint('BLE device disconnected: ${event.peerId}');
         _bleFriendAnnounceSent.remove(event.peerId);
@@ -4484,6 +4576,36 @@ class GrassrootsNetwork {
   /// §BLE Discovery: ANNOUNCE is exchanged upon successful BLE connection).
   /// Receivers treat repeated ANNOUNCEs from the same pubkey as idempotent,
   /// so racing with the periodic broadcast is harmless.
+  /// Last time we sent sync offers to a given neighbor (keyed by the pathId's
+  /// address part so the pair's two legs — central: and peripheral: — share
+  /// one debounce). Entries are pruned by age; BLE address rotation naturally
+  /// retires old keys.
+  final Map<String, DateTime> _lastSyncOfferAt = {};
+  static const Duration _syncOfferDebounce = Duration(seconds: 60);
+
+  /// Offer our DTN custody summary to a newly-connected neighbor
+  /// (sync-on-connect). Dual-role pairs fire two connect events (one per
+  /// leg); the per-address debounce collapses them into one offer round.
+  void _sendSyncOffers(String deviceId) {
+    if (_bleService == null || !_bleAvailable) return;
+    final addr = deviceId.substring(deviceId.indexOf(':') + 1);
+    final now = DateTime.now();
+    _lastSyncOfferAt.removeWhere(
+        (_, at) => now.difference(at) > const Duration(minutes: 10));
+    final last = _lastSyncOfferAt[addr];
+    if (last != null && now.difference(last) < _syncOfferDebounce) return;
+
+    final offers = _messageRouter.buildSyncOffers();
+    if (offers.isEmpty) return; // carrying nothing — offer nothing
+    _lastSyncOfferAt[addr] = now;
+    debugPrint(
+        '[sync] Offering ${_messageRouter.dtnBufferedCount} carried '
+        'packet(s) to $deviceId in ${offers.length} offer packet(s)');
+    for (final offer in offers) {
+      unawaited(_bleService!.sendToPeer(deviceId, offer.serialize()));
+    }
+  }
+
   Future<bool> _sendAnnounceToDevice(String deviceId) async {
     if (_bleService == null || !_bleAvailable) return false;
 
@@ -4794,6 +4916,27 @@ class GrassrootsNetwork {
 ///     state is gone.
 ///   - state unchanged or one-of-two transports flipping while the other
 ///     stays live: no fire.
+/// Whether a queued outbound message for a recipient can be attempted right
+/// now, given the recipient's currently available paths.
+///
+/// Returns true when either:
+///   - [hasDirectSendPath] — a direct BLE link or a live UDP connection to the
+///     recipient, OR
+///   - [bleUsable] AND [hasNoiseSession] — BLE is on/available and we hold an
+///     established Noise session with the recipient, so a flood can reach them
+///     over the **mesh** via relays even with no direct link.
+///
+/// The mesh clause is the fix for queued messages sitting until the recipient
+/// reconnects directly: a fresh `send()` already floods to any session peer, so
+/// a drained message rides the same relay path. See `_canAttemptSend`.
+@visibleForTesting
+bool canAttemptQueuedSend({
+  required bool hasDirectSendPath,
+  required bool bleUsable,
+  required bool hasNoiseSession,
+}) =>
+    hasDirectSendPath || (bleUsable && hasNoiseSession);
+
 @visibleForTesting
 void processReachabilityTransitions({
   required PeersState peersState,

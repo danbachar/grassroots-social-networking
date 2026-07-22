@@ -14,7 +14,19 @@ enum PacketType {
   /// is one opaque `secure` packet: the content type and any fragmentation live
   /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
   /// an opaque, recipient-addressed blob — never the message class.
-  secure(0x03);
+  secure(0x03),
+
+  /// Sync-on-connect custody summary (neighbor-local, never relayed).
+  /// Cleartext list of packetIds this node's DTN store is carrying; the
+  /// receiving neighbor tests them against its seen-set and requests the ones
+  /// it lacks. Reveals only packetIds — which the envelope already exposes to
+  /// every flood recipient.
+  syncOffer(0x04),
+
+  /// Reply to [syncOffer] (neighbor-local, never relayed): the subset of
+  /// offered packetIds the sender wants conveyed. The offerer answers by
+  /// sending each stored sealed packet over the same link.
+  syncRequest(0x05);
 
   final int value;
   const PacketType(this.value);
@@ -157,7 +169,7 @@ class GrassrootsPacket {
     offset += 32;
 
     // Packet ID (16 bytes - UUID as bytes)
-    final idBytes = _uuidToBytes(packetId);
+    final idBytes = uuidToBytes(packetId);
     bytes.setRange(offset, offset + 16, idBytes);
     offset += 16;
 
@@ -199,7 +211,7 @@ class GrassrootsPacket {
 
     // Packet ID
     final idBytes = data.sublist(offset, offset + 16);
-    final packetId = _bytesToUuid(idBytes);
+    final packetId = bytesToUuid(idBytes);
     offset += 16;
 
     // Payload length
@@ -236,7 +248,7 @@ class GrassrootsPacket {
   }
 
   /// Convert UUID string to 16 bytes
-  static Uint8List _uuidToBytes(String uuid) {
+  static Uint8List uuidToBytes(String uuid) {
     final hex = uuid.replaceAll('-', '');
     final bytes = Uint8List(16);
     for (var i = 0; i < 16; i++) {
@@ -246,7 +258,7 @@ class GrassrootsPacket {
   }
 
   /// Convert 16 bytes to UUID string
-  static String _bytesToUuid(Uint8List bytes) {
+  static String bytesToUuid(Uint8List bytes) {
     if (bytes.length != 16) throw ArgumentError('UUID must be 16 bytes');
     final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     return '${hex.substring(0, 8)}-'

@@ -10,7 +10,6 @@ import 'package:grassroots_networking/src/mesh/sync_codec.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
@@ -128,7 +127,7 @@ void main() {
         identity: identity,
         store: store,
         protocolHandler:
-            ProtocolHandler(identity: identity, platform: PeerPlatform.other, sodium: sodium),
+            ProtocolHandler(identity: identity, sodium: sodium),
         fragmentHandler: FragmentHandler(),
       );
     });
@@ -158,6 +157,30 @@ void main() {
     }
 
     test('buildSyncOffers is empty when carrying nothing', () {
+      expect(router.buildSyncOffers(), isEmpty);
+    });
+
+    test('originated custody enters the sync vector and ends on ACK', () {
+      final recipient = Uint8List.fromList(List.generate(32, (i) => i + 50));
+      final sealed = GrassrootsPacket(
+        type: PacketType.secure,
+        recipientPubkey: recipient,
+        payload: Uint8List.fromList([1, 2, 3]),
+      );
+
+      // The sender is the message's first custodian: its own sealed packet
+      // is offered in sync like any relayed custody.
+      router.storeCustody(recipient, sealed);
+      expect(
+        decodeSyncIds(router.buildSyncOffers().single.payload),
+        contains(sealed.packetId),
+      );
+      expect(router.custodyFor(recipient).single.packetId, sealed.packetId);
+      // Own packets are marked seen — a copy conveyed back is never re-relayed.
+      expect(router.isDuplicate(sealed.packetId), isTrue);
+
+      // ACK ends custody; nothing left to offer.
+      router.removeCustody([sealed.packetId]);
       expect(router.buildSyncOffers(), isEmpty);
     });
 

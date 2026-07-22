@@ -10,7 +10,6 @@ import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
@@ -64,9 +63,9 @@ void main() {
         initialState: const AppState(),
       );
 
-      protocolHandler = ProtocolHandler(identity: identity, platform: PeerPlatform.other, sodium: sodium);
+      protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
       otherProtocolHandler =
-          ProtocolHandler(identity: otherIdentity, platform: PeerPlatform.other, sodium: sodium);
+          ProtocolHandler(identity: otherIdentity, sodium: sodium);
       fragmentHandler = FragmentHandler();
 
       router = MessageRouter(
@@ -564,10 +563,8 @@ void main() {
         await establishSession();
 
         store.dispatch(PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
           publicKey: otherPubkey,
           nickname: 'Alice',
-          protocolVersion: 1,
           rssi: -44,
           bleCentralDeviceId: 'central:peer-1',
         ));
@@ -766,11 +763,9 @@ void main() {
         expect(relayCount, equals(1));
       });
 
-      test('flushDtnFor re-floods cached packets when recipient reappears',
+      test('custody is kept per recipient and ends on removeCustody',
           () async {
-        final relayed = <GrassrootsPacket>[];
-        router.onRelay = (packet, {String? excludeBlePeerId}) =>
-            relayed.add(packet);
+        router.onRelay = (packet, {String? excludeBlePeerId}) {};
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 7));
         final p = GrassrootsPacket(
@@ -780,16 +775,16 @@ void main() {
           payload: Uint8List.fromList([3]),
         );
 
-        // Recipient is not a reachable peer -> first sighting relays once AND
-        // the sealed packet is DTN-cached.
+        // Recipient is not a reachable peer -> first sighting relays AND the
+        // sealed packet enters custody, retrievable per recipient.
         await router.processPacket(p,
             transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
-        expect(relayed, hasLength(1));
+        expect(router.custodyFor(thirdParty).map((c) => c.packetId),
+            contains(p.packetId));
 
-        // Recipient reappears: cached packet is re-flooded.
-        router.flushDtnFor(thirdParty);
-        expect(relayed, hasLength(2));
-        expect(relayed.last.packetId, equals(p.packetId));
+        // The end-to-end ACK ends custody.
+        router.removeCustody([p.packetId]);
+        expect(router.custodyFor(thirdParty), isEmpty);
       });
     });
 

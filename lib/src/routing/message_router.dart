@@ -7,7 +7,6 @@ import '../trace/trace_logger.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
-import '../models/platform.dart';
 import '../models/secure_frame.dart';
 import '../protocol/fragment_handler.dart';
 import '../protocol/protocol_handler.dart';
@@ -115,7 +114,7 @@ class MessageRouter {
   /// fired after the announce has been applied to Redux. The BLE transport
   /// uses it to act on the pair's reverse leg at the authoritative moment
   /// (cancel a doomed dial on iOS, or open the reverse central leg).
-  void Function(String pathId, Uint8List pubkey, PeerPlatform platform)?
+  void Function(String pathId, Uint8List pubkey)?
       onBlePeerIdentified;
 
   /// Called when a Noise handshake packet arrives. The coordinator owns
@@ -428,8 +427,6 @@ class MessageRouter {
     store.dispatch(PeerAnnounceReceivedAction(
       publicKey: pubkey,
       nickname: data.nickname,
-      protocolVersion: data.protocolVersion,
-      platform: data.platform,
       willingToFacilitate: data.willingToFacilitate,
       rssi: effectiveRssi,
       transport: transport,
@@ -443,7 +440,7 @@ class MessageRouter {
     // The announce action above already recorded the role attachment; now
     // that Redux reflects it, let the BLE transport act on the reverse leg.
     if (resolvedBleDeviceId != null) {
-      onBlePeerIdentified?.call(resolvedBleDeviceId, pubkey, data.platform);
+      onBlePeerIdentified?.call(resolvedBleDeviceId, pubkey);
     }
 
     debugPrint(
@@ -641,16 +638,28 @@ class MessageRouter {
     return _seenPackets.mightContain(packetId);
   }
 
-  /// Re-flood any store-carry-forward packets cached for [recipientPubkey] —
-  /// called by the coordinator when that recipient reappears (their ANNOUNCE /
-  /// peer-connected event). The recipient dedups on their side, so re-delivery
-  /// is safe.
-  void flushDtnFor(Uint8List recipientPubkey) {
-    final cached = _dtnStore.takeFor(_pubkeyToHex(recipientPubkey));
-    for (final packet in cached) {
-      onRelay?.call(packet);
+  /// Enter a self-originated sealed packet into custody: the sender is the
+  /// message's first custodian. Custody is offered in sync-on-connect,
+  /// conveyed to whoever lacks it, and ends only on ACK ([removeCustody])
+  /// or age expiry.
+  void storeCustody(Uint8List recipientPubkey, GrassrootsPacket sealedPacket) {
+    _dtnStore.store(_pubkeyToHex(recipientPubkey), sealedPacket);
+    // Our own sealed packets count as seen: a copy conveyed back to us by a
+    // relay must not be re-relayed as a fresh sighting.
+    _seenPackets.add(sealedPacket.packetId);
+  }
+
+  /// End custody of [packetIds] — the recipient ACKed the message.
+  void removeCustody(Iterable<String> packetIds) {
+    for (final id in packetIds) {
+      _dtnStore.removeById(id);
     }
   }
+
+  /// All custody packets held for [recipientPubkey] (own + relayed), for
+  /// direct conveyance over a freshly established session with them.
+  List<GrassrootsPacket> custodyFor(Uint8List recipientPubkey) =>
+      _dtnStore.packetsFor(_pubkeyToHex(recipientPubkey));
 
   // ===== Sync-on-connect (DTN anti-entropy) =====
   //

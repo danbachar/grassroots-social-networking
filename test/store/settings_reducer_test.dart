@@ -169,10 +169,10 @@ void main() {
     });
 
     group('SetColdCallTrustLevelAction', () {
-      test('defaults to closed until set', () {
+      test('defaults to open until set (testbed default)', () {
         expect(
           SettingsState.initial.coldCallTrustLevel,
-          ColdCallTrustLevel.closed,
+          ColdCallTrustLevel.open,
         );
       });
 

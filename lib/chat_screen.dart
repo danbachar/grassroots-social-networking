@@ -79,6 +79,22 @@ class _ChatScreenState extends State<ChatScreen> {
   final Set<String> _sentReadReceiptIds = {};
 
   String get _peerHex => ChatMessage.pubkeyToHex(widget.peer.publicKey);
+
+  /// Debug link-diagnostics app-bar line ("2 links to peer · 5 total"), or
+  /// null when the toggle is off. Counts come from the plugin's OS-level
+  /// link snapshot, joined to this peer's live path IDs by address.
+  String? get _linkDiagnosticsLine {
+    final s = widget.store.state;
+    if (!s.settings.showLinkDiagnostics) return null;
+    final links = s.transports.bleLinks;
+    // widget.peer is a navigation-time snapshot; read the live record for
+    // current device IDs.
+    final live = s.peers.getPeerByPubkey(widget.peer.publicKey) ?? widget.peer;
+    final toPeer = bleLinkCountForPathIds(
+        links, [live.bleCentralDeviceId, live.blePeripheralDeviceId]);
+    return '$toPeer link${toPeer == 1 ? '' : 's'} to peer · '
+        '${links.length} total';
+  }
   String get _myHex => ChatMessage.pubkeyToHex(widget.myPubkey);
 
   FriendshipState? get _friendship =>
@@ -642,21 +658,39 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Row(
+        // The AppBar clips its toolbar to a fixed height; with the display
+        // font (+ any system font scaling) a two-line title can exceed the
+        // default 56 and the second line is silently clipped in release.
+        // Give it explicit room whenever the diagnostics line is shown.
+        toolbarHeight:
+            _linkDiagnosticsLine != null ? kToolbarHeight + 20 : kToolbarHeight,
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: Text(
-                widget.peer.nickname.isNotEmpty
-                    ? widget.peer.nickname
-                    : 'Peer ${_peerHex.substring(0, 8)}...',
-                overflow: TextOverflow.ellipsis,
-              ),
+            Row(
+              children: [
+                Flexible(
+                  child: Text(
+                    widget.peer.nickname.isNotEmpty
+                        ? widget.peer.nickname
+                        : 'Peer ${_peerHex.substring(0, 8)}...',
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (_isFriend)
+                  const Padding(
+                    padding: EdgeInsets.only(left: GlSpace.s1),
+                    child: Icon(Icons.spa_rounded,
+                        size: 18, color: GlColors.primary),
+                  ),
+              ],
             ),
-            if (_isFriend)
-              const Padding(
-                padding: EdgeInsets.only(left: GlSpace.s1),
-                child:
-                    Icon(Icons.spa_rounded, size: 18, color: GlColors.primary),
+            if (_linkDiagnosticsLine != null)
+              Text(
+                _linkDiagnosticsLine!,
+                style: GlType.monoStyle(11, color: GlColors.textMuted),
               ),
           ],
         ),

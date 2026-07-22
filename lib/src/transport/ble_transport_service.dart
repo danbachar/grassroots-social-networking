@@ -8,7 +8,6 @@ import 'package:redux/redux.dart';
 
 import '../models/identity.dart';
 import '../models/packet.dart';
-import '../models/platform.dart';
 import '../store/store.dart';
 import 'transport_service.dart';
 
@@ -112,6 +111,12 @@ class BleTransportService extends TransportService {
   Timer? _scanWatchdog;
   DateTime _lastAdvertisementAt = DateTime.now();
   static const Duration _scanWatchdogInterval = Duration(seconds: 10);
+
+  /// Debug: periodic OS-level link (ACL) snapshot poll, projected into Redux
+  /// for the link-diagnostics overlay. Runs only while the transport is up;
+  /// each tick is a no-op unless settings.showLinkDiagnostics is on.
+  Timer? _linkSnapshotTimer;
+  static const Duration _linkSnapshotInterval = Duration(seconds: 3);
 
   /// Full service-UUID candidates currently installed as *hardware* scan
   /// filters (empty = a plain prefix scan). Populated with the candidate
@@ -326,6 +331,10 @@ class BleTransportService extends TransportService {
         } catch (_) {}
       }
 
+      // Debug link-diagnostics poll: runs for every role mode; each tick is
+      // a no-op unless the settings toggle is on.
+      _armLinkSnapshotPoll();
+
       if (anyStarted) {
         _setState(TransportState.active);
       }
@@ -340,6 +349,40 @@ class BleTransportService extends TransportService {
       _scanWatchdogInterval,
       (_) => unawaited(checkScanLiveness()),
     );
+  }
+
+  void _armLinkSnapshotPoll() {
+    _linkSnapshotTimer?.cancel();
+    _linkSnapshotTimer = Timer.periodic(
+      _linkSnapshotInterval,
+      (_) => unawaited(_pollLinkSnapshot()),
+    );
+  }
+
+  /// Project the plugin's OS-level link snapshot into Redux — only while the
+  /// diagnostics toggle is on (a fresh empty snapshot is dispatched once when
+  /// the toggle turns off, so stale links never linger in the UI).
+  Future<void> _pollLinkSnapshot() async {
+    if (_stopped) return;
+    if (!store.state.settings.showLinkDiagnostics) {
+      if (store.state.transports.bleLinks.isNotEmpty) {
+        store.dispatch(BleLinkSnapshotAction(const []));
+      }
+      return;
+    }
+    try {
+      final links = await _ble.linkSnapshot();
+      store.dispatch(BleLinkSnapshotAction([
+        for (final l in links)
+          BleLinkDiagnostic(
+            address: l.address,
+            clientRole: l.clientRole,
+            serverRole: l.serverRole,
+          ),
+      ]));
+    } catch (e) {
+      debugPrint('[ble] link snapshot failed: $e');
+    }
   }
 
   void _startSlotTimer() {
@@ -507,6 +550,8 @@ class BleTransportService extends TransportService {
     _stopped = true;
     _scanWatchdog?.cancel();
     _scanWatchdog = null;
+    _linkSnapshotTimer?.cancel();
+    _linkSnapshotTimer = null;
     _stopSlotTimer();
     _advertisedSlot = null;
     try {
@@ -598,14 +643,8 @@ class BleTransportService extends TransportService {
   /// The advertisement-driven election remains the retry path if no
   /// advertising MAC for the identity is known yet.
   ///
-  /// EXPERIMENT: platform is no longer consulted here. We dial the reverse
-  /// leg regardless of platform, including when we are iOS and the peer is
-  /// not — deliberately exercising the (unverified in this build) claim that
-  /// an iOS central cannot open the second link toward a peer it is already
-  /// linked with.
-  ///
   /// Central-role paths need nothing here: the peer opens its own reverse leg.
-  void onPeerIdentified(String pathId, Uint8List pubkey, PeerPlatform platform) {
+  void onPeerIdentified(String pathId, Uint8List pubkey) {
     final path = _paths[pathId];
     if (path == null || !_isReady(path)) return;
     if (_roleFromPathId(pathId) != BleRole.peripheral) return;
@@ -1041,7 +1080,7 @@ class BleTransportService extends TransportService {
   /// Cap on simultaneous `connecting` central paths.
   /// Each `connectGatt` consumes a controller slot for ~5s on Android; too
   /// many parallel dials starve real connections.
-  static const int _maxInFlightCentralDials = 2;
+  static const int _maxInFlightCentralDials = 7;
 
   int _inFlightCentralDials() {
     var count = 0;

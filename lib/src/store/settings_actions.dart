@@ -60,6 +60,13 @@ class SetColdCallTrustLevelAction extends SettingsAction {
   SetColdCallTrustLevelAction(this.level);
 }
 
+/// Debug: toggle the BLE link (ACL) count overlay in the UI.
+class SetShowLinkDiagnosticsAction extends SettingsAction {
+  final bool enabled;
+
+  SetShowLinkDiagnosticsAction(this.enabled);
+}
+
 /// Opt in/out of trace logging + upload. [consentTimestamp] is computed at the
 /// dispatch site (reducers are pure) and stored only when opting in.
 class SetTraceLoggingConsentAction extends SettingsAction {

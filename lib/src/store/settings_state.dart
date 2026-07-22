@@ -86,6 +86,11 @@ class SettingsState {
   /// cold calls, so you cannot do it while closed to cold calls.
   final bool facilitateInvites;
 
+  /// Debug: overlay ground-truth BLE link (ACL) counts in the UI — total on
+  /// the chat screen and a per-peer count on peer rows. Data comes from the
+  /// plugin's OS-level link snapshot, not the app's path bookkeeping.
+  final bool showLinkDiagnostics;
+
   // ===== Trace logging (opt-in research telemetry) =====
 
   /// Whether the user has opted in to local trace logging + upload.
@@ -113,8 +118,9 @@ class SettingsState {
       TransportProtocol.udp,
     ],
     this.bleRoleMode = BleRoleMode.auto,
-    this.coldCallTrustLevel = ColdCallTrustLevel.closed,
+    this.coldCallTrustLevel = ColdCallTrustLevel.open,
     this.facilitateInvites = false,
+    this.showLinkDiagnostics = false,
     this.traceLoggingConsent = false,
     this.consentTimestamp,
     this.neighborAllowlist,
@@ -153,6 +159,7 @@ class SettingsState {
     BleRoleMode? bleRoleMode,
     ColdCallTrustLevel? coldCallTrustLevel,
     bool? facilitateInvites,
+    bool? showLinkDiagnostics,
     bool? traceLoggingConsent,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? consentTimestamp = _sentinel,
@@ -166,6 +173,7 @@ class SettingsState {
       bleRoleMode: bleRoleMode ?? this.bleRoleMode,
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       facilitateInvites: facilitateInvites ?? this.facilitateInvites,
+      showLinkDiagnostics: showLinkDiagnostics ?? this.showLinkDiagnostics,
       traceLoggingConsent: traceLoggingConsent ?? this.traceLoggingConsent,
       consentTimestamp: identical(consentTimestamp, _sentinel)
           ? this.consentTimestamp
@@ -186,6 +194,7 @@ class SettingsState {
         'bleRoleMode': bleRoleMode.name,
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
+        'showLinkDiagnostics': showLinkDiagnostics,
         'traceLoggingConsent': traceLoggingConsent,
         'consentTimestamp': consentTimestamp,
         'neighborAllowlist': neighborAllowlist?.toJson(),
@@ -217,6 +226,7 @@ class SettingsState {
       bleRoleMode: bleRoleMode,
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
+      showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
       traceLoggingConsent: json['traceLoggingConsent'] as bool? ?? false,
       consentTimestamp: json['consentTimestamp'] as String?,
       neighborAllowlist: json['neighborAllowlist'] == null
@@ -241,6 +251,7 @@ class SettingsState {
           bleRoleMode == other.bleRoleMode &&
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
+          showLinkDiagnostics == other.showLinkDiagnostics &&
           traceLoggingConsent == other.traceLoggingConsent &&
           consentTimestamp == other.consentTimestamp &&
           neighborAllowlist == other.neighborAllowlist &&
@@ -254,6 +265,7 @@ class SettingsState {
         bleRoleMode,
         coldCallTrustLevel,
         facilitateInvites,
+        showLinkDiagnostics,
         traceLoggingConsent,
         consentTimestamp,
         neighborAllowlist,

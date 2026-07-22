@@ -4,7 +4,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
@@ -123,8 +122,8 @@ void main() {
     aliceStore = Store<AppState>(appReducer, initialState: const AppState());
     bobStore = Store<AppState>(appReducer, initialState: const AppState());
 
-    aliceProtocol = ProtocolHandler(identity: aliceIdentity, platform: PeerPlatform.other, sodium: sodium);
-    bobProtocol = ProtocolHandler(identity: bobIdentity, platform: PeerPlatform.other, sodium: sodium);
+    aliceProtocol = ProtocolHandler(identity: aliceIdentity, sodium: sodium);
+    bobProtocol = ProtocolHandler(identity: bobIdentity, sodium: sodium);
 
     aliceSessions = NoiseSessionManager(identity: aliceIdentity, sodium: sodium);
     bobSessions = NoiseSessionManager(identity: bobIdentity, sodium: sodium);
@@ -178,7 +177,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.bleDirect));
 
       // Verify Bob's Redux store was updated.
@@ -459,7 +457,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.udp));
 
       // Verify Bob's Redux store was updated.

@@ -1,6 +1,5 @@
 import 'dart:typed_data';
 import '../models/peer.dart';
-import '../models/platform.dart';
 
 /// Which BLE role our device played in the connection.
 /// - central: we scanned and connected to the remote peer
@@ -84,11 +83,6 @@ class ClearDiscoveredBlePeersAction extends PeerAction {}
 class PeerAnnounceReceivedAction extends PeerAction {
   final Uint8List publicKey;
   final String nickname;
-  final int protocolVersion;
-
-  /// The peer's OS platform from the signed ANNOUNCE payload. Pubkey-keyed
-  /// and rotation-stable — the substrate for BLE dual-role leg ordering.
-  final PeerPlatform platform;
 
   /// Whether the peer advertised willingness to introduce strangers (from the
   /// signed ANNOUNCE flags).
@@ -114,8 +108,6 @@ class PeerAnnounceReceivedAction extends PeerAction {
   PeerAnnounceReceivedAction({
     required this.publicKey,
     required this.nickname,
-    required this.protocolVersion,
-    required this.platform,
     this.willingToFacilitate = false,
     this.rssi,
     this.transport = PeerTransport.bleDirect,

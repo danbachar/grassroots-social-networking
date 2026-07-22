@@ -2,7 +2,6 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart';
 import 'package:grassroots_networking/src/store/peers_reducer.dart';
 import 'package:grassroots_networking/src/store/peers_state.dart';
@@ -33,10 +32,8 @@ void main() {
       state = peersReducer(state, BleDeviceConnectingAction(pathId));
       state = peersReducer(state, BleDeviceConnectedAction(pathId));
       state = peersReducer(state, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pk,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -55,
         bleCentralDeviceId: pathId,
       ));
@@ -56,10 +53,8 @@ void main() {
 
       var state = PeersState.initial;
       state = peersReducer(state, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pk,
         nickname: 'Bob',
-        protocolVersion: 1,
         rssi: -50,
         blePeripheralDeviceId: pathId,
       ));
@@ -81,10 +76,8 @@ void main() {
       aView = peersReducer(aView, BleDeviceConnectingAction(aPath));
       aView = peersReducer(aView, BleDeviceConnectedAction(aPath));
       aView = peersReducer(aView, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey(20),
         nickname: 'B',
-        protocolVersion: 1,
         rssi: -55,
         bleCentralDeviceId: aPath,
       ));
@@ -93,10 +86,8 @@ void main() {
       var bView = PeersState.initial;
       const bPath = 'peripheral:A-MAC';
       bView = peersReducer(bView, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey(10),
         nickname: 'A',
-        protocolVersion: 1,
         rssi: -55,
         blePeripheralDeviceId: bPath,
       ));
@@ -115,10 +106,8 @@ void main() {
       var state = PeersState.initial;
       // Establish a peer with both a central and peripheral path.
       state = peersReducer(state, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pk,
         nickname: 'Carol',
-        protocolVersion: 1,
         rssi: -50,
         bleCentralDeviceId: 'central:cmac',
         blePeripheralDeviceId: 'peripheral:cmac',
@@ -143,10 +132,8 @@ void main() {
       final pk = pubkey(4);
       var state = PeersState.initial;
       state = peersReducer(state, PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pk,
         nickname: 'Dave',
-        protocolVersion: 1,
         rssi: -50,
         bleCentralDeviceId: 'central:dmac',
       ));

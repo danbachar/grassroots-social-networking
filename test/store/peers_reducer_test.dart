@@ -5,7 +5,6 @@ import 'package:grassroots_networking/src/store/peers_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart';
 import 'package:grassroots_networking/src/store/peers_reducer.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 
 /// Generate a deterministic 32-byte public key from a seed value.
 Uint8List _testPubkey(int seed) {
@@ -353,10 +352,8 @@ void main() {
       final pubkey = _testPubkey(1);
       const state = PeersState.initial;
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 2,
         rssi: -55,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'ble-central-1',
@@ -369,7 +366,6 @@ void main() {
       final peer = result.peers[hex]!;
       expect(peer.publicKey, pubkey);
       expect(peer.nickname, 'Alice');
-      expect(peer.protocolVersion, 2);
       expect(peer.rssi, -55);
       expect(peer.transport, PeerTransport.bleDirect);
       expect(peer.bleCentralDeviceId, 'ble-central-1');
@@ -384,10 +380,8 @@ void main() {
       final pubkey = _testPubkey(1);
       const state = PeersState.initial;
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -60,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'ble-peripheral-1',
@@ -412,10 +406,8 @@ void main() {
         var state = peersReducer(
           PeersState.initial,
           PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
             publicKey: pubkey,
             nickname: 'Alice',
-            protocolVersion: 1,
             rssi: -55,
             transport: PeerTransport.bleDirect,
             bleCentralDeviceId: 'central-id',
@@ -429,10 +421,8 @@ void main() {
         state = peersReducer(
           state,
           PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
             publicKey: pubkey,
             nickname: 'Alice',
-            protocolVersion: 1,
             rssi: -50,
             transport: PeerTransport.bleDirect,
             blePeripheralDeviceId: 'peripheral-id',
@@ -459,15 +449,12 @@ void main() {
             nickname: 'OldNick',
             connectionState: PeerConnectionState.disconnected,
             rssi: -90,
-            protocolVersion: 1,
           ),
         },
       );
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'NewNick',
-        protocolVersion: 3,
         rssi: -40,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::1]:4001',
@@ -477,7 +464,6 @@ void main() {
 
       final peer = result.peers[hex]!;
       expect(peer.nickname, 'NewNick');
-      expect(peer.protocolVersion, 3);
       expect(peer.rssi, -40);
       expect(peer.transport, PeerTransport.udp);
       expect(peer.udpAddress, '[2001:db8::1]:4001');
@@ -497,7 +483,6 @@ void main() {
             connectionState: PeerConnectionState.disconnected,
             transport: PeerTransport.udp,
             rssi: -90,
-            protocolVersion: 1,
             udpAddress: udpAddress,
             udpAddressCandidates: const {udpAddress},
             isFriend: true,
@@ -510,10 +495,8 @@ void main() {
       final result = peersReducer(
         initial,
         PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
           publicKey: pubkey,
           nickname: 'NewNick',
-          protocolVersion: 3,
           rssi: -40,
           transport: PeerTransport.udp,
           udpAddress: udpAddress,
@@ -522,7 +505,6 @@ void main() {
 
       final peer = result.peers[hex]!;
       expect(peer.nickname, 'NewNick');
-      expect(peer.protocolVersion, 3);
       expect(peer.rssi, -40);
       expect(peer.connectionState, PeerConnectionState.connected);
       expect(peer.isFriend, isTrue);
@@ -533,10 +515,8 @@ void main() {
     test('sets connectionState to connected', () {
       final pubkey = _testPubkey(2);
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Bob',
-        protocolVersion: 1,
         rssi: -60,
       );
 
@@ -561,10 +541,8 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -40,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::1]:4001',
@@ -582,10 +560,8 @@ void main() {
     test('UDP ANNOUNCE records lastUdpSeen', () {
       final pubkey = _testPubkey(3);
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Carol',
-        protocolVersion: 1,
         rssi: -42,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::3]:4003',
@@ -614,10 +590,8 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Dana',
-        protocolVersion: 1,
         rssi: -55,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'central-4',
@@ -960,10 +934,8 @@ void main() {
         peers: {hex: PeerState(publicKey: pubkey, nickname: 'Alice')},
       );
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         bleCentralDeviceId: 'ble-central-99',
       );
 
@@ -987,10 +959,8 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         blePeripheralDeviceId: 'ble-peripheral-99',
       );
 
@@ -1000,55 +970,6 @@ void main() {
       expect(result.peers[hex]!.blePeripheralDeviceId, 'ble-peripheral-99');
     });
 
-    test('records the announced platform pubkey-keyed', () {
-      final pubkey = _testPubkey(1);
-      final hex = _pubkeyHex(pubkey);
-      final action = PeerAnnounceReceivedAction(
-        platform: PeerPlatform.ios,
-        publicKey: pubkey,
-        nickname: 'Alice',
-        protocolVersion: 1,
-      );
-
-      final result = peersReducer(PeersState.initial, action);
-
-      expect(result.peers[hex]!.platform, PeerPlatform.ios);
-    });
-
-    test(
-        'platform survives disconnects and association updates — null only '
-        'before the first ANNOUNCE', () {
-      final pubkey = _testPubkey(1);
-      final hex = _pubkeyHex(pubkey);
-      var state = peersReducer(
-        PeersState.initial,
-        PeerAnnounceReceivedAction(
-          platform: PeerPlatform.ios,
-          publicKey: pubkey,
-          nickname: 'Alice',
-          protocolVersion: 1,
-          bleCentralDeviceId: 'central:AA',
-        ),
-      );
-
-      // The platform is BLE leg-ordering input for the peer's NEXT
-      // appearance — precisely the moment no fresh ANNOUNCE is available —
-      // so no disconnect or address update may wipe it.
-      state = peersReducer(state, PeerBleDisconnectedAction(pubkey));
-      expect(state.peers[hex]!.platform, PeerPlatform.ios,
-          reason: 'BLE disconnect must not wipe the authenticated platform.');
-
-      state = peersReducer(state, PeerUdpDisconnectedAction(pubkey));
-      expect(state.peers[hex]!.platform, PeerPlatform.ios,
-          reason: 'UDP disconnect must not wipe the authenticated platform.');
-
-      state = peersReducer(
-        state,
-        AssociateUdpAddressAction(publicKey: pubkey, address: '1.2.3.4:5'),
-      );
-      expect(state.peers[hex]!.platform, PeerPlatform.ios,
-          reason: 'Address association must not wipe the platform.');
-    });
   });
 
   // =========================================================================

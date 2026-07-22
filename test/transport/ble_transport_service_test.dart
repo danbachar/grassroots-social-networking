@@ -19,8 +19,6 @@ import 'package:grassroots_networking/src/transport/ble_transport_service.dart';
 import 'package:grassroots_networking/src/transport/transport_service.dart'
     show TransportState;
 import 'package:cryptography/cryptography.dart';
-import 'package:flutter/foundation.dart'
-    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 
@@ -86,6 +84,9 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
 
   @override
   Future<List<BlePath?>> paths() async => [];
+
+  @override
+  Future<List<BleLinkInfo?>> linkSnapshot() async => [];
 
   @override
   Future<void> dispose() async {
@@ -591,7 +592,6 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'Rotator',
-        protocolVersion: 1,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: oldPathId,
       ));
@@ -648,7 +648,6 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'DualRole',
-        protocolVersion: 1,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
@@ -656,8 +655,10 @@ void main() {
       // Drop any setup-driven dial so the assertion sees only the ad below.
       hostApi.calls.clear();
 
-      // The peer advertises the address hosting its GATT server. Because we
-      // only hold the peripheral leg, the central dial MUST fire.
+      // The peer advertises. Because we only hold the peripheral leg, the
+      // central dial MUST fire — targeted at the live inbound link's remote
+      // address (attaching over the existing ACL), NOT the advertised MAC
+      // (a second ACL, which modern stacks refuse with GATT 133).
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: advertisingMac,
         serviceUuids: [serviceUuid],
@@ -666,10 +667,43 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
           hasLength(1),
           reason: 'Peripheral-only attachment must not suppress the central '
-              'dial — that dial completes the dual-role connection.');
+              'dial, and the dial must ride the existing ACL (connection '
+              'MAC) rather than open a second one (advertised MAC).');
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          isEmpty,
+          reason: 'Dialing the advertised MAC while a link exists attempts a '
+              'second ACL — measured fast-133 on modern stacks.');
+
+      // The over-ACL dial goes in flight (plugin reports `connecting`). It
+      // has NO discovery entry — the one-central-per-identity guard must
+      // still recognise it (matched by the inbound leg's remote address) and
+      // suppress further dials on the next advertisement.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$connectionMac',
+        role: BleRole.central,
+        state: BlePathState.connecting,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [serviceUuid],
+        rssi: -48,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'An in-flight over-ACL reverse dial (no discovery entry) '
+              'must be matched to the identity by remote address and count '
+              'as the pair\'s one central leg.');
     });
 
     test(
@@ -719,7 +753,7 @@ void main() {
     test(
         'reverse-leg dial after ANNOUNCE: when the peer\'s advertising MAC '
         'differs from their connection MAC (modern Android BLE privacy), '
-        'we still dial the advertising MAC once identity is known',
+        'we dial the LIVE connection MAC — attaching over the existing ACL',
         () async {
       // Connection (peripheral) MAC and advertising MAC are different —
       // this is the real-world Android case where BLE privacy uses
@@ -745,9 +779,9 @@ void main() {
       hostApi.calls.clear();
 
       // Peripheral path arrives from the (different) connection MAC and
-      // reaches ready before ANNOUNCE — `_maybeDialReverseCentralAfterPeripheralReady`
-      // bails because we don't yet know who's on the other end and the
-      // same-address fallback finds no `central:99:88:...` discovery.
+      // reaches ready before ANNOUNCE — nothing dials: the reverse leg
+      // fires only from `onPeerIdentified`, once we know who is on the
+      // other end.
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -763,28 +797,30 @@ void main() {
               'Pre-ANNOUNCE peripheral-ready must NOT dial the connection MAC '
               '— that address has no GATT server attached on a BLE-privacy stack.');
 
-      // ANNOUNCE arrives over the peripheral path. GrassrootsNetwork would
-      // dispatch PeerAnnounceReceivedAction (creating the peer entry) and
-      // then call associatePeerWithPubkey to link the peripheral path to
-      // the pubkey. The transport is supposed to then trigger the reverse
-      // leg against an advertising MAC we already know works.
+      // ANNOUNCE arrives over the peripheral path. The router dispatches
+      // PeerAnnounceReceivedAction (recording the attachment) and then
+      // invokes onPeerIdentified. The transport must then trigger the
+      // reverse leg against an advertising MAC we already know works.
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'Remote',
-        protocolVersion: 1,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.associatePeerWithPubkey(
-        'peripheral:$connectionMac',
-        peerIdentity.publicKey,
-      );
+      transport.onPeerIdentified('peripheral:$connectionMac', peerIdentity.publicKey);
       await Future<void>.delayed(Duration.zero);
 
-      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
           hasLength(1),
-          reason: 'Reverse leg must dial the advertising MAC (which has a '
-              'live GATT server), not the connection MAC.');
+          reason: 'Reverse leg must dial the live inbound connection MAC — '
+              'connecting to an already-linked device attaches the GATT '
+              'client over the existing ACL. Dialing the advertising MAC '
+              'would attempt a second ACL, which modern stacks refuse '
+              '(measured fast-133 on Pixel 10 / Android 16).');
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          isEmpty,
+          reason: 'No second ACL toward the advertised MAC while the '
+              'inbound link is live.');
     });
 
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
@@ -1062,7 +1098,8 @@ void main() {
           reason: 'Non-initiator must not first-mover-dial.');
 
       // The initiator dials us → inbound peripheral leg, then ANNOUNCE
-      // identifies it.
+      // identifies it. (The path event must deliver first — in production
+      // the ANNOUNCE payload is only forwarded once the path is ready.)
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -1071,23 +1108,21 @@ void main() {
         mtu: 517,
         canSend: true,
       ));
+      await Future<void>.delayed(Duration.zero);
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peer.publicKey,
         nickname: 'Peer',
-        protocolVersion: 1,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.associatePeerWithPubkey(
-        'peripheral:$connectionMac',
-        peer.publicKey,
-      );
+      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
       await Future<void>.delayed(Duration.zero);
 
-      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
           hasLength(1),
           reason: 'Once the inbound leg is up, the non-initiator opens its '
-              'reverse central leg to the advertising MAC.');
+              'reverse central leg over the existing ACL (the inbound '
+              'connection MAC), not via a second ACL to the advertised MAC.');
     });
 
     test(
@@ -1140,552 +1175,6 @@ void main() {
       expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
           reason: 'A central-only device never advertises, so it can never be '
               'dialed — it must always first-move regardless of the tie-break.');
-    });
-  });
-
-  group('BleTransportService — iOS first-link asymmetry (grs-ios marker)', () {
-    const lowPeerUuid = '84c40316-0871-e5ad-0000-000000000001';
-    const highPeerUuid = '84c40316-0871-e5ad-ffff-fffffffffffe';
-
-    Future<
-        (
-          _RecordingHostApi,
-          FakeGrassrootsBluetoothCallbacks,
-          Store<AppState>,
-          BleTransportService,
-        )> build(
-      GrassrootsIdentity identity, {
-      TargetPlatform platform = TargetPlatform.android,
-      Duration firstMoverFallback = const Duration(hours: 1),
-    }) async {
-      debugDefaultTargetPlatformOverride = platform;
-      addTearDown(() => debugDefaultTargetPlatformOverride = null);
-      final hostApi = _RecordingHostApi();
-      final callbacks = FakeGrassrootsBluetoothCallbacks();
-      final ble =
-          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
-      final store = Store<AppState>(appReducer, initialState: AppState.initial);
-      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
-      final transport = BleTransportService(
-        identity: identity,
-        store: store,
-        firstMoverFallback: firstMoverFallback,
-        grassrootsBluetooth: ble,
-      );
-      await transport.initialize();
-      addTearDown(transport.dispose);
-      return (hostApi, callbacks, store, transport);
-    }
-
-    test(
-        'Android yields the first dial to an iOS-marked advertisement even '
-        'as the deterministic initiator', () async {
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeLowIdentity('AndroidInitiator'));
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE'), isEmpty,
-          reason: 'An iOS central can only open the FIRST link of a pair, so '
-              'a non-iOS peer must yield the first dial to it — even when the '
-              'service-UUID tiebreaker says we are the initiator.');
-      expect(
-          store.state.peers.discoveredBlePeers.containsKey('central:IPHONE'),
-          true,
-          reason: 'Discovery is still recorded while yielding, so the reverse '
-              'leg has a dial candidate later.');
-    });
-
-    test(
-        'Android opens the reverse leg to an iOS peer once the inbound '
-        'peripheral leg is identified', () async {
-      final iosPeer = await _makeIdentity('iPhone');
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeHighIdentity('AndroidWaiter'));
-
-      // The iPhone dials us before we ever saw it advertise (its first
-      // link), and ANNOUNCE identifies it. The announce-driven reverse dial
-      // has no discovered advertising MAC yet, so it can't act.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:IPHONE_CONN',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: iosPeer.publicKey,
-        nickname: 'iPhone',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:IPHONE_CONN',
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty);
-
-      // Its first advertisement now triggers OUR reverse central leg — the
-      // second link, which a non-iOS central opens fine. The iOS marker must
-      // not hold us back once the inbound leg exists.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE_ADV'),
-          hasLength(1),
-          reason: 'With the inbound iOS leg up, the non-iOS side owns the '
-              'reverse leg of the dual-role pair.');
-    });
-
-    test(
-        'Android falls back to dialing an iOS-marked peer that never '
-        'connects', () async {
-      final (hostApi, callbacks, _, _) = await build(
-        await _makeLowIdentity('AndroidFallback'),
-        firstMoverFallback: Duration.zero,
-      );
-
-      // First sighting: yield to iOS.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE'), isEmpty);
-
-      // Re-sighting with the fallback window elapsed: a single
-      // Android-central first link works fine — dial.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [highPeerUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE'), hasLength(1),
-          reason: 'An iOS peer that never dials (backgrounded, gone) must not '
-              'deadlock the pair — the non-iOS side eventually first-moves.');
-    });
-
-    test(
-        'iOS dials a non-marked (non-iOS) peer on sight, even as the '
-        'tiebreaker non-initiator', () async {
-      final (hostApi, callbacks, _, _) = await build(
-        await _makeHighIdentity('iosWaiterByUuid'),
-        platform: TargetPlatform.iOS,
-      );
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'ANDROID',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:ANDROID'), hasLength(1),
-          reason: 'iOS must own the FIRST link of every mixed pair — it dials '
-              'immediately regardless of the service-UUID tiebreaker.');
-    });
-
-    test(
-        'iOS never dials an identity it holds an inbound peripheral leg '
-        'from, and aborts the in-flight doomed dial on identification',
-        () async {
-      final androidPeer = await _makeIdentity('Pixel');
-      final (hostApi, callbacks, store, transport) = await build(
-        await _makeIdentity('iPhone'),
-        platform: TargetPlatform.iOS,
-      );
-
-      // We discover the Android and dial on sight (potential first link).
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PIXEL_ADV',
-        serviceUuids: [androidPeer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:PIXEL_ADV'),
-          hasLength(1));
-      callbacks.pushPath(BlePath(
-        pathId: 'central:PIXEL_ADV',
-        role: BleRole.central,
-        state: BlePathState.connecting,
-        rssi: -55,
-        mtu: 23,
-        canSend: false,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      // The Android's dial wins the race: inbound peripheral leg + ANNOUNCE.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:PIXEL_CONN',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      // Let the path event deliver before associating — associate reads the
-      // transport's live path mirror synchronously.
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: androidPeer.publicKey,
-        nickname: 'Pixel',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:PIXEL_CONN',
-      ));
-      transport.associatePeerWithPubkey(
-        'peripheral:PIXEL_CONN',
-        androidPeer.publicKey,
-      );
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'disconnect:central:PIXEL_ADV'),
-          hasLength(1),
-          reason: 'The in-flight central dial became a doomed second link the '
-              'moment the inbound leg was authenticated — abort it instead of '
-              'letting it wedge until the connect timeout.');
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')),
-          hasLength(1),
-          reason: 'No reverse-leg dial on iOS — the peer owns the second '
-              'link.');
-
-      // Subsequent advertisements (fresh rotated MAC included) must not dial.
-      hostApi.calls.clear();
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PIXEL_ADV2',
-        serviceUuids: [androidPeer.bleServiceUuid],
-        rssi: -50,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'An iOS central can never open a second link to a pair it '
-              'is already peripherally attached to.');
-    });
-
-    test('iOS↔iOS pairs use the deterministic tiebreaker', () async {
-      // Waiter: higher UUID sees a marked (iOS) lower-UUID peer → holds off.
-      final (hostApiHigh, callbacksHigh, _, _) = await build(
-        await _makeHighIdentity('iosHigh'),
-        platform: TargetPlatform.iOS,
-      );
-      callbacksHigh.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IOS_LOW',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApiHigh.calls.where((c) => c == 'connect:IOS_LOW'), isEmpty,
-          reason: 'Between two iOS devices the lower service UUID owns the '
-              'single link; the higher one waits.');
-
-      // Initiator: lower UUID sees a marked higher-UUID iOS peer → dials.
-      final (hostApiLow, callbacksLow, _, _) = await build(
-        await _makeLowIdentity('iosLow'),
-        platform: TargetPlatform.iOS,
-      );
-      callbacksLow.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IOS_HIGH',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApiLow.calls.where((c) => c == 'connect:IOS_HIGH'),
-          hasLength(1),
-          reason: 'The lower-UUID iOS device opens the pair\'s first link.');
-    });
-
-    test(
-        'iOS attempts the reverse leg toward an iOS-marked peer once the '
-        'inbound peripheral leg is identified (dual-role mandate)', () async {
-      // Peer below the threshold, us above: we are deterministically the
-      // tiebreaker waiter, so the only dial in this test is the reverse leg.
-      final iosPeer = await _makeLowIdentity('OtherIphone');
-      final (hostApi, callbacks, store, transport) = await build(
-        await _makeHighIdentity('iosWaiter'),
-        platform: TargetPlatform.iOS,
-      );
-
-      // Marked ad records the peer as iOS; we are the tiebreaker waiter.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IOS_PEER_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty);
-
-      // The initiator iPhone dials us; ANNOUNCE identifies it.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:IOS_PEER_CONN',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: iosPeer.publicKey,
-        nickname: 'OtherIphone',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:IOS_PEER_CONN',
-      ));
-      transport.associatePeerWithPubkey(
-        'peripheral:IOS_PEER_CONN',
-        iosPeer.publicKey,
-      );
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:IOS_PEER_ADV'),
-          hasLength(1),
-          reason: 'The iOS second link toward an iOS peer is unmeasured, so '
-              'per the dual-role mandate it must be ATTEMPTED — hardware '
-              'decides, not extrapolation.');
-      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
-          reason: 'Cancel-on-identify is scoped to the measured constraint '
-              '(non-iOS peers) and must not abort dials toward iOS peers.');
-    });
-
-    test(
-        'cancel-on-identify spares in-flight dials toward iOS-marked peers',
-        () async {
-      // Peer above the threshold, us below: we are deterministically the
-      // tiebreaker initiator and dial on sight.
-      final iosPeer = await _makeHighIdentity('OtherIphone');
-      final (hostApi, callbacks, store, transport) = await build(
-        await _makeLowIdentity('iosInitiator'),
-        platform: TargetPlatform.iOS,
-      );
-
-      // Marked ad → we are the tiebreaker initiator → dial on sight.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IOS_PEER_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:IOS_PEER_ADV'),
-          hasLength(1));
-      callbacks.pushPath(BlePath(
-        pathId: 'central:IOS_PEER_ADV',
-        role: BleRole.central,
-        state: BlePathState.connecting,
-        rssi: -55,
-        mtu: 23,
-        canSend: false,
-      ));
-
-      // Their dial lands first; ANNOUNCE identifies them as the iOS peer.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:IOS_PEER_CONN',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: iosPeer.publicKey,
-        nickname: 'OtherIphone',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:IOS_PEER_CONN',
-      ));
-      transport.associatePeerWithPubkey(
-        'peripheral:IOS_PEER_CONN',
-        iosPeer.publicKey,
-      );
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
-          reason: 'An in-flight dial toward an iOS peer may be the pair\'s '
-              'viable second link — it must be left to complete or time out '
-              'on its own, never aborted on extrapolation.');
-    });
-
-    test(
-        'the iOS marker is sticky: a later unmarked advertisement (background '
-        'dropout) still yields', () async {
-      final (hostApi, callbacks, _, _) =
-          await build(await _makeLowIdentity('AndroidInitiator'));
-
-      // Foregrounded iPhone: marker present → yield.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE'), isEmpty);
-
-      // Same identity later without the marker (e.g. name dropped from the
-      // scan response). Platform doesn't change — keep yielding rather than
-      // dialing into the measured-broken wrong order.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE',
-        serviceUuids: [highPeerUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:IPHONE'), isEmpty,
-          reason: 'Marker sightings are remembered per identity for the '
-              'session; a dropout must not flip arbitration to the '
-              'platform-neutral tiebreaker.');
-    });
-
-    test(
-        'wrong-order mixed pair reforms: a fresh iOS marker drops our '
-        'central-only leg so the pair can rebuild in the right order',
-        () async {
-      final iosPeer = await _makeIdentity('iPhone');
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeIdentity('Android'));
-
-      // Wrong-order formation: WE dialed the iPhone first (marker was
-      // invisible — backgrounded iOS). Central leg live, no inbound leg.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE_ADV',
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      callbacks.pushPath(BlePath(
-        pathId: 'central:IPHONE_ADV',
-        role: BleRole.central,
-        state: BlePathState.ready,
-        rssi: -55,
-        mtu: 247,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: iosPeer.publicKey,
-        nickname: 'iPhone',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        bleCentralDeviceId: 'central:IPHONE_ADV',
-      ));
-      await Future<void>.delayed(Duration.zero);
-      hostApi.calls.clear();
-
-      // The iPhone foregrounds: its advertisement carries the marker again.
-      // The pair's missing leg (iOS-central second link toward us) is
-      // hardware-broken, so the only path to dual-role is reform.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'disconnect:central:IPHONE_ADV'),
-          hasLength(1),
-          reason: 'A fresh marker proves the iPhone is foregrounded and can '
-              'redial; dropping our wrong-order central leg is the only way '
-              'this pair reaches dual-role.');
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'We yield after the reform teardown — the iPhone opens the '
-              'first leg.');
-
-      // Ad bursts must not issue duplicate teardowns while the disconnect
-      // round-trip is in flight.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'disconnect:central:IPHONE_ADV'),
-          hasLength(1),
-          reason: 'Reform is idempotent per teardown round-trip.');
-    });
-
-    test(
-        'a dual-role mixed pair does NOT reform on marker sightings',
-        () async {
-      final iosPeer = await _makeIdentity('iPhone');
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeIdentity('Android'));
-
-      // Right-order pair fully formed: inbound iOS leg + our reverse leg.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:IPHONE_CONN',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      callbacks.pushPath(BlePath(
-        pathId: 'central:IPHONE_ADV',
-        role: BleRole.central,
-        state: BlePathState.ready,
-        rssi: -55,
-        mtu: 247,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: iosPeer.publicKey,
-        nickname: 'iPhone',
-        protocolVersion: 1,
-        transport: PeerTransport.bleDirect,
-        bleCentralDeviceId: 'central:IPHONE_ADV',
-        blePeripheralDeviceId: 'peripheral:IPHONE_CONN',
-      ));
-      await Future<void>.delayed(Duration.zero);
-      hostApi.calls.clear();
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'IPHONE_ADV',
-        advertisedName: grassrootsIosLocalName,
-        serviceUuids: [iosPeer.bleServiceUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
-          reason: 'Both legs are live — dual-role is achieved; reform must '
-              'never touch a healthy pair.');
     });
   });
 
@@ -1765,6 +1254,58 @@ void main() {
       expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty,
           reason: 'Peripheral-only devices do not scan; the watchdog must '
               'not start one.');
+    });
+
+    test(
+        'a silent restart is hardware-filtered for a peer we hold only a '
+        'peripheral leg from (so its advertising MAC is discoverable)',
+        () async {
+      // The peer connected to us (we are its GATT server): a ready peripheral
+      // leg, ANNOUNCE-identified, with no central leg back. This is exactly
+      // the stranded-single-link state where an unfiltered scan gets muted.
+      final peer = await _makeIdentity('StuckPeer');
+      const peripheralPathId = 'peripheral:AA:BB:CC:DD:EE:FF';
+      callbacks.pushPath(BlePath(
+        pathId: peripheralPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'StuckPeer',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: peripheralPathId,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.scanRequests.clear();
+
+      await transport.checkScanLiveness(
+          now: DateTime.now().add(const Duration(seconds: 31)));
+
+      expect(hostApi.scanRequests, isNotEmpty,
+          reason: 'Silence with a pending reverse leg must restart the scan.');
+      final targets = hostApi.scanRequests.last.serviceUuids;
+      final wanted = GrassrootsIdentity.candidateServiceUuids(peer.publicKey);
+      for (final uuid in wanted) {
+        expect(targets, contains(uuid),
+            reason: "The peer's candidate UUIDs must be installed as hardware "
+                'scan filters so Android reliably surfaces its advertisement.');
+      }
+    });
+
+    test('a plain silent restart carries no hardware filters (broad scan)',
+        () async {
+      // No peripheral-only-attached peers → nothing to target → broad scan,
+      // preserving normal discovery.
+      await transport.checkScanLiveness(
+          now: DateTime.now().add(const Duration(seconds: 31)));
+      expect(hostApi.scanRequests.last.serviceUuids, isEmpty,
+          reason: 'With no stranded reverse leg the scan stays unfiltered so '
+              'new peers keep being discovered.');
     });
   });
 }

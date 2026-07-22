@@ -24,7 +24,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         lastSeen: now,
       );
     } else {
-      // TODO: this should be a different action, use update rssi
       newOrUpdated = existing.copyWith(
         rssi: action.rssi,
         serviceUuid: action.serviceUuid,
@@ -60,21 +59,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
     updatedMap[action.deviceId] = newOrUpdated;
 
     return state.copyWith(discoveredBlePeers: updatedMap);
-  }
-
-  if (action is BleDeviceRssiUpdatedAction) {
-    final existing = state.discoveredBlePeers[action.deviceId];
-    if (existing != null) {
-      final updated = existing.copyWith(
-        rssi: action.rssi,
-        lastSeen: DateTime.now(),
-      );
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = updated,
-      );
-    }
-    return state;
   }
 
   if (action is BleDeviceConnectingAction) {
@@ -176,8 +160,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
         transport: action.transport,
+        willingToFacilitate: action.willingToFacilitate,
         rssi: action.rssi,
-        protocolVersion: action.protocolVersion,
         lastSeen: now,
         bleCentralDeviceId: action.bleCentralDeviceId,
         blePeripheralDeviceId: action.blePeripheralDeviceId,
@@ -222,8 +206,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
         transport: action.transport,
+        willingToFacilitate: action.willingToFacilitate,
         rssi: action.rssi,
-        protocolVersion: action.protocolVersion,
         lastSeen: now,
         bleCentralDeviceId:
             action.bleCentralDeviceId ?? existing.bleCentralDeviceId,
@@ -289,10 +273,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: newConnectionState,
         transport: existing.transport,
         rssi: hasAnyBle ? existing.rssi : null,
-        protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
         bleCentralDeviceId: newCentralId,
         blePeripheralDeviceId: newPeripheralId,
@@ -338,6 +322,19 @@ PeersState peersReducer(PeersState state, dynamic action) {
     return state;
   }
 
+  if (action is PeerBleSeenAction) {
+    final pubkeyHex = _pubkeyToHex(action.publicKey);
+    final existing = state.peers[pubkeyHex];
+    if (existing != null) {
+      final now = DateTime.now();
+      final updated = existing.copyWith(lastSeen: now, lastBleSeen: now);
+      return state.copyWith(
+        peers: Map.from(state.peers)..[pubkeyHex] = updated,
+      );
+    }
+    return state;
+  }
+
   if (action is PeerUdpSeenAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -365,10 +362,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: newConnectionState,
         transport: existing.transport,
         rssi: existing.rssi,
-        protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
         bleCentralDeviceId: existing.bleCentralDeviceId,
         blePeripheralDeviceId: existing.blePeripheralDeviceId,
@@ -440,20 +437,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
 
   // ===== Association Actions =====
 
-  if (action is AssociateBleDeviceAction) {
-    final pubkeyHex = _pubkeyToHex(action.publicKey);
-    final existing = state.peers[pubkeyHex];
-    if (existing != null) {
-      final updated = action.role == BleRole.central
-          ? existing.copyWith(bleCentralDeviceId: action.deviceId)
-          : existing.copyWith(blePeripheralDeviceId: action.deviceId);
-      return state.copyWith(
-        peers: Map.from(state.peers)..[pubkeyHex] = updated,
-      );
-    }
-    return state;
-  }
-
   if (action is AssociateUdpAddressAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -472,10 +455,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: existing.connectionState,
         transport: existing.transport,
         rssi: existing.rssi,
-        protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
         bleCentralDeviceId: existing.bleCentralDeviceId,
         blePeripheralDeviceId: existing.blePeripheralDeviceId,
@@ -568,10 +551,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: PeerConnectionState.connected,
         transport: PeerTransport.bleDirect, // Reset to BLE
         rssi: existing.rssi,
-        protocolVersion: existing.protocolVersion,
         lastSeen: existing.lastSeen,
         bleCentralDeviceId: existing.bleCentralDeviceId,
         blePeripheralDeviceId: existing.blePeripheralDeviceId,

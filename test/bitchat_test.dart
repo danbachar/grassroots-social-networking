@@ -250,7 +250,8 @@ void main() {
 
     test('single frame for small payloads reassembles immediately', () {
       const messageId = '00000000-0000-4000-8000-000000000003';
-      final payload = Uint8List.fromList(List.generate(200, (i) => i % 256));
+      final payload = Uint8List.fromList(List.generate(
+          FragmentHandler.fragmentThreshold, (i) => i % 256));
 
       final frames = handler.framesFor(
         payload: payload,

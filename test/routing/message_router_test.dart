@@ -565,7 +565,6 @@ void main() {
         store.dispatch(PeerAnnounceReceivedAction(
           publicKey: otherPubkey,
           nickname: 'Alice',
-          protocolVersion: 1,
           rssi: -44,
           bleCentralDeviceId: 'central:peer-1',
         ));
@@ -764,11 +763,9 @@ void main() {
         expect(relayCount, equals(1));
       });
 
-      test('flushDtnFor re-floods cached packets when recipient reappears',
+      test('custody is kept per recipient and ends on removeCustody',
           () async {
-        final relayed = <GrassrootsPacket>[];
-        router.onRelay = (packet, {String? excludeBlePeerId}) =>
-            relayed.add(packet);
+        router.onRelay = (packet, {String? excludeBlePeerId}) {};
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 7));
         final p = GrassrootsPacket(
@@ -778,16 +775,16 @@ void main() {
           payload: Uint8List.fromList([3]),
         );
 
-        // Recipient is not a reachable peer -> first sighting relays once AND
-        // the sealed packet is DTN-cached.
+        // Recipient is not a reachable peer -> first sighting relays AND the
+        // sealed packet enters custody, retrievable per recipient.
         await router.processPacket(p,
             transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
-        expect(relayed, hasLength(1));
+        expect(router.custodyFor(thirdParty).map((c) => c.packetId),
+            contains(p.packetId));
 
-        // Recipient reappears: cached packet is re-flooded.
-        router.flushDtnFor(thirdParty);
-        expect(relayed, hasLength(2));
-        expect(relayed.last.packetId, equals(p.packetId));
+        // The end-to-end ACK ends custody.
+        router.removeCustody([p.packetId]);
+        expect(router.custodyFor(thirdParty), isEmpty);
       });
     });
 

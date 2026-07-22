@@ -1,37 +1,6 @@
 import 'settings_state.dart';
 import 'settings_actions.dart';
 
-List<RendezvousServerSettings> _dedupeServers(
-  Iterable<RendezvousServerSettings> servers,
-) {
-  final deduped = <RendezvousServerSettings>[];
-  final seen = <String>{};
-
-  for (final server in servers) {
-    final key = server.configKey;
-    if (server.address.trim().isEmpty || server.pubkeyHex.trim().isEmpty) {
-      continue;
-    }
-    if (seen.add(key)) {
-      deduped.add(server);
-    }
-  }
-
-  return deduped;
-}
-
-SettingsState _copyWithServers(
-  SettingsState state,
-  List<RendezvousServerSettings> servers,
-) {
-  final primary = servers.isNotEmpty ? servers.first : null;
-  return state.copyWith(
-    rendezvousServers: servers,
-    anchorAddress: primary?.address,
-    anchorPubkeyHex: primary?.pubkeyHex,
-  );
-}
-
 /// Reducer for settings state
 SettingsState settingsReducer(SettingsState state, SettingsAction action) {
   if (action is SetBluetoothEnabledAction) {
@@ -50,43 +19,6 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     );
   }
 
-  if (action is SetAnchorServerAction) {
-    final hasValue = (action.anchorAddress?.isNotEmpty ?? false) &&
-        (action.anchorPubkeyHex?.isNotEmpty ?? false);
-    final servers = hasValue
-        ? [
-            RendezvousServerSettings(
-              address: action.anchorAddress!,
-              pubkeyHex: action.anchorPubkeyHex!,
-            ),
-          ]
-        : const <RendezvousServerSettings>[];
-    return _copyWithServers(state, servers);
-  }
-
-  if (action is SetRendezvousServersAction) {
-    return _copyWithServers(state, _dedupeServers(action.servers));
-  }
-
-  if (action is AddRendezvousServerAction) {
-    return _copyWithServers(
-      state,
-      _dedupeServers([
-        ...state.configuredRendezvousServers,
-        action.server,
-      ]),
-    );
-  }
-
-  if (action is RemoveRendezvousServerAction) {
-    return _copyWithServers(
-      state,
-      state.configuredRendezvousServers
-          .where((server) => server.configKey != action.server.configKey)
-          .toList(growable: false),
-    );
-  }
-
   if (action is HydrateSettingsAction) {
     return action.settings;
   }
@@ -96,7 +28,25 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
   }
 
   if (action is SetColdCallTrustLevelAction) {
+    // Turning cold-call closed also withdraws the introduce-strangers
+    // opt-in, since introducing is a strictly more-open stance (the
+    // effective willingness is AND-gated, but keeping the stored flag in
+    // sync avoids a surprise re-enable when cold-call reopens).
+    if (action.level == ColdCallTrustLevel.closed) {
+      return state.copyWith(
+        coldCallTrustLevel: action.level,
+        facilitateInvites: false,
+      );
+    }
     return state.copyWith(coldCallTrustLevel: action.level);
+  }
+
+  if (action is SetFacilitateInvitesAction) {
+    return state.copyWith(facilitateInvites: action.enabled);
+  }
+
+  if (action is SetShowLinkDiagnosticsAction) {
+    return state.copyWith(showLinkDiagnostics: action.enabled);
   }
 
   if (action is SetTraceLoggingConsentAction) {
@@ -108,15 +58,12 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     );
   }
 
-  if (action is SetTraceServerAction) {
-    return state.copyWith(
-      traceServerUrl: action.url,
-      traceServerToken: action.token,
-    );
+  if (action is SetNeighborAllowlistAction) {
+    return state.copyWith(neighborAllowlist: action.allowlist);
   }
 
-  if (action is SetLastTraceUploadDateAction) {
-    return state.copyWith(lastTraceUploadDate: action.date);
+  if (action is SetWorkloadConfigAction) {
+    return state.copyWith(workloadConfig: action.config);
   }
 
   return state;

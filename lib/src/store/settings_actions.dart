@@ -1,3 +1,4 @@
+import '../testbed/testbed_config.dart';
 import 'settings_state.dart';
 
 /// Base class for settings-related actions
@@ -30,35 +31,6 @@ class UpdateTransportSettingsAction extends SettingsAction {
   });
 }
 
-/// Configure the rendezvous server address and public key.
-///
-/// The server has its own independent keypair — both the address and
-/// the public key must be provided.
-class SetAnchorServerAction extends SettingsAction {
-  final String? anchorAddress;
-  final String? anchorPubkeyHex;
-
-  SetAnchorServerAction({this.anchorAddress, this.anchorPubkeyHex});
-}
-
-class SetRendezvousServersAction extends SettingsAction {
-  final List<RendezvousServerSettings> servers;
-
-  SetRendezvousServersAction(this.servers);
-}
-
-class AddRendezvousServerAction extends SettingsAction {
-  final RendezvousServerSettings server;
-
-  AddRendezvousServerAction(this.server);
-}
-
-class RemoveRendezvousServerAction extends SettingsAction {
-  final RendezvousServerSettings server;
-
-  RemoveRendezvousServerAction(this.server);
-}
-
 /// Hydrate settings from persistence
 class HydrateSettingsAction extends SettingsAction {
   final SettingsState settings;
@@ -73,11 +45,26 @@ class SetBleRoleModeAction extends SettingsAction {
   SetBleRoleModeAction(this.mode);
 }
 
+/// Set whether this device volunteers to introduce strangers redeeming an
+/// invite issued by one of our friends.
+class SetFacilitateInvitesAction extends SettingsAction {
+  final bool enabled;
+
+  SetFacilitateInvitesAction(this.enabled);
+}
+
 /// Set whether nearby unknown peers may complete BLE first contact.
 class SetColdCallTrustLevelAction extends SettingsAction {
   final ColdCallTrustLevel level;
 
   SetColdCallTrustLevelAction(this.level);
+}
+
+/// Debug: toggle the BLE link (ACL) count overlay in the UI.
+class SetShowLinkDiagnosticsAction extends SettingsAction {
+  final bool enabled;
+
+  SetShowLinkDiagnosticsAction(this.enabled);
 }
 
 /// Opt in/out of trace logging + upload. [consentTimestamp] is computed at the
@@ -89,19 +76,19 @@ class SetTraceLoggingConsentAction extends SettingsAction {
   SetTraceLoggingConsentAction(this.consent, {this.consentTimestamp});
 }
 
-/// Configure the trace-upload server URL and bearer token (either may be null
-/// to clear).
-class SetTraceServerAction extends SettingsAction {
-  final String? url;
-  final String? token;
+/// DEBUG/TESTBED ONLY. Install (or clear, with null) the software-defined BLE
+/// topology allowlist.
+class SetNeighborAllowlistAction extends SettingsAction {
+  final NeighborAllowlist? allowlist;
 
-  SetTraceServerAction({this.url, this.token});
+  SetNeighborAllowlistAction(this.allowlist);
 }
 
-/// Record the local calendar date (yyyy-MM-dd) of the last successful upload,
-/// so the daily prompt fires at most once per day.
-class SetLastTraceUploadDateAction extends SettingsAction {
-  final String date;
+/// DEBUG/TESTBED ONLY. Install (or clear, with null) the deterministic
+/// offered-load workload config. Does NOT start the driver.
+class SetWorkloadConfigAction extends SettingsAction {
+  final WorkloadConfig? config;
 
-  SetLastTraceUploadDateAction(this.date);
+  SetWorkloadConfigAction(this.config);
 }
+

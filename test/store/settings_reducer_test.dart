@@ -168,82 +168,11 @@ void main() {
       });
     });
 
-    group('rendezvous server actions', () {
-      const serverA = RendezvousServerSettings(
-        address: '[2001:db8::10]:9516',
-        pubkeyHex:
-            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      );
-      const serverB = RendezvousServerSettings(
-        address: '198.51.100.20:9514',
-        pubkeyHex:
-            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-      );
-
-      test('SetRendezvousServersAction stores multiple configured servers', () {
-        const state = SettingsState.initial;
-        final result = settingsReducer(
-          state,
-          SetRendezvousServersAction(const [serverA, serverB]),
-        );
-
-        expect(result.configuredRendezvousServers,
-            equals(const [serverA, serverB]));
-        expect(result.anchorAddress, equals(serverA.address));
-        expect(result.anchorPubkeyHex, equals(serverA.pubkeyHex));
-      });
-
-      test('AddRendezvousServerAction deduplicates matching server', () {
-        final state = SettingsState(
-          rendezvousServers: const [serverA],
-          anchorAddress: serverA.address,
-          anchorPubkeyHex: serverA.pubkeyHex,
-        );
-
-        final result = settingsReducer(
-          state,
-          AddRendezvousServerAction(serverA),
-        );
-
-        expect(result.configuredRendezvousServers, equals(const [serverA]));
-      });
-
-      test('RemoveRendezvousServerAction removes only matching server', () {
-        final state = SettingsState(
-          rendezvousServers: const [serverA, serverB],
-          anchorAddress: serverA.address,
-          anchorPubkeyHex: serverA.pubkeyHex,
-        );
-
-        final result = settingsReducer(
-          state,
-          RemoveRendezvousServerAction(serverA),
-        );
-
-        expect(result.configuredRendezvousServers, equals(const [serverB]));
-        expect(result.anchorAddress, equals(serverB.address));
-        expect(result.anchorPubkeyHex, equals(serverB.pubkeyHex));
-      });
-
-      test('SetAnchorServerAction still hydrates legacy single server', () {
-        const state = SettingsState.initial;
-        final result = settingsReducer(
-          state,
-          SetAnchorServerAction(
-            anchorAddress: serverA.address,
-            anchorPubkeyHex: serverA.pubkeyHex,
-          ),
-        );
-
-        expect(result.configuredRendezvousServers, equals(const [serverA]));
-      });
-    });
-
     group('SetColdCallTrustLevelAction', () {
-      test('defaults to closed until set', () {
+      test('defaults to open until set (testbed default)', () {
         expect(
           SettingsState.initial.coldCallTrustLevel,
-          ColdCallTrustLevel.closed,
+          ColdCallTrustLevel.open,
         );
       });
 
@@ -257,6 +186,53 @@ void main() {
         expect(result.coldCallTrustLevel, ColdCallTrustLevel.open);
         expect(result.bluetoothEnabled, state.bluetoothEnabled);
         expect(result.udpEnabled, state.udpEnabled);
+      });
+
+      test('closing cold-call also withdraws the introduce opt-in', () {
+        const state = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: true,
+        );
+        final result = settingsReducer(
+          state,
+          SetColdCallTrustLevelAction(ColdCallTrustLevel.closed),
+        );
+
+        expect(result.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(result.facilitateInvites, isFalse);
+      });
+    });
+
+    group('SetFacilitateInvitesAction', () {
+      test('sets the stored flag', () {
+        const state = SettingsState.initial;
+        final result =
+            settingsReducer(state, SetFacilitateInvitesAction(true));
+        expect(result.facilitateInvites, isTrue);
+      });
+
+      test('effective willingness is AND-gated by an open cold-call posture',
+          () {
+        // Flag on but cold-call closed → not willing.
+        const closed = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.closed,
+          facilitateInvites: true,
+        );
+        expect(closed.willingToFacilitateInvites, isFalse);
+
+        // Flag on and cold-call open → willing.
+        const open = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: true,
+        );
+        expect(open.willingToFacilitateInvites, isTrue);
+
+        // Flag off → not willing regardless.
+        const off = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: false,
+        );
+        expect(off.willingToFacilitateInvites, isFalse);
       });
     });
 

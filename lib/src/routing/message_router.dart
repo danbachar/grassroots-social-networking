@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
 import '../mesh/dtn_store.dart';
+import '../mesh/sync_codec.dart';
 import '../trace/trace_logger.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
@@ -109,6 +110,13 @@ class MessageRouter {
   /// identification that previously required ANNOUNCE as the first message).
   void Function(Uint8List senderPubkey, String udpPeerId)? onUdpPeerIdentified;
 
+  /// Called when a verified BLE ANNOUNCE identifies the peer behind a path —
+  /// fired after the announce has been applied to Redux. The BLE transport
+  /// uses it to act on the pair's reverse leg at the authoritative moment
+  /// (cancel a doomed dial on iOS, or open the reverse central leg).
+  void Function(String pathId, Uint8List pubkey)?
+      onBlePeerIdentified;
+
   /// Called when a Noise handshake packet arrives. The coordinator owns
   /// session state and sends any handshake response over the same medium.
   Future<void> Function(
@@ -127,6 +135,11 @@ class MessageRouter {
   /// neighbors except [excludeBlePeerId] (the inbound path). The coordinator
   /// wires this to the BLE transport's broadcast.
   void Function(GrassrootsPacket packet, {String? excludeBlePeerId})? onRelay;
+
+  /// Sends a sync-on-connect packet (offer/request/conveyed custody copy) to
+  /// one specific BLE neighbor — directed, never flooded. The coordinator
+  /// wires this to the BLE transport's per-device send.
+  void Function(GrassrootsPacket packet, String bleDeviceId)? onSyncSend;
 
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
@@ -195,6 +208,21 @@ class MessageRouter {
       return;
     }
 
+    // Sync-on-connect (anti-entropy): neighbor-local custody reconciliation.
+    // BLE-only — the UDP transport is direct point-to-point and carries no
+    // DTN custody. Never relayed (TTL 1), never deduped (each sync packet is
+    // acted on exactly where it lands).
+    if (packet.type == PacketType.syncOffer ||
+        packet.type == PacketType.syncRequest) {
+      if (transport != PeerTransport.bleDirect || bleDeviceId == null) return;
+      if (packet.type == PacketType.syncOffer) {
+        _handleSyncOffer(packet, bleDeviceId);
+      } else {
+        _handleSyncRequest(packet, bleDeviceId);
+      }
+      return;
+    }
+
     final forUs = _isForUs(packet);
 
     // The BloomFilter is the "seen packetId" set: it both prevents relay loops
@@ -257,10 +285,19 @@ class MessageRouter {
       store.dispatch(PeerUdpSeenAction(senderPubkey));
     }
     if (transport == PeerTransport.bleDirect &&
-        rssi != null &&
         _peersState.getPeerByPubkey(senderPubkey) != null) {
-      store.dispatch(
-          PeerRssiUpdatedAction(publicKey: senderPubkey, rssi: rssi));
+      // ANY authenticated packet that arrived DIRECT (undecremented TTL —
+      // relayed traffic must not refresh a departed neighbour's dead
+      // attachment) proves the BLE link is alive. Without this, a marginal
+      // link whose ANNOUNCEs get lost is torn down by the 20s stale sweep
+      // every cycle even while messages/ACKs are flowing over it.
+      if (GrassrootsPacket.defaultTtl - packet.ttl <= 0) {
+        store.dispatch(PeerBleSeenAction(senderPubkey));
+      }
+      if (rssi != null) {
+        store.dispatch(
+            PeerRssiUpdatedAction(publicKey: senderPubkey, rssi: rssi));
+      }
     }
 
     // The decrypted plaintext is a SecureFrame: it carries the content type and
@@ -390,7 +427,7 @@ class MessageRouter {
     store.dispatch(PeerAnnounceReceivedAction(
       publicKey: pubkey,
       nickname: data.nickname,
-      protocolVersion: data.protocolVersion,
+      willingToFacilitate: data.willingToFacilitate,
       rssi: effectiveRssi,
       transport: transport,
       bleCentralDeviceId: centralId,
@@ -400,12 +437,10 @@ class MessageRouter {
       udpAddressCandidates: udpAddressCandidates,
     ));
 
-    if (resolvedBleDeviceId != null && resolvedBleRole != null) {
-      store.dispatch(AssociateBleDeviceAction(
-        publicKey: pubkey,
-        deviceId: resolvedBleDeviceId,
-        role: resolvedBleRole,
-      ));
+    // The announce action above already recorded the role attachment; now
+    // that Redux reflects it, let the BLE transport act on the reverse leg.
+    if (resolvedBleDeviceId != null) {
+      onBlePeerIdentified?.call(resolvedBleDeviceId, pubkey);
     }
 
     debugPrint(
@@ -603,14 +638,95 @@ class MessageRouter {
     return _seenPackets.mightContain(packetId);
   }
 
-  /// Re-flood any store-carry-forward packets cached for [recipientPubkey] —
-  /// called by the coordinator when that recipient reappears (their ANNOUNCE /
-  /// peer-connected event). The recipient dedups on their side, so re-delivery
-  /// is safe.
-  void flushDtnFor(Uint8List recipientPubkey) {
-    final cached = _dtnStore.takeFor(_pubkeyToHex(recipientPubkey));
-    for (final packet in cached) {
-      onRelay?.call(packet);
+  /// Enter a self-originated sealed packet into custody: the sender is the
+  /// message's first custodian. Custody is offered in sync-on-connect,
+  /// conveyed to whoever lacks it, and ends only on ACK ([removeCustody])
+  /// or age expiry.
+  void storeCustody(Uint8List recipientPubkey, GrassrootsPacket sealedPacket) {
+    _dtnStore.store(_pubkeyToHex(recipientPubkey), sealedPacket);
+    // Our own sealed packets count as seen: a copy conveyed back to us by a
+    // relay must not be re-relayed as a fresh sighting.
+    _seenPackets.add(sealedPacket.packetId);
+  }
+
+  /// End custody of [packetIds] — the recipient ACKed the message.
+  void removeCustody(Iterable<String> packetIds) {
+    for (final id in packetIds) {
+      _dtnStore.removeById(id);
+    }
+  }
+
+  /// All custody packets held for [recipientPubkey] (own + relayed), for
+  /// direct conveyance over a freshly established session with them.
+  List<GrassrootsPacket> custodyFor(Uint8List recipientPubkey) =>
+      _dtnStore.packetsFor(_pubkeyToHex(recipientPubkey));
+
+  // ===== Sync-on-connect (DTN anti-entropy) =====
+  //
+  // Epidemic custody replication: on meeting a new neighbor, each side offers
+  // the packetIds its DTN store carries; the other requests the ones it has
+  // not seen; the offerer conveys the stored sealed packets over that link.
+  // The conveyed packets enter the neighbor's normal processPacket path
+  // (dedup → deliver / relay / DTN-store), so carried messages spread through
+  // mobile relays instead of waiting for the recipient itself to appear.
+  // Reconciliation operates purely on cleartext packetIds — content stays
+  // sealed end-to-end and no custody is ever *transferred*, only replicated.
+
+  /// Build the sync offer packets advertising every packetId currently in the
+  /// DTN store (chunked to fit single BLE writes). Empty when carrying
+  /// nothing — the common case, costing zero packets.
+  List<GrassrootsPacket> buildSyncOffers() {
+    final ids = _dtnStore.carriedPacketIds();
+    if (ids.isEmpty) return const [];
+    return buildSyncPackets(PacketType.syncOffer, ids);
+  }
+
+  /// A neighbor offered the packetIds it carries: request the ones our
+  /// seen-set lacks. A bloom false positive skips a packet we actually lack —
+  /// healed by the next contact or the recipient-triggered flush.
+  void _handleSyncOffer(GrassrootsPacket packet, String bleDeviceId) {
+    final List<String> offered;
+    try {
+      offered = decodeSyncIds(packet.payload);
+    } on FormatException catch (e) {
+      debugPrint('[sync] Malformed offer from $bleDeviceId: $e');
+      return;
+    }
+    final wanted =
+        offered.where((id) => !_seenPackets.mightContain(id)).toList();
+    if (wanted.isEmpty) return;
+    debugPrint(
+        '[sync] Requesting ${wanted.length}/${offered.length} offered '
+        'packet(s) from $bleDeviceId');
+    for (final request in buildSyncPackets(PacketType.syncRequest, wanted)) {
+      onSyncSend?.call(request, bleDeviceId);
+    }
+  }
+
+  /// A neighbor requested packets from our offer: convey each one we still
+  /// carry, directed over that link. Conveyance counts against the
+  /// requester's per-neighbor relay budget — sync must not be a way around
+  /// the flooding cap. Ids expired/evicted since the offer are skipped.
+  void _handleSyncRequest(GrassrootsPacket packet, String bleDeviceId) {
+    final List<String> requested;
+    try {
+      requested = decodeSyncIds(packet.payload);
+    } on FormatException catch (e) {
+      debugPrint('[sync] Malformed request from $bleDeviceId: $e');
+      return;
+    }
+    var conveyed = 0;
+    for (final id in requested) {
+      final stored = _dtnStore.packetById(id);
+      if (stored == null) continue; // expired/evicted since the offer
+      if (!_allowRelayFrom(bleDeviceId)) break; // budget exhausted this window
+      onSyncSend?.call(stored, bleDeviceId);
+      conveyed++;
+    }
+    if (conveyed > 0) {
+      debugPrint(
+          '[sync] Conveyed $conveyed/${requested.length} requested '
+          'packet(s) to $bleDeviceId');
     }
   }
 

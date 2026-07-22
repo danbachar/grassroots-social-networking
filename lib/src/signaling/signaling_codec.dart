@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-/// Signaling message types for the rendezvous reconnection protocol.
+/// Signaling message types for the friends-based reconnection protocol.
 ///
 /// These ride inside a [SecureFrame] with [ContentType.signaling], sealed in a
 /// [PacketType.secure] packet. Authentication is end-to-end: the frame is
@@ -8,8 +8,9 @@ import 'dart:typed_data';
 /// trial-decrypt — the sender-anonymous envelope carries no packet signature.
 ///
 /// Wire byte values are stable; gaps reflect deprecated message types
-/// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the rendezvous
-/// flow switched to RECONNECT/AVAILABLE matching).
+/// (ADDR_QUERY/ADDR_RESPONSE/PUNCH_REQUEST were removed when the flow
+/// switched to RECONNECT mediation; AVAILABLE/RV_LIST died with the
+/// rendezvous servers — friend mediators need neither).
 enum SignalingType {
   /// "Start sending UDP to ip:port Y for hole-punch" — facilitator → agent
   /// (also used for direct friend-to-friend punch coordination)
@@ -22,36 +23,27 @@ enum SignalingType {
   /// (STUN-equivalent reflection, triggered by ANNOUNCE)
   addrReflect(0x07),
 
-  /// "I want to reconnect to peer X" — agent → rendezvous facilitator
+  /// "I want to reconnect to peer X" — agent → friend mediator
   ///
-  /// Cold-call message sent when the agent's connectivity changed and it
-  /// wants the facilitator to coordinate a hole-punch with peer X. The
-  /// facilitator observes the sender's source IP/port and waits for a
-  /// matching AVAILABLE from peer X.
+  /// Sent when the agent's connectivity changed and it wants the mediator to
+  /// coordinate a hole-punch with peer X. The mediator observes the sender's
+  /// source IP/port, looks X up in its own friend address table, and sends
+  /// both sides a PUNCH_INITIATE.
   reconnect(0x08),
-
-  /// "I'm available to peer X" — agent → rendezvous facilitator
-  ///
-  /// Cold-call message sent when the agent detects peer X went silent and
-  /// wants to remain reachable for X's reconnect attempts. The facilitator
-  /// observes the sender's source IP/port and matches against any pending
-  /// RECONNECT from peer X.
-  available(0x09),
-
-  /// "Here is my list of rendezvous server pubkeys" — agent → friend
-  ///
-  /// Sent after friendship establishment, on new live connection to a friend,
-  /// and whenever the agent's RV settings change. The recipient stores the
-  /// list per-friend so that on detecting the friend went silent, it fans
-  /// out AVAILABLE to those exact servers (per the spec: B contacts A's
-  /// known rendezvous agents).
-  rvList(0x0a),
 
   /// "Here is my current accepted friend set" — agent → friend.
   ///
   /// Used to maintain the friends-of-friends map that drives friend-mediated
   /// rendezvous.
-  friendList(0x0b);
+  friendList(0x0b),
+
+  /// "I am redeeming this invite" — invitee → introducer, and
+  /// invitee → inviter. Carries the full signed invite blob. This is the one
+  /// signaling message a non-friend may send: it is self-authorizing (the
+  /// embedded inviter signature is verified by the receiver), so it bypasses
+  /// the friend-only trust gate. The introducer coordinates the punch; the
+  /// inviter accepts first contact and burns the nonce.
+  introduce(0x0c);
 
   final int value;
   const SignalingType(this.value);
@@ -137,9 +129,9 @@ class AddrReflectMessage extends SignalingMessage {
   String toString() => 'AddrReflect($ip:$port)';
 }
 
-/// Agent asks a rendezvous facilitator to coordinate reconnection with a peer.
+/// Agent asks a friend mediator to coordinate reconnection with a peer.
 ///
-/// The agent's source address is observed by the facilitator from the
+/// The agent's source address is observed by the mediator from the
 /// containing UDP packet — no address is carried in the payload.
 class ReconnectMessage extends SignalingMessage {
   @override
@@ -161,60 +153,6 @@ class ReconnectMessage extends SignalingMessage {
       'Reconnect(initiator: ${initiatorPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}, peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
 }
 
-/// Agent declares availability to a peer at a rendezvous facilitator.
-///
-/// The agent's source address is observed by the facilitator from the
-/// containing UDP packet — no address is carried in the payload.
-class AvailableMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.available;
-
-  /// The public key of the peer we want to be reachable from (32 bytes).
-  final Uint8List peerPubkey;
-
-  AvailableMessage({required this.peerPubkey});
-
-  @override
-  String toString() =>
-      'Available(peer: ${peerPubkey.sublist(0, 4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}...)';
-}
-
-/// One rendezvous server's identity: pubkey + reachable address.
-class RvServerEntry {
-  /// 32-byte Ed25519 public key of the rendezvous server.
-  final Uint8List pubkey;
-
-  /// "ip:port" address where the rendezvous server can be reached.
-  final String address;
-
-  const RvServerEntry({required this.pubkey, required this.address});
-
-  String get pubkeyHex =>
-      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-
-  @override
-  String toString() =>
-      'RvServerEntry($address, ${pubkeyHex.substring(0, 8)}...)';
-}
-
-/// Agent informs a friend about its configured rendezvous servers.
-///
-/// The friend stores this list keyed by the sender's pubkey so that, on
-/// detecting the sender went silent, it can send AVAILABLE to these exact
-/// servers — matching the sender's RECONNECT (which goes to the same set).
-class RvListMessage extends SignalingMessage {
-  @override
-  SignalingType get type => SignalingType.rvList;
-
-  /// Rendezvous server entries (pubkey + address pairs).
-  final List<RvServerEntry> entries;
-
-  RvListMessage({required this.entries});
-
-  @override
-  String toString() => 'RvList(count: ${entries.length})';
-}
-
 /// Agent informs a friend about its current accepted friends.
 class FriendListMessage extends SignalingMessage {
   @override
@@ -229,6 +167,22 @@ class FriendListMessage extends SignalingMessage {
   String toString() => 'FriendList(count: ${friendPubkeys.length})';
 }
 
+/// Invitee presents a signed invite to redeem it (to an introducer, then to
+/// the inviter). The payload is the full `Invite.encode()` blob (body ||
+/// signature); the receiver decodes and verifies it.
+class IntroduceMessage extends SignalingMessage {
+  @override
+  SignalingType get type => SignalingType.introduce;
+
+  /// The signed invite blob (`Invite.encode()`).
+  final Uint8List inviteBlob;
+
+  IntroduceMessage({required this.inviteBlob});
+
+  @override
+  String toString() => 'Introduce(${inviteBlob.length}B invite)';
+}
+
 // ===== Codec =====
 
 /// Binary encoder/decoder for signaling messages.
@@ -240,10 +194,8 @@ class FriendListMessage extends SignalingMessage {
 /// PUNCH_READY    : type(1) + peerPubkey(32)
 /// ADDR_REFLECT   : type(1) + ipLen(2) + ipBytes + port(2)
 /// RECONNECT      : type(1) + initiatorPubkey(32) + peerPubkey(32)
-/// AVAILABLE      : type(1) + peerPubkey(32)
-/// RV_LIST        : type(1) + count(2) +
-///                  repeated(pubkey(32) + addrLen(2) + addrBytes)
 /// FRIEND_LIST    : type(1) + count(2) + repeated(pubkey(32))
+/// INTRODUCE      : type(1) + inviteLen(2) + inviteBlob
 /// ```
 class SignalingCodec {
   const SignalingCodec();
@@ -256,9 +208,8 @@ class SignalingCodec {
       PunchReadyMessage() => _encodePunchReady(msg),
       AddrReflectMessage() => _encodeAddrReflect(msg),
       ReconnectMessage() => _encodeReconnect(msg),
-      AvailableMessage() => _encodeAvailable(msg),
-      RvListMessage() => _encodeRvList(msg),
       FriendListMessage() => _encodeFriendList(msg),
+      IntroduceMessage() => _encodeIntroduce(msg),
     };
   }
 
@@ -298,26 +249,6 @@ class SignalingCodec {
     return buffer.toBytes();
   }
 
-  Uint8List _encodeAvailable(AvailableMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.available.value);
-    buffer.add(msg.peerPubkey);
-    return buffer.toBytes();
-  }
-
-  Uint8List _encodeRvList(RvListMessage msg) {
-    final buffer = BytesBuilder();
-    buffer.addByte(SignalingType.rvList.value);
-    _writeUint16(buffer, msg.entries.length);
-    for (final entry in msg.entries) {
-      buffer.add(entry.pubkey);
-      final addrBytes = Uint8List.fromList(entry.address.codeUnits);
-      _writeUint16(buffer, addrBytes.length);
-      buffer.add(addrBytes);
-    }
-    return buffer.toBytes();
-  }
-
   Uint8List _encodeFriendList(FriendListMessage msg) {
     final buffer = BytesBuilder();
     buffer.addByte(SignalingType.friendList.value);
@@ -328,6 +259,14 @@ class SignalingCodec {
       }
       buffer.add(pubkey);
     }
+    return buffer.toBytes();
+  }
+
+  Uint8List _encodeIntroduce(IntroduceMessage msg) {
+    final buffer = BytesBuilder();
+    buffer.addByte(SignalingType.introduce.value);
+    _writeUint16(buffer, msg.inviteBlob.length);
+    buffer.add(msg.inviteBlob);
     return buffer.toBytes();
   }
 
@@ -349,9 +288,8 @@ class SignalingCodec {
       SignalingType.punchReady => _decodePunchReady(payload),
       SignalingType.addrReflect => _decodeAddrReflect(payload),
       SignalingType.reconnect => _decodeReconnect(payload),
-      SignalingType.available => _decodeAvailable(payload),
-      SignalingType.rvList => _decodeRvList(payload),
       SignalingType.friendList => _decodeFriendList(payload),
+      SignalingType.introduce => _decodeIntroduce(payload),
     };
   }
 
@@ -399,42 +337,6 @@ class SignalingCodec {
     );
   }
 
-  AvailableMessage _decodeAvailable(Uint8List data) {
-    if (data.length < 32) {
-      throw const FormatException('Available payload too short');
-    }
-    return AvailableMessage(
-      peerPubkey: Uint8List.fromList(data.sublist(0, 32)),
-    );
-  }
-
-  RvListMessage _decodeRvList(Uint8List data) {
-    if (data.length < 2) {
-      throw const FormatException('RvList payload too short');
-    }
-    final count = _readUint16(data, 0);
-    var offset = 2;
-    final entries = <RvServerEntry>[];
-    for (var i = 0; i < count; i++) {
-      if (offset + 34 > data.length) {
-        throw const FormatException('RvList entry truncated');
-      }
-      final pubkey = Uint8List.fromList(data.sublist(offset, offset + 32));
-      offset += 32;
-      final addrLen = _readUint16(data, offset);
-      offset += 2;
-      if (offset + addrLen > data.length) {
-        throw const FormatException('RvList address truncated');
-      }
-      final address = String.fromCharCodes(
-        data.sublist(offset, offset + addrLen),
-      );
-      offset += addrLen;
-      entries.add(RvServerEntry(pubkey: pubkey, address: address));
-    }
-    return RvListMessage(entries: entries);
-  }
-
   FriendListMessage _decodeFriendList(Uint8List data) {
     if (data.length < 2) {
       throw const FormatException('FriendList payload too short');
@@ -453,6 +355,19 @@ class SignalingCodec {
       throw const FormatException('FriendList payload has trailing bytes');
     }
     return FriendListMessage(friendPubkeys: friendPubkeys);
+  }
+
+  IntroduceMessage _decodeIntroduce(Uint8List data) {
+    if (data.length < 2) {
+      throw const FormatException('Introduce payload too short');
+    }
+    final len = _readUint16(data, 0);
+    if (2 + len > data.length) {
+      throw const FormatException('Introduce invite truncated');
+    }
+    return IntroduceMessage(
+      inviteBlob: Uint8List.fromList(data.sublist(2, 2 + len)),
+    );
   }
 
   // ===== Helpers =====

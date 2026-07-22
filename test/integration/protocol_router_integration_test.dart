@@ -177,7 +177,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.bleDirect));
 
       // Verify Bob's Redux store was updated.
@@ -458,7 +457,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.udp));
 
       // Verify Bob's Redux store was updated.

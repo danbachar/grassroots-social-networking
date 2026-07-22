@@ -33,6 +33,10 @@ dependencies:
   # Collection utilities (for bloom filter, queues)
   collection: ^1.18.0
   
+  # File attachments (chat) + sharing debug logs / received files out
+  file_picker: ^8.1.2
+  share_plus: ^10.1.2
+
   # Logging
   logger: ^2.0.0
   flutter_secure_storage: ^10.0.0
@@ -69,6 +73,9 @@ dependencies:
   # macOS / Windows / Linux.
   sodium_libs: ^3.4.4+1
 
+# EXPERIMENT (uncommitted, machine-specific): build against the local plugin
+# clone with the grs-ios marker removed. Remove this block to fall back to the
+# git-pinned plugin.
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -82,4 +89,31 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  # No assets needed for transport layer
+
+  # grasslink brand fonts (OFL, self-hosted per the design handoff):
+  # Bricolage Grotesque (display), Hanken Grotesk (text), JetBrains Mono (mono).
+  fonts:
+    - family: Bricolage Grotesque
+      fonts:
+        - asset: assets/fonts/BricolageGrotesque-700.ttf
+          weight: 700
+        - asset: assets/fonts/BricolageGrotesque-800.ttf
+          weight: 800
+    - family: Hanken Grotesk
+      fonts:
+        - asset: assets/fonts/HankenGrotesk-400.ttf
+          weight: 400
+        - asset: assets/fonts/HankenGrotesk-500.ttf
+          weight: 500
+        - asset: assets/fonts/HankenGrotesk-600.ttf
+          weight: 600
+        - asset: assets/fonts/HankenGrotesk-700.ttf
+          weight: 700
+    - family: JetBrains Mono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-400.ttf
+          weight: 400
+        - asset: assets/fonts/JetBrainsMono-500.ttf
+          weight: 500
+        - asset: assets/fonts/JetBrainsMono-600.ttf
+          weight: 600

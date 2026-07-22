@@ -67,14 +67,48 @@ class DtnStore {
     }
   }
 
-  /// Remove and return all (non-expired) cached packets for [recipientHex],
-  /// called when that recipient reappears so the relay can re-flood toward them.
-  List<GrassrootsPacket> takeFor(String recipientHex, {DateTime? now}) {
-    final at = now ?? DateTime.now();
-    _prune(at);
-    final list = _byRecipient.remove(recipientHex);
+  /// All (non-expired) packetIds currently carried, across recipients —
+  /// the custody summary offered to a newly-connected neighbor during
+  /// sync-on-connect. Non-destructive: sync replicates custody, it does not
+  /// transfer it.
+  List<String> carriedPacketIds({DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    return [
+      for (final list in _byRecipient.values)
+        for (final e in list) e.packet.packetId,
+    ];
+  }
+
+  /// Look up a carried packet by [packetId] without removing it — used to
+  /// convey a copy to a neighbor that requested it from our sync offer.
+  /// Returns null if expired/evicted since the offer.
+  GrassrootsPacket? packetById(String packetId, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    for (final list in _byRecipient.values) {
+      for (final e in list) {
+        if (e.packet.packetId == packetId) return e.packet;
+      }
+    }
+    return null;
+  }
+
+  /// All (non-expired) packets held for [recipientHex] — non-destructive.
+  /// Used to convey a reconnecting recipient's messages directly over a
+  /// freshly established session (custody is kept until ACKed or expired).
+  List<GrassrootsPacket> packetsFor(String recipientHex, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    final list = _byRecipient[recipientHex];
     if (list == null || list.isEmpty) return const [];
     return list.map((e) => e.packet).toList(growable: false);
+  }
+
+  /// Drop the packet with [packetId] wherever it is held — called when the
+  /// end-to-end ACK proves delivery, ending our custody of it.
+  void removeById(String packetId) {
+    _byRecipient.removeWhere((_, list) {
+      list.removeWhere((e) => e.packet.packetId == packetId);
+      return list.isEmpty;
+    });
   }
 
   void _prune(DateTime now) {

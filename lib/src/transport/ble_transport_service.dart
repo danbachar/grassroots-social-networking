@@ -20,7 +20,11 @@ const _defaultBleDisplayInfo = TransportDisplayInfo(
 );
 
 /// Grassroots characteristic UUID, fixed across all peers. The containing
-/// service UUID is derived from the advertiser's public key.
+/// GATT service UUID is derived from the advertiser's public key and the
+/// current 15-minute slot (`docs/GLP_Networking_API/sections/ble.tex` §BLE
+/// Discovery) — advertisement and GATT service carry the SAME rotating
+/// derived UUID, deliberately: rotation severs a connected stranger's
+/// continuity of observation each slot.
 const String _grassrootsCharacteristicUuid =
     '0000ff01-0000-1000-8000-00805f9b34fb';
 
@@ -87,27 +91,19 @@ class BleTransportService extends TransportService {
   /// This is a strict cache of plugin facts, not consumer state.
   final Map<String, ble.BlePath> _paths = {};
 
-  /// Derived service UUIDs (lowercase) whose advertisements have carried the
-  /// iOS platform marker ([ble.grassrootsIosLocalName]) this session. Like
-  /// [_paths] this is a cache of transport facts, not consumer state: a
-  /// peer's platform never changes, but the marker is only present while the
-  /// iOS app is foregrounded, so we remember every sighting. Used to scope
-  /// the iOS second-link rules to the *measured* constraint (iOS-central →
-  /// non-iOS second link is broken) without extrapolating it to iOS peers —
-  /// dual-role is mandatory wherever hardware allows it (see CLAUDE.md,
-  /// "Dual-Role BLE Is Mandatory").
-  final Set<String> _iosMarkedServiceUuids = {};
-
-  /// Central pathIds we are tearing down for a wrong-order mixed-pair reform
-  /// (see `_onAdvertisement`). Advertisements arrive far faster than the
-  /// plugin's disconnect round-trip, so without this an ad burst would issue
-  /// duplicate disconnects. Entries clear when the path reaches a terminal
-  /// state in [_onPathChanged].
-  final Set<String> _reformingCentralPathIds = {};
-
   /// True while a `start()` call is in flight. Prevents re-entrant `start()`
   /// from `_onAdapterStateChanged` running concurrently with the original.
   bool _starting = false;
+
+  /// When we last locally tore down a leg to an identity (reform, stale
+  /// sweep), keyed by `pk:<pubkeyHex>` and `uuid:<serviceUuid>`. Resets the
+  /// first-mover fallback clock ([_fallbackElapsed]): `discoveredAt` never
+  /// refreshes, so without this every yield branch would be permanently
+  /// escaped ~[firstMoverFallback] after first sighting, and a reform
+  /// teardown would be followed by an instant wrong-order redial racing the
+  /// iPhone's dial-on-sight. Entries are pruned on write; only the fallback
+  /// window matters.
+  final Map<String, DateTime> _lastLocalTeardownAt = {};
 
   /// Scan-liveness watchdog (see [scanSilenceRestart]). Armed whenever the
   /// continuous scan is started; cancelled on stop/dispose or when the role
@@ -115,6 +111,22 @@ class BleTransportService extends TransportService {
   Timer? _scanWatchdog;
   DateTime _lastAdvertisementAt = DateTime.now();
   static const Duration _scanWatchdogInterval = Duration(seconds: 10);
+
+  /// Debug: periodic OS-level link (ACL) snapshot poll, projected into Redux
+  /// for the link-diagnostics overlay. Runs only while the transport is up;
+  /// each tick is a no-op unless settings.showLinkDiagnostics is on.
+  Timer? _linkSnapshotTimer;
+  static const Duration _linkSnapshotInterval = Duration(seconds: 3);
+
+  /// Full service-UUID candidates currently installed as *hardware* scan
+  /// filters (empty = a plain prefix scan). Populated with the candidate
+  /// UUIDs of peers we hold an inbound peripheral leg from but have no reverse
+  /// (central) leg to yet — see [_reverseLegScanTargets]. A filterless Android
+  /// scan is silently muted under load (advertising + several GATT-server
+  /// connections), which strands such a pair peripheral-only because their
+  /// advertising MAC is never discovered to dial back; a hardware-filtered
+  /// scan for the exact identities we need is not muted the same way.
+  Set<String> _scanTargetUuids = {};
 
   /// Rolls the advertised beacon each 15-minute BLE slot. The advertised
   /// service UUID's suffix rotates ([GrassrootsIdentity.deriveServiceUuidForSlot]),
@@ -305,22 +317,11 @@ class BleTransportService extends TransportService {
       }
 
       if (shouldScan) {
-        try {
-          await _ble.startScan(
-            serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
-            timeout: Duration.zero, // continuous scan
-            // iOS CoreBluetooth deduplicates per-peer advertisements by
-            // default; with allowDuplicates=true it keeps delivering
-            // didDiscover so we see liveness/RSSI updates and so a peer that
-            // joined mid-scan still gets observed. It costs a bit more power,
-            // but also gives us fresh chances to retry a missing reverse leg.
-            allowDuplicates: true,
-          );
+        _scanTargetUuids = _reverseLegScanTargets();
+        if (await _startContinuousScan()) {
           anyStarted = true;
           _lastAdvertisementAt = DateTime.now();
           _armScanWatchdog();
-        } catch (e) {
-          debugPrint('Failed to start scanning: $e');
         }
       } else {
         _scanWatchdog?.cancel();
@@ -329,6 +330,10 @@ class BleTransportService extends TransportService {
           await _ble.stopScan();
         } catch (_) {}
       }
+
+      // Debug link-diagnostics poll: runs for every role mode; each tick is
+      // a no-op unless the settings toggle is on.
+      _armLinkSnapshotPoll();
 
       if (anyStarted) {
         _setState(TransportState.active);
@@ -344,6 +349,40 @@ class BleTransportService extends TransportService {
       _scanWatchdogInterval,
       (_) => unawaited(checkScanLiveness()),
     );
+  }
+
+  void _armLinkSnapshotPoll() {
+    _linkSnapshotTimer?.cancel();
+    _linkSnapshotTimer = Timer.periodic(
+      _linkSnapshotInterval,
+      (_) => unawaited(_pollLinkSnapshot()),
+    );
+  }
+
+  /// Project the plugin's OS-level link snapshot into Redux — only while the
+  /// diagnostics toggle is on (a fresh empty snapshot is dispatched once when
+  /// the toggle turns off, so stale links never linger in the UI).
+  Future<void> _pollLinkSnapshot() async {
+    if (_stopped) return;
+    if (!store.state.settings.showLinkDiagnostics) {
+      if (store.state.transports.bleLinks.isNotEmpty) {
+        store.dispatch(BleLinkSnapshotAction(const []));
+      }
+      return;
+    }
+    try {
+      final links = await _ble.linkSnapshot();
+      store.dispatch(BleLinkSnapshotAction([
+        for (final l in links)
+          BleLinkDiagnostic(
+            address: l.address,
+            clientRole: l.clientRole,
+            serverRole: l.serverRole,
+          ),
+      ]));
+    } catch (e) {
+      debugPrint('[ble] link snapshot failed: $e');
+    }
   }
 
   void _startSlotTimer() {
@@ -402,20 +441,86 @@ class BleTransportService extends TransportService {
     final t = now ?? DateTime.now();
     if (t.difference(_lastAdvertisementAt) < scanSilenceRestart) return;
 
+    // Silence means the scan is dead. If we have pending reverse legs, restart
+    // it hardware-FILTERED for exactly those identities — a filterless restart
+    // just re-enters the same Android muting that stranded us here.
+    _scanTargetUuids = _reverseLegScanTargets();
     debugPrint(
-      '[ble] scan-watchdog: no advertisements for '
-      '${scanSilenceRestart.inSeconds}s — restarting the continuous scan '
-      '(a long-running unfiltered Android scan can be silently muted).',
+      _scanTargetUuids.isEmpty
+          ? '[ble] scan-watchdog: no advertisements for '
+              '${scanSilenceRestart.inSeconds}s — restarting the continuous '
+              'scan (a long-running unfiltered Android scan can be silently '
+              'muted).'
+          : '[ble] scan-watchdog: no advertisements for '
+              '${scanSilenceRestart.inSeconds}s with pending reverse legs — '
+              'restarting a hardware-filtered scan for their identities '
+              '(the unfiltered scan is being silently muted under load).',
     );
     _lastAdvertisementAt = t;
+    await _startContinuousScan();
+  }
+
+  /// Candidate service UUIDs of every peer we hold a live inbound peripheral
+  /// leg from but have no live/in-flight central (reverse) leg to — i.e. the
+  /// pairs stuck single-link that need us to dial back. Feeding these to the
+  /// scanner as hardware filters is what makes Android reliably surface their
+  /// advertising MAC (see [_scanTargetUuids]). Empty in steady state, so the
+  /// scan falls back to a plain prefix scan and normal discovery continues.
+  Set<String> _reverseLegScanTargets() {
+    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return const {};
+    final targets = <String>{};
+    for (final peer in _peersState.peersList) {
+      final peripheralId = peer.blePeripheralDeviceId;
+      if (peripheralId == null || !isDeviceConnected(peripheralId)) continue;
+      final uuid = GrassrootsIdentity.deriveServiceUuidForSlot(
+        peer.publicKey,
+        GrassrootsIdentity.currentBleSlot(),
+      );
+      final pair = _pairViewFor(uuid);
+      if (pair.liveCentralPathId != null || pair.centralInFlight) continue;
+      targets.addAll(GrassrootsIdentity.candidateServiceUuids(peer.publicKey));
+    }
+    return targets;
+  }
+
+  /// (Re)start the continuous scan with the current [_scanTargetUuids] as
+  /// hardware filters (or a plain prefix scan when empty). Returns whether the
+  /// scan started. `allowDuplicates` keeps already-discovered peers surfacing
+  /// so RSSI refreshes and reverse-leg retries keep flowing.
+  Future<bool> _startContinuousScan() async {
     try {
       await _ble.startScan(
         serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
+        serviceUuids: _scanTargetUuids.toList(growable: false),
         timeout: Duration.zero,
         allowDuplicates: true,
       );
+      if (_scanTargetUuids.isNotEmpty) {
+        debugPrint(
+          '[ble] scan: hardware-filtered for ${_scanTargetUuids.length} '
+          'candidate UUID(s) covering stuck reverse-leg peers',
+        );
+      }
+      return true;
     } catch (e) {
-      debugPrint('[ble] scan-watchdog: scan restart failed: $e');
+      debugPrint('[ble] startContinuousScan failed: $e');
+      return false;
+    }
+  }
+
+  /// Recompute the reverse-leg scan targets and, if they changed, restart the
+  /// scan to match. Debounced ([setEquals]) so steady state issues no scan
+  /// restarts. Called whenever a leg attaches/detaches or a reverse leg is
+  /// found stuck.
+  Future<void> _applyScanTargets() async {
+    if (_stopped) return;
+    if (state != TransportState.active) return;
+    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
+    final targets = _reverseLegScanTargets();
+    if (setEquals(targets, _scanTargetUuids)) return;
+    _scanTargetUuids = targets;
+    if (await _startContinuousScan()) {
+      _lastAdvertisementAt = DateTime.now();
     }
   }
 
@@ -445,6 +550,8 @@ class BleTransportService extends TransportService {
     _stopped = true;
     _scanWatchdog?.cancel();
     _scanWatchdog = null;
+    _linkSnapshotTimer?.cancel();
+    _linkSnapshotTimer = null;
     _stopSlotTimer();
     _advertisedSlot = null;
     try {
@@ -525,64 +632,105 @@ class BleTransportService extends TransportService {
     return sent;
   }
 
-  @override
-  void associatePeerWithPubkey(String peerId, Uint8List pubkey) {
-    final path = _paths[peerId];
+  /// Act on the pair's reverse leg the moment a verified ANNOUNCE identifies
+  /// the peer behind a BLE path. Wired from
+  /// `MessageRouter.onBlePeerIdentified`, after the announce has been applied
+  /// to Redux (so the role attachment is already visible to [_pairViewFor]).
+  ///
+  /// Peripheral-role paths only — an inbound leg just became attributable,
+  /// which is the authoritative moment to open the pair's SECOND (reverse
+  /// central) link now, at ANNOUNCE time rather than next-advertisement time.
+  /// The advertisement-driven election remains the retry path if no
+  /// advertising MAC for the identity is known yet.
+  ///
+  /// Central-role paths need nothing here: the peer opens its own reverse leg.
+  void onPeerIdentified(String pathId, Uint8List pubkey) {
+    final path = _paths[pathId];
     if (path == null || !_isReady(path)) return;
+    if (_roleFromPathId(pathId) != BleRole.peripheral) return;
 
-    final role = _roleFromPathId(peerId);
-    if (role == null) return;
-    store.dispatch(AssociateBleDeviceAction(
-      publicKey: pubkey,
-      deviceId: peerId,
-      role: role,
-    ));
+    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
 
-    // Peripheral-side ANNOUNCE just identified the peer. This is the
-    // moment we have enough information to act on the pair's reverse leg:
-    // we know the peer's pubkey, so we can derive their service UUID and
-    // correlate it with discovery state.
-    if (role == BleRole.peripheral) {
-      final peerIsIos = GrassrootsIdentity.candidateServiceUuids(pubkey)
-          .any(_isIosPeerServiceUuid);
-      if (defaultTargetPlatform == TargetPlatform.iOS && !peerIsIos) {
-        // The reverse leg toward a non-iOS peer is the pair's SECOND link,
-        // which an iOS central cannot open (hardware-measured; see
-        // [_shouldOpenCentralLeg]) — so far from dialing it, abort any of our
-        // central dials to this identity that are still in flight: they were
-        // racing the inbound leg that just won, and would otherwise wedge in
-        // `connecting` until the connect timeout. Toward iOS peers the
-        // reverse leg is attempted like on any other platform (dual-role
-        // mandate).
-        _cancelDoomedCentralDialsForPubkey(pubkey);
-      } else {
-        _maybeDialReverseCentralForPubkey(pubkey);
-      }
-    }
+    // Already have the central direction (live or mid-handshake)? Nothing
+    // to do — without this, every periodic ANNOUNCE over the peripheral leg
+    // of a healthy dual-role pair would re-run the reverse-leg attempt.
+    final pair = _pairViewFor(GrassrootsIdentity.deriveServiceUuidForSlot(
+        pubkey, GrassrootsIdentity.currentBleSlot()));
+    if (pair.liveCentralPathId != null || pair.centralInFlight) return;
+
+    unawaited(_openReverseLeg(pathId, pubkey));
   }
 
-  /// iOS only: abort in-flight central dials to the peer identified by
-  /// [pubkey]. Called the moment an inbound peripheral leg is authenticated —
-  /// from that point any central dial of ours to the same identity is a
-  /// doomed second link (it can never reach `didConnect`) and would hold a
-  /// dial slot for the full connect timeout.
-  void _cancelDoomedCentralDialsForPubkey(Uint8List pubkey) {
-    final candidates = GrassrootsIdentity.candidateServiceUuids(pubkey);
-    for (final p in _paths.values.toList(growable: false)) {
-      if (p.role != ble.BleRole.central) continue;
-      if (p.state != ble.BlePathState.connecting) continue;
-      final discovered = _peersState.getDiscoveredBlePeer(p.pathId);
-      final discoveredUuid = discovered?.serviceUuid?.toLowerCase();
-      if (discoveredUuid == null || !candidates.contains(discoveredUuid)) {
-        continue;
+  /// Open the reverse (central) leg toward a peer whose inbound peripheral
+  /// leg [peripheralPathId] just became attributable.
+  ///
+  /// Preferred target: the inbound link's OWN remote address. Connecting to a
+  /// device we already share an ACL link with attaches our GATT client over
+  /// that existing link — no second ACL is created. This matters because a
+  /// second ACL between the same two radios is refused by spec-conformant
+  /// stacks: measured on Pixel 10 Pro (Android 16), every dial to the peer's
+  /// advertised MAC fast-failed GATT 133 while the first link existed, while
+  /// older Android 8.1 pairs happened to tolerate dual ACLs. (The measured
+  /// iOS "cannot open the second link" wedge is plausibly the same LL rule.)
+  ///
+  /// Fallback: a discovered advertising MAC (a fresh ACL) for stacks where
+  /// dialing the connection address fails outright.
+  Future<void> _openReverseLeg(
+    String peripheralPathId,
+    Uint8List pubkey,
+  ) async {
+    // A scanned advertising MAC for this identity, if the scanner has one.
+    // Its UUID is the peer's current advertised (= GATT, they rotate
+    // together) service UUID — fresher than a clock-derived one.
+    DiscoveredPeerState? scanned;
+    for (final uuid in GrassrootsIdentity.candidateServiceUuids(pubkey)) {
+      for (final dp in _peersState.getDiscoveredBlePeersByServiceUuid(uuid)) {
+        if (!dp.isConnected && !dp.isConnecting) {
+          scanned = dp;
+          break;
+        }
       }
-      debugPrint(
-        '[ble] aborting central dial ${p.pathId}: peer just authenticated an '
-        'inbound peripheral leg, and an iOS central cannot open a second '
-        'link to the same pair.',
-      );
-      unawaited(disconnectDevice(p.pathId, forget: true));
+      if (scanned != null) break;
     }
+
+    final remoteId = peripheralPathId.substring('peripheral:'.length);
+    final gattUuid = scanned?.serviceUuid ??
+        GrassrootsIdentity.deriveServiceUuidForSlot(
+            pubkey, GrassrootsIdentity.currentBleSlot());
+    debugPrint(
+      '[ble] reverse leg: dialing central:$remoteId over the existing '
+      'inbound link (attaches to the live ACL; a second ACL to the same '
+      'peer is refused by modern stacks).',
+    );
+    if (await connectToDevice('central:$remoteId',
+        serviceUuidOverride: gattUuid)) {
+      return;
+    }
+
+    // The over-ACL dial did not start (choke-point guard or a stack that
+    // cannot connect to a connection address) — fall back to a fresh ACL
+    // toward the scanned advertising MAC.
+    if (scanned != null) {
+      debugPrint(
+        '[ble] reverse leg: over-ACL dial did not start; dialing advertised '
+        '${scanned.transportId} instead.',
+      );
+      unawaited(connectToDevice(scanned.transportId));
+      return;
+    }
+
+    // Loud on purpose: a peripheral-attached peer with no dialable target is
+    // the signature of a muted scanner (the pair then silently stays
+    // single-link). The scan watchdog restarts a silent scanner; this log is
+    // the breadcrumb tying the two together.
+    debugPrint(
+      '[ble] reverse leg: over-ACL dial did not start and no advertising '
+      'MAC for the identity has been discovered — waiting for an '
+      'advertisement.',
+    );
+    // Add this identity to the hardware scan filter so Android reliably
+    // surfaces its advertisement (the unfiltered scan is what got muted).
+    unawaited(_applyScanTargets());
   }
 
   @override
@@ -652,53 +800,69 @@ class BleTransportService extends TransportService {
     await _connectionController.close();
   }
 
-  // ===== Manual connect/disconnect (still exposed for the UI) =====
+  // ===== Connect/disconnect =====
 
-  /// Connect to a discovered peer. The pathId is `central:<remote-id>`.
+  /// Dial the central leg to a discovered peer. The pathId is
+  /// `central:<remote-id>`.
   ///
-  /// The plugin's `connect()` is itself idempotent — calling it twice for
-  /// the same pathId either reuses the in-flight connection (iOS) or returns
-  /// the existing path (Android). We do not duplicate that guard here.
-  /// Path-state updates flow through `_onPathChanged`, which is the only
-  /// dispatcher of `BleDeviceConnectingAction` / `Connected` / `Failed`.
-  Future<bool> connectToDevice(String pathId) async {
+  /// THE choke point: every central dial — election-driven from
+  /// [_onAdvertisement], reverse-leg from [onPeerIdentified], or a manual UI
+  /// tap — passes through here, and each validity guard is enforced exactly
+  /// once, in order. The plugin's `connect()` idempotency (Android returns
+  /// the live path; iOS never drops an existing link) is the backstop for
+  /// any race that slips through. Path-state updates flow through
+  /// `_onPathChanged`, which is the only dispatcher of
+  /// `BleDeviceConnectingAction` / `Connected` / `Failed`.
+  /// [serviceUuidOverride] supplies the peer's GATT service UUID for dial
+  /// targets that have no scanner discovery entry — the reverse-leg dial to a
+  /// live inbound link's remote address (see [_openReverseLeg]). Ignored when
+  /// the discovery map already knows the advertised UUID (the fresher truth).
+  Future<bool> connectToDevice(
+    String pathId, {
+    String? serviceUuidOverride,
+  }) async {
     if (!pathId.startsWith('central:')) {
       // Peripheral-side paths are inbound — we don't dial them.
       return false;
     }
-    if (isDeviceConnected(pathId)) {
-      return false;
-    }
-
     final discovered = _peersState.getDiscoveredBlePeer(pathId);
-    if (discovered?.isConnecting == true) {
-      return false;
-    }
-    final serviceUuid = discovered?.serviceUuid;
+    final serviceUuid = discovered?.serviceUuid ?? serviceUuidOverride;
     if (serviceUuid == null) {
       debugPrint('Cannot connect to $pathId: no advertised service UUID');
       return false;
     }
-    // Hard invariant on iOS, enforced at the one choke point every central
-    // dial passes (auto arbitration, reverse-leg helpers, manual UI taps):
-    // an iOS central cannot open the second link toward a NON-iOS peer
-    // (hardware-measured), so a dial to such an identity we already hold an
-    // inbound peripheral leg from can never complete — it would wedge in
-    // `connecting` for the full connect timeout. Scoped strictly to the
-    // measured constraint: toward iOS peers the second link is attempted
-    // (dual-role mandate; see CLAUDE.md).
-    if (defaultTargetPlatform == TargetPlatform.iOS &&
-        !_isIosPeerServiceUuid(serviceUuid) &&
-        _hasLivePeripheralPathForServiceUuid(serviceUuid)) {
-      debugPrint(
-        'Skipping $pathId: already attached via inbound peripheral leg and '
-        'an iOS central cannot open a second link toward a non-iOS peer.',
-      );
+
+    final pair = _pairViewFor(serviceUuid);
+    // One central leg per identity — live or in flight, across MAC
+    // rotations. Dialing a freshly-rotated MAC while another is up is the
+    // GATT-status-133 storm.
+    if (pair.liveCentralPathId != null || pair.centralInFlight) {
       return false;
     }
+    // EXPERIMENT: the iOS "cannot open the second link toward a non-iOS peer"
+    // veto has been removed. We now dial the reverse central leg even when
+    // we are iOS and already hold an inbound peripheral leg from a non-iOS
+    // peer, to observe whether that dial actually wedges in `connecting`.
     if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed &&
         _friendPubkeyForDerivedServiceUuid(serviceUuid) == null) {
       debugPrint('Skipping $pathId: closed trust and unknown service UUID');
+      return false;
+    }
+    // TESTBED Layer 1 (software-defined topology): refuse the dial when the
+    // allowlist is active and this peer's derived service UUID is not an
+    // allowed neighbour. This is the cleanest enforcement point — it never
+    // opens the leg, so there is no flapping. Off in production.
+    final allowlist = store.state.settings.neighborAllowlist;
+    if (allowlist != null &&
+        allowlist.enabled &&
+        !allowlist.allowsServiceUuid(serviceUuid)) {
+      debugPrint('Skipping $pathId: neighbor allowlist excludes this peer');
+      return false;
+    }
+    // BLE address rotation produces a fresh pathId every ~30s for the same
+    // peer. Cap the number of in-flight central dials so a chatty rotator
+    // can't exhaust the BLE stack's connection slots.
+    if (_inFlightCentralDials() >= _maxInFlightCentralDials) {
       return false;
     }
 
@@ -706,15 +870,18 @@ class BleTransportService extends TransportService {
     try {
       await _ble.connect(
         remoteId: remoteId,
+        // The peer's GATT service carries the same derived UUID it
+        // advertises (design: advertisement and GATT service rotate
+        // together), so the discovered UUID is the service to attach to.
         serviceUuid: serviceUuid,
         characteristicUuid: _grassrootsCharacteristicUuid,
         androidMtu: _requestedAndroidMtu,
         // Apple's docs say CoreBluetooth's connect can legitimately take
-        // 10-15s, so we stay safely above that. The deterministic first-mover
-        // gate should prevent the simultaneous-dial collision that used to wedge
-        // a connect for the full window; 20s is a safety net for any collision
-        // that still slips through (e.g. during the first-mover fallback) so it
-        // recovers and retries sooner.
+        // 10-15s, so we stay safely above that. The election's first-mover
+        // gate should prevent the simultaneous-dial collision that used to
+        // wedge a connect for the full window; 20s is a safety net for any
+        // collision that still slips through (e.g. during the first-mover
+        // fallback) so it recovers and retries sooner.
         timeout: const Duration(seconds: 20),
       );
       return true;
@@ -729,11 +896,51 @@ class BleTransportService extends TransportService {
   }
 
   Future<void> disconnectDevice(String pathId, {bool forget = true}) async {
+    _recordLocalTeardown(pathId);
     try {
       await _ble.disconnect(pathId, forget: forget);
     } catch (e) {
       debugPrint('disconnect() failed for $pathId: $e');
     }
+  }
+
+  /// Reset the first-mover fallback clock for the identity behind [pathId]
+  /// (see [_lastLocalTeardownAt]). Written under both the discovered
+  /// service-UUID key and — when the path is attached to an identified peer —
+  /// the pubkey key, so [_lastTeardownFor] finds it from either direction.
+  void _recordLocalTeardown(String pathId) {
+    final now = DateTime.now();
+    final uuid = _peersState.getDiscoveredBlePeer(pathId)?.serviceUuid;
+    if (uuid != null) {
+      _lastLocalTeardownAt['uuid:${uuid.toLowerCase()}'] = now;
+    }
+    for (final peer in _peersState.peersList) {
+      if (peer.bleCentralDeviceId == pathId ||
+          peer.blePeripheralDeviceId == pathId) {
+        _lastLocalTeardownAt['pk:${peer.pubkeyHex}'] = now;
+        break;
+      }
+    }
+    // Bounded: entries only matter within the fallback window.
+    _lastLocalTeardownAt.removeWhere(
+      (_, t) => now.difference(t) > firstMoverFallback * 4,
+    );
+  }
+
+  /// The most recent local teardown for the identity behind [serviceUuid],
+  /// or null if none is recorded.
+  DateTime? _lastTeardownFor(String serviceUuid) {
+    final uuid = serviceUuid.toLowerCase();
+    var best = _lastLocalTeardownAt['uuid:$uuid'];
+    for (final peer in _peersState.peersList) {
+      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(uuid, peer.publicKey)) {
+        continue;
+      }
+      final t = _lastLocalTeardownAt['pk:${peer.pubkeyHex}'];
+      if (t != null && (best == null || t.isAfter(best))) best = t;
+      break;
+    }
+    return best;
   }
 
   /// Process an incoming raw BLE packet. Deserializes and forwards to the
@@ -805,86 +1012,36 @@ class BleTransportService extends TransportService {
       return;
     }
 
-    // Record platform-marker sightings before any early return: the marker
-    // identifies the peer as iOS for the rest of the session, including for
-    // decisions made while this identity is connected (and thus not dialed).
-    if (_advertisementCarriesIosMarker(adv)) {
-      _iosMarkedServiceUuids.add(serviceUuid.toLowerCase());
+    final pair = _pairViewFor(serviceUuid);
 
-      // Wrong-order mixed-pair reform (dual-role mandate, CLAUDE.md). We are
-      // non-iOS, hold ONLY a central leg to this iOS identity, and its
-      // missing leg — an iOS-central second link toward us — is
-      // hardware-broken: the pair can never upgrade in place. The marker in
-      // THIS advertisement (not the sticky set) proves the iOS app is
-      // foregrounded right now, i.e. it can redial within seconds. So drop
-      // our wrong-order central leg and yield: the iPhone opens the first
-      // leg, and our reverse dial completes the dual-role pair. Backgrounded
-      // iPhones advertise no marker, so this self-damps — we never trade a
-      // working link away unless the peer is provably there to rebuild it.
-      if (defaultTargetPlatform != TargetPlatform.iOS &&
-          store.state.settings.bleRoleMode == BleRoleMode.auto &&
-          !_hasLivePeripheralPathForServiceUuid(serviceUuid)) {
-        final centralId = _liveCentralPathIdForServiceUuid(serviceUuid);
-        if (centralId != null && !_reformingCentralPathIds.contains(centralId)) {
-          _reformingCentralPathIds.add(centralId);
-          debugPrint(
-            '[ble] reforming wrong-order pair: dropping our central leg '
-            '$centralId so the (foregrounded) iOS peer can open the first '
-            'leg; we reopen ours as the reverse leg.',
-          );
-          unawaited(disconnectDevice(centralId, forget: true));
-          return;
-        }
-      }
-    }
+    // EXPERIMENT: the wrong-order mixed-pair reform (Android tearing down its
+    // central leg so a foregrounded iPhone can re-open the pair in the right
+    // order) has been removed, along with the grs-ios marker it keyed off.
+    // Both sides now dial per the platform-neutral first-mover election.
 
-    // Drop advertisements from a rotated radio MAC when we already have a
-    // live or in-flight path to the same logical peer on a different MAC.
-    // The service UUID is derived from the peer's pubkey and is stable
-    // across rotations, so a different pathId with the same serviceUuid is
-    // the same peer with a freshly-rotated address. Recording it as a new
-    // DiscoveredPeerState (and dialing it) would create a duplicate central
-    // path racing the existing one — that's exactly the failure mode behind
-    // the GATT-status-133 storm we see when iOS rotates rapidly.
-    final activeOnOtherMac = _peersState
-        .getDiscoveredBlePeersByServiceUuid(serviceUuid)
-        .where((p) => p.transportId != pathId)
-        .any((p) => p.isConnected || p.isConnecting);
-    if (activeOnOtherMac) {
-      return;
-    }
-
-    // Same suppression, keyed on the identified peer instead of the transient
-    // discovery map. Once ANNOUNCE identifies the peer, the connected MAC's
-    // DiscoveredPeerState stops being re-advertised (the peer rotates its RPA)
-    // and is stale-pruned, which blinds the `activeOnOtherMac` check above. The
-    // central attachment on the identified PeerState is rotation-stable, so
-    // consult it directly: if we already hold a live central leg to this
-    // identity, dialing a freshly-rotated MAC only duplicates it — the
-    // GATT-133 storm. Peripheral attachments are deliberately ignored: when we
-    // hold only the inbound peripheral leg, this dial is the reverse (central)
-    // leg that completes the dual-role connection and must proceed.
-    if (_hasLiveCentralPathForServiceUuid(serviceUuid)) {
-      return;
-    }
-
+    // One central leg per identity — live or in flight, across MAC
+    // rotations (the identity-keyed [_pairViewFor] sees through a rotated
+    // advertising MAC; dialing a fresh MAC while another is up is the
+    // GATT-status-133 storm).
+    final centralActive =
+        pair.liveCentralPathId != null || pair.centralInFlight;
     final existing = _peersState.getDiscoveredBlePeer(pathId);
-    if (existing == null) {
-      store.dispatch(BleDeviceDiscoveredAction(
-        deviceId: pathId,
-        displayName: adv.advertisedName ?? adv.platformName,
-        rssi: adv.rssi,
-        serviceUuid: serviceUuid,
-      ));
-    } else {
-      store.dispatch(BleDeviceRssiUpdatedAction(
-        deviceId: pathId,
-        rssi: adv.rssi,
-      ));
+    if (centralActive && existing == null) {
+      // A rotated MAC for an identity whose central leg is already live or
+      // being dialed: neither dial it nor pile up a ghost discovery entry.
+      return;
     }
 
-    // Update RSSI on identified peers too, so the UI ordering reflects fresh
-    // signal strength.
+    // Redux dispatches BEFORE the dial suppression below: RSSI/lastSeen
+    // freshness must keep flowing for connected identities too (UI ordering
+    // and the stale-pruning inputs). The reducer merges into the existing
+    // entry.
+    store.dispatch(BleDeviceDiscoveredAction(
+      deviceId: pathId,
+      displayName: adv.advertisedName ?? adv.platformName,
+      rssi: adv.rssi,
+      serviceUuid: serviceUuid,
+    ));
     final pubkey = getPubkeyForPeerId(pathId);
     if (pubkey != null) {
       final existingPeer = _peersState.getPeerByPubkey(pubkey);
@@ -896,58 +1053,34 @@ class BleTransportService extends TransportService {
       }
     }
 
-    if (existing != null && (existing.isConnected || existing.isConnecting)) {
+    if (centralActive) {
       return;
     }
-    if (!_shouldOpenCentralLeg(adv, serviceUuid, existing)) {
+    if (!_shouldDialNow(pair, serviceUuid, existing)) {
       return;
     }
-    if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed &&
-        _friendPubkeyForDerivedServiceUuid(serviceUuid) == null) {
-      return;
-    }
-    // BLE address rotation produces a fresh pathId every ~30s for the same
-    // peer. Cap the number of in-flight central dials so a chatty rotator
-    // can't exhaust the BLE stack's connection slots.
-    if (_inFlightCentralDials() >= _maxInFlightCentralDials) {
+
+    // Reverse leg with a live inbound link: dial the link's own remote
+    // address so the GATT client attaches over the existing ACL. Dialing the
+    // advertised MAC here would attempt a SECOND ACL to the same radio,
+    // which modern stacks refuse (fast GATT 133) while a link exists. The
+    // freshly-advertised UUID is the peer's current GATT service.
+    final livePeripheralPathId = pair.livePeripheralPathId;
+    if (livePeripheralPathId != null) {
+      final remoteId =
+          livePeripheralPathId.substring('peripheral:'.length);
+      unawaited(connectToDevice('central:$remoteId',
+          serviceUuidOverride: serviceUuid));
       return;
     }
 
     unawaited(connectToDevice(pathId));
   }
 
-  /// True when we already hold a live central (outbound) BLE path to the peer
-  /// whose pubkey derives [serviceUuid]. Suppresses duplicate central dials to
-  /// a peer that has merely rotated its advertising MAC: the rotation defeats
-  /// the discovery-map guard in [_onAdvertisement] once the old MAC's
-  /// DiscoveredPeerState is stale-pruned, but the identified peer's central
-  /// attachment survives rotation. Mirrors the `bleCentralDeviceId != null`
-  /// check in [_maybeDialReverseCentralForPubkey], and — like it — ignores
-  /// peripheral attachments so the central leg of a dual-role connection is
-  /// still dialed when only the inbound peripheral leg exists.
-  bool _hasLiveCentralPathForServiceUuid(String serviceUuid) =>
-      _liveCentralPathIdForServiceUuid(serviceUuid) != null;
-
-  /// The live central pathId attached to the identified peer whose pubkey
-  /// derives [serviceUuid], or null when none is connected.
-  String? _liveCentralPathIdForServiceUuid(String serviceUuid) {
-    for (final peer in _peersState.peersList) {
-      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(
-          serviceUuid, peer.publicKey)) {
-        continue;
-      }
-      final centralId = peer.bleCentralDeviceId;
-      return centralId != null && isDeviceConnected(centralId)
-          ? centralId
-          : null;
-    }
-    return null;
-  }
-
   /// Cap on simultaneous `connecting` central paths.
   /// Each `connectGatt` consumes a controller slot for ~5s on Android; too
   /// many parallel dials starve real connections.
-  static const int _maxInFlightCentralDials = 2;
+  static const int _maxInFlightCentralDials = 7;
 
   int _inFlightCentralDials() {
     var count = 0;
@@ -962,101 +1095,50 @@ class BleTransportService extends TransportService {
     return count;
   }
 
-  /// Central-dial arbitration for `auto` mode: decides whether this
-  /// advertisement should trigger an outbound (central) dial right now.
+  /// Central-dial election: decides whether this advertisement should
+  /// trigger an outbound (central) dial right now. All *validity* guards
+  /// (identity dedup, trust, in-flight cap) live in [connectToDevice] — this
+  /// is purely the leg-ORDER arbitration for `auto` mode.
   ///
   /// Dual-role (two legs per pair, each device central on one) is mandatory —
-  /// see CLAUDE.md, "Dual-Role BLE Is Mandatory". Arbitration exists to pick
-  /// the leg ORDER that makes it reachable, around one hardware-measured
-  /// constraint (A2/iPhone field tests):
+  /// see CLAUDE.md, "Dual-Role BLE Is Mandatory".
   ///
-  ///  1. An **iOS central cannot open the second link toward a non-iOS
-  ///     peer.** Once such a pair is linked, an iOS-initiated connect never
-  ///     reaches `didConnect` and wedges in `connecting` until the connect
-  ///     timeout. (Toward iOS peers this is unmeasured, so per the mandate we
-  ///     attempt it — hardware, not extrapolation, gets to refuse.)
-  ///  2. A **non-iOS central opens a second (reverse) link just fine** — to
-  ///     iOS and Android peripherals alike.
+  /// EXPERIMENT: all iOS-specific leg-order arbitration has been removed. The
+  /// election is now platform-neutral for every pair:
   ///
-  /// So for mixed pairs iOS must own the first link and the non-iOS side the
-  /// reverse leg. iOS peers are recognized by the fixed `grs-ios` local name
-  /// their advertisements carry (see [ble.grassrootsIosLocalName]); among
-  /// same-platform peers the deterministic service-UUID tiebreaker (mirroring
-  /// the UDP "smaller pubkey initiates" convention) avoids the mutual-dial
-  /// collision. Every waiting branch is backstopped by [firstMoverFallback]
-  /// so a peer whose expected initiator never shows (backgrounded iOS,
-  /// peripheral-only device, marker lost from the scan response) still gets a
-  /// first link — and the pair keeps upgrading toward dual-role from there.
+  ///  - If we already hold the inbound peripheral leg, dial the reverse
+  ///    (central) leg unconditionally — including when we are iOS and the
+  ///    peer is not. This is the case that tests whether an iOS central can
+  ///    actually open a second link toward a peer it is already linked with.
+  ///  - Otherwise pick the first link by the deterministic service-UUID
+  ///    tiebreaker (mirroring the UDP "smaller pubkey initiates" convention),
+  ///    backstopped by [firstMoverFallback] so the non-initiator still opens
+  ///    a link if the expected initiator never shows.
   ///
   /// Auto-only: a central-only device never advertises, so it can never be
   /// dialed and must always first-move.
-  bool _shouldOpenCentralLeg(
-    ble.BleAdvertisement adv,
+  bool _shouldDialNow(
+    _PairView pair,
     String serviceUuid,
     DiscoveredPeerState? existing,
   ) {
     if (store.state.settings.bleRoleMode != BleRoleMode.auto) return true;
 
-    final peerIsIos = _isIosPeerServiceUuid(serviceUuid);
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
-      if (!peerIsIos) {
-        // Constraint 1: toward a non-iOS peer we already hold an inbound
-        // peripheral leg from, our dial is the measured-broken second link.
-        // The reverse leg of this pair is the peer's to open (fact 2).
-        if (_hasLivePeripheralPathForServiceUuid(serviceUuid)) return false;
-        // Mixed pair, no link yet: iOS must own the first link — dial on
-        // sight.
-        return true;
-      }
-      // iOS↔iOS: same dual-role protocol as any same-platform pair — the
-      // tiebreaker picks who opens the first leg, and a live inbound
-      // peripheral leg makes this dial the reverse leg. Unmeasured on
-      // hardware; if iOS refuses the second link the dial times out and the
-      // pair stays single-link with retries — never silently abandoned.
-      return _isBleDialInitiator(serviceUuid) ||
-          _hasLivePeripheralPathForServiceUuid(serviceUuid) ||
-          _firstMoverFallbackElapsed(existing);
-    }
+    // We already hold the inbound leg: this dial is our reverse leg, which
+    // completes the dual-role pair. Attempt it for every pair regardless of
+    // platform.
+    if (pair.livePeripheral) return true;
 
-    // Non-iOS facing an iOS peer: yield the first dial (constraint 1 — only
-    // iOS can open it). Once its inbound leg lands, the dial below IS our
-    // reverse leg (fact 2); the fallback covers an iOS peer that never
-    // dials, where a single us-central first link still beats no link.
-    if (peerIsIos) {
-      return _hasLivePeripheralPathForServiceUuid(serviceUuid) ||
-          _firstMoverFallbackElapsed(existing);
-    }
-
-    // Same-platform (non-iOS) pair: deterministic first-mover; the
-    // non-initiator dials only as reverse leg or fallback.
+    // No leg yet: deterministic first-mover, non-initiator dials on fallback.
     return _isBleDialInitiator(serviceUuid) ||
-        _hasLivePeripheralPathForServiceUuid(serviceUuid) ||
-        _firstMoverFallbackElapsed(existing);
-  }
-
-  /// Whether the peer behind [serviceUuid] has been seen advertising the iOS
-  /// platform marker this session. Sightings are recorded in
-  /// [_onAdvertisement]; membership is sticky because a peer's platform never
-  /// changes, while the marker itself comes and goes with iOS foregrounding.
-  bool _isIosPeerServiceUuid(String serviceUuid) =>
-      _iosMarkedServiceUuids.contains(serviceUuid.toLowerCase());
-
-  /// Whether [adv] carries the fixed iOS platform marker
-  /// ([ble.grassrootsIosLocalName]) in its local name. iOS surfaces a scanned
-  /// local name as `advertisedName`; Android surfaces the scan-response name
-  /// there too, with the GAP-cached name in `platformName` — check both.
-  /// Absence proves nothing (backgrounded iOS drops the name), which is why
-  /// every marker-dependent branch in [_shouldOpenCentralLeg] has a fallback.
-  bool _advertisementCarriesIosMarker(ble.BleAdvertisement adv) {
-    return adv.advertisedName == ble.grassrootsIosLocalName ||
-        adv.platformName == ble.grassrootsIosLocalName;
+        _fallbackElapsed(existing, serviceUuid);
   }
 
   /// Cold-start tie-breaker between same-platform peers: the one whose
   /// derived service UUID sorts lower is the initiator and opens the first
   /// (central) leg; the higher one waits for that inbound leg and then opens
-  /// its reverse central leg via [_maybeDialReverseCentralForPubkey]. Mirrors
-  /// the UDP "smaller pubkey initiates" convention, adapted to what we have at
+  /// its reverse central leg via [onPeerIdentified]. Mirrors the UDP
+  /// "smaller pubkey initiates" convention, adapted to what we have at
   /// advertisement time: the service UUID is a stable, deterministic function
   /// of the pubkey, so both peers compute the same comparison and reach
   /// opposite verdicts. Without it, both peers dial on discovery and collide.
@@ -1067,182 +1149,97 @@ class BleTransportService extends TransportService {
         0;
   }
 
-  /// Whether we've been seeing [existing] long enough that the initiator has
-  /// had its chance and we (the non-initiator) should fall back to dialing.
-  /// A just-discovered (or absent) entry is never elapsed — the initiator gets
+  /// Whether we've been seeing [existing] long enough that the expected
+  /// initiator has had its chance and we should fall back to dialing. A
+  /// just-discovered (or absent) entry is never elapsed — the initiator gets
   /// the first move.
-  bool _firstMoverFallbackElapsed(DiscoveredPeerState? existing) {
+  ///
+  /// The clock starts at the LATER of first discovery and our last local
+  /// teardown of a leg to this identity (see [_lastLocalTeardownAt]).
+  bool _fallbackElapsed(DiscoveredPeerState? existing, String serviceUuid) {
     if (existing == null) return false;
-    return DateTime.now().difference(existing.discoveredAt) >=
-        firstMoverFallback;
+    var since = existing.discoveredAt;
+    final teardown = _lastTeardownFor(serviceUuid);
+    if (teardown != null && teardown.isAfter(since)) since = teardown;
+    return DateTime.now().difference(since) >= firstMoverFallback;
   }
 
-  /// True when we already hold a live inbound peripheral path to the peer whose
-  /// pubkey derives [serviceUuid]. Lets a non-initiator that has already been
-  /// dialed open its reverse central leg from [_onAdvertisement] instead of
-  /// being held back by the first-mover gate. Companion to
-  /// [_hasLiveCentralPathForServiceUuid].
-  bool _hasLivePeripheralPathForServiceUuid(String serviceUuid) {
+  /// One identity-keyed answer to every pair-state question the arbitration
+  /// asks about the peer behind [serviceUuid]. Computed from plugin path
+  /// facts ([_paths] + [isDeviceConnected]) and Redux attachments — never
+  /// inferred.
+  ///
+  /// Identity matching is rotation-stable: an identified peer is matched via
+  /// [GrassrootsIdentity.serviceUuidMatchesPubkey] (prev/current/next slot),
+  /// and its in-flight central dials are found by matching every central
+  /// path's discovery UUID against the same candidate set — so a freshly
+  /// rotated advertising MAC still resolves to the same pair. Pre-identity,
+  /// only the literal advertised UUID can be matched.
+  _PairView _pairViewFor(String serviceUuid) {
+    final uuid = serviceUuid.toLowerCase();
+
+    PeerState? identified;
     for (final peer in _peersState.peersList) {
-      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(
-          serviceUuid, peer.publicKey)) {
-        continue;
+      if (GrassrootsIdentity.serviceUuidMatchesPubkey(uuid, peer.publicKey)) {
+        identified = peer;
+        break;
       }
-      final peripheralId = peer.blePeripheralDeviceId;
-      return peripheralId != null && isDeviceConnected(peripheralId);
-    }
-    return false;
-  }
-
-  /// Bridge for the peripheral-ready event in `_onPathChanged`. Two ways
-  /// to identify the dial target, tried in order:
-  ///
-  /// 1. **Identity-based** (correct for modern Android with BLE privacy):
-  ///    if ANNOUNCE has already landed, look up the peer's pubkey via the
-  ///    peripheral pathId and dial a discovered advertising MAC that
-  ///    matches their derived service UUID.
-  ///
-  /// 2. **Same-address fallback** (older Android stacks, iOS, simulators,
-  ///    and any platform where the advertising MAC equals the connection
-  ///    MAC): dial `central:<peripheral's_remoteId>` if scan already saw
-  ///    that exact remoteId advertising as Grassroots.
-  ///
-  /// Pre-ANNOUNCE-AND-no-same-address-discovery, there's nothing useful
-  /// to do here. The dial is retried from [associatePeerWithPubkey] when
-  /// identity arrives, or from `_onAdvertisement` when a fresh advertising
-  /// MAC for this peer lands.
-  void _maybeDialReverseCentralAfterPeripheralReady(ble.BlePath path) {
-    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
-    if (path.role != ble.BleRole.peripheral || !_isReady(path)) return;
-
-    final pubkey = getPubkeyForPeerId(path.pathId);
-    if (pubkey != null) {
-      _maybeDialReverseCentralForPubkey(pubkey);
-      return;
     }
 
-    // Same-address fallback. Strip `peripheral:` and look up the matching
-    // `central:` discovery. Only proceed when the scanner actually saw the
-    // remote advertising as a Grassroots peripheral (so the dial has a
-    // known-good target).
-    const peripheralPrefix = 'peripheral:';
-    if (!path.pathId.startsWith(peripheralPrefix)) return;
-    final remoteId = path.pathId.substring(peripheralPrefix.length);
-    final centralPathId = 'central:$remoteId';
+    final candidates = identified != null
+        ? GrassrootsIdentity.candidateServiceUuids(identified.publicKey)
+        : {uuid};
 
-    final existingCentral = _paths[centralPathId];
-    if (existingCentral != null &&
-        (existingCentral.state == ble.BlePathState.connecting ||
-            existingCentral.state == ble.BlePathState.connected ||
-            existingCentral.state == ble.BlePathState.subscribed ||
-            existingCentral.state == ble.BlePathState.ready)) {
-      return;
-    }
-    if (_peersState.getDiscoveredBlePeer(centralPathId) == null) return;
-    if (_inFlightCentralDials() >= _maxInFlightCentralDials) return;
-
-    debugPrint(
-      '[ble] reverse leg (same-address fallback): peripheral path '
-      '${path.pathId} is ready; dialing $centralPathId.',
-    );
-    unawaited(connectToDevice(centralPathId));
-  }
-
-  /// Try to open the central direction for a peer we already hold a
-  /// peripheral path to. Keyed by the peer's **identity** (derived service
-  /// UUID), NOT by the radio MAC they connected to us from: modern Android
-  /// stacks use BLE-privacy with distinct advertising and initiator
-  /// addresses, so a peer's connection MAC almost never appears in scan
-  /// results. Looking up the dial target by service UUID lets us pick an
-  /// advertising MAC the scanner has actually seen (and therefore one with
-  /// a live Grassroots GATT server) rather than blindly dialing the
-  /// connection MAC, which would always fail.
-  ///
-  /// Idempotent and safe to call repeatedly. Triggered from:
-  ///   - peripheral-path-ready (when ANNOUNCE has already landed),
-  ///   - `associatePeerWithPubkey` (when ANNOUNCE just identified the peer),
-  ///   - `_onAdvertisement` (when a fresh advertising MAC appears for a
-  ///     peer we have peripheral-only).
-  void _maybeDialReverseCentralForPubkey(Uint8List pubkey) {
-    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
-    // On iOS, only toward iOS peers: the reverse leg toward a non-iOS peer
-    // is the measured-broken second link, owned by the non-iOS side (see
-    // [_shouldOpenCentralLeg]). Toward iOS peers we attempt it — dual-role
-    // mandate.
-    if (defaultTargetPlatform == TargetPlatform.iOS &&
-        !GrassrootsIdentity.candidateServiceUuids(pubkey)
-            .any(_isIosPeerServiceUuid)) {
-      return;
+    // Central attachment on the identified peer (rotation-stable).
+    String? liveCentral;
+    final attachedCentral = identified?.bleCentralDeviceId;
+    if (attachedCentral != null && isDeviceConnected(attachedCentral)) {
+      liveCentral = attachedCentral;
     }
 
-    final peer = _peersState.getPeerByPubkey(pubkey);
-    if (peer == null) return;
-    // Already have central? Nothing to do. Already have an in-flight dial
-    // for the central side? Likewise — `_paths` tracks every state the
-    // plugin has surfaced for the central pathIds we've requested.
-    if (peer.bleCentralDeviceId != null) return;
-    if (peer.blePeripheralDeviceId == null) return; // not actually peripheral-attached
+    // Peripheral attachment — needed before the central loop: a reverse-leg
+    // dial over the existing ACL targets the peripheral leg's remote address
+    // and has NO discovery entry, so it is matched to this identity by
+    // remoteId instead of by advertised UUID.
+    final attachedPeripheral = identified?.blePeripheralDeviceId;
+    final peripheralRemoteId = attachedPeripheral == null
+        ? null
+        : attachedPeripheral.substring('peripheral:'.length);
+    final livePeripheralPathId =
+        attachedPeripheral != null && isDeviceConnected(attachedPeripheral)
+            ? attachedPeripheral
+            : null;
 
-    // A peer may currently be advertising under its current or an adjacent
-    // slot's UUID; match against the whole candidate set.
-    final candidates = GrassrootsIdentity.candidateServiceUuids(pubkey);
-
-    // Skip if any central pathId for this identity is mid-handshake.
-    // (Across-MAC, since the discovery map can hold multiple rotated MACs.)
-    final alreadyDialing = _paths.values.any((p) {
-      if (p.role != ble.BleRole.central) return false;
-      if (p.state != ble.BlePathState.connecting &&
-          p.state != ble.BlePathState.connected &&
-          p.state != ble.BlePathState.subscribed &&
-          p.state != ble.BlePathState.ready) {
-        return false;
+    // Plugin central paths that belong to this identity: matched by the
+    // discovery map's advertised UUID (pre-ANNOUNCE window, rotated-MAC
+    // dials) or by sharing the attached peripheral leg's remote address (the
+    // over-ACL reverse dial, which never appears in scan results).
+    var inFlight = false;
+    for (final p in _paths.values) {
+      if (p.role != ble.BleRole.central) continue;
+      final du = _peersState
+          .getDiscoveredBlePeer(p.pathId)
+          ?.serviceUuid
+          ?.toLowerCase();
+      final matchesByUuid = du != null && candidates.contains(du);
+      final matchesByRemoteId = peripheralRemoteId != null &&
+          p.pathId.substring('central:'.length) == peripheralRemoteId;
+      if (!matchesByUuid && !matchesByRemoteId) continue;
+      if (_isReady(p)) {
+        liveCentral ??= p.pathId;
+      } else if (p.state == ble.BlePathState.connecting ||
+          p.state == ble.BlePathState.connected ||
+          p.state == ble.BlePathState.subscribed) {
+        inFlight = true;
       }
-      final discovered = _peersState.getDiscoveredBlePeer(p.pathId);
-      final du = discovered?.serviceUuid?.toLowerCase();
-      return du != null && candidates.contains(du);
-    });
-    if (alreadyDialing) return;
-
-    if (_inFlightCentralDials() >= _maxInFlightCentralDials) return;
-
-    // Pick any discovered advertising MAC that hashes to this peer's identity
-    // (under any candidate slot) and isn't itself in a connecting/connected
-    // state. If none exist yet we bail — the next advertisement that lands for
-    // this peer will re-trigger us (`_onAdvertisement` calls back into here).
-    final candidate = candidates
-        .expand((u) => _peersState.getDiscoveredBlePeersByServiceUuid(u))
-        .firstWhere(
-          (dp) => !dp.isConnected && !dp.isConnecting,
-          orElse: () => _noCandidate,
-        );
-    if (identical(candidate, _noCandidate)) {
-      // Loud on purpose: a peripheral-attached peer with no discovered
-      // advertising MAC is the signature of a muted scanner (the pair then
-      // silently stays single-link). The scan watchdog restarts a silent
-      // scanner; this log is the breadcrumb tying the two together.
-      debugPrint(
-        '[ble] reverse leg: ${peer.displayName} is peripheral-attached but '
-        'no advertising MAC for their identity has been discovered — cannot '
-        'dial the reverse leg until an advertisement arrives.',
-      );
-      return;
     }
 
-    debugPrint(
-      '[ble] reverse leg: dialing ${candidate.transportId} for peer '
-      '${peer.displayName} (peripheral up, opening central direction).',
+    return _PairView(
+      liveCentralPathId: liveCentral,
+      centralInFlight: inFlight,
+      livePeripheralPathId: livePeripheralPathId,
     );
-    unawaited(connectToDevice(candidate.transportId));
   }
-
-  /// Sentinel returned by `firstWhere` when no candidate matches.
-  /// Constructed once because `DiscoveredPeerState` requires positional args.
-  static final DiscoveredPeerState _noCandidate = DiscoveredPeerState(
-    transportId: '',
-    rssi: 0,
-    discoveredAt: DateTime.fromMillisecondsSinceEpoch(0),
-    lastSeen: DateTime.fromMillisecondsSinceEpoch(0),
-  );
 
   void _onPathChanged(ble.BlePath path) {
     final previous = _paths[path.pathId];
@@ -1275,15 +1272,20 @@ class BleTransportService extends TransportService {
             reason: role.name,
             isIncoming: role == BleRole.peripheral,
           ));
-          _maybeDialReverseCentralAfterPeripheralReady(path);
+          // A ready peripheral leg needs no dial here: the peer's directed
+          // ANNOUNCE arrives within one announce interval and triggers the
+          // reverse leg via [onPeerIdentified]; later advertisements retry
+          // it via the election in [_onAdvertisement].
+          //
+          // Re-evaluate the reverse-leg scan filters: a new peripheral leg
+          // may need targeted scanning to find its MAC, and a completed
+          // central leg lets us drop a target and fall back to a broad scan.
+          unawaited(_applyScanTargets());
         }
         break;
       case ble.BlePathState.failed:
       case ble.BlePathState.disconnected:
       case ble.BlePathState.stale:
-        // A reform teardown (wrong-order mixed pair) has completed its
-        // disconnect round-trip; allow future reforms for this pathId.
-        _reformingCentralPathIds.remove(path.pathId);
         if (path.state == ble.BlePathState.failed &&
             path.role == ble.BleRole.central) {
           store.dispatch(BleDeviceConnectionFailedAction(path.pathId));
@@ -1298,6 +1300,8 @@ class BleTransportService extends TransportService {
           _emitDisconnect(path, role);
         }
         _paths.remove(path.pathId);
+        // A dropped leg may add or clear a reverse-leg scan target.
+        unawaited(_applyScanTargets());
         break;
     }
   }
@@ -1388,5 +1392,33 @@ class BleTransportService extends TransportService {
     }
     return null;
   }
+}
 
+/// Snapshot of a pair's leg state, keyed by the peer's identity (derived
+/// service UUID). Produced by [BleTransportService._pairViewFor]; consumed by
+/// the choke-point guards in `connectToDevice` and the election in
+/// `_onAdvertisement`.
+class _PairView {
+  /// Ready (sendable) central path to this identity, if one exists.
+  final String? liveCentralPathId;
+
+  /// A central dial to this identity is mid-handshake
+  /// (connecting/connected/subscribed — not yet ready).
+  final bool centralInFlight;
+
+  /// The ready inbound peripheral leg from this identity, if one exists.
+  /// Its remote address is the preferred reverse-leg dial target: connecting
+  /// to it attaches our GATT client OVER the existing ACL link instead of
+  /// opening a second ACL, which modern stacks (Pixel 10 / Android 16,
+  /// measured) refuse with a fast GATT 133 while a link already exists.
+  final String? livePeripheralPathId;
+
+  /// We hold a ready inbound peripheral leg from this identity.
+  bool get livePeripheral => livePeripheralPathId != null;
+
+  const _PairView({
+    required this.liveCentralPathId,
+    required this.centralInFlight,
+    required this.livePeripheralPathId,
+  });
 }

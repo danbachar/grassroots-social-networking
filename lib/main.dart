@@ -6,6 +6,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
 import 'src/trace/trace_logger.dart';
+import 'src/trace/trace_config.dart';
 import 'src/trace/location_sampler.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
@@ -17,6 +18,10 @@ import 'dart:async';
 import 'chat_screen.dart';
 import 'chat_models.dart';
 import 'settings_screen.dart';
+import 'testbed_screen.dart';
+import 'theme/grasslink_theme.dart';
+import 'theme/grasslink_tokens.dart';
+import 'theme/grasslink_widgets.dart';
 
 // Global notification plugin instance
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
@@ -117,15 +122,14 @@ Map<String, dynamic> _serializeAppState(AppState state) {
 
 /// Set up debug log capture by intercepting debugPrint.
 ///
-/// Adds a `[HH:MM:SS.fff]` timestamp to every console line (matching the
-/// rendezvous-server format so client/server logs can be cross-referenced),
-/// and feeds the in-memory LogBuffer that drives the Debug Logs screen.
+/// Adds a `[HH:MM:SS.fff]` timestamp to every console line and feeds the
+/// in-memory LogBuffer that drives the Debug Logs screen.
 void _setupDebugLogCapture() {
   final originalDebugPrint = debugPrint;
   debugPrint = (String? message, {int? wrapWidth}) {
-    // Prepend a wall-clock timestamp so console output is correlatable with
-    // the rendezvous-server logs. The LogBuffer entry below uses its own
-    // structured timestamp; only the console line gets the prefix.
+    // Prepend a wall-clock timestamp so console output is correlatable
+    // across devices. The LogBuffer entry below uses its own structured
+    // timestamp; only the console line gets the prefix.
     final stamped = message == null ? null : '[${_logTimestamp()}] $message';
     originalDebugPrint(stamped, wrapWidth: wrapWidth);
 
@@ -254,8 +258,10 @@ void _mediaCleanupMiddleware(
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Capture all Flutter print output (including Logger) into the debug log buffer.
-  // This feeds the Debug Logs screen in Settings.
+  // Load persisted logs from prior runs, then capture all Flutter print output
+  // (including Logger) into the debug log buffer. init() first so a crash from
+  // the setup below still leaves the previous session's logs on screen/disk.
+  await LogBuffer.instance.init();
   _setupDebugLogCapture();
 
   // Initialize libsodium (SUMO) once for the main isolate. SUMO is required for
@@ -336,8 +342,9 @@ class MainApp extends StatelessWidget {
     return StoreProvider<AppState>(
       store: appStore,
       child: MaterialApp(
+        title: 'grasslink',
         navigatorKey: navigatorKey,
-        theme: ThemeData.dark(),
+        theme: grasslinkTheme(),
         home: const GrassrootsHome(),
       ),
     );
@@ -577,15 +584,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     return _connectivity.first.name;
   }
 
-  String _localDateString(DateTime dt) =>
-      '${dt.year.toString().padLeft(4, '0')}-'
-      '${dt.month.toString().padLeft(2, '0')}-'
-      '${dt.day.toString().padLeft(2, '0')}';
-
-  /// One-time consent prompt, then the daily upload prompt (cold start).
+  /// One-time consent prompt, then the upload prompt — run once per app start.
   Future<void> _runTracePrompts() async {
     await _maybeConsentPrompt();
-    await _maybeDailyTracePrompt();
+    await _maybeTraceUploadPrompt();
+  }
+
+  /// Manual "Upload now" from settings. Uploads immediately (no prompt) and
+  /// returns a short user-facing status message for the caller to surface.
+  Future<String> _uploadTracesNow() async {
+    if (!TraceConfig.isConfigured) return 'Trace uploads are not configured';
+    if (!await traceLogger.hasUnuploaded()) return 'Nothing to upload';
+    final ok = await traceLogger.uploadAll(
+      url: TraceConfig.serverUrl,
+      token: TraceConfig.serverToken,
+    );
+    return ok ? 'Traces uploaded' : 'Trace upload failed';
   }
 
   /// Ask once, ever, whether the user opts in to trace logging + upload.
@@ -633,19 +647,18 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     }
   }
 
-  /// On the first open of a new calendar day, offer to upload traces that
-  /// haven't been uploaded yet.
-  Future<void> _maybeDailyTracePrompt() async {
+  /// On every app start, offer to upload any traces not yet uploaded since the
+  /// last successful upload. Fires only when the user has opted in, a
+  /// destination is baked in, and there is actually something pending.
+  Future<void> _maybeTraceUploadPrompt() async {
     if (_tracePromptBusy) return;
     final settings = appStore.state.settings;
     if (!settings.traceLoggingConsent) return;
 
-    final url = settings.traceServerUrl;
-    final token = settings.traceServerToken;
-    if (url == null || url.isEmpty || token == null || token.isEmpty) return;
+    // Destination is baked in (not user-configurable). A build shipped without
+    // a token stays inert.
+    if (!TraceConfig.isConfigured) return;
 
-    final today = _localDateString(DateTime.now());
-    if (settings.lastTraceUploadDate == today) return; // already handled today
     if (!await traceLogger.hasUnuploaded()) return;
     if (!mounted) return;
 
@@ -672,11 +685,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         ),
       );
 
-      // Mark the day handled either way, so we prompt at most once per day.
-      appStore.dispatch(SetLastTraceUploadDateAction(today));
-
       if (accepted == true) {
-        final ok = await traceLogger.uploadAll(url: url, token: token);
+        final ok = await traceLogger.uploadAll(
+          url: TraceConfig.serverUrl,
+          token: TraceConfig.serverToken,
+        );
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(
             content: Text(ok ? 'Traces uploaded' : 'Trace upload failed'),
@@ -709,6 +722,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       _backgroundedAt ??= now;
+      // Persist the log tail before a possible background kill.
+      unawaited(LogBuffer.instance.flushNow());
     }
     if (state == AppLifecycleState.resumed) {
       final bgMs = _backgroundedAt != null ? now - _backgroundedAt! : null;
@@ -725,8 +740,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         }));
       }
       unawaited(_grassroots?.onAppResumed() ?? Future.value());
-      // First open of a new day → offer to upload not-yet-uploaded traces.
-      unawaited(_maybeDailyTracePrompt());
     }
   }
 
@@ -862,6 +875,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               '📷 [$transportName] Picture from $senderName (${sayBlock.imageBytes.length} bytes, viewOnce=${sayBlock.viewOnce})');
           await _handlePictureMessage(
               senderHex, myHex, sayBlock, messageId, senderPubkey);
+        } else if (sayBlock is FileSayBlock) {
+          debugPrint(
+              '📎 [$transportName] File "${sayBlock.fileName}" from $senderName '
+              '(${sayBlock.bytes.length} bytes)');
+          await _handleFileMessage(
+              senderHex, myHex, sayBlock, messageId, senderPubkey);
         }
 
       case BlockType.friendshipOffer:
@@ -934,6 +953,34 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       senderHex,
       senderName,
       block.viewOnce ? '🔥 Sent a 1-time photo' : '📷 Sent a photo',
+    );
+  }
+
+  Future<void> _handleFileMessage(String senderHex, String myHex,
+      FileSayBlock block, String messageId, Uint8List senderPubkey) async {
+    // Persist under the original file name so open/share works by extension.
+    final file = await writeNamedMediaFile(block.bytes, block.fileName);
+
+    appStore.dispatch(SaveChatMessageAction(
+      senderPubkeyHex: senderHex,
+      recipientPubkeyHex: myHex,
+      // The original file name rides in `content` for file messages.
+      content: block.fileName,
+      isOutgoing: false,
+      messageId: messageId,
+      messageType: ChatMessageType.file.index,
+      mediaPath: file.path,
+      mediaMime: block.mime,
+    ));
+
+    final peer = _peers.values
+        .where((p) => ChatMessage.pubkeyToHex(p.publicKey) == senderHex)
+        .firstOrNull;
+    final senderName = peer?.displayName ?? 'Unknown';
+    await _showMessageNotification(
+      senderHex,
+      senderName,
+      '📎 Sent a file: ${block.fileName}',
     );
   }
 
@@ -1055,7 +1102,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         AndroidNotificationDetails(
       'grassroots_messages',
       'Messages',
-      channelDescription: 'Grassroots message notifications',
+      channelDescription: 'New messages carried to you over the mesh',
       importance: Importance.high,
       priority: Priority.high,
     );
@@ -1083,8 +1130,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     const AndroidNotificationDetails androidDetails =
         AndroidNotificationDetails(
       'grassroots_friend_requests',
-      'Friend Requests',
-      channelDescription: 'Grassroots friend request notifications',
+      'Friend requests',
+      channelDescription: 'Friend requests from peers on the mesh',
       importance: Importance.high,
       priority: Priority.high,
     );
@@ -1278,37 +1325,31 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   Widget _buildBottomNavBar() {
     return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF1B3D2F), // Dark green background
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.2),
-            blurRadius: 10,
-            offset: const Offset(0, -2),
-          ),
-        ],
+      decoration: const BoxDecoration(
+        color: GlColors.surfaceCard,
+        border: Border(top: BorderSide(color: GlColors.borderSubtle)),
       ),
       child: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          padding: const EdgeInsets.symmetric(
+              horizontal: GlSpace.s4, vertical: GlSpace.s2),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceAround,
             children: [
               _buildNavItem(
-                icon: Icons.chat_bubble_outline,
-                label: 'Chats',
+                icon: Icons.forum_outlined,
+                label: 'Threads',
                 index: 0,
                 badge: _getTotalUnreadCount(),
               ),
               _buildNavItem(
-                icon: Icons.radar,
-                label: 'Around',
+                icon: Icons.cell_tower_rounded,
+                label: 'Nearby',
                 index: 1,
-                isCenter: true,
               ),
               _buildNavItem(
-                icon: Icons.person_outline,
-                label: 'Profile',
+                icon: Icons.person_outline_rounded,
+                label: 'You',
                 index: 2,
               ),
             ],
@@ -1323,38 +1364,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     required String label,
     required int index,
     int badge = 0,
-    bool isCenter = false,
   }) {
     final isSelected = _currentIndex == index;
-
-    // Use orange highlight for selected item
-    final Color bgColor =
-        isSelected ? const Color(0xFFE8A33C) : Colors.transparent;
-    final Color iconColor =
-        isSelected ? (isCenter ? Colors.black : Colors.black) : Colors.white54;
-    final Color textColor =
-        isSelected ? (isCenter ? Colors.black : Colors.black) : Colors.white54;
+    final color = isSelected ? GlColors.primaryOnSoft : GlColors.textSubtle;
 
     return GestureDetector(
       onTap: () => setState(() => _currentIndex = index),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
+        duration: GlMotion.normal,
+        curve: GlMotion.easeOut,
         padding: EdgeInsets.symmetric(
-          horizontal: isSelected ? 16 : 12,
-          vertical: 8,
+          horizontal: isSelected ? GlSpace.s4 : GlSpace.s3,
+          vertical: GlSpace.s2,
         ),
         decoration: BoxDecoration(
-          color: bgColor,
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: isSelected
-              ? [
-                  BoxShadow(
-                    color: const Color(0xFFE8A33C).withOpacity(0.4),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
-                  ),
-                ]
-              : null,
+          color: isSelected ? GlColors.primarySoft : Colors.transparent,
+          borderRadius: GlRadius.rPill,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1362,19 +1387,15 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             Stack(
               clipBehavior: Clip.none,
               children: [
-                Icon(
-                  icon,
-                  color: iconColor,
-                  size: 24,
-                ),
+                Icon(icon, color: color, size: 24),
                 if (badge > 0)
                   Positioned(
                     right: -8,
                     top: -4,
                     child: Container(
-                      padding: const EdgeInsets.all(4),
+                      padding: const EdgeInsets.all(GlSpace.s1),
                       decoration: const BoxDecoration(
-                        color: Colors.red,
+                        color: GlColors.accent,
                         shape: BoxShape.circle,
                       ),
                       constraints:
@@ -1382,9 +1403,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                       child: Text(
                         badge > 99 ? '99+' : badge.toString(),
                         style: const TextStyle(
-                          color: Colors.white,
+                          color: GlColors.textOnPrimary,
                           fontSize: 10,
-                          fontWeight: FontWeight.bold,
+                          fontWeight: FontWeight.w700,
                         ),
                         textAlign: TextAlign.center,
                       ),
@@ -1392,13 +1413,13 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   ),
               ],
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: GlSpace.s1),
             Text(
               label,
               style: TextStyle(
-                color: textColor,
-                fontSize: 12,
-                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                color: color,
+                fontSize: GlType.textXs,
+                fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
               ),
             ),
           ],
@@ -1419,39 +1440,32 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            'Chats',
-            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-          ),
+        Padding(
+          padding: const EdgeInsets.all(GlSpace.s4),
+          child: Text('Threads', style: GlType.displayStyle(GlType.text2xl)),
         ),
         // Pending friend requests section
         if (pendingRequests.isNotEmpty) ...[
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
             child: Row(
               children: [
-                const Icon(Icons.person_add,
-                    size: 18, color: Color(0xFFE8A33C)),
-                const SizedBox(width: 8),
-                Text(
-                  'Friend Requests (${pendingRequests.length})',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFFE8A33C),
-                  ),
+                const Icon(Icons.person_add_alt_rounded,
+                    size: 16, color: GlColors.accent),
+                const SizedBox(width: GlSpace.s2),
+                EyebrowLabel(
+                  'Friend requests · ${pendingRequests.length}',
+                  color: GlColors.accentOnSoft,
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           SizedBox(
             height: 100,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.symmetric(horizontal: GlSpace.s3),
               itemCount: pendingRequests.length,
               itemBuilder: (context, index) {
                 final request = pendingRequests[index];
@@ -1459,26 +1473,26 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               },
             ),
           ),
-          const Divider(height: 24),
+          const Divider(height: GlSpace.s5),
         ],
         Expanded(
           child: chatsWithMessages.isEmpty
-              ? const Center(
+              ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.chat_bubble_outline,
-                          size: 64, color: Colors.grey),
-                      SizedBox(height: 16),
+                      const SignalDot(size: 20),
+                      const SizedBox(height: GlSpace.s5),
                       Text(
-                        'No chats yet',
-                        style: TextStyle(color: Colors.grey, fontSize: 16),
+                        'No threads yet',
+                        style: GlType.displayStyle(GlType.textLg,
+                            weight: FontWeight.w700),
                       ),
-                      SizedBox(height: 8),
-                      Text(
-                        'Start a conversation from\nthe Around tab',
+                      const SizedBox(height: GlSpace.s2),
+                      const Text(
+                        'Say hello to someone nearby —\nyour neighbours will carry it.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.grey),
+                        style: TextStyle(color: GlColors.textMuted),
                       ),
                     ],
                   ),
@@ -1497,32 +1511,24 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   Widget _buildFriendRequestCard(FriendshipState request) {
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 4),
-      color: const Color(0xFF1B3D2F),
+      margin: const EdgeInsets.symmetric(horizontal: GlSpace.s1),
       child: Container(
-        width: 160,
-        padding: const EdgeInsets.all(12),
+        width: 180,
+        padding: const EdgeInsets.all(GlSpace.s3),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                CircleAvatar(
-                  radius: 16,
-                  backgroundColor: Colors.blueGrey,
-                  child: Text(
-                    request.displayName.isNotEmpty
-                        ? request.displayName[0].toUpperCase()
-                        : '?',
-                    style: const TextStyle(color: Colors.white, fontSize: 14),
-                  ),
-                ),
-                const SizedBox(width: 8),
+                PeerAvatar(name: request.displayName, size: 32),
+                const SizedBox(width: GlSpace.s2),
                 Expanded(
                   child: Text(
                     request.displayName,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.bold),
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: GlColors.textStrong),
                   ),
                 ),
               ],
@@ -1534,11 +1540,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                 TextButton(
                   onPressed: () => _declineFriendRequest(request.peerPubkeyHex),
                   style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    foregroundColor: GlColors.textMuted,
+                    padding: const EdgeInsets.symmetric(horizontal: GlSpace.s2),
                     minimumSize: Size.zero,
                   ),
-                  child: const Text('Decline',
-                      style: TextStyle(color: Colors.grey)),
+                  child: const Text('Decline'),
                 ),
                 ElevatedButton(
                   onPressed: () async {
@@ -1554,12 +1560,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                     }
                   },
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE8A33C),
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    backgroundColor: GlColors.accent,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: GlSpace.s3),
                     minimumSize: Size.zero,
                   ),
-                  child: const Text('Accept',
-                      style: TextStyle(color: Colors.black)),
+                  child: const Text('Accept'),
                 ),
               ],
             ),
@@ -1615,19 +1621,19 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       key: ValueKey('chat-${chat.peerHex}'),
       direction: DismissDirection.endToStart,
       background: Container(
-        color: Colors.red,
+        color: GlColors.danger,
         alignment: Alignment.centerRight,
-        padding: const EdgeInsets.symmetric(horizontal: 24),
+        padding: const EdgeInsets.symmetric(horizontal: GlSpace.s5),
         child: const Row(
           mainAxisAlignment: MainAxisAlignment.end,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.delete, color: Colors.white),
-            SizedBox(width: 8),
+            Icon(Icons.delete_outline_rounded, color: GlColors.textOnPrimary),
+            SizedBox(width: GlSpace.s2),
             Text(
               'Delete',
-              style:
-                  TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              style: TextStyle(
+                  color: GlColors.textOnPrimary, fontWeight: FontWeight.w700),
             ),
           ],
         ),
@@ -1645,30 +1651,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         }
       },
       child: ListTile(
-        leading: Stack(
-          children: [
-            CircleAvatar(
-              backgroundColor: isFriend ? Colors.blue : Colors.blueGrey,
-              child: Text(
-                displayName.isNotEmpty ? displayName[0].toUpperCase() : '?',
-                style: const TextStyle(color: Colors.white),
-              ),
-            ),
-            if (isOnline)
-              Positioned(
-                right: 0,
-                bottom: 0,
-                child: Container(
-                  width: 12,
-                  height: 12,
-                  decoration: BoxDecoration(
-                    color: Colors.green,
-                    shape: BoxShape.circle,
-                    border: Border.all(color: Colors.black, width: 2),
-                  ),
-                ),
-              ),
-          ],
+        leading: PeerAvatar(
+          name: displayName,
+          size: 44,
+          presence: isOnline ? PeerPresence.online : null,
         ),
         title: Row(
           children: [
@@ -1679,22 +1665,27 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                     child: Text(displayName, overflow: TextOverflow.ellipsis),
                   ),
                   if (isFriend) ...[
-                    const SizedBox(width: 4),
-                    const Icon(Icons.people, size: 14, color: Colors.blue),
+                    const SizedBox(width: GlSpace.s1),
+                    const Icon(Icons.spa_rounded,
+                        size: 14, color: GlColors.primary),
                   ],
                 ],
               ),
             ),
             if (chat.unreadCount > 0)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.red,
-                  borderRadius: BorderRadius.circular(10),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: GlSpace.s2, vertical: 2),
+                decoration: const BoxDecoration(
+                  color: GlColors.accent,
+                  borderRadius: BorderRadius.all(Radius.circular(999)),
                 ),
                 child: Text(
                   chat.unreadCount.toString(),
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
+                  style: const TextStyle(
+                      color: GlColors.textOnPrimary,
+                      fontSize: GlType.textXs,
+                      fontWeight: FontWeight.w700),
                 ),
               ),
           ],
@@ -1704,14 +1695,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
-            color: chat.unreadCount > 0 ? Colors.white : Colors.grey,
+            color: chat.unreadCount > 0
+                ? GlColors.textStrong
+                : GlColors.textMuted,
             fontWeight:
-                chat.unreadCount > 0 ? FontWeight.w500 : FontWeight.normal,
+                chat.unreadCount > 0 ? FontWeight.w600 : FontWeight.normal,
           ),
         ),
         trailing: Text(
           _formatMessageTime(chat.lastMessage.timestamp),
-          style: const TextStyle(color: Colors.grey, fontSize: 12),
+          style: const TextStyle(
+              color: GlColors.textSubtle, fontSize: GlType.textXs),
         ),
         onTap: () {
           // Live peer wins; otherwise synthesize a stub from the friendship so
@@ -1733,19 +1727,19 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     final accepted = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
-        title: const Text('Delete chat?'),
+        title: const Text('Delete this thread?'),
         content: Text(
-          'Delete the entire chat with ${chat.displayName}? '
-          'Messages and any photos in this chat will be removed from this device.',
+          'Delete the whole thread with ${chat.displayName}? '
+          'Messages and any photos in it will be removed from this device.',
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('Cancel'),
+            child: const Text('Keep it'),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            style: TextButton.styleFrom(foregroundColor: GlColors.danger),
             child: const Text('Delete'),
           ),
         ],
@@ -1773,8 +1767,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   /// picture messages instead of trying to show the empty `content` field.
   String _chatPreviewText(ChatMessageState m) {
     if (m.messageType == ChatMessageType.picture) {
-      if (m.viewOnce) return '🔥 1-time photo';
-      return '📷 Photo';
+      if (m.viewOnce) return 'One-time photo';
+      return 'Photo';
     }
     return m.content;
   }
@@ -1808,87 +1802,72 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(GlSpace.s4),
           child: Row(
             children: [
-              const Text(
-                'Around',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-              ),
+              const GrasslinkWordmark(size: GlType.text2xl),
               const Spacer(),
               IconButton(
-                icon: const Icon(Icons.search),
+                icon: const Icon(Icons.search_rounded),
                 onPressed: _showPeerLookupDialog,
-                tooltip: 'Look up peer by public key',
+                tooltip: 'Find a peer by public key',
               ),
             ],
           ),
         ),
-        // Status bar - using StoreConnector to listen to redux state
+        // Mesh status pill — projection of transport health from Redux.
         StoreConnector<AppState, AppState>(
           converter: (store) => store.state,
           builder: (context, state) {
             return Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              margin: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: GlSpace.s3, vertical: GlSpace.s2),
               decoration: BoxDecoration(
                 color: state.isHealthy
-                    ? Colors.green.withOpacity(0.2)
-                    : Colors.orange.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(8),
+                    ? GlColors.successSoft
+                    : GlColors.warningSoft,
+                borderRadius: GlRadius.rPill,
               ),
               child: Row(
                 children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: state.isHealthy ? Colors.green : Colors.orange,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
+                  SignalMeter(strength: state.isHealthy ? 4 : 1),
+                  const SizedBox(width: GlSpace.s2),
                   Text(
                     state.statusDisplayString,
-                    style: const TextStyle(fontSize: 13),
+                    style: TextStyle(
+                      fontSize: GlType.textSm,
+                      fontWeight: FontWeight.w600,
+                      color: state.isHealthy
+                          ? GlColors.moss700
+                          : GlColors.amber500,
+                    ),
                   ),
                   const Spacer(),
                   Text(
-                    '${_peers.length} nearby • ${onlineFriends.length} friends online',
-                    style: const TextStyle(fontSize: 13, color: Colors.grey),
+                    '${_peers.length} nearby · ${onlineFriends.length} friends',
+                    style: const TextStyle(
+                        fontSize: GlType.textXs, color: GlColors.textMuted),
                   ),
                 ],
               ),
             );
           },
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: GlSpace.s4),
 
         // Online friends section
         if (onlineFriends.isNotEmpty) ...[
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                const Icon(Icons.wifi, size: 18, color: Colors.blue),
-                const SizedBox(width: 8),
-                Text(
-                  'Friends Online (${onlineFriends.length})',
-                  style: const TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.blue,
-                  ),
-                ),
-              ],
-            ),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
+            child: EyebrowLabel('Friends online'),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           SizedBox(
             height: 100,
             child: ListView.builder(
               scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.symmetric(horizontal: GlSpace.s3),
               itemCount: onlineFriends.length,
               itemBuilder: (context, index) {
                 final friend = onlineFriends[index];
@@ -1896,46 +1875,34 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               },
             ),
           ),
-          const Divider(height: 24),
+          const Divider(height: GlSpace.s5),
         ],
 
         // Nearby peers section header
         Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: [
-              const Icon(Icons.bluetooth, size: 18, color: Colors.blueGrey),
-              const SizedBox(width: 8),
-              Text(
-                'Nearby (${_peers.length})',
-                style: const TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.blueGrey,
-                ),
-              ),
-            ],
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
+          child: EyebrowLabel('Nearby · ${_peers.length}'),
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: GlSpace.s2),
 
         Expanded(
           child: (_peers.isEmpty)
-              ? const Center(
+              ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.radar, size: 64, color: Colors.grey),
-                      SizedBox(height: 16),
+                      const SignalDot(size: 20),
+                      const SizedBox(height: GlSpace.s5),
                       Text(
-                        'No peers nearby',
-                        style: TextStyle(color: Colors.grey, fontSize: 16),
+                        'No one nearby yet',
+                        style: GlType.displayStyle(GlType.textLg,
+                            weight: FontWeight.w700),
                       ),
-                      SizedBox(height: 8),
-                      Text(
-                        'Make sure Bluetooth is enabled\non both devices',
+                      const SizedBox(height: GlSpace.s2),
+                      const Text(
+                        'Keep Bluetooth on — peers appear\nas they come into range.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: Colors.grey),
+                        style: TextStyle(color: GlColors.textMuted),
                       ),
                     ],
                   ),
@@ -1944,13 +1911,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   children: [
                     if (_peers.isNotEmpty) ...[
                       const Padding(
-                        padding:
-                            EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                        child: Text('Connected Peers',
-                            style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color: Colors.grey,
-                                fontSize: 12)),
+                        padding: EdgeInsets.symmetric(
+                            horizontal: GlSpace.s4, vertical: GlSpace.s2),
+                        child: EyebrowLabel('In range'),
                       ),
                       ...(_peers.values.toList()
                             ..sort((a, b) =>
@@ -1970,47 +1933,27 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         _openChat(friend);
       },
       child: Container(
-        margin: const EdgeInsets.symmetric(horizontal: 4),
-        padding: const EdgeInsets.all(12),
+        margin: const EdgeInsets.symmetric(horizontal: GlSpace.s1),
+        padding: const EdgeInsets.all(GlSpace.s3),
         decoration: BoxDecoration(
-          color: Colors.blue.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.blue.withOpacity(0.3)),
+          color: GlColors.surfaceCard,
+          borderRadius: GlRadius.rLg,
+          border: Border.all(color: GlColors.borderSubtle),
+          boxShadow: GlShadows.xs,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Stack(
-              children: [
-                CircleAvatar(
-                  radius: 20,
-                  backgroundColor: Colors.blueGrey,
-                  child: Text(
-                    friend.displayName.isNotEmpty
-                        ? friend.displayName[0].toUpperCase()
-                        : '?',
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                ),
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: Container(
-                    width: 12,
-                    height: 12,
-                    decoration: BoxDecoration(
-                      color: Colors.green,
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.black, width: 2),
-                    ),
-                  ),
-                ),
-              ],
+            PeerAvatar(
+              name: friend.displayName,
+              size: 40,
+              presence: PeerPresence.online,
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: GlSpace.s1),
             Text(
               friend.displayName,
-              style: const TextStyle(fontSize: 12),
+              style: const TextStyle(
+                  fontSize: GlType.textXs, color: GlColors.textBody),
               overflow: TextOverflow.ellipsis,
             ),
           ],
@@ -2030,51 +1973,28 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     // RSSI is unavailable for some peripheral-role BLE links because the OS
     // does not expose remote signal strength to the GATT server side.
     final rssiDbm = peer.rssi;
-    final IconData signalIcon;
-    final Color signalColor;
-    if (rssiDbm == null) {
-      signalIcon = Icons.signal_cellular_alt;
-      signalColor = Colors.grey;
-    } else if (rssiDbm < -80) {
-      signalIcon = Icons.signal_cellular_alt_1_bar;
-      signalColor = Colors.red;
-    } else if (rssiDbm < -60) {
-      signalIcon = Icons.signal_cellular_alt_2_bar;
-      signalColor = Colors.orange;
-    } else {
-      signalIcon = Icons.signal_cellular_alt;
-      signalColor = Colors.green;
-    }
 
     // Check if this peer has a recent nickname change
     final nicknameChange = _nicknameChanges[peerHex];
     final isChanging = nicknameChange != null;
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
+        duration: GlMotion.slow,
+        curve: GlMotion.easeOut,
         decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: GlRadius.rLg,
           border: isChanging
-              ? Border.all(color: const Color(0xFFE8A33C), width: 2)
+              ? Border.all(color: GlColors.focusRing, width: 2)
               : null,
         ),
         child: ListTile(
           leading: Stack(
             children: [
-              CircleAvatar(
-                backgroundColor: isFriend ? Colors.blue : Colors.blueGrey,
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  child: Text(
-                    peer.displayName.isNotEmpty
-                        ? peer.displayName[0].toUpperCase()
-                        : '?',
-                    key: ValueKey(peer.displayName),
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                ),
+              PeerAvatar(
+                name: peer.displayName,
+                size: 44,
+                presence: isFriend ? PeerPresence.online : null,
               ),
               if (unreadCount > 0)
                 Positioned(
@@ -2082,34 +2002,20 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   top: 0,
                   child: Container(
                     padding: const EdgeInsets.all(2),
-                    decoration: BoxDecoration(
-                      color: Colors.red,
-                      borderRadius: BorderRadius.circular(10),
+                    decoration: const BoxDecoration(
+                      color: GlColors.accent,
+                      shape: BoxShape.circle,
                     ),
                     constraints:
                         const BoxConstraints(minWidth: 16, minHeight: 16),
                     child: Text(
                       unreadCount > 99 ? '99+' : unreadCount.toString(),
                       style: const TextStyle(
-                          color: Colors.white,
+                          color: GlColors.textOnPrimary,
                           fontSize: 10,
-                          fontWeight: FontWeight.bold),
+                          fontWeight: FontWeight.w700),
                       textAlign: TextAlign.center,
                     ),
-                  ),
-                ),
-              if (isFriend)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  child: Container(
-                    padding: const EdgeInsets.all(2),
-                    decoration: const BoxDecoration(
-                      color: Colors.blue,
-                      shape: BoxShape.circle,
-                    ),
-                    child:
-                        const Icon(Icons.star, color: Colors.white, size: 10),
                   ),
                 ),
             ],
@@ -2118,7 +2024,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             children: [
               Expanded(
                 child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 500),
+                  duration: GlMotion.slow,
+                  switchInCurve: GlMotion.easeOut,
                   transitionBuilder: (child, animation) {
                     return FadeTransition(
                       opacity: animation,
@@ -2138,17 +2045,18 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                         child: Text(
                           peer.displayName,
                           style: TextStyle(
-                            color: isChanging ? const Color(0xFFE8A33C) : null,
+                            color: isChanging ? GlColors.accent : null,
                             fontWeight: isChanging
-                                ? FontWeight.bold
-                                : FontWeight.normal,
+                                ? FontWeight.w700
+                                : FontWeight.w600,
                           ),
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
                       if (isFriend) ...[
-                        const SizedBox(width: 4),
-                        const Icon(Icons.people, size: 14, color: Colors.blue),
+                        const SizedBox(width: GlSpace.s1),
+                        const Icon(Icons.spa_rounded,
+                            size: 14, color: GlColors.primary),
                       ],
                     ],
                   ),
@@ -2157,42 +2065,53 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               peer.activeTransport.icon,
             ],
           ),
-          subtitle: Text(
-            peer.lastBleSeen != null
-                ? 'Last seen: ${_formatSecondsAgo(peer.lastBleSeen!)}'
-                : 'Connecting...',
-          ),
+          subtitle: Builder(builder: (context) {
+            final heard = peer.lastBleSeen != null
+                ? 'Heard ${_formatSecondsAgo(peer.lastBleSeen!)}'
+                : 'Reaching out…';
+            // Debug link-diagnostics: physical link (ACL) count to this peer
+            // from the plugin's OS-level snapshot.
+            if (!appStore.state.settings.showLinkDiagnostics) {
+              return Text(heard);
+            }
+            final linkCount = bleLinkCountForPathIds(
+              appStore.state.transports.bleLinks,
+              [peer.bleCentralDeviceId, peer.blePeripheralDeviceId],
+            );
+            return Text(
+                '$heard · $linkCount link${linkCount == 1 ? '' : 's'}');
+          }),
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(signalIcon, color: signalColor, size: 20),
+                  SignalMeter.fromRssi(rssiDbm),
                   Text(
                     rssiDbm == null ? '-- dBm' : '$rssiDbm dBm',
-                    style: TextStyle(fontSize: 10, color: signalColor),
+                    style: GlType.monoStyle(10, color: GlColors.textSubtle),
                   ),
                 ],
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: GlSpace.s2),
               // Friend request / Chat button
               if (!isFriend && !hasPendingRequest)
                 IconButton(
-                  icon: const Icon(Icons.person_add_outlined),
-                  color: const Color(0xFFE8A33C),
-                  tooltip: 'Send friend request',
+                  icon: const Icon(Icons.person_add_alt_rounded),
+                  color: GlColors.accent,
+                  tooltip: 'Send a friend request',
                   onPressed: () => _sendFriendRequest(peer),
                 )
               else if (hasPendingRequest)
                 const Padding(
                   padding: EdgeInsets.all(8.0),
-                  child:
-                      Icon(Icons.hourglass_empty, color: Colors.grey, size: 20),
+                  child: Icon(Icons.hourglass_empty_rounded,
+                      color: GlColors.textSubtle, size: 20),
                 ),
               IconButton(
-                icon: const Icon(Icons.chat_bubble_outline),
-                color: Colors.blue,
+                icon: const Icon(Icons.chat_bubble_outline_rounded),
+                color: GlColors.primary,
                 onPressed: () => _openChat(peer),
               ),
             ],
@@ -2209,20 +2128,20 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Look up Peer'),
+        title: const Text('Find a peer'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Text(
-              'Enter public key (hex) to check if peer is reachable:',
+              'Paste a public key to see whether the mesh can reach them:',
               style: TextStyle(fontSize: 14),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: GlSpace.s4),
             TextField(
               controller: controller,
+              style: GlType.monoStyle(GlType.textSm),
               decoration: const InputDecoration(
                 hintText: 'Public key (64 hex chars)',
-                border: OutlineInputBorder(),
               ),
               maxLines: 2,
             ),
@@ -2263,20 +2182,34 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
-          title:
-              Text(isReachable ? '✅ Peer Reachable' : '❌ Peer Not Reachable'),
+          title: Row(
+            children: [
+              Icon(
+                isReachable
+                    ? Icons.check_circle_rounded
+                    : Icons.cancel_rounded,
+                color: isReachable ? GlColors.success : GlColors.danger,
+              ),
+              const SizedBox(width: GlSpace.s2),
+              Expanded(
+                child: Text(isReachable
+                    ? 'The mesh can reach them'
+                    : 'Out of reach right now'),
+              ),
+            ],
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               if (peer != null) ...[
-                Text('Nickname: ${peer.displayName}'),
+                Text('Name: ${peer.displayName}'),
                 Text('Status: ${peer.connectionState.name}'),
                 if (peer.rssi != null) Text('Signal: ${peer.rssi} dBm'),
                 if (peer.lastSeen != null)
-                  Text('Last seen: ${_formatSecondsAgo(peer.lastSeen!)}'),
+                  Text('Heard ${_formatSecondsAgo(peer.lastSeen!)}'),
               ] else
-                const Text('Peer not found in known peers list.'),
+                const Text('No one by that key has been seen yet.'),
             ],
           ),
           actions: [
@@ -2290,7 +2223,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   Navigator.pop(context);
                   _openChat(peer);
                 },
-                child: const Text('Open Chat'),
+                child: const Text('Open thread'),
               ),
           ],
         ),
@@ -2302,43 +2235,31 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     }
   }
 
-  // ===== PROFILE TAB =====
+  // ===== YOU TAB =====
   Widget _buildProfileTab() {
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(GlSpace.s4),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Text(
-                'Profile',
-                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-              ),
+              Text('You', style: GlType.displayStyle(GlType.text2xl)),
               const Spacer(),
               IconButton(
-                icon: const Icon(Icons.settings),
+                icon: const Icon(Icons.settings_outlined),
                 onPressed: _openSettings,
                 tooltip: 'Settings',
               ),
             ],
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: GlSpace.s5),
 
           // Avatar
           Center(
-            child: CircleAvatar(
-              radius: 50,
-              backgroundColor: Colors.blueGrey,
-              child: Text(
-                _identity?.nickname.isNotEmpty == true
-                    ? _identity!.nickname[0].toUpperCase()
-                    : '?',
-                style: const TextStyle(fontSize: 40, color: Colors.white),
-              ),
-            ),
+            child: PeerAvatar(name: _identity?.nickname ?? '', size: 100),
           ),
-          const SizedBox(height: 16),
+          const SizedBox(height: GlSpace.s4),
 
           // Nickname with edit button
           Center(
@@ -2346,68 +2267,71 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  _identity?.nickname ?? 'Loading...',
-                  style: const TextStyle(
-                      fontSize: 24, fontWeight: FontWeight.bold),
+                  _identity?.nickname ?? 'Loading…',
+                  style: GlType.displayStyle(GlType.textXl),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: GlSpace.s2),
                 IconButton(
-                  icon: const Icon(Icons.edit, size: 20),
+                  icon: const Icon(Icons.edit_outlined, size: 20),
                   onPressed: _showEditNicknameDialog,
-                  tooltip: 'Edit nickname',
+                  tooltip: 'Change your name',
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 32),
+          const SizedBox(height: GlSpace.s6),
 
           // Info cards
           _buildInfoCard(
             title: 'Fingerprint',
-            value: _identity?.shortFingerprint ?? '...',
-            icon: Icons.fingerprint,
+            value: _identity?.shortFingerprint ?? '…',
+            icon: Icons.fingerprint_rounded,
             onCopy: () => _copyToClipboard(_identity?.shortFingerprint ?? ''),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
 
           _buildInfoCard(
             title: 'Service UUID',
-            value: _identity?.bleServiceUuid ?? '...',
-            icon: Icons.bluetooth,
+            value: _identity?.bleServiceUuid ?? '…',
+            icon: Icons.bluetooth_rounded,
             onCopy: () => _copyToClipboard(_identity?.bleServiceUuid ?? ''),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
 
           _buildInfoCard(
-            title: 'Public Key',
+            title: 'Public key',
             value: _identity != null
                 ? ChatMessage.pubkeyToHex(_identity!.publicKey)
-                : '...',
-            icon: Icons.key,
+                : '…',
+            icon: Icons.key_rounded,
             onCopy: () => _copyToClipboard(_identity != null
                 ? ChatMessage.pubkeyToHex(_identity!.publicKey)
                 : ''),
             maxLines: 2,
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
 
           // Regenerate identity (dev/testing affordance).
           // Re-rolls the Ed25519 keypair so peers treat this install as a new
           // device without requiring uninstall + reinstall.
           OutlinedButton.icon(
-            icon: const Icon(Icons.refresh),
-            label: const Text('Regenerate Identity'),
+            icon: const Icon(Icons.refresh_rounded),
+            label: const Text('Regenerate identity'),
             style: OutlinedButton.styleFrom(
-              foregroundColor: Colors.red,
-              side: const BorderSide(color: Colors.red),
+              foregroundColor: GlColors.danger,
+              side: const BorderSide(color: GlColors.danger, width: 1.5),
               minimumSize: const Size.fromHeight(44),
             ),
             onPressed: _identity == null ? null : _regenerateIdentity,
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
 
           // Transport status card
           _buildTransportStatusCard(),
+          const SizedBox(height: 12),
+
+          // Invite / cold-bootstrap card
+          _buildInviteCard(),
           const SizedBox(height: 12),
 
           // Settings shortcut card
@@ -2417,10 +2341,263 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     );
   }
 
+  Widget _buildInviteCard() {
+    final canInvite = _grassroots?.canCreateInvite ?? false;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(GlSpace.s4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Row(
+              children: [
+                SignalDot(size: 12),
+                SizedBox(width: GlSpace.s2),
+                Text(
+                  'Invites',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w600, color: GlColors.textStrong),
+                ),
+              ],
+            ),
+            const SizedBox(height: GlSpace.s2),
+            Text(
+              canInvite
+                  ? 'Bring someone new onto the mesh — a willing well-connected '
+                      'friend passes the first hello along.'
+                  : 'To invite someone new, you need a well-connected friend '
+                      'online who has offered to introduce newcomers.',
+              style: const TextStyle(
+                  color: GlColors.textMuted, fontSize: GlType.textSm),
+            ),
+            const SizedBox(height: GlSpace.s3),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.person_add_alt_rounded, size: 18),
+                    label: const Text('Create invite'),
+                    onPressed: canInvite ? _createInviteLink : null,
+                  ),
+                ),
+                const SizedBox(width: GlSpace.s3),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.link_rounded, size: 18),
+                    label: const Text('Redeem'),
+                    onPressed:
+                        _grassroots == null ? null : _showRedeemInviteDialog,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _createInviteLink() {
+    final grassroots = _grassroots;
+    if (grassroots == null) return;
+    final candidates = grassroots.invitableIntroducers;
+    if (candidates.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              'No willing well-connected friend is online to introduce you'),
+        ),
+      );
+      return;
+    }
+    // Pick which willing friends to name as introducers (default: all).
+    final selected = {for (final p in candidates) p.pubkeyHex};
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('Who can introduce you?'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'These well-connected friends have offered to help newcomers '
+                'reach you. Pick who can pass this invite along.',
+                style: TextStyle(
+                    color: GlColors.textMuted, fontSize: GlType.textSm),
+              ),
+              const SizedBox(height: GlSpace.s2),
+              ...candidates.map((p) => CheckboxListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    value: selected.contains(p.pubkeyHex),
+                    onChanged: (v) => setDialogState(() {
+                      if (v == true) {
+                        selected.add(p.pubkeyHex);
+                      } else {
+                        selected.remove(p.pubkeyHex);
+                      }
+                    }),
+                    secondary: PeerAvatar(name: p.displayName, size: 36),
+                    title: Text(p.displayName),
+                  )),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: selected.isEmpty
+                  ? null
+                  : () {
+                      Navigator.pop(ctx);
+                      _generateAndShowInvite(introducerHexes: selected);
+                    },
+              child: const Text('Create link'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _generateAndShowInvite({required Set<String> introducerHexes}) {
+    final link = _grassroots?.createInvite(introducerPubkeyHexes: introducerHexes);
+    if (link == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No willing introducer is available'),
+        ),
+      );
+      return;
+    }
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Share this invite'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Send this link to someone new. It works for 24 hours and can '
+              'be redeemed once.',
+            ),
+            const SizedBox(height: GlSpace.s3),
+            Container(
+              padding: const EdgeInsets.all(GlSpace.s3),
+              decoration: BoxDecoration(
+                color: GlColors.bgSunken,
+                borderRadius: GlRadius.rSm,
+              ),
+              child: SelectableText(
+                link,
+                style: GlType.monoStyle(GlType.textXs),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+          ElevatedButton.icon(
+            icon: const Icon(Icons.copy_rounded, size: 18),
+            label: const Text('Copy link'),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: link));
+              Navigator.pop(ctx);
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Invite link copied')),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showRedeemInviteDialog() {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Redeem an invite'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Paste an invite link a friend sent you. A well-connected '
+              'neighbour will help you reach them.',
+            ),
+            const SizedBox(height: GlSpace.s3),
+            TextField(
+              controller: controller,
+              minLines: 2,
+              maxLines: 4,
+              style: GlType.monoStyle(GlType.textXs),
+              decoration: const InputDecoration(
+                hintText: 'grassroots://invite?d=…',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              final link = controller.text.trim();
+              Navigator.pop(ctx);
+              if (link.isNotEmpty) _redeemInviteLink(link);
+            },
+            child: const Text('Reach out'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _redeemInviteLink(String link) async {
+    final grassroots = _grassroots;
+    if (grassroots == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Reaching out through the mesh…')),
+    );
+    final result = await grassroots.redeemInvite(link);
+    if (!mounted) return;
+    if (result.ok) {
+      final peer = result.inviter == null
+          ? null
+          : grassroots.getPeer(result.inviter!);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(peer != null
+              ? 'Connected to ${peer.displayName}'
+              : 'Connected — say hello!'),
+        ),
+      );
+      if (peer != null) _openChat(peer);
+    } else {
+      messenger.showSnackBar(
+        SnackBar(content: Text(result.error ?? 'Could not redeem the invite')),
+      );
+    }
+  }
+
   Widget _buildTransportStatusCard() {
     return Card(
+      margin: EdgeInsets.zero,
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(GlSpace.s4),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2428,44 +2605,42 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               children: [
                 StoreConnector<AppState, bool>(
                   converter: (store) => store.state.isHealthy,
-                  builder: (context, isHealthy) => Icon(
-                    isHealthy ? Icons.check_circle : Icons.error,
-                    color: isHealthy ? Colors.green : Colors.orange,
+                  builder: (context, isHealthy) => SignalMeter(
+                    strength: isHealthy ? 4 : 1,
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: GlSpace.s2),
                 const Text(
-                  'Transport Status',
-                  style: TextStyle(fontWeight: FontWeight.bold),
+                  'Your links',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w600, color: GlColors.textStrong),
                 ),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: GlSpace.s3),
 
             // BLE status
             _buildTransportStatusRow(
-              icon: Icons.bluetooth,
-              iconColor: Colors.blue,
+              icon: Icons.bluetooth_rounded,
               name: 'Bluetooth',
               enabled: appStore.state.settings.bluetoothEnabled,
               available: _bleAvailable,
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: GlSpace.s2),
 
             // UDP status
             _buildTransportStatusRow(
-              icon: Icons.public,
-              iconColor: Colors.green,
-              name: 'Internet (UDP)',
+              icon: Icons.public_rounded,
+              name: 'Internet',
               enabled: appStore.state.settings.udpEnabled,
               available: _udpAvailable,
             ),
 
-            const Divider(height: 24),
+            const Divider(height: GlSpace.s5),
 
             Text(
-              '${_peers.length} connected peers',
-              style: const TextStyle(color: Colors.grey),
+              '${_peers.length} peers in reach',
+              style: const TextStyle(color: GlColors.textMuted),
             ),
           ],
         ),
@@ -2475,46 +2650,47 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   Widget _buildTransportStatusRow({
     required IconData icon,
-    required Color iconColor,
     required String name,
     required bool enabled,
     required bool available,
   }) {
     final isActive = enabled && available;
+    final badgeColor = isActive
+        ? GlColors.success
+        : (enabled ? GlColors.warning : GlColors.textSubtle);
+    final badgeBg = isActive
+        ? GlColors.successSoft
+        : (enabled ? GlColors.warningSoft : GlColors.bgSunken);
 
     return Row(
       children: [
         Icon(
           icon,
           size: 18,
-          color: isActive ? iconColor : Colors.grey,
+          color: isActive ? GlColors.primary : GlColors.textSubtle,
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: GlSpace.s2),
         Expanded(
           child: Text(
             name,
             style: TextStyle(
-              color: isActive ? Colors.white : Colors.grey,
+              color: isActive ? GlColors.textBody : GlColors.textMuted,
             ),
           ),
         ),
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          padding: const EdgeInsets.symmetric(
+              horizontal: GlSpace.s2, vertical: 2),
           decoration: BoxDecoration(
-            color: isActive
-                ? Colors.green.withOpacity(0.2)
-                : (enabled
-                    ? Colors.orange.withOpacity(0.2)
-                    : Colors.grey.withOpacity(0.2)),
-            borderRadius: BorderRadius.circular(4),
+            color: badgeBg,
+            borderRadius: GlRadius.rPill,
           ),
           child: Text(
-            isActive ? 'Active' : (enabled ? 'Unavailable' : 'Disabled'),
+            isActive ? 'Carrying' : (enabled ? 'Out of reach' : 'Off'),
             style: TextStyle(
-              fontSize: 11,
-              color: isActive
-                  ? Colors.green
-                  : (enabled ? Colors.orange : Colors.grey),
+              fontSize: GlType.text2xs,
+              fontWeight: FontWeight.w600,
+              color: badgeColor,
             ),
           ),
         ),
@@ -2524,11 +2700,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
 
   Widget _buildSettingsCard() {
     return Card(
+      margin: EdgeInsets.zero,
       child: ListTile(
-        leading: const Icon(Icons.settings, color: Color(0xFFE8A33C)),
-        title: const Text('Transport Settings'),
-        subtitle: const Text('Configure Bluetooth and Internet protocols'),
-        trailing: const Icon(Icons.chevron_right),
+        leading: const Icon(Icons.settings_outlined, color: GlColors.accent),
+        title: const Text('Settings'),
+        subtitle: const Text('Bluetooth, Internet, and how you lend your link'),
+        trailing: const Icon(Icons.chevron_right_rounded),
         onTap: _openSettings,
       ),
     );
@@ -2542,24 +2719,31 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onSettingsChanged: () {
             setState(() {});
           },
-          onAddRendezvousServer: _grassroots == null
-              ? null
-              : (address, pubkeyHex) => _grassroots!.addRendezvousServer(
-                    address: address,
-                    pubkeyHex: pubkeyHex,
-                  ),
-          onRemoveRendezvousServer: _grassroots == null
-              ? null
-              : (address, pubkeyHex) => _grassroots!.removeRendezvousServer(
-                    address: address,
-                    pubkeyHex: pubkeyHex,
-                  ),
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
+          onUploadTracesNow: _uploadTracesNow,
+          myPubkeyHex: _grassroots?.identity.publicKey
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(),
+          onStartWorkload: _grassroots == null
+              ? null
+              : () async => _grassroots!.startWorkload(),
+          onStopWorkload:
+              _grassroots == null ? null : () => _grassroots!.stopWorkload(),
+          workloadStatus: _grassroots == null
+              ? null
+              : () {
+                  final d = _grassroots!.workloadDriver;
+                  return WorkloadStatus(
+                    running: d.isRunning,
+                    scheduled: d.scheduledCount,
+                    sent: d.sentCount,
+                  );
+                },
         ),
       ),
     );
@@ -2573,23 +2757,21 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     int maxLines = 1,
   }) {
     return Card(
+      margin: EdgeInsets.zero,
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(GlSpace.s4),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
-                Icon(icon, size: 20, color: Colors.grey),
-                const SizedBox(width: 8),
-                Text(
-                  title,
-                  style: const TextStyle(color: Colors.grey, fontSize: 12),
-                ),
+                Icon(icon, size: 20, color: GlColors.textMuted),
+                const SizedBox(width: GlSpace.s2),
+                EyebrowLabel(title),
                 const Spacer(),
                 if (onCopy != null)
                   IconButton(
-                    icon: const Icon(Icons.copy, size: 18),
+                    icon: const Icon(Icons.copy_rounded, size: 18),
                     onPressed: onCopy,
                     tooltip: 'Copy',
                     padding: EdgeInsets.zero,
@@ -2597,10 +2779,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                   ),
               ],
             ),
-            const SizedBox(height: 4),
+            const SizedBox(height: GlSpace.s1),
             Text(
               value,
-              style: const TextStyle(fontSize: 14, fontFamily: 'monospace'),
+              style: GlType.monoStyle(GlType.textSm),
               maxLines: maxLines,
               overflow: TextOverflow.ellipsis,
             ),
@@ -2625,12 +2807,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Edit Nickname'),
+        title: const Text('Change your name'),
         content: TextField(
           controller: controller,
           decoration: const InputDecoration(
-            hintText: 'Enter new nickname',
-            border: OutlineInputBorder(),
+            hintText: 'What should neighbours call you?',
           ),
           autofocus: true,
           maxLength: 30,
@@ -2694,8 +2875,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red,
-              foregroundColor: Colors.white,
+              backgroundColor: GlColors.danger,
+              foregroundColor: GlColors.textOnPrimary,
             ),
             onPressed: () => Navigator.pop(ctx, true),
             child: const Text('Regenerate'),
@@ -2748,8 +2929,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Identity regenerated but Grassroots init failed'),
-            backgroundColor: Colors.red,
+            content: Text('Identity regenerated, but the mesh failed to start'),
+            backgroundColor: GlColors.danger,
           ),
         );
       }
@@ -2779,25 +2960,26 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       SnackBar(
         content: Row(
           children: [
-            const Icon(Icons.person, color: Colors.white),
-            const SizedBox(width: 12),
+            const Icon(Icons.person_rounded, color: GlColors.textInverse),
+            const SizedBox(width: GlSpace.s3),
             Expanded(
               child: RichText(
                 text: TextSpan(
-                  style: const TextStyle(color: Colors.white),
+                  style: const TextStyle(
+                      fontFamily: GlType.sans, color: GlColors.textInverse),
                   children: [
                     TextSpan(
                       text: oldName.isEmpty ? 'Unknown' : oldName,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
                         decoration: TextDecoration.lineThrough,
-                        color: Colors.white70,
+                        color: GlColors.textInverse.withValues(alpha: 0.7),
                       ),
                     ),
                     const TextSpan(text: ' → '),
                     TextSpan(
                       text: newName,
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                      style: const TextStyle(fontWeight: FontWeight.w700),
                     ),
                   ],
                 ),
@@ -2806,8 +2988,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           ],
         ),
         duration: const Duration(seconds: 3),
-        behavior: SnackBarBehavior.floating,
-        backgroundColor: const Color(0xFF1B3D2F),
       ),
     );
 

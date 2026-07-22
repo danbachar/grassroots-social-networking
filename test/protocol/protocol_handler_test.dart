@@ -34,28 +34,25 @@ void main() {
     });
 
     group('createAnnouncePayload', () {
-      test('encodes public key, version, and nickname correctly', () {
+      test('encodes public key, flags, and nickname correctly', () {
         final payload = handler.createAnnouncePayload();
 
         // Verify payload structure
         expect(payload.length,
-            greaterThanOrEqualTo(32 + 2 + 1 + 'TestUser'.length + 2));
+            greaterThanOrEqualTo(32 + 1 + 1 + 'TestUser'.length + 2));
 
         // Public key (first 32 bytes)
         final pubkeyFromPayload = payload.sublist(0, 32);
         expect(pubkeyFromPayload, equals(testIdentity.publicKey));
 
-        // Protocol version (next 2 bytes)
-        final versionData =
-            ByteData.view(payload.buffer, payload.offsetInBytes + 32, 2);
-        final version = versionData.getUint16(0, Endian.big);
-        expect(version, equals(1)); // Protocol version 1
+        // Flags (1 byte) — willing-to-facilitate bit, off by default.
+        expect(payload[32], equals(0));
 
         // Nickname length and nickname
-        final nickLen = payload[34];
+        final nickLen = payload[33];
         expect(nickLen, equals('TestUser'.length));
         final nickname =
-            String.fromCharCodes(payload.sublist(35, 35 + nickLen));
+            String.fromCharCodes(payload.sublist(34, 34 + nickLen));
         expect(nickname, equals('TestUser'));
       });
 
@@ -63,7 +60,7 @@ void main() {
         final payload = handler.createAnnouncePayload();
 
         // Candidate count should be 0 after the nickname.
-        const offset = 32 + 2 + 1 + 'TestUser'.length;
+        const offset = 32 + 1 + 1 + 'TestUser'.length;
         final candidateCountData =
             ByteData.view(payload.buffer, payload.offsetInBytes + offset, 2);
         final candidateCount = candidateCountData.getUint16(0, Endian.big);
@@ -92,9 +89,9 @@ void main() {
         final payload = emptyHandler.createAnnouncePayload();
 
         // Should have valid structure with 0-length nickname.
-        // pubkey + version + nickLen(0) + candidateCount(0) + signature(64)
-        expect(payload.length, equals(32 + 2 + 1 + 2 + 64));
-        expect(payload[34], equals(0)); // nickname length = 0
+        // pubkey + flags + nickLen(0) + candidateCount(0) + signature(64)
+        expect(payload.length, equals(32 + 1 + 1 + 2 + 64));
+        expect(payload[33], equals(0)); // nickname length = 0
       });
 
       test('includes UDP address candidates when provided', () {
@@ -131,7 +128,18 @@ void main() {
 
         expect(decoded.nickname, equals(fancyNick));
         // The 1-byte length prefix counts UTF-8 bytes, not characters.
-        expect(payload[34], equals(utf8.encode(fancyNick).length));
+        expect(payload[33], equals(utf8.encode(fancyNick).length));
+      });
+
+      test('round-trips the willing-to-facilitate flag', () {
+        final off = handler.decodeAnnounce(handler.createAnnouncePayload());
+        expect(off.willingToFacilitate, isFalse);
+
+        final on = handler.decodeAnnounce(
+            handler.createAnnouncePayload(willingToFacilitate: true));
+        expect(on.willingToFacilitate, isTrue);
+        // The flag is inside the signed body — tampering breaks the signature.
+        expect(on.nickname, equals('TestUser'));
       });
     });
 
@@ -142,7 +150,6 @@ void main() {
 
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
-        expect(decoded.protocolVersion, equals(1));
         expect(decoded.udpAddress, isNull);
         expect(decoded.addressCandidates, isEmpty);
       });
@@ -154,7 +161,6 @@ void main() {
 
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
-        expect(decoded.protocolVersion, equals(1));
         expect(decoded.udpAddress, equals(testAddress));
         expect(decoded.addressCandidates, contains(testAddress));
       });
@@ -399,7 +405,7 @@ void main() {
       test('tampered body byte fails verification (FormatException)', () {
         final payload = handler.createAnnouncePayload();
 
-        // Flip a byte inside the signed body (the nickname-length byte).
+        // Flip a byte inside the signed body (the platform byte).
         payload[34] = payload[34] ^ 0xFF;
 
         expect(

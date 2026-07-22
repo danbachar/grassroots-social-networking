@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:redux/redux.dart';
 import 'debug_log_screen.dart';
+import 'testbed_screen.dart';
+import 'theme/grasslink_tokens.dart';
+import 'theme/grasslink_widgets.dart';
 import 'src/store/app_state.dart';
 import 'src/store/settings_actions.dart';
 import 'src/store/settings_state.dart';
@@ -16,10 +18,6 @@ class SettingsScreen extends StatefulWidget {
 
   /// Callback when settings are changed
   final VoidCallback? onSettingsChanged;
-  final Future<bool> Function(String address, String pubkeyHex)?
-      onAddRendezvousServer;
-  final Future<void> Function(String address, String pubkeyHex)?
-      onRemoveRendezvousServer;
 
   /// Debug-only: switch which BLE roles the local device runs.
   final Future<void> Function(BleRoleMode mode)? onBleRoleModeChanged;
@@ -28,14 +26,28 @@ class SettingsScreen extends StatefulWidget {
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
 
+  /// Upload not-yet-uploaded diagnostic traces on demand ("Upload now").
+  /// Returns a short user-facing status message to surface in a snackbar.
+  final Future<String> Function()? onUploadTracesNow;
+
+  /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
+  /// is not up. [myPubkeyHex] is this device's hex identity.
+  final String? myPubkeyHex;
+  final Future<void> Function()? onStartWorkload;
+  final VoidCallback? onStopWorkload;
+  final WorkloadStatus Function()? workloadStatus;
+
   const SettingsScreen({
     super.key,
     required this.store,
     this.onSettingsChanged,
-    this.onAddRendezvousServer,
-    this.onRemoveRendezvousServer,
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
+    this.onUploadTracesNow,
+    this.myPubkeyHex,
+    this.onStartWorkload,
+    this.onStopWorkload,
+    this.workloadStatus,
   });
 
   @override
@@ -45,14 +57,11 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   late bool _bluetoothEnabled;
   late bool _udpEnabled;
-  bool _isSavingAnchor = false;
   bool _isRetryingPublicAddressDiscovery = false;
   StreamSubscription<AppState>? _storeSubscription;
 
-  late final TextEditingController _anchorAddressController;
-  late final TextEditingController _anchorPubkeyController;
-  late final TextEditingController _traceUrlController;
-  late final TextEditingController _traceTokenController;
+  /// True while a manual "Upload now" is in flight (disables the button).
+  bool _uploadingTraces = false;
 
   @override
   void initState() {
@@ -60,14 +69,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _bluetoothEnabled = widget.store.state.settings.bluetoothEnabled;
     _udpEnabled = widget.store.state.settings.udpEnabled;
 
-    _anchorAddressController = TextEditingController();
-    _anchorPubkeyController = TextEditingController();
-    _traceUrlController = TextEditingController(
-      text: widget.store.state.settings.traceServerUrl ?? '',
-    );
-    _traceTokenController = TextEditingController(
-      text: widget.store.state.settings.traceServerToken ?? '',
-    );
     _storeSubscription = widget.store.onChange.listen((state) {
       final settings = state.settings;
       if (_bluetoothEnabled != settings.bluetoothEnabled) {
@@ -85,10 +86,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     _storeSubscription?.cancel();
-    _anchorAddressController.dispose();
-    _anchorPubkeyController.dispose();
-    _traceUrlController.dispose();
-    _traceTokenController.dispose();
     super.dispose();
   }
 
@@ -97,37 +94,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Settings'),
-        backgroundColor: const Color(0xFF1B3D2F),
       ),
       body: ListView(
         children: [
           const SizedBox(height: 16),
 
           // Transport Section Header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                const Icon(Icons.swap_horiz, color: Color(0xFFE8A33C)),
-                const SizedBox(width: 8),
-                const Text(
-                  'Transport Protocols',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFFE8A33C),
-                  ),
-                ),
-              ],
-            ),
+          const Padding(
+            padding: EdgeInsets.symmetric(
+                horizontal: GlSpace.s4, vertical: GlSpace.s2),
+            child: EyebrowLabel('Your links', color: GlColors.accentOnSoft),
           ),
 
           const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16),
+            padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
             child: Text(
-              'Choose which protocols to use for peer communication. '
-              'Bluetooth is preferred when peers are nearby.',
-              style: TextStyle(color: Colors.grey, fontSize: 13),
+              'Choose how you reach your peers. Bluetooth carries messages '
+              'when neighbours are nearby.',
+              style:
+                  TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
             ),
           ),
 
@@ -135,10 +120,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // Bluetooth Toggle
           _buildTransportTile(
-            icon: Icons.bluetooth,
-            iconColor: Colors.blue,
+            icon: Icons.bluetooth_rounded,
+            iconColor: GlColors.primary,
             title: 'Bluetooth',
-            subtitle: 'Connect to nearby peers via BLE',
+            subtitle: 'Reach neighbours nearby, no Internet needed',
             value: _bluetoothEnabled,
             available:
                 widget.store.state.transports.bleState != TransportState.error,
@@ -154,10 +139,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // UDP Toggle
           _buildTransportTile(
-            icon: Icons.public,
-            iconColor: Colors.green,
+            icon: Icons.public_rounded,
+            iconColor: GlColors.info,
             title: 'Internet',
-            subtitle: 'Connect to peers over the Internet',
+            subtitle: 'Reach peers anywhere in the world',
             value: _udpEnabled,
             available:
                 widget.store.state.transports.udpState != TransportState.error,
@@ -171,8 +156,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const Divider(height: 32),
 
-          // Anchor Server Section
-          _buildAnchorServerSection(),
+          // Introduce strangers (invite facilitation)
+          _buildFacilitateInvitesSection(),
 
           const Divider(height: 32),
 
@@ -184,33 +169,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // Warning if no transport enabled
           if (!_bluetoothEnabled && !_udpEnabled)
             Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.all(16),
+              margin: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
+              padding: const EdgeInsets.all(GlSpace.s4),
               decoration: BoxDecoration(
-                color: Colors.red.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.red.withOpacity(0.3)),
+                color: GlColors.dangerSoft,
+                borderRadius: GlRadius.rMd,
               ),
-              child: Row(
+              child: const Row(
                 children: [
-                  const Icon(Icons.warning, color: Colors.red),
-                  const SizedBox(width: 12),
+                  Icon(Icons.warning_amber_rounded, color: GlColors.danger),
+                  SizedBox(width: GlSpace.s3),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      children: const [
+                      children: [
                         Text(
-                          'No transport enabled',
+                          'No link is on',
                           style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.red,
+                            fontWeight: FontWeight.w700,
+                            color: GlColors.danger,
                           ),
                         ),
-                        SizedBox(height: 4),
+                        SizedBox(height: GlSpace.s1),
                         Text(
-                          'You won\'t be able to communicate with other peers. '
-                          'Enable at least one transport protocol.',
-                          style: TextStyle(color: Colors.red, fontSize: 13),
+                          'You can\'t reach anyone right now. '
+                          'Turn on at least one link.',
+                          style: TextStyle(
+                              color: GlColors.danger, fontSize: GlType.textSm),
                         ),
                       ],
                     ),
@@ -234,27 +219,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: ListTile(
               leading: Container(
-                padding: const EdgeInsets.all(8),
+                padding: const EdgeInsets.all(GlSpace.s2),
                 decoration: BoxDecoration(
-                  color: Colors.purple.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(8),
+                  color: GlColors.infoSoft,
+                  borderRadius: GlRadius.rSm,
                 ),
-                child: const Icon(Icons.bug_report, color: Colors.purple),
+                child: const Icon(Icons.bug_report_outlined,
+                    color: GlColors.info),
               ),
               title: const Text(
-                'Debug Logs',
+                'Debug logs',
                 style: TextStyle(fontWeight: FontWeight.w600),
               ),
-              subtitle: Text(
-                'View live transport logs',
-                style: TextStyle(color: Colors.grey[400], fontSize: 13),
+              subtitle: const Text(
+                'Live transport logs',
+                style: TextStyle(
+                    color: GlColors.textMuted, fontSize: GlType.textSm),
               ),
-              trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+              trailing: const Icon(Icons.chevron_right_rounded,
+                  color: GlColors.textSubtle),
               onTap: () {
                 Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (context) => const DebugLogScreen(),
+                  ),
+                );
+              },
+            ),
+          ),
+
+          // Testbed (debug harnesses)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(GlSpace.s2),
+                decoration: BoxDecoration(
+                  color: GlColors.infoSoft,
+                  borderRadius: GlRadius.rSm,
+                ),
+                child: const Icon(Icons.science_outlined, color: GlColors.info),
+              ),
+              title: const Text(
+                'Testbed',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: const Text(
+                'Neighbour allowlist + workload driver',
+                style: TextStyle(
+                    color: GlColors.textMuted, fontSize: GlType.textSm),
+              ),
+              trailing: const Icon(Icons.chevron_right_rounded,
+                  color: GlColors.textSubtle),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => TestbedScreen(
+                      store: widget.store,
+                      myPubkeyHex: widget.myPubkeyHex,
+                      onStartWorkload: widget.onStartWorkload,
+                      onStopWorkload: widget.onStopWorkload,
+                      workloadStatus: widget.workloadStatus,
+                    ),
                   ),
                 );
               },
@@ -280,18 +308,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final isEnabled = value && available;
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      color: isEnabled ? const Color(0xFF1B3D2F) : null,
       child: ListTile(
         leading: Container(
-          padding: const EdgeInsets.all(8),
+          padding: const EdgeInsets.all(GlSpace.s2),
           decoration: BoxDecoration(
-            color: iconColor.withOpacity(isEnabled ? 0.2 : 0.1),
-            borderRadius: BorderRadius.circular(8),
+            color: isEnabled ? GlColors.primarySoft : GlColors.bgSunken,
+            borderRadius: GlRadius.rSm,
           ),
           child: Icon(
             icon,
-            color: isEnabled ? iconColor : Colors.grey,
+            color: isEnabled ? iconColor : GlColors.textSubtle,
           ),
         ),
         title: Row(
@@ -301,37 +327,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 title,
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
-                  color: isEnabled ? Colors.white : Colors.grey,
+                  color:
+                      isEnabled ? GlColors.textStrong : GlColors.textMuted,
                 ),
               ),
             ),
             if (!available)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: GlSpace.s2, vertical: 2),
                 decoration: BoxDecoration(
-                  color: Colors.orange.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(4),
+                  color: GlColors.warningSoft,
+                  borderRadius: GlRadius.rPill,
                 ),
                 child: const Text(
-                  'Unavailable',
+                  'Out of reach',
                   style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.orange,
+                    fontSize: GlType.text2xs,
+                    fontWeight: FontWeight.w600,
+                    color: GlColors.warning,
                   ),
                 ),
               ),
             if (available && isEnabled)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: GlSpace.s2, vertical: 2),
                 decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(4),
+                  color: GlColors.successSoft,
+                  borderRadius: GlRadius.rPill,
                 ),
                 child: Text(
                   'Priority $priority',
                   style: const TextStyle(
-                    fontSize: 10,
-                    color: Colors.green,
+                    fontSize: GlType.text2xs,
+                    fontWeight: FontWeight.w600,
+                    color: GlColors.success,
                   ),
                 ),
               ),
@@ -340,14 +371,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         subtitle: Text(
           !available ? 'Not available on this device' : subtitle,
           style: TextStyle(
-            color: isEnabled ? Colors.grey[400] : Colors.grey,
-            fontSize: 13,
+            color: isEnabled ? GlColors.textMuted : GlColors.textSubtle,
+            fontSize: GlType.textSm,
           ),
         ),
         trailing: Switch(
           value: value,
           onChanged: available ? onChanged : null,
-          activeColor: const Color(0xFFE8A33C),
         ),
         onTap: available ? () => onChanged(!value) : null,
       ),
@@ -361,22 +391,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.bug_report_outlined,
-                  size: 16, color: Colors.orange),
-              const SizedBox(width: 6),
+              Icon(Icons.bug_report_outlined,
+                  size: 16, color: GlColors.warning),
+              SizedBox(width: 6),
               Text(
                 'BLE role (debug)',
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: GlType.textSm,
                   fontWeight: FontWeight.w600,
-                  color: Colors.orange[700],
+                  color: GlColors.warning,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: GlSpace.s1),
           Text(
             switch (mode) {
               BleRoleMode.auto =>
@@ -386,7 +416,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               BleRoleMode.peripheralOnly =>
                 'Advertise only — we never dial; peers reach us as peripheral.',
             },
-            style: const TextStyle(fontSize: 12, color: Colors.black54),
+            style: const TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
           ),
           const SizedBox(height: 8),
           SegmentedButton<BleRoleMode>(
@@ -415,8 +446,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
               widget.onSettingsChanged?.call();
             },
           ),
+          const SizedBox(height: 4),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: widget.store.state.settings.showLinkDiagnostics,
+            onChanged: (v) {
+              widget.store.dispatch(SetShowLinkDiagnosticsAction(v));
+              widget.onSettingsChanged?.call();
+              setState(() {});
+            },
+            title: const Text(
+              'Link diagnostics (debug)',
+              style: TextStyle(
+                  fontSize: GlType.textSm, fontWeight: FontWeight.w600),
+            ),
+            subtitle: const Text(
+              'Show physical BLE link (ACL) counts: total in the chat '
+              'screen, per-peer on peer rows. Ground truth from the OS.',
+              style: TextStyle(
+                  fontSize: GlType.textXs, color: GlColors.textMuted),
+            ),
+          ),
         ],
       ),
+    );
+  }
+
+  Widget _buildFacilitateInvitesSection() {
+    final settings = widget.store.state.settings;
+    final coldCallOpen = settings.coldCallTrustLevel == ColdCallTrustLevel.open;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(
+              horizontal: GlSpace.s4, vertical: GlSpace.s2),
+          child: EyebrowLabel('Introductions', color: GlColors.accentOnSoft),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
+          child: Text(
+            'Lend a hand so a friend can reach someone new: help connect a '
+            'stranger who is redeeming an invite one of your friends sent. '
+            'You never learn their messages — only pass along a first hello.',
+            style:
+                TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
+          ),
+        ),
+        SwitchListTile(
+          value: settings.facilitateInvites && coldCallOpen,
+          onChanged: coldCallOpen
+              ? (v) => widget.store.dispatch(SetFacilitateInvitesAction(v))
+              : null,
+          title: const Text('Help introduce newcomers'),
+          subtitle: Text(
+            coldCallOpen
+                ? (settings.facilitateInvites ? 'On' : 'Off')
+                : 'Turn on “meeting new peers” first',
+            style: TextStyle(
+              color: coldCallOpen ? GlColors.textMuted : GlColors.textSubtle,
+              fontSize: GlType.textSm,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -426,33 +519,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            children: [
-              Icon(Icons.insights, color: Color(0xFFE8A33C)),
-              SizedBox(width: 8),
-              Text(
-                'Diagnostic Traces',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFFE8A33C),
-                ),
-              ),
-            ],
-          ),
+          padding: EdgeInsets.symmetric(
+              horizontal: GlSpace.s4, vertical: GlSpace.s2),
+          child:
+              EyebrowLabel('Diagnostic traces', color: GlColors.accentOnSoft),
         ),
         const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
+          padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
           child: Text(
             'Opt in to collect anonymous diagnostic traces on this device. '
-            'Once a day the app asks before uploading to your research server.',
-            style: TextStyle(color: Colors.grey, fontSize: 13),
+            'The app asks on every start before uploading, or upload manually '
+            'below.',
+            style:
+                TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
           ),
         ),
         SwitchListTile(
           value: settings.traceLoggingConsent,
-          activeColor: const Color(0xFFE8A33C),
           title: const Text('Collect diagnostic traces'),
           subtitle: Text(settings.traceLoggingConsent ? 'On' : 'Off'),
           onChanged: (value) => widget.store.dispatch(
@@ -462,51 +545,45 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
           ),
         ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _traceUrlController,
-            keyboardType: TextInputType.url,
-            decoration: const InputDecoration(
-              labelText: 'Trace server URL',
-              hintText: 'https://host:8443',
+        if (settings.traceLoggingConsent && widget.onUploadTracesNow != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: ElevatedButton.icon(
+                onPressed: _uploadingTraces ? null : _handleUploadNow,
+                icon: _uploadingTraces
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.upload),
+                label: Text(_uploadingTraces ? 'Uploading…' : 'Upload now'),
+              ),
             ),
           ),
-        ),
-        const SizedBox(height: 8),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _traceTokenController,
-            obscureText: true,
-            decoration: const InputDecoration(labelText: 'Upload token'),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Align(
-            alignment: Alignment.centerRight,
-            child: ElevatedButton(
-              onPressed: () {
-                final url = _traceUrlController.text.trim();
-                final token = _traceTokenController.text.trim();
-                widget.store.dispatch(SetTraceServerAction(
-                  url: url.isEmpty ? null : url,
-                  token: token.isEmpty ? null : token,
-                ));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Trace server saved'),
-                    duration: Duration(seconds: 2),
-                  ),
-                );
-              },
-              child: const Text('Save trace server'),
-            ),
-          ),
-        ),
       ],
     );
+  }
+
+  /// Run the manual trace upload and surface its status in a snackbar.
+  Future<void> _handleUploadNow() async {
+    final upload = widget.onUploadTracesNow;
+    if (upload == null) return;
+    setState(() => _uploadingTraces = true);
+    String message;
+    try {
+      message = await upload();
+    } catch (_) {
+      message = 'Trace upload failed';
+    }
+    if (!mounted) return;
+    setState(() => _uploadingTraces = false);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(message),
+      duration: const Duration(seconds: 2),
+    ));
   }
 
   Widget _buildColdCallTrustSelector() {
@@ -516,49 +593,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.verified_user_outlined,
-                  size: 16, color: Color(0xFF1B3D2F)),
-              const SizedBox(width: 6),
+              Icon(Icons.verified_user_outlined,
+                  size: 16, color: GlColors.primary),
+              SizedBox(width: 6),
               Text(
-                'Cold calls',
+                'Meeting new peers',
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: GlType.textSm,
                   fontWeight: FontWeight.w600,
-                  color: Colors.green[800],
+                  color: GlColors.primaryOnSoft,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: GlSpace.s1),
           const Text(
-            'A "cold call" is an unsolicited BLE first-contact attempt from a '
-            'nearby peer you have not friended yet. This setting controls '
-            'whether you reply.\n\n'
-            '• Open — anyone in range can complete the signed ANNOUNCE '
-            'handshake, so you can discover and meet new peers. Strangers '
-            'learn your public key and nickname, but never your address '
-            'or any friend-only metadata.\n'
-            '• Closed — first contact from non-friends is refused. Nearby '
-            'devices still see your service advertisement, but ANNOUNCE is '
-            'not sent and incoming ANNOUNCEs from strangers are dropped, '
-            'so unknown peers cannot learn your nickname over BLE.',
-            style: TextStyle(fontSize: 12, color: Colors.black54),
+            'Controls whether you reply when a nearby peer you have not '
+            'friended yet says hello over Bluetooth.\n\n'
+            '• Open — anyone in range can introduce themselves, so you can '
+            'meet new peers. Strangers learn your public key and nickname, '
+            'but never your address or any friend-only details.\n'
+            '• Closed — introductions from non-friends are refused. Nearby '
+            'devices still see your advertisement, but strangers cannot '
+            'learn your nickname over Bluetooth.',
+            style: TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           Text(
             switch (level) {
               ColdCallTrustLevel.open =>
-                'Currently open: nearby unknown peers can complete first '
-                    'contact.',
+                'Currently open: nearby unknown peers can introduce '
+                    'themselves.',
               ColdCallTrustLevel.closed =>
-                'Currently closed: only accepted friends complete BLE first '
-                    'contact.',
+                'Currently closed: only accepted friends can say hello over '
+                    'Bluetooth.',
             },
-            style: TextStyle(
-              fontSize: 12,
-              color: Colors.green[800],
+            style: const TextStyle(
+              fontSize: GlType.textXs,
+              color: GlColors.primaryOnSoft,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -601,17 +676,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             publicIp == null;
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: isWellConnected
-          ? Colors.green.withOpacity(0.1)
-          : Colors.grey.withOpacity(0.1),
+      color: isWellConnected ? GlColors.successSoft : GlColors.bgSunken,
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(GlSpace.s3),
         child: Row(
           children: [
             Icon(
-              isWellConnected ? Icons.language : Icons.shield_outlined,
-              color: isWellConnected ? Colors.green : Colors.grey,
+              isWellConnected ? Icons.language_rounded : Icons.shield_outlined,
+              color: isWellConnected ? GlColors.success : GlColors.textSubtle,
               size: 20,
             ),
             const SizedBox(width: 10),
@@ -620,21 +692,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    isWellConnected ? 'Well-connected' : 'Standard connection',
+                    isWellConnected
+                        ? 'Well-connected'
+                        : 'Standard connection',
                     style: TextStyle(
                       fontWeight: FontWeight.w600,
-                      fontSize: 13,
-                      color: isWellConnected ? Colors.green : Colors.grey[400],
+                      fontSize: GlType.textSm,
+                      color: isWellConnected
+                          ? GlColors.moss700
+                          : GlColors.textMuted,
                     ),
                   ),
                   const SizedBox(height: 2),
                   Text(
                     isWellConnected
-                        ? 'Your device has a globally routable address and can help friends connect'
-                        : 'Your device is behind NAT — connections to friends may require hole-punching',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Colors.grey[500],
+                        ? 'Anyone can reach you directly — you can lend your link to help friends connect'
+                        : 'You are behind NAT — a well-connected friend helps your connections find their way',
+                    style: const TextStyle(
+                      fontSize: GlType.text2xs,
+                      color: GlColors.textMuted,
                     ),
                   ),
                   const SizedBox(height: 6),
@@ -643,14 +719,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Icon(
                         _networkTypeIcon(connectionType),
                         size: 14,
-                        color: Colors.grey[400],
+                        color: GlColors.textSubtle,
                       ),
                       const SizedBox(width: 6),
                       Text(
                         'Connection type: ${connectionType.displayName}',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey[400],
+                        style: const TextStyle(
+                          fontSize: GlType.text2xs,
+                          color: GlColors.textSubtle,
                         ),
                       ),
                     ],
@@ -659,11 +735,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     const SizedBox(height: 6),
                     Text(
                       publicAddress ?? publicIp!,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                        color: Colors.grey[400],
-                      ),
+                      style: GlType.monoStyle(GlType.text2xs,
+                          color: GlColors.textSubtle),
                     ),
                   ] else if (showDiscoveryFailedWarning) ...[
                     const SizedBox(height: 6),
@@ -681,23 +754,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _buildNoPublicAddressWarning() {
     return Row(
       children: [
-        Icon(
+        const Icon(
           Icons.warning_amber_rounded,
           size: 14,
-          color: Colors.orange[700],
+          color: GlColors.warning,
         ),
         const SizedBox(width: 6),
-        Expanded(
+        const Expanded(
           child: Text(
             'No public IP address available',
             style: TextStyle(
-              fontSize: 11,
-              color: Colors.orange[700],
+              fontSize: GlType.text2xs,
+              color: GlColors.warning,
               fontWeight: FontWeight.w500,
             ),
           ),
         ),
-        const SizedBox(width: 4),
+        const SizedBox(width: GlSpace.s1),
         SizedBox(
           height: 24,
           child: TextButton.icon(
@@ -711,8 +784,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     height: 12,
                     child: CircularProgressIndicator(strokeWidth: 1.5),
                   )
-                : const Icon(Icons.refresh, size: 14),
-            label: const Text('Retry', style: TextStyle(fontSize: 11)),
+                : const Icon(Icons.refresh_rounded, size: 14),
+            label: const Text(
+              'Retry',
+              style: TextStyle(fontSize: GlType.text2xs),
+            ),
             style: TextButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 8),
               minimumSize: Size.zero,
@@ -761,46 +837,44 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Widget _buildInfoCard() {
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(GlSpace.s4),
       decoration: BoxDecoration(
-        color: Colors.blue.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.blue.withOpacity(0.2)),
+        color: GlColors.primarySoft,
+        borderRadius: GlRadius.rLg,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: const [
-              Icon(Icons.info_outline, color: Colors.blue, size: 20),
-              SizedBox(width: 8),
+          const Row(
+            children: [
+              SignalDot(size: 12),
+              SizedBox(width: GlSpace.s2),
               Text(
-                'How it works',
+                'How the mesh works',
                 style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  color: Colors.blue,
+                  fontWeight: FontWeight.w700,
+                  color: GlColors.primaryOnSoft,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
           _buildInfoRow(
-            icon: Icons.bluetooth,
-            iconColor: Colors.blue,
-            text: 'Bluetooth connects you to nearby peers without Internet',
+            icon: Icons.bluetooth_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'Bluetooth reaches neighbours nearby — no Internet needed',
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           _buildInfoRow(
-            icon: Icons.public,
-            iconColor: Colors.green,
-            text: 'Internet connects you to peers anywhere in the world',
+            icon: Icons.public_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'Internet reaches peers anywhere in the world',
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           _buildInfoRow(
-            icon: Icons.priority_high,
-            iconColor: const Color(0xFFE8A33C),
-            text:
-                'When both are available, Bluetooth is preferred for faster communication',
+            icon: Icons.route_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'When both are on, messages take the nearest path first',
           ),
         ],
       ),
@@ -824,474 +898,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         ),
       ],
-    );
-  }
-
-  Widget _buildAnchorServerSection() {
-    final servers = widget.store.state.settings.configuredRendezvousServers;
-    final hasAnchor = servers.isNotEmpty;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        // Section header
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            children: [
-              const Icon(Icons.cloud_outlined, color: Color(0xFFE8A33C)),
-              const SizedBox(width: 8),
-              const Text(
-                'Rendezvous Server',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFFE8A33C),
-                ),
-              ),
-              if (hasAnchor) ...[
-                const SizedBox(width: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.green.withOpacity(0.2),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    '${servers.length} configured',
-                    style: TextStyle(fontSize: 10, color: Colors.green),
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
-
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
-          child: Text(
-            'A lightweight server that helps peers find each other for '
-            'hole-punching. Add one or more servers below. Server is stored '
-            'only after live ANNOUNCE response. IPv6 only.',
-            style: TextStyle(color: Colors.grey, fontSize: 13),
-          ),
-        ),
-
-        if (servers.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          for (final server in servers) _buildConfiguredAnchorTile(server),
-        ],
-
-        const SizedBox(height: 12),
-
-        // Address field
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _anchorAddressController,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
-            decoration: InputDecoration(
-              labelText: 'Server address',
-              hintText: '[2600:1234::1]:9514 or 198.51.100.5:9514',
-              hintStyle: TextStyle(
-                color: Colors.grey[700],
-                fontFamily: 'monospace',
-                fontSize: 14,
-              ),
-              prefixIcon: const Icon(Icons.dns_outlined, size: 20),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-            ),
-          ),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Public key field
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: TextField(
-            controller: _anchorPubkeyController,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 14),
-            decoration: InputDecoration(
-              labelText: 'Server public key',
-              hintText: '64-character hex',
-              hintStyle: TextStyle(
-                color: Colors.grey[700],
-                fontFamily: 'monospace',
-                fontSize: 14,
-              ),
-              prefixIcon: const Icon(Icons.key_outlined, size: 20),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-            ),
-          ),
-        ),
-
-        const SizedBox(height: 12),
-
-        // Save / Clear buttons
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _isSavingAnchor ? null : _onSaveAnchor,
-                  icon: _isSavingAnchor
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.add_link_outlined, size: 18),
-                  label: Text(_isSavingAnchor ? 'Verifying...' : 'Add Server'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF1B3D2F),
-                    foregroundColor: const Color(0xFFE8A33C),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-
-        _buildFriendSharedRendezvousTable(),
-      ],
-    );
-  }
-
-  Widget _buildFriendSharedRendezvousTable() {
-    final rows = _friendSharedRendezvousRows();
-
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(
-                Icons.group_work_outlined,
-                size: 18,
-                color: Colors.grey[600],
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                'Friend-shared Rendezvous Servers',
-                style: TextStyle(fontWeight: FontWeight.w600),
-              ),
-              if (rows.isNotEmpty) ...[
-                const SizedBox(width: 8),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1B3D2F).withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(4),
-                  ),
-                  child: Text(
-                    '${rows.length}',
-                    style: const TextStyle(
-                      fontSize: 10,
-                      color: Color(0xFF1B3D2F),
-                    ),
-                  ),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 8),
-          if (rows.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey.withValues(alpha: 0.25)),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(
-                'No friend-shared rendezvous servers',
-                style: TextStyle(color: Colors.grey[600], fontSize: 13),
-              ),
-            )
-          else
-            Container(
-              width: double.infinity,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.grey.withValues(alpha: 0.25)),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: DataTable(
-                    headingRowHeight: 36,
-                    dataRowMinHeight: 44,
-                    dataRowMaxHeight: 56,
-                    columnSpacing: 18,
-                    columns: const [
-                      DataColumn(label: Text('Friend')),
-                      DataColumn(label: Text('Address')),
-                      DataColumn(label: Text('Public key')),
-                    ],
-                    rows: [
-                      for (final row in rows)
-                        DataRow(
-                          cells: [
-                            DataCell(_textCell(row.sharedBy)),
-                            DataCell(_monoCell(row.address)),
-                            DataCell(_monoCell(_shortPubkey(row.pubkeyHex))),
-                          ],
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  List<_FriendSharedRendezvousRow> _friendSharedRendezvousRows() {
-    final byServer = <String, _MutableFriendSharedRendezvousRow>{};
-
-    // `knownRvServers` now lives on the friendship record (friendship-scoped
-    // and persisted). Iterate accepted friendships and pull each friend's
-    // human-readable name from the live PeerState when available so the UI
-    // matches the rest of the Friends list (which uses PeerState nicknames).
-    for (final friendship in widget.store.state.friendships.friends) {
-      final hex = friendship.peerPubkeyHex;
-      final peer = widget.store.state.peers.getPeerByPubkeyHex(hex);
-      final friendName = peer?.displayName.trim().isNotEmpty == true
-          ? peer!.displayName
-          : (friendship.nickname?.trim().isNotEmpty == true
-              ? friendship.nickname!
-              : hex.substring(0, 8));
-
-      for (final entry in friendship.knownRvServers.entries) {
-        final pubkeyHex = entry.key.toLowerCase();
-        final address = entry.value.trim();
-        if (pubkeyHex.isEmpty || address.isEmpty) continue;
-        final key = '$pubkeyHex|$address';
-        final row = byServer.putIfAbsent(
-          key,
-          () => _MutableFriendSharedRendezvousRow(
-            pubkeyHex: pubkeyHex,
-            address: address,
-          ),
-        );
-        row.sharedBy.add(friendName);
-      }
-    }
-
-    final rows = byServer.values
-        .map(
-          (row) => _FriendSharedRendezvousRow(
-            pubkeyHex: row.pubkeyHex,
-            address: row.address,
-            sharedBy: (row.sharedBy.toList()..sort()).join(', '),
-          ),
-        )
-        .toList()
-      ..sort((a, b) {
-        final byAddress = a.address.compareTo(b.address);
-        if (byAddress != 0) return byAddress;
-        return a.pubkeyHex.compareTo(b.pubkeyHex);
-      });
-
-    return rows;
-  }
-
-  Widget _textCell(String text) {
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 220),
-      child: Text(
-        text,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontSize: 12),
-      ),
-    );
-  }
-
-  Widget _monoCell(String text) {
-    return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 260),
-      child: Text(
-        text,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-      ),
-    );
-  }
-
-  static String _shortPubkey(String pubkeyHex) {
-    return pubkeyHex.length > 16
-        ? '${pubkeyHex.substring(0, 16)}...'
-        : pubkeyHex;
-  }
-
-  Widget _buildConfiguredAnchorTile(RendezvousServerSettings server) {
-    final shortPubkey = server.pubkeyHex.length > 16
-        ? '${server.pubkeyHex.substring(0, 16)}...'
-        : server.pubkeyHex;
-
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      child: ListTile(
-        leading: const Icon(Icons.cloud_done_outlined, color: Colors.green),
-        title: Text(
-          server.address,
-          style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-        ),
-        subtitle: Text(
-          shortPubkey,
-          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-        ),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            IconButton(
-              tooltip: 'Copy server details',
-              icon: const Icon(Icons.copy_outlined),
-              onPressed: () => _copyAnchorDetails(server),
-            ),
-            IconButton(
-              tooltip: 'Remove server',
-              icon: const Icon(Icons.delete_outline, color: Colors.red),
-              onPressed: () => _onRemoveAnchor(server),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _formatAnchorDetails(RendezvousServerSettings server) {
-    return '${server.address} ${server.pubkeyHex}';
-  }
-
-  Future<void> _copyAnchorDetails(RendezvousServerSettings server) async {
-    await Clipboard.setData(
-      ClipboardData(text: _formatAnchorDetails(server)),
-    );
-
-    if (!mounted) return;
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Rendezvous server details copied')),
-    );
-  }
-
-  Future<void> _onSaveAnchor() async {
-    final address = _anchorAddressController.text.trim();
-    final pubkey = _anchorPubkeyController.text.trim();
-
-    if (address.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Server address is required')),
-      );
-      return;
-    }
-
-    if (pubkey.isEmpty ||
-        pubkey.length != 64 ||
-        !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(pubkey)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Public key must be 64 hex characters')),
-      );
-      return;
-    }
-
-    if (widget.onAddRendezvousServer == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Transport not ready. Cannot verify server yet'),
-        ),
-      );
-      return;
-    }
-
-    setState(() {
-      _isSavingAnchor = true;
-    });
-
-    final saved =
-        await widget.onAddRendezvousServer!.call(address, pubkey.toLowerCase());
-
-    if (!mounted) return;
-
-    setState(() {
-      _isSavingAnchor = false;
-    });
-
-    if (!saved) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Server did not respond. Not saved'),
-        ),
-      );
-      return;
-    }
-
-    _anchorAddressController.clear();
-    _anchorPubkeyController.clear();
-    widget.onSettingsChanged?.call();
-
-    setState(() {});
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Rendezvous server added')),
-    );
-  }
-
-  void _onRemoveAnchor(RendezvousServerSettings server) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Remove Rendezvous Server?'),
-        content: Text(
-          'Remove ${server.address}? Reconnection after IP changes will use '
-          'remaining rendezvous servers, BLE, or friends-based signaling.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              if (widget.onRemoveRendezvousServer != null) {
-                await widget.onRemoveRendezvousServer!(
-                  server.address,
-                  server.pubkeyHex,
-                );
-              } else {
-                widget.store.dispatch(RemoveRendezvousServerAction(server));
-              }
-              widget.onSettingsChanged?.call();
-              if (mounted) {
-                setState(() {});
-              }
-            },
-            child: const Text('Remove', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
     );
   }
 
@@ -1329,9 +935,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Cannot Disable'),
+        title: const Text('Keep one link on'),
         content: const Text(
-          'At least one transport protocol must be enabled to communicate with peers.',
+          'You need at least one way to reach your peers — Bluetooth or '
+          'Internet.',
         ),
         actions: [
           TextButton(
@@ -1342,27 +949,4 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
   }
-}
-
-class _FriendSharedRendezvousRow {
-  final String pubkeyHex;
-  final String address;
-  final String sharedBy;
-
-  const _FriendSharedRendezvousRow({
-    required this.pubkeyHex,
-    required this.address,
-    required this.sharedBy,
-  });
-}
-
-class _MutableFriendSharedRendezvousRow {
-  final String pubkeyHex;
-  final String address;
-  final Set<String> sharedBy = {};
-
-  _MutableFriendSharedRendezvousRow({
-    required this.pubkeyHex,
-    required this.address,
-  });
 }

@@ -1,7 +1,11 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:logger/logger.dart';
+import 'package:path_provider/path_provider.dart';
 import 'src/debug/log_buffer.dart';
+import 'theme/grasslink_tokens.dart';
 
 /// Debug log viewer screen.
 ///
@@ -46,22 +50,58 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
   List<LogEntry> get _filteredEntries =>
       LogBuffer.instance.entries.where((e) => e.level.index >= _minLevel.index).toList();
 
+  /// Flush pending lines, then save a copy of the persisted log to a NEW file
+  /// named with the current save time — e.g. `grassroots-log-2026-07-20_13-45-30.txt`.
+  /// Written to app-specific external storage on Android (adb-pullable, no
+  /// permission), falling back to the documents dir.
+  Future<void> _downloadLogs() async {
+    await LogBuffer.instance.flushNow();
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final now = DateTime.now();
+      String two(int n) => n.toString().padLeft(2, '0');
+      final stamp = '${now.year}-${two(now.month)}-${two(now.day)}_'
+          '${two(now.hour)}-${two(now.minute)}-${two(now.second)}';
+
+      final dir = (await getExternalStorageDirectory()) ??
+          await getApplicationDocumentsDirectory();
+      final dest = File('${dir.path}/grassroots-log-$stamp.txt');
+
+      final srcPath = LogBuffer.instance.logFilePath;
+      if (srcPath != null && await File(srcPath).exists()) {
+        await File(srcPath).copy(dest.path);
+      } else {
+        // Persistence unavailable — dump the in-memory buffer instead.
+        final text =
+            LogBuffer.instance.entries.map((e) => e.toFileLine()).join('\n');
+        await dest.writeAsString(text);
+      }
+
+      messenger.showSnackBar(SnackBar(
+        content: Text('Saved to ${dest.path}'),
+        duration: const Duration(seconds: 6),
+      ));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not save log: $e')));
+    }
+  }
+
   Color _colorForLevel(Level level) {
     switch (level) {
       case Level.trace:
-        return Colors.grey;
+        return GlColors.textSubtle;
       case Level.debug:
-        return Colors.grey[400]!;
+        return GlColors.textMuted;
       case Level.info:
-        return Colors.blue[300]!;
+        return GlColors.info;
       case Level.warning:
-        return Colors.orange[300]!;
+        return GlColors.warning;
       case Level.error:
-        return Colors.red[300]!;
+        return GlColors.danger;
       case Level.fatal:
-        return Colors.red;
+        return GlColors.rust400;
       default:
-        return Colors.white;
+        return GlColors.textBody;
     }
   }
 
@@ -71,21 +111,22 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Debug Logs (${entries.length})'),
-        backgroundColor: const Color(0xFF1B3D2F),
+        title: Text('Debug logs (${entries.length})'),
         actions: [
           // Auto-scroll toggle
           IconButton(
             icon: Icon(
-              _autoScroll ? Icons.vertical_align_bottom : Icons.vertical_align_center,
-              color: _autoScroll ? Colors.green : Colors.grey,
+              _autoScroll
+                  ? Icons.vertical_align_bottom
+                  : Icons.vertical_align_center,
+              color: _autoScroll ? GlColors.success : GlColors.textSubtle,
             ),
             tooltip: _autoScroll ? 'Auto-scroll on' : 'Auto-scroll off',
             onPressed: () => setState(() => _autoScroll = !_autoScroll),
           ),
           // Copy all logs
           IconButton(
-            icon: const Icon(Icons.copy),
+            icon: const Icon(Icons.copy_rounded),
             tooltip: 'Copy logs',
             onPressed: () {
               final text = entries
@@ -97,13 +138,19 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
               );
             },
           ),
+          // Download / share the persisted log file
+          IconButton(
+            icon: const Icon(Icons.download_rounded),
+            tooltip: 'Download logs',
+            onPressed: _downloadLogs,
+          ),
           // Clear logs
           IconButton(
             icon: const Icon(Icons.delete_outline),
             tooltip: 'Clear logs',
-            onPressed: () {
-              LogBuffer.instance.clear();
-              setState(() {});
+            onPressed: () async {
+              await LogBuffer.instance.clear();
+              if (mounted) setState(() {});
             },
           ),
         ],
@@ -112,8 +159,9 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
         children: [
           // Level filter chips
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            color: Colors.black26,
+            padding: const EdgeInsets.symmetric(
+                horizontal: GlSpace.s3, vertical: GlSpace.s2),
+            color: GlColors.bgSunken,
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(
@@ -137,7 +185,7 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
                 ? const Center(
                     child: Text(
                       'No log entries',
-                      style: TextStyle(color: Colors.grey),
+                      style: TextStyle(color: GlColors.textMuted),
                     ),
                   )
                 : ListView.builder(
@@ -160,33 +208,24 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
                               width: 55,
                               child: Text(
                                 time,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 10,
-                                  color: Colors.grey[600],
-                                ),
+                                style: GlType.monoStyle(10,
+                                    color: GlColors.textSubtle),
                               ),
                             ),
                             SizedBox(
                               width: 40,
                               child: Text(
                                 entry.levelLabel,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold,
-                                  color: _colorForLevel(entry.level),
-                                ),
+                                style: GlType.monoStyle(10,
+                                        color: _colorForLevel(entry.level))
+                                    .copyWith(fontWeight: FontWeight.w600),
                               ),
                             ),
                             Expanded(
                               child: Text(
                                 entry.message,
-                                style: const TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 10,
-                                  color: Colors.white70,
-                                ),
+                                style: GlType.monoStyle(10,
+                                    color: GlColors.textBody),
                               ),
                             ),
                           ],
@@ -205,24 +244,21 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
     return GestureDetector(
       onTap: () => setState(() => _minLevel = level),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        padding: const EdgeInsets.symmetric(
+            horizontal: GlSpace.s3, vertical: 6),
         decoration: BoxDecoration(
-          color: isSelected
-              ? const Color(0xFFE8A33C).withOpacity(0.3)
-              : Colors.white.withOpacity(0.08),
-          borderRadius: BorderRadius.circular(16),
+          color: isSelected ? GlColors.primarySoft : GlColors.surfaceCard,
+          borderRadius: GlRadius.rPill,
           border: Border.all(
-            color: isSelected
-                ? const Color(0xFFE8A33C)
-                : Colors.white.withOpacity(0.15),
+            color: isSelected ? GlColors.primary : GlColors.borderSubtle,
           ),
         ),
         child: Text(
           label,
           style: TextStyle(
-            fontSize: 12,
-            color: isSelected ? const Color(0xFFE8A33C) : Colors.grey[400],
-            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+            fontSize: GlType.textXs,
+            color: isSelected ? GlColors.primaryOnSoft : GlColors.textMuted,
+            fontWeight: isSelected ? FontWeight.w700 : FontWeight.normal,
           ),
         ),
       ),

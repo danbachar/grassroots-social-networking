@@ -1,6 +1,9 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:logger/logger.dart';
+import 'package:path_provider/path_provider.dart';
 import 'src/debug/log_buffer.dart';
 import 'theme/grasslink_tokens.dart';
 
@@ -46,6 +49,42 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
 
   List<LogEntry> get _filteredEntries =>
       LogBuffer.instance.entries.where((e) => e.level.index >= _minLevel.index).toList();
+
+  /// Flush pending lines, then save a copy of the persisted log to a NEW file
+  /// named with the current save time — e.g. `grassroots-log-2026-07-20_13-45-30.txt`.
+  /// Written to app-specific external storage on Android (adb-pullable, no
+  /// permission), falling back to the documents dir.
+  Future<void> _downloadLogs() async {
+    await LogBuffer.instance.flushNow();
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final now = DateTime.now();
+      String two(int n) => n.toString().padLeft(2, '0');
+      final stamp = '${now.year}-${two(now.month)}-${two(now.day)}_'
+          '${two(now.hour)}-${two(now.minute)}-${two(now.second)}';
+
+      final dir = (await getExternalStorageDirectory()) ??
+          await getApplicationDocumentsDirectory();
+      final dest = File('${dir.path}/grassroots-log-$stamp.txt');
+
+      final srcPath = LogBuffer.instance.logFilePath;
+      if (srcPath != null && await File(srcPath).exists()) {
+        await File(srcPath).copy(dest.path);
+      } else {
+        // Persistence unavailable — dump the in-memory buffer instead.
+        final text =
+            LogBuffer.instance.entries.map((e) => e.toFileLine()).join('\n');
+        await dest.writeAsString(text);
+      }
+
+      messenger.showSnackBar(SnackBar(
+        content: Text('Saved to ${dest.path}'),
+        duration: const Duration(seconds: 6),
+      ));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not save log: $e')));
+    }
+  }
 
   Color _colorForLevel(Level level) {
     switch (level) {
@@ -99,13 +138,19 @@ class _DebugLogScreenState extends State<DebugLogScreen> {
               );
             },
           ),
+          // Download / share the persisted log file
+          IconButton(
+            icon: const Icon(Icons.download_rounded),
+            tooltip: 'Download logs',
+            onPressed: _downloadLogs,
+          ),
           // Clear logs
           IconButton(
             icon: const Icon(Icons.delete_outline),
             tooltip: 'Clear logs',
-            onPressed: () {
-              LogBuffer.instance.clear();
-              setState(() {});
+            onPressed: () async {
+              await LogBuffer.instance.clear();
+              if (mounted) setState(() {});
             },
           ),
         ],

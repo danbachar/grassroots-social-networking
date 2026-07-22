@@ -33,6 +33,10 @@ dependencies:
   # Collection utilities (for bloom filter, queues)
   collection: ^1.18.0
   
+  # File attachments (chat) + sharing debug logs / received files out
+  file_picker: ^8.1.2
+  share_plus: ^10.1.2
+
   # Logging
   logger: ^2.0.0
   flutter_secure_storage: ^10.0.0

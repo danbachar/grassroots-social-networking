@@ -135,6 +135,8 @@ abstract class SayBlock extends Block {
         return TextSayBlock.fromBody(body);
       case SaySubtype.picture:
         return PictureSayBlock.fromBody(body);
+      case SaySubtype.file:
+        return FileSayBlock.fromBody(body);
     }
   }
 }
@@ -143,7 +145,8 @@ abstract class SayBlock extends Block {
 /// top-level [BlockType].
 enum SaySubtype {
   text(0x00),
-  picture(0x01);
+  picture(0x01),
+  file(0x02);
 
   final int value;
   const SaySubtype(this.value);
@@ -223,6 +226,79 @@ class PictureSayBlock extends SayBlock {
     final mime = utf8.decode(body.sublist(2, 2 + mimeLen));
     final image = Uint8List.fromList(body.sublist(2 + mimeLen));
     return PictureSayBlock(viewOnce: viewOnce, mime: mime, imageBytes: image);
+  }
+}
+
+/// Arbitrary-file attachment. Wire body:
+///   [nameLen: 2 bytes BE] +
+///   [name: utf8] +
+///   [mimeLen: 1 byte] +
+///   [mime: utf8] +
+///   [bytes: rest of payload]
+///
+/// The raw file bytes are carried as-is (no compression, unlike pictures) and
+/// fragmented over BLE by the transport. Callers should bound the size before
+/// sending — a large file at ~15 KB/s takes minutes.
+class FileSayBlock extends SayBlock {
+  @override
+  SaySubtype get subtype => SaySubtype.file;
+
+  final String fileName;
+  final String mime;
+  final Uint8List bytes;
+
+  FileSayBlock({
+    required this.fileName,
+    required this.mime,
+    required this.bytes,
+  });
+
+  @override
+  Uint8List serializeSubtypePayload() {
+    final nameBytes = utf8.encode(fileName);
+    if (nameBytes.length > 0xffff) {
+      throw ArgumentError('file name too long (max 65535 bytes)');
+    }
+    final mimeBytes = utf8.encode(mime);
+    if (mimeBytes.length > 255) {
+      throw ArgumentError('mime too long (max 255 bytes): $mime');
+    }
+    final out = Uint8List(2 + nameBytes.length + 1 + mimeBytes.length + bytes.length);
+    final view = ByteData.view(out.buffer);
+    view.setUint16(0, nameBytes.length, Endian.big);
+    var offset = 2;
+    out.setRange(offset, offset + nameBytes.length, nameBytes);
+    offset += nameBytes.length;
+    out[offset++] = mimeBytes.length;
+    out.setRange(offset, offset + mimeBytes.length, mimeBytes);
+    offset += mimeBytes.length;
+    out.setRange(offset, out.length, bytes);
+    return out;
+  }
+
+  factory FileSayBlock.fromBody(Uint8List body) {
+    if (body.length < 3) {
+      throw const FormatException('FileSayBlock body too short');
+    }
+    final view = ByteData.view(body.buffer, body.offsetInBytes);
+    final nameLen = view.getUint16(0, Endian.big);
+    var offset = 2;
+    if (body.length < offset + nameLen + 1) {
+      throw const FormatException('FileSayBlock body truncated in name');
+    }
+    final fileName = utf8.decode(body.sublist(offset, offset + nameLen));
+    offset += nameLen;
+    final mimeLen = body[offset++];
+    if (body.length < offset + mimeLen) {
+      throw const FormatException('FileSayBlock body truncated in mime');
+    }
+    final mime = utf8.decode(body.sublist(offset, offset + mimeLen));
+    offset += mimeLen;
+    return FileSayBlock(
+      fileName: fileName,
+      mime: mime,
+      bytes: Uint8List.fromList(body.sublist(offset)),
+    );
   }
 }
 

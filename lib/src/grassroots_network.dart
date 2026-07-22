@@ -1902,34 +1902,39 @@ class GrassrootsNetwork {
     required String messageId,
     required Uint8List senderPubkey,
   }) async {
-    final peer = _peersState.getPeerByPubkey(senderPubkey);
+    // We must already share a Noise session with the sender — we decrypted
+    // their message to display it, which is what makes it "read". The receipt
+    // is sealed to that session; there is no wire signature.
+    if (!_noiseSessions.hasSession(senderPubkey)) {
+      debugPrint('No Noise session with sender; cannot send read receipt');
+      return false;
+    }
 
-    // Create read receipt packet at coordinator level. Its payload is sealed to
-    // the recipient's Noise session before sending; there is no wire signature.
     final packet = _protocolHandler.createReadReceiptPacket(
       messageId: messageId,
       recipientPubkey: senderPubkey,
     );
 
-    // Try BLE first
+    // BLE: flood into the mesh, exactly like a delivery ACK. Do NOT target a
+    // Redux-tracked device id (`_connectedBleDeviceIdForPeer` can be null or
+    // stale across a MAC rotation or a half-tracked dual-role pair, which
+    // silently dropped read receipts even on a live direct link). Broadcasting
+    // to the actual live BLE connections reaches the original sender whether
+    // it is a direct neighbour or several hops away — the same guarantee
+    // messages and ACKs already have.
     if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
-      final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
-      if (peer != null && bleDeviceId != null) {
-        final bytes = await _sealedPacketBytesForTransport(
-          packet: packet,
-          transport: PeerTransport.bleDirect,
-          recipientPubkey: senderPubkey,
-          peerId: bleDeviceId,
-        );
-        if (bytes != null &&
-            await _bleService!.sendToPeer(bleDeviceId, bytes)) {
-          return true;
-        }
+      final sealed = await _noiseSessions.encryptPacket(
+        packet,
+        remotePubkey: senderPubkey,
+      );
+      if (await _floodViaBle(sealed.serialize()) > 0) {
+        return true;
       }
     }
 
-    // Fall back to UDP
+    // Fall back to UDP (direct point-to-point) if we have an address.
     if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
+      final peer = _peersState.getPeerByPubkey(senderPubkey);
       final udpCandidates = _udpCandidatesForPeer(peer);
       if (peer != null && udpCandidates.isNotEmpty) {
         if (await _sendPacketViaUdp(
@@ -3831,10 +3836,10 @@ class GrassrootsNetwork {
         debugPrint('UDP peer connected: ${event.peerId}');
         store.dispatch(PeerUdpSeenAction(_hexToBytes(event.peerId)));
         // A friend just came back online with us. Tell them our friend list
-        // (so they can pick us as a mediator), then, as a mediator ourselves,
-        // proactively pair them with every common friend we're also live with.
+        // so they can pick us as a mediator when they need to reconnect to a
+        // common friend. We do NOT proactively mediate here — mediation only
+        // happens on an explicit RECONNECT the peer fans out to us.
         _sendFriendListToFriendIfEligible(event.peerId);
-        _mediateCommonFriendsFor(event.peerId);
 
         final wasPunching = _holePunchTargets.containsKey(event.peerId) ||
             _holePunchLocalReady.contains(event.peerId) ||
@@ -4320,37 +4325,6 @@ class GrassrootsNetwork {
   List<Uint8List> _ownFriendListEntries() {
     final friends = _peersState.friendPubkeyHexes.toList()..sort();
     return [for (final hex in friends) _hexToBytes(hex)];
-  }
-
-  /// Proactively mediate between a reconnected friend and all common friends.
-  ///
-  /// This implements the bootstrap-friend step from the GLP friends-based
-  /// rendezvous algorithm: when B reconnects to A, B consults its
-  /// friends-of-friends map for A and immediately mediates for every common
-  /// friend C that is currently live with B.
-  void _mediateCommonFriendsFor(String reconnectedFriendHex) {
-    final requester = _peersState.getPeerByPubkeyHex(reconnectedFriendHex);
-    if (requester == null || !requester.isFriend) return;
-
-    final commonFriendHexes = _peersState
-        .commonFriendHexesWith(reconnectedFriendHex)
-        .toList()
-      ..sort();
-    for (final commonHex in commonFriendHexes) {
-      if (commonHex == reconnectedFriendHex) continue;
-      final common = _peersState.getPeerByPubkeyHex(commonHex);
-      if (common == null || !common.isFriend || !common.isReachable) {
-        continue;
-      }
-      debugPrint(
-        '[fof] Proactively mediating ${requester.displayName} <-> '
-        '${common.displayName}',
-      );
-      _signalingService.mediateFriends(
-        requesterPubkey: requester.publicKey,
-        targetPubkey: common.publicKey,
-      );
-    }
   }
 
   /// Called by the host app when it returns to the foreground.

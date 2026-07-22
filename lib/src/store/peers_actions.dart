@@ -20,18 +20,11 @@ class BleDeviceDiscoveredAction extends PeerAction {
   final int rssi;
   final String? serviceUuid;
 
-  /// Whether THIS advertisement carried the iOS platform marker
-  /// (`grs-ios` local name). Sticky per discovery entry in the reducer: the
-  /// marker comes and goes with iOS foregrounding, but a peer's platform
-  /// never changes.
-  final bool isIosMarked;
-
   BleDeviceDiscoveredAction({
     required this.deviceId,
     this.displayName,
     required this.rssi,
     this.serviceUuid,
-    this.isIosMarked = false,
   });
 }
 

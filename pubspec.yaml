@@ -69,6 +69,13 @@ dependencies:
   # macOS / Windows / Linux.
   sodium_libs: ^3.4.4+1
 
+# EXPERIMENT (uncommitted, machine-specific): build against the local plugin
+# clone with the grs-ios marker removed. Remove this block to fall back to the
+# git-pinned plugin.
+dependency_overrides:
+  grassroots_bluetooth_layer:
+    path: /Users/dbachar/git/technion/grassroots-bluetooth-layer
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

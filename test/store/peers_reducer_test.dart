@@ -123,28 +123,6 @@ void main() {
       expect(entry.lastSeen.isAfter(firstSeen), isTrue);
     });
 
-    test('isIosMarked is sticky: a marker-less re-advertisement keeps it',
-        () {
-      const state = PeersState.initial;
-      final marked = peersReducer(
-        state,
-        BleDeviceDiscoveredAction(
-          deviceId: 'device-1',
-          rssi: -60,
-          isIosMarked: true,
-        ),
-      );
-      expect(marked.discoveredBlePeers['device-1']!.isIosMarked, isTrue);
-
-      // Backgrounded iOS drops the marker from later advertisements; the
-      // recorded platform must not decay with it.
-      final refreshed = peersReducer(
-        marked,
-        BleDeviceDiscoveredAction(deviceId: 'device-1', rssi: -50),
-      );
-      expect(refreshed.discoveredBlePeers['device-1']!.isIosMarked, isTrue);
-      expect(refreshed.discoveredBlePeers['device-1']!.rssi, -50);
-    });
   });
 
   // =========================================================================
@@ -1620,42 +1598,6 @@ void main() {
 
       expect(fromFriend.friendsOfFriends[friendHex], equals({commonHex}));
     });
-
-    test(
-      'commonFriendHexesWith intersects direct friends with FoF entries',
-      () {
-        final friendPubkey = _testPubkey(23);
-        final commonPubkey = _testPubkey(24);
-        final remoteOnlyPubkey = _testPubkey(25);
-        final friendHex = _pubkeyHex(friendPubkey);
-        final commonHex = _pubkeyHex(commonPubkey);
-        final remoteOnlyHex = _pubkeyHex(remoteOnlyPubkey);
-        final state = PeersState(
-          peers: {
-            friendHex: PeerState(
-              publicKey: friendPubkey,
-              nickname: 'Friend',
-              isFriend: true,
-            ),
-            commonHex: PeerState(
-              publicKey: commonPubkey,
-              nickname: 'Common',
-              isFriend: true,
-            ),
-            remoteOnlyHex: PeerState(
-              publicKey: remoteOnlyPubkey,
-              nickname: 'RemoteOnly',
-              isFriend: false,
-            ),
-          },
-          friendsOfFriends: {
-            friendHex: {commonHex, remoteOnlyHex},
-          },
-        );
-
-        expect(state.commonFriendHexesWith(friendHex), equals({commonHex}));
-      },
-    );
 
     test(
       'mediatorsForFriend returns live direct friends that advertise target',

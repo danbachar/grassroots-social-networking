@@ -1,3 +1,4 @@
+import '../testbed/testbed_config.dart';
 import 'settings_state.dart';
 
 /// Base class for settings-related actions
@@ -66,5 +67,21 @@ class SetTraceLoggingConsentAction extends SettingsAction {
   final String? consentTimestamp;
 
   SetTraceLoggingConsentAction(this.consent, {this.consentTimestamp});
+}
+
+/// DEBUG/TESTBED ONLY. Install (or clear, with null) the software-defined BLE
+/// topology allowlist.
+class SetNeighborAllowlistAction extends SettingsAction {
+  final NeighborAllowlist? allowlist;
+
+  SetNeighborAllowlistAction(this.allowlist);
+}
+
+/// DEBUG/TESTBED ONLY. Install (or clear, with null) the deterministic
+/// offered-load workload config. Does NOT start the driver.
+class SetWorkloadConfigAction extends SettingsAction {
+  final WorkloadConfig? config;
+
+  SetWorkloadConfigAction(this.config);
 }
 

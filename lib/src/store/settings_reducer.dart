@@ -54,5 +54,13 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     );
   }
 
+  if (action is SetNeighborAllowlistAction) {
+    return state.copyWith(neighborAllowlist: action.allowlist);
+  }
+
+  if (action is SetWorkloadConfigAction) {
+    return state.copyWith(workloadConfig: action.config);
+  }
+
   return state;
 }

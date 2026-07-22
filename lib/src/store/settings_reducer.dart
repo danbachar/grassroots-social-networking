@@ -45,6 +45,10 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(facilitateInvites: action.enabled);
   }
 
+  if (action is SetShowLinkDiagnosticsAction) {
+    return state.copyWith(showLinkDiagnostics: action.enabled);
+  }
+
   if (action is SetTraceLoggingConsentAction) {
     return state.copyWith(
       traceLoggingConsent: action.consent,

@@ -446,6 +446,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
               widget.onSettingsChanged?.call();
             },
           ),
+          const SizedBox(height: 4),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: widget.store.state.settings.showLinkDiagnostics,
+            onChanged: (v) {
+              widget.store.dispatch(SetShowLinkDiagnosticsAction(v));
+              widget.onSettingsChanged?.call();
+              setState(() {});
+            },
+            title: const Text(
+              'Link diagnostics (debug)',
+              style: TextStyle(
+                  fontSize: GlType.textSm, fontWeight: FontWeight.w600),
+            ),
+            subtitle: const Text(
+              'Show physical BLE link (ACL) counts: total in the chat '
+              'screen, per-peer on peer rows. Ground truth from the OS.',
+              style: TextStyle(
+                  fontSize: GlType.textXs, color: GlColors.textMuted),
+            ),
+          ),
         ],
       ),
     );

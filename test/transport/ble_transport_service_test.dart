@@ -5,7 +5,6 @@ import 'dart:typed_data';
 
 import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer_testing.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart'
     show
@@ -85,6 +84,9 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
 
   @override
   Future<List<BlePath?>> paths() async => [];
+
+  @override
+  Future<List<BleLinkInfo?>> linkSnapshot() async => [];
 
   @override
   Future<void> dispose() async {
@@ -590,8 +592,6 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'Rotator',
-        protocolVersion: 1,
-        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: oldPathId,
       ));
@@ -648,8 +648,6 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'DualRole',
-        protocolVersion: 1,
-        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
@@ -806,16 +804,10 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'Remote',
-        protocolVersion: 1,
-        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.onPeerIdentified(
-        'peripheral:$connectionMac',
-        peerIdentity.publicKey,
-        PeerPlatform.other,
-      );
+      transport.onPeerIdentified('peripheral:$connectionMac', peerIdentity.publicKey);
       await Future<void>.delayed(Duration.zero);
 
       expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
@@ -1120,16 +1112,10 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peer.publicKey,
         nickname: 'Peer',
-        protocolVersion: 1,
-        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.onPeerIdentified(
-        'peripheral:$connectionMac',
-        peer.publicKey,
-        PeerPlatform.other,
-      );
+      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
       await Future<void>.delayed(Duration.zero);
 
       expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
@@ -1291,8 +1277,6 @@ void main() {
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peer.publicKey,
         nickname: 'StuckPeer',
-        protocolVersion: 1,
-        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: peripheralPathId,
       ));

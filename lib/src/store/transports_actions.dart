@@ -72,3 +72,10 @@ class UnsolicitedInboundObservedAction extends TransportAction {
   UnsolicitedInboundObservedAction({DateTime? observedAt})
     : observedAt = observedAt ?? DateTime.now();
 }
+
+/// Fresh OS-level BLE link snapshot from the plugin (debug diagnostics poll).
+class BleLinkSnapshotAction extends TransportAction {
+  final List<BleLinkDiagnostic> links;
+
+  BleLinkSnapshotAction(this.links);
+}

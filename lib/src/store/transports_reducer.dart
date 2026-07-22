@@ -57,5 +57,9 @@ TransportsState transportsReducer(
     return state.copyWith(lastUnsolicitedInboundAt: action.observedAt);
   }
 
+  if (action is BleLinkSnapshotAction) {
+    return state.copyWith(bleLinks: action.links);
+  }
+
   return state;
 }

@@ -23,6 +23,49 @@ extension NetworkConnectionTypeX on NetworkConnectionType {
   }
 }
 
+/// One live physical BLE link (ACL) as reported by the plugin's OS-level
+/// snapshot — a strict projection of a transport fact. [address] matches the
+/// address part of path IDs (`central:X` / `peripheral:X`), so peers are
+/// joined to links by address. An entry with both roles is one shared link
+/// carrying both GATT directions (over-ACL); two entries mapping to the same
+/// peer mean a dual-ACL pair.
+@immutable
+class BleLinkDiagnostic {
+  final String address;
+  final bool clientRole;
+  final bool serverRole;
+
+  const BleLinkDiagnostic({
+    required this.address,
+    required this.clientRole,
+    required this.serverRole,
+  });
+
+  @override
+  bool operator ==(Object other) =>
+      other is BleLinkDiagnostic &&
+      other.address == address &&
+      other.clientRole == clientRole &&
+      other.serverRole == serverRole;
+
+  @override
+  int get hashCode => Object.hash(address, clientRole, serverRole);
+}
+
+/// Number of live physical links whose remote address matches one of the
+/// given path IDs (`central:X` / `peripheral:X`; nulls skipped). Used by the
+/// link-diagnostics overlay to attribute OS-level links to a peer: 1 with a
+/// dual-role pair means the shared over-ACL link; 2 means dual ACLs.
+int bleLinkCountForPathIds(
+    List<BleLinkDiagnostic> links, Iterable<String?> pathIds) {
+  final addrs = pathIds
+      .whereType<String>()
+      .map((id) => id.substring(id.indexOf(':') + 1))
+      .toSet();
+  if (addrs.isEmpty) return 0;
+  return links.where((l) => addrs.contains(l.address)).length;
+}
+
 /// Per-transport lifecycle state for Redux store.
 ///
 /// Tracks the lifecycle state of each transport independently,
@@ -69,6 +112,10 @@ class TransportsState {
   /// reflected IP arrives, or when a new discovery attempt is in flight.
   final bool publicAddressDiscoveryFailed;
 
+  /// Latest OS-level BLE link snapshot (debug diagnostics; empty unless the
+  /// showLinkDiagnostics setting has the poll running).
+  final List<BleLinkDiagnostic> bleLinks;
+
   const TransportsState({
     this.bleState = TransportState.uninitialized,
     this.udpState = TransportState.uninitialized,
@@ -80,6 +127,7 @@ class TransportsState {
     this.networkConnectionType = NetworkConnectionType.offline,
     this.lastUnsolicitedInboundAt,
     this.publicAddressDiscoveryFailed = false,
+    this.bleLinks = const [],
   });
 
   static const TransportsState initial = TransportsState();
@@ -129,6 +177,7 @@ class TransportsState {
     NetworkConnectionType? networkConnectionType,
     DateTime? lastUnsolicitedInboundAt,
     bool? publicAddressDiscoveryFailed,
+    List<BleLinkDiagnostic>? bleLinks,
   }) {
     return TransportsState(
       bleState: bleState ?? this.bleState,
@@ -144,6 +193,7 @@ class TransportsState {
           lastUnsolicitedInboundAt ?? this.lastUnsolicitedInboundAt,
       publicAddressDiscoveryFailed:
           publicAddressDiscoveryFailed ?? this.publicAddressDiscoveryFailed,
+      bleLinks: bleLinks ?? this.bleLinks,
     );
   }
 
@@ -162,6 +212,7 @@ class TransportsState {
       networkConnectionType: networkConnectionType,
       lastUnsolicitedInboundAt: null,
       publicAddressDiscoveryFailed: publicAddressDiscoveryFailed,
+      bleLinks: bleLinks,
     );
   }
 
@@ -179,6 +230,7 @@ class TransportsState {
       networkConnectionType: networkConnectionType,
       lastUnsolicitedInboundAt: null,
       publicAddressDiscoveryFailed: publicAddressDiscoveryFailed,
+      bleLinks: bleLinks,
     );
   }
 
@@ -197,6 +249,7 @@ class TransportsState {
       networkConnectionType: networkConnectionType,
       lastUnsolicitedInboundAt: null,
       publicAddressDiscoveryFailed: false,
+      bleLinks: bleLinks,
     );
   }
 
@@ -214,7 +267,8 @@ class TransportsState {
           publicIp == other.publicIp &&
           networkConnectionType == other.networkConnectionType &&
           lastUnsolicitedInboundAt == other.lastUnsolicitedInboundAt &&
-          publicAddressDiscoveryFailed == other.publicAddressDiscoveryFailed;
+          publicAddressDiscoveryFailed == other.publicAddressDiscoveryFailed &&
+          listEquals(bleLinks, other.bleLinks);
 
   @override
   int get hashCode => Object.hash(
@@ -228,6 +282,7 @@ class TransportsState {
     networkConnectionType,
     lastUnsolicitedInboundAt,
     publicAddressDiscoveryFailed,
+    Object.hashAll(bleLinks),
   );
 
   @override

@@ -2065,11 +2065,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               peer.activeTransport.icon,
             ],
           ),
-          subtitle: Text(
-            peer.lastBleSeen != null
+          subtitle: Builder(builder: (context) {
+            final heard = peer.lastBleSeen != null
                 ? 'Heard ${_formatSecondsAgo(peer.lastBleSeen!)}'
-                : 'Reaching out…',
-          ),
+                : 'Reaching out…';
+            // Debug link-diagnostics: physical link (ACL) count to this peer
+            // from the plugin's OS-level snapshot.
+            if (!appStore.state.settings.showLinkDiagnostics) {
+              return Text(heard);
+            }
+            final linkCount = bleLinkCountForPathIds(
+              appStore.state.transports.bleLinks,
+              [peer.bleCentralDeviceId, peer.blePeripheralDeviceId],
+            );
+            return Text(
+                '$heard · $linkCount link${linkCount == 1 ? '' : 's'}');
+          }),
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
             children: [

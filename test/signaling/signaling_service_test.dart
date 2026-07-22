@@ -94,7 +94,7 @@ void main() {
   const codec = SignalingCodec();
 
   // ==========================================================================
-  // Outgoing: fanOutReconnect / fanOutAvailable
+  // Outgoing: fanOutReconnect
   // ==========================================================================
 
   group('fanOutReconnect', () {
@@ -215,18 +215,18 @@ void main() {
     });
 
     test('orders facilitators lexicographically by pubkey hex', () async {
-      // Two well-connected friends of the target — pubkeys are seed=3 and
-      // seed=4, so friendHex < friend2Hex. They are intentionally inserted in
-      // reverse lexicographic order; the fan-out must still hit them sorted.
+      // Two well-connected mutual friends — pubkeys are seed=3 and seed=4,
+      // so friendHex < friend2Hex. The fan-out must hit them in that order.
       service = SignalingService(
         store: _storeWithPeers(
           {
+            // intentionally listed in reverse lexicographic order
             friend2Hex: _wellConnectedFriend(friend2Key),
             friendHex: _wellConnectedFriend(friendKey),
           },
           friendsOfFriends: {
-            friend2Hex: {bobHex},
             friendHex: {bobHex},
+            friend2Hex: {bobHex},
           },
         ),
       );
@@ -243,73 +243,6 @@ void main() {
         equals([friendHex, friend2Hex]),
         reason: 'facilitators must be visited in lexicographic order',
       );
-    });
-  });
-
-  group('fanOutAvailable', () {
-    late SignalingService service;
-    late List<(Uint8List, Uint8List)> sentMessages;
-
-    setUp(() {
-      sentMessages = [];
-    });
-
-    tearDown(() => service.dispose());
-
-    test(
-      'sends AVAILABLE via sendSignaling to every trusted friend facilitator',
-      () async {
-        // AVAILABLE now routes through the same trusted-friend facilitator
-        // fan-out as RECONNECT: it is delivered to each well-connected friend
-        // of the target via the sendSignaling callback (no RV addresses).
-        service = SignalingService(
-          store: _storeWithPeers(
-            {
-              friendHex: _wellConnectedFriend(friendKey),
-              friend2Hex: _wellConnectedFriend(friend2Key),
-            },
-            friendsOfFriends: {
-              friendHex: {bobHex},
-              friend2Hex: {bobHex},
-            },
-          ),
-        );
-        service.sendSignaling = (recipient, payload) async {
-          sentMessages.add((recipient, payload));
-          return true;
-        };
-
-        final sent = await service.fanOutAvailable(bobKey);
-
-        expect(sent, equals(2));
-        expect(sentMessages, hasLength(2));
-        for (final (recipient, payload) in sentMessages) {
-          final decoded = codec.decode(payload) as AvailableMessage;
-          expect(decoded.peerPubkey, equals(bobKey));
-          expect(
-            [
-              friendKey,
-              friend2Key,
-            ].any((k) => _pubkeyHex(k) == _pubkeyHex(recipient)),
-            isTrue,
-          );
-        }
-      },
-    );
-
-    test('returns 0 when there are no facilitators', () async {
-      service = SignalingService(
-        store: _storeWithPeers({bobHex: _regularFriend(bobKey)}),
-      );
-      service.sendSignaling = (recipient, payload) async {
-        sentMessages.add((recipient, payload));
-        return true;
-      };
-
-      final sent = await service.fanOutAvailable(bobKey);
-
-      expect(sent, equals(0));
-      expect(sentMessages, isEmpty);
     });
   });
 
@@ -477,6 +410,7 @@ void main() {
       );
       expect(lastReflectIp, isNotNull);
     });
+
   });
 
   // ==========================================================================
@@ -579,6 +513,7 @@ void main() {
       expect(gotIp, equals(reflectedIp));
       expect(gotPort, equals(7000));
     });
+
   });
 
   // ==========================================================================
@@ -607,53 +542,6 @@ void main() {
     });
 
     tearDown(() => service.dispose());
-
-    test('coordinates a punch on AVAILABLE when the target is live', () {
-      // AVAILABLE(peerPubkey=alice) from bob: bob announces it is available to
-      // be reached by alice. This mediator is connected to alice (the live
-      // target), so it coordinates a single-step punch between bob and alice —
-      // identical handling to RECONNECT.
-      service.dispose();
-      sentMessages = [];
-      service = SignalingService(
-        store: _storeWithPeers({
-          aliceHex: PeerState(
-            publicKey: aliceKey,
-            nickname: 'Alice',
-            connectionState: PeerConnectionState.connected,
-            isFriend: true,
-            udpAddress: '[2606:4700::10]:7000',
-            hasLiveUdpConnection: true,
-          ),
-          bobHex: _regularFriend(bobKey, udpAddress: '[2606:4700::20]:9001'),
-        }),
-      );
-      service.sendSignaling = (recipient, payload) async {
-        sentMessages.add((recipient, payload));
-        return true;
-      };
-
-      service.processSignaling(
-        bobKey,
-        codec.encode(AvailableMessage(peerPubkey: aliceKey)),
-        observedIp: '2606:4700::20',
-        observedPort: 9001,
-      );
-
-      expect(sentMessages, hasLength(2));
-      final toBob = sentMessages.firstWhere((m) => _pubkeyHex(m.$1) == bobHex);
-      final initiateToBob = codec.decode(toBob.$2) as PunchInitiateMessage;
-      expect(_pubkeyHex(initiateToBob.peerPubkey), equals(aliceHex));
-      expect(initiateToBob.ip, equals('2606:4700::10'));
-      expect(initiateToBob.port, equals(7000));
-
-      final toAlice = sentMessages
-          .firstWhere((m) => _pubkeyHex(m.$1) == aliceHex);
-      final initiateToAlice = codec.decode(toAlice.$2) as PunchInitiateMessage;
-      expect(_pubkeyHex(initiateToAlice.peerPubkey), equals(bobHex));
-      expect(initiateToAlice.ip, equals('2606:4700::20'));
-      expect(initiateToAlice.port, equals(9001));
-    });
 
     test(
       'uses stored friend addresses when signaling has no observed source',
@@ -834,6 +722,126 @@ void main() {
       expect(_pubkeyHex(sentMessages.single.$1), equals(bobHex));
       final decoded = codec.decode(sentMessages.single.$2) as FriendListMessage;
       expect(decoded.friendPubkeys.single, equals(aliceKey));
+
+      service.dispose();
+    });
+  });
+
+  // ==========================================================================
+  // Incoming: INTRODUCE (cold-bootstrap invite)
+  // ==========================================================================
+
+  group('INTRODUCE handling', () {
+    test('codec round-trips the invite blob', () {
+      final blob = Uint8List.fromList(List.generate(120, (i) => i % 256));
+      final encoded = codec.encode(IntroduceMessage(inviteBlob: blob));
+      final decoded = codec.decode(encoded) as IntroduceMessage;
+      expect(decoded.inviteBlob, equals(blob));
+    });
+
+    test('bypasses the friend gate — a non-friend INTRODUCE is delivered', () {
+      // Bob is a stranger; INTRODUCE must still reach the coordinator, unlike
+      // every other signaling message which is friend-gated.
+      final service = SignalingService(
+        store: _storeWithPeers({bobHex: _stranger(bobKey)}),
+      );
+      Uint8List? gotSender;
+      Uint8List? gotBlob;
+      String? gotIp;
+      int? gotPort;
+      service.onIntroduceReceived = (sender, blob, ip, port) {
+        gotSender = sender;
+        gotBlob = blob;
+        gotIp = ip;
+        gotPort = port;
+      };
+
+      final blob = Uint8List.fromList([1, 2, 3, 4]);
+      service.processSignaling(
+        bobKey,
+        codec.encode(IntroduceMessage(inviteBlob: blob)),
+        observedIp: '203.0.113.40',
+        observedPort: 9100,
+      );
+
+      expect(_pubkeyHex(gotSender!), equals(bobHex));
+      expect(gotBlob, equals(blob));
+      expect(gotIp, equals('203.0.113.40'));
+      expect(gotPort, equals(9100));
+
+      service.dispose();
+    });
+
+    test(
+        'a transiently-trusted introducer\'s PUNCH_INITIATE reaches the '
+        'redeeming invitee (else its punch leg is dead)', () {
+      // Bob (the introducer) is NOT the invitee's friend. During redemption
+      // the invitee transiently trusts him so his PUNCH_INITIATE lands.
+      final service = SignalingService(
+        store: _storeWithPeers({bobHex: _stranger(bobKey)}),
+      );
+      Uint8List? gotPeer;
+      service.onPunchInitiate = (peer, ip, port, ready) => gotPeer = peer;
+
+      final punch = codec.encode(PunchInitiateMessage(
+        peerPubkey: friendKey,
+        ip: '2400::5',
+        port: 7000,
+      ));
+
+      // Without trust: dropped.
+      service.processSignaling(bobKey, punch);
+      expect(gotPeer, isNull);
+
+      // With transient trust: delivered.
+      service.trustTransientSignalingPeer(bobHex);
+      service.processSignaling(bobKey, punch);
+      expect(_pubkeyHex(gotPeer!), equals(friendHex));
+
+      // After untrust: dropped again.
+      gotPeer = null;
+      service.untrustTransientSignalingPeer(bobHex);
+      service.processSignaling(bobKey, punch);
+      expect(gotPeer, isNull);
+
+      service.dispose();
+    });
+
+    test('coordinateIntroduction PUNCH_INITIATEs both invitee and inviter',
+        () {
+      // The inviter is a friend of this introducer with a known address; the
+      // invitee is identified by its observed address.
+      final service = SignalingService(
+        store: _storeWithPeers({
+          friendHex: _wellConnectedFriend(friendKey,
+              udpAddress: '[2606:4700::9]:5000'),
+        }),
+      );
+      final sent = <(Uint8List, Uint8List)>[];
+      service.sendSignaling = (recipient, payload) async {
+        sent.add((recipient, payload));
+        return true;
+      };
+
+      service.coordinateIntroduction(
+        inviteePubkey: bobKey,
+        inviteeIp: '2400::42',
+        inviteePort: 7000,
+        inviterPubkey: friendKey,
+      );
+
+      expect(sent, hasLength(2));
+      final byRecipient = {for (final s in sent) _pubkeyHex(s.$1): s.$2};
+      // Inviter is told to punch toward the invitee's observed address.
+      final toInviter =
+          codec.decode(byRecipient[friendHex]!) as PunchInitiateMessage;
+      expect(_pubkeyHex(toInviter.peerPubkey), equals(bobHex));
+      expect(toInviter.ip, equals('2400::42'));
+      expect(toInviter.port, equals(7000));
+      // Invitee is told to punch toward the inviter's address.
+      final toInvitee =
+          codec.decode(byRecipient[bobHex]!) as PunchInitiateMessage;
+      expect(_pubkeyHex(toInvitee.peerPubkey), equals(friendHex));
 
       service.dispose();
     });

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
+import '../models/platform.dart';
 import '../transport/address_utils.dart';
 
 /// A discovered BLE peer before identity (ANNOUNCE) is exchanged.
@@ -43,6 +44,13 @@ class DiscoveredPeerState {
   /// True iff the plugin's last path state was `ready` with `canSend=true`.
   final bool isConnected;
 
+  /// Whether any advertisement from this entry carried the iOS platform
+  /// marker (`grs-ios` local name). Sticky for the entry's lifetime — the
+  /// marker is only present while the iOS app is foregrounded, but a peer's
+  /// platform never changes. Identified peers use the authenticated
+  /// [PeerState.platform] instead; this is the pre-ANNOUNCE hint.
+  final bool isIosMarked;
+
   const DiscoveredPeerState({
     required this.transportId,
     this.displayName,
@@ -52,6 +60,7 @@ class DiscoveredPeerState {
     required this.lastSeen,
     this.isConnecting = false,
     this.isConnected = false,
+    this.isIosMarked = false,
   });
 
   /// Signal quality indicator (0.0 - 1.0), derived from rssi.
@@ -70,6 +79,7 @@ class DiscoveredPeerState {
     DateTime? lastSeen,
     bool? isConnecting,
     bool? isConnected,
+    bool? isIosMarked,
   }) {
     return DiscoveredPeerState(
       transportId: transportId ?? this.transportId,
@@ -80,6 +90,7 @@ class DiscoveredPeerState {
       lastSeen: lastSeen ?? this.lastSeen,
       isConnecting: isConnecting ?? this.isConnecting,
       isConnected: isConnected ?? this.isConnected,
+      isIosMarked: isIosMarked ?? this.isIosMarked,
     );
   }
 
@@ -92,7 +103,8 @@ class DiscoveredPeerState {
           rssi == other.rssi &&
           serviceUuid == other.serviceUuid &&
           isConnecting == other.isConnecting &&
-          isConnected == other.isConnected;
+          isConnected == other.isConnected &&
+          isIosMarked == other.isIosMarked;
 
   @override
   int get hashCode => Object.hash(
@@ -101,6 +113,7 @@ class DiscoveredPeerState {
         serviceUuid,
         isConnecting,
         isConnected,
+        isIosMarked,
       );
 
   @override
@@ -115,6 +128,18 @@ class PeerState {
   final String nickname;
   final PeerConnectionState connectionState;
   final PeerTransport transport;
+
+  /// The peer's OS platform, from the signed ANNOUNCE payload. Null only
+  /// before the first ANNOUNCE identifies the peer (e.g. a peer restored
+  /// from persistence that has not announced this session). Pubkey-keyed and
+  /// therefore stable across MAC/slot rotations and backgrounding — the
+  /// authoritative input to BLE dual-role leg ordering.
+  final PeerPlatform? platform;
+
+  /// Whether the peer advertises willingness to introduce strangers redeeming
+  /// a friend's invite (from its signed ANNOUNCE). Used to pick eligible
+  /// introducers when creating an invite.
+  final bool willingToFacilitate;
 
   /// Latest BLE signal strength in dBm.
   ///
@@ -185,6 +210,8 @@ class PeerState {
     required this.nickname,
     this.connectionState = PeerConnectionState.discovered,
     this.transport = PeerTransport.bleDirect,
+    this.platform,
+    this.willingToFacilitate = false,
     this.rssi,
     this.protocolVersion = 1,
     this.lastSeen,
@@ -285,6 +312,8 @@ class PeerState {
     String? nickname,
     PeerConnectionState? connectionState,
     PeerTransport? transport,
+    PeerPlatform? platform,
+    bool? willingToFacilitate,
     int? rssi,
     int? protocolVersion,
     DateTime? lastSeen,
@@ -306,6 +335,8 @@ class PeerState {
       nickname: nickname ?? this.nickname,
       connectionState: connectionState ?? this.connectionState,
       transport: transport ?? this.transport,
+      platform: platform ?? this.platform,
+      willingToFacilitate: willingToFacilitate ?? this.willingToFacilitate,
       rssi: rssi ?? this.rssi,
       protocolVersion: protocolVersion ?? this.protocolVersion,
       lastSeen: lastSeen ?? this.lastSeen,
@@ -335,6 +366,8 @@ class PeerState {
           nickname == other.nickname &&
           connectionState == other.connectionState &&
           transport == other.transport &&
+          platform == other.platform &&
+          willingToFacilitate == other.willingToFacilitate &&
           rssi == other.rssi &&
           bleCentralDeviceId == other.bleCentralDeviceId &&
           blePeripheralDeviceId == other.blePeripheralDeviceId &&
@@ -351,6 +384,8 @@ class PeerState {
         nickname,
         connectionState,
         transport,
+        platform,
+        willingToFacilitate,
         rssi,
         bleCentralDeviceId,
         blePeripheralDeviceId,

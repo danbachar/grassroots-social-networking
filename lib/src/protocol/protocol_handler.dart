@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
+import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:sodium_libs/sodium_libs.dart';
 
@@ -12,11 +13,20 @@ import 'package:sodium_libs/sodium_libs.dart';
 /// Extracted from transport layer to achieve separation of concerns.
 class ProtocolHandler {
   final GrassrootsIdentity identity;
+
+  /// The local device's OS platform, embedded in every ANNOUNCE we create.
+  final PeerPlatform platform;
+
   final Sodium _sodium;
   static const int protocolVersion = 1;
 
+  /// ANNOUNCE flags-byte bit 0: the peer volunteers to introduce strangers
+  /// redeeming a friend's invite (see [createAnnouncePayload]).
+  static const int _flagWillingToFacilitate = 0x01;
+
   ProtocolHandler({
     required this.identity,
+    required this.platform,
     required Sodium sodium,
   }) : _sodium = sodium;
 
@@ -31,13 +41,18 @@ class ProtocolHandler {
   /// it, verifiable against the embedded pubkey ([decodeAnnounce] enforces it).
   ///
   /// Format:
-  /// [pubkey(32) + version(2) + nickLen(1) + nick
+  /// [pubkey(32) + version(2) + platform(1) + flags(1) + nickLen(1) + nick
   ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)
   ///  + signature(64)]
+  ///
+  /// [willingToFacilitate] sets bit 0 of the flags byte: the peer volunteers
+  /// to introduce strangers redeeming a friend's invite. It rides inside the
+  /// signed body, so a peer's advertised willingness cannot be forged.
   Uint8List createAnnouncePayload({
     String? address,
     String? linkLocalAddress,
     Iterable<String> addressCandidates = const [],
+    bool willingToFacilitate = false,
   }) {
     final nicknameBytes = _encodeNickname(identity.nickname);
     final candidates = <String>{
@@ -55,6 +70,13 @@ class ProtocolHandler {
     final versionBytes = ByteData(2);
     versionBytes.setUint16(0, protocolVersion, Endian.big);
     buffer.add(versionBytes.buffer.asUint8List());
+
+    // Platform (1 byte) — see [PeerPlatform]. Inside the signed body, so
+    // neighbors cannot forge a peer's platform.
+    buffer.addByte(platform.wireByte);
+
+    // Flags (1 byte): bit 0 = willing to facilitate invites.
+    buffer.addByte(willingToFacilitate ? _flagWillingToFacilitate : 0);
 
     // Nickname length (1 byte) + nickname
     buffer.addByte(nicknameBytes.length);
@@ -133,7 +155,7 @@ class ProtocolHandler {
   /// Decode ANNOUNCE payload
   ///
   /// Format:
-  /// [pubkey(32) + version(2) + nickLen(1) + nick
+  /// [pubkey(32) + version(2) + platform(1) + flags(1) + nickLen(1) + nick
   ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
   AnnounceData decodeAnnounce(Uint8List data) {
     if (data.length < 32 + 64) {
@@ -155,6 +177,15 @@ class ProtocolHandler {
     final version = ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
         .getUint16(0, Endian.big);
     offset += 2;
+
+    // Platform (1 byte) — required; an unknown value is malformed.
+    final peerPlatform = PeerPlatform.fromWireByte(body[offset]);
+    offset += 1;
+
+    // Flags (1 byte).
+    final flags = body[offset];
+    final willingToFacilitate = (flags & _flagWillingToFacilitate) != 0;
+    offset += 1;
 
     // Nickname length (1 byte) + nickname
     final nicknameLength = body[offset];
@@ -202,6 +233,8 @@ class ProtocolHandler {
       publicKey: Uint8List.fromList(pubkey),
       nickname: nickname,
       protocolVersion: version,
+      platform: peerPlatform,
+      willingToFacilitate: willingToFacilitate,
       udpAddress: address,
       linkLocalAddress: linkLocalAddress,
       addressCandidates: addressCandidates,
@@ -318,6 +351,12 @@ class AnnounceData {
   final Uint8List publicKey;
   final String nickname;
   final int protocolVersion;
+  final PeerPlatform platform;
+
+  /// Whether the peer advertises willingness to introduce strangers redeeming
+  /// a friend's invite (authenticated by the ANNOUNCE signature).
+  final bool willingToFacilitate;
+
   final String? udpAddress;
   final String? linkLocalAddress;
   final Set<String> addressCandidates;
@@ -326,13 +365,16 @@ class AnnounceData {
     required this.publicKey,
     required this.nickname,
     required this.protocolVersion,
+    required this.platform,
+    this.willingToFacilitate = false,
     this.udpAddress,
     this.linkLocalAddress,
     this.addressCandidates = const {},
   });
 
   @override
-  String toString() => 'AnnounceData($nickname, v$protocolVersion'
+  String toString() => 'AnnounceData($nickname, v$protocolVersion, '
+      '${platform.name}'
       '${udpAddress != null ? ", addr: $udpAddress" : ""}'
       '${linkLocalAddress != null ? ", ll: $linkLocalAddress" : ""}'
       '${addressCandidates.isNotEmpty ? ", candidates: $addressCandidates" : ""})';

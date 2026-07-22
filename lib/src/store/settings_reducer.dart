@@ -28,7 +28,21 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
   }
 
   if (action is SetColdCallTrustLevelAction) {
+    // Turning cold-call closed also withdraws the introduce-strangers
+    // opt-in, since introducing is a strictly more-open stance (the
+    // effective willingness is AND-gated, but keeping the stored flag in
+    // sync avoids a surprise re-enable when cold-call reopens).
+    if (action.level == ColdCallTrustLevel.closed) {
+      return state.copyWith(
+        coldCallTrustLevel: action.level,
+        facilitateInvites: false,
+      );
+    }
     return state.copyWith(coldCallTrustLevel: action.level);
+  }
+
+  if (action is SetFacilitateInvitesAction) {
+    return state.copyWith(facilitateInvites: action.enabled);
   }
 
   if (action is SetTraceLoggingConsentAction) {

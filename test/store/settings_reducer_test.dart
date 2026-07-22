@@ -187,6 +187,53 @@ void main() {
         expect(result.bluetoothEnabled, state.bluetoothEnabled);
         expect(result.udpEnabled, state.udpEnabled);
       });
+
+      test('closing cold-call also withdraws the introduce opt-in', () {
+        const state = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: true,
+        );
+        final result = settingsReducer(
+          state,
+          SetColdCallTrustLevelAction(ColdCallTrustLevel.closed),
+        );
+
+        expect(result.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(result.facilitateInvites, isFalse);
+      });
+    });
+
+    group('SetFacilitateInvitesAction', () {
+      test('sets the stored flag', () {
+        const state = SettingsState.initial;
+        final result =
+            settingsReducer(state, SetFacilitateInvitesAction(true));
+        expect(result.facilitateInvites, isTrue);
+      });
+
+      test('effective willingness is AND-gated by an open cold-call posture',
+          () {
+        // Flag on but cold-call closed → not willing.
+        const closed = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.closed,
+          facilitateInvites: true,
+        );
+        expect(closed.willingToFacilitateInvites, isFalse);
+
+        // Flag on and cold-call open → willing.
+        const open = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: true,
+        );
+        expect(open.willingToFacilitateInvites, isTrue);
+
+        // Flag off → not willing regardless.
+        const off = SettingsState(
+          coldCallTrustLevel: ColdCallTrustLevel.open,
+          facilitateInvites: false,
+        );
+        expect(off.willingToFacilitateInvites, isFalse);
+      });
     });
 
     group('HydrateSettingsAction', () {

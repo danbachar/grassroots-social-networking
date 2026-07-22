@@ -191,12 +191,6 @@ abstract class TransportService {
   /// addressed ANNOUNCE).
   Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds});
 
-  /// Associate a peer with a public key.
-  ///
-  /// Called after identity exchange (e.g., ANNOUNCE packet).
-  /// This allows higher layers to address peers by pubkey.
-  void associatePeerWithPubkey(String peerId, Uint8List pubkey);
-
   /// Get peer ID for a public key (if known).
   String? getPeerIdForPubkey(Uint8List pubkey);
 

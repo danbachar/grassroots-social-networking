@@ -44,6 +44,14 @@ class SetBleRoleModeAction extends SettingsAction {
   SetBleRoleModeAction(this.mode);
 }
 
+/// Set whether this device volunteers to introduce strangers redeeming an
+/// invite issued by one of our friends.
+class SetFacilitateInvitesAction extends SettingsAction {
+  final bool enabled;
+
+  SetFacilitateInvitesAction(this.enabled);
+}
+
 /// Set whether nearby unknown peers may complete BLE first contact.
 class SetColdCallTrustLevelAction extends SettingsAction {
   final ColdCallTrustLevel level;

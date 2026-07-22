@@ -6,6 +6,7 @@ import '../trace/trace_logger.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
+import '../models/platform.dart';
 import '../models/secure_frame.dart';
 import '../protocol/fragment_handler.dart';
 import '../protocol/protocol_handler.dart';
@@ -108,6 +109,13 @@ class MessageRouter {
   /// pubkey so the coordinator can map the connection (replacing tempKey-based
   /// identification that previously required ANNOUNCE as the first message).
   void Function(Uint8List senderPubkey, String udpPeerId)? onUdpPeerIdentified;
+
+  /// Called when a verified BLE ANNOUNCE identifies the peer behind a path —
+  /// fired after the announce has been applied to Redux. The BLE transport
+  /// uses it to act on the pair's reverse leg at the authoritative moment
+  /// (cancel a doomed dial on iOS, or open the reverse central leg).
+  void Function(String pathId, Uint8List pubkey, PeerPlatform platform)?
+      onBlePeerIdentified;
 
   /// Called when a Noise handshake packet arrives. The coordinator owns
   /// session state and sends any handshake response over the same medium.
@@ -391,6 +399,8 @@ class MessageRouter {
       publicKey: pubkey,
       nickname: data.nickname,
       protocolVersion: data.protocolVersion,
+      platform: data.platform,
+      willingToFacilitate: data.willingToFacilitate,
       rssi: effectiveRssi,
       transport: transport,
       bleCentralDeviceId: centralId,
@@ -400,12 +410,10 @@ class MessageRouter {
       udpAddressCandidates: udpAddressCandidates,
     ));
 
-    if (resolvedBleDeviceId != null && resolvedBleRole != null) {
-      store.dispatch(AssociateBleDeviceAction(
-        publicKey: pubkey,
-        deviceId: resolvedBleDeviceId,
-        role: resolvedBleRole,
-      ));
+    // The announce action above already recorded the role attachment; now
+    // that Redux reflects it, let the BLE transport act on the reverse leg.
+    if (resolvedBleDeviceId != null) {
+      onBlePeerIdentified?.call(resolvedBleDeviceId, pubkey, data.platform);
     }
 
     debugPrint(

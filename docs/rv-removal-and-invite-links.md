@@ -123,11 +123,37 @@ Keep: AddrReflect, hole-punch, friend-mediator, `public_address_discovery`.
 
 1. **Generalize mediation** — dynamic dual-connected friend mediation +
    well-connected auto-detect + advertise; repoint fan-out to friends.
-   *(Reconnection now works without RVs.)*
+   *(Reconnection now works without RVs.)* — **DONE.**
 2. **Delete RVs** — remove `bootstrap_anchor/`, RV settings + UI + code paths,
-   `RvList*`.
-3. **Invite links** — scheme + dep + generate/share UI + signed invite +
-   `INTRODUCE` flow + `facilitateInvites` setting (the cold-bootstrap path).
+   `RvList*`. — **DONE.**
+3. **Invite links** — signed invite + `INTRODUCE` flow + `facilitateInvites`
+   setting + generate/redeem UI (the cold-bootstrap path). — **DONE**, with one
+   deferral: the `grassroots://` link is generated and redeemed **in-app**
+   (paste the link), but the native URL-scheme registration (Android
+   intent-filter + iOS `CFBundleURLSchemes` + an `app_links`-style dependency
+   so a tapped link cold-launches the app) is **not wired** — it is pure
+   platform plumbing with no protocol logic, left as a follow-up. The
+   ANNOUNCE "willing to facilitate" bit was not added: an introducer that
+   declines simply drops the INTRODUCE, and invite redundancy covers it, so
+   advertising willingness up front is an optimization rather than a
+   requirement.
+
+### What landed for phase 3
+
+- `lib/src/signaling/invite.dart` — `Invite` (inviter, introducers,
+  expiry, nonce, maxUses), Ed25519 sign/verify over the canonical body, and
+  the `grassroots://invite?d=<base64url(body‖sig)>` codec. `InviteSigner`,
+  `InviteRedeemResult`.
+- `SignalingType.introduce` (0x0c) + `IntroduceMessage`; the friend-only
+  trust gate in `processSignaling` now lets INTRODUCE through (self-authorizing).
+- `SignalingService.coordinateIntroduction` — the introducer's single-step
+  punch between invitee (observed address) and inviter (friend address).
+- `GrassrootsNetwork`: `createInvite`, `redeemInvite`, `_handleIntroduceReceived`
+  (inviter-role accept+nonce-burn / introducer-role verify+coordinate),
+  `_availableIntroducers`, and the `_invitedContacts` first-contact
+  authorization that lets an invitee through even under closed cold-call.
+- `facilitateInvites` setting, AND-gated by cold-call
+  (`willingToFacilitateInvites`); settings toggle + You-tab generate/redeem UI.
 
 ## Open items / risks
 

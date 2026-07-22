@@ -13,6 +13,17 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final existing = state.discoveredBlePeers[action.deviceId];
     final now = DateTime.now();
 
+    // The marker is sticky per IDENTITY, not per radio MAC: a peer's
+    // platform never changes, but its advertising MAC rotates and the
+    // ghost-prune below deletes the rotated-away entry. Inherit the marker
+    // from any same-UUID sibling so the hint survives the rotation.
+    final actionUuid = action.serviceUuid?.toLowerCase();
+    final inheritedIosMark = actionUuid != null &&
+        state.discoveredBlePeers.values.any((p) =>
+            p.transportId != action.deviceId &&
+            p.serviceUuid?.toLowerCase() == actionUuid &&
+            p.isIosMarked);
+
     final DiscoveredPeerState newOrUpdated;
     if (existing == null) {
       newOrUpdated = DiscoveredPeerState(
@@ -22,9 +33,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         serviceUuid: action.serviceUuid,
         discoveredAt: now,
         lastSeen: now,
+        isIosMarked: action.isIosMarked || inheritedIosMark,
       );
     } else {
-      // TODO: this should be a different action, use update rssi
       newOrUpdated = existing.copyWith(
         rssi: action.rssi,
         serviceUuid: action.serviceUuid,
@@ -32,6 +43,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
         displayName: (action.displayName?.isNotEmpty ?? false)
             ? action.displayName
             : existing.displayName,
+        // Sticky: the marker is dropped while the iOS app is backgrounded,
+        // but a peer's platform never changes.
+        isIosMarked:
+            existing.isIosMarked || action.isIosMarked || inheritedIosMark,
       );
     }
 
@@ -60,21 +75,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
     updatedMap[action.deviceId] = newOrUpdated;
 
     return state.copyWith(discoveredBlePeers: updatedMap);
-  }
-
-  if (action is BleDeviceRssiUpdatedAction) {
-    final existing = state.discoveredBlePeers[action.deviceId];
-    if (existing != null) {
-      final updated = existing.copyWith(
-        rssi: action.rssi,
-        lastSeen: DateTime.now(),
-      );
-      return state.copyWith(
-        discoveredBlePeers: Map.from(state.discoveredBlePeers)
-          ..[action.deviceId] = updated,
-      );
-    }
-    return state;
   }
 
   if (action is BleDeviceConnectingAction) {
@@ -176,6 +176,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
         transport: action.transport,
+        platform: action.platform,
+        willingToFacilitate: action.willingToFacilitate,
         rssi: action.rssi,
         protocolVersion: action.protocolVersion,
         lastSeen: now,
@@ -222,6 +224,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
         nickname: action.nickname,
         connectionState: PeerConnectionState.connected,
         transport: action.transport,
+        platform: action.platform,
+        willingToFacilitate: action.willingToFacilitate,
         rssi: action.rssi,
         protocolVersion: action.protocolVersion,
         lastSeen: now,
@@ -289,6 +293,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        platform: existing.platform,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: newConnectionState,
         transport: existing.transport,
         rssi: hasAnyBle ? existing.rssi : null,
@@ -365,6 +371,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        platform: existing.platform,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: newConnectionState,
         transport: existing.transport,
         rssi: existing.rssi,
@@ -440,20 +448,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
 
   // ===== Association Actions =====
 
-  if (action is AssociateBleDeviceAction) {
-    final pubkeyHex = _pubkeyToHex(action.publicKey);
-    final existing = state.peers[pubkeyHex];
-    if (existing != null) {
-      final updated = action.role == BleRole.central
-          ? existing.copyWith(bleCentralDeviceId: action.deviceId)
-          : existing.copyWith(blePeripheralDeviceId: action.deviceId);
-      return state.copyWith(
-        peers: Map.from(state.peers)..[pubkeyHex] = updated,
-      );
-    }
-    return state;
-  }
-
   if (action is AssociateUdpAddressAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];
@@ -472,6 +466,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        platform: existing.platform,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: existing.connectionState,
         transport: existing.transport,
         rssi: existing.rssi,
@@ -568,6 +564,8 @@ PeersState peersReducer(PeersState state, dynamic action) {
       final updated = PeerState(
         publicKey: existing.publicKey,
         nickname: existing.nickname,
+        platform: existing.platform,
+        willingToFacilitate: existing.willingToFacilitate,
         connectionState: PeerConnectionState.connected,
         transport: PeerTransport.bleDirect, // Reset to BLE
         rssi: existing.rssi,

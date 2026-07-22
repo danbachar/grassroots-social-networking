@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer_testing.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart'
     show
@@ -592,6 +593,7 @@ void main() {
         publicKey: peerIdentity.publicKey,
         nickname: 'Rotator',
         protocolVersion: 1,
+        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: oldPathId,
       ));
@@ -649,6 +651,7 @@ void main() {
         publicKey: peerIdentity.publicKey,
         nickname: 'DualRole',
         protocolVersion: 1,
+        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
@@ -745,9 +748,9 @@ void main() {
       hostApi.calls.clear();
 
       // Peripheral path arrives from the (different) connection MAC and
-      // reaches ready before ANNOUNCE — `_maybeDialReverseCentralAfterPeripheralReady`
-      // bails because we don't yet know who's on the other end and the
-      // same-address fallback finds no `central:99:88:...` discovery.
+      // reaches ready before ANNOUNCE — nothing dials: the reverse leg
+      // fires only from `onPeerIdentified`, once we know who is on the
+      // other end.
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -763,21 +766,22 @@ void main() {
               'Pre-ANNOUNCE peripheral-ready must NOT dial the connection MAC '
               '— that address has no GATT server attached on a BLE-privacy stack.');
 
-      // ANNOUNCE arrives over the peripheral path. GrassrootsNetwork would
-      // dispatch PeerAnnounceReceivedAction (creating the peer entry) and
-      // then call associatePeerWithPubkey to link the peripheral path to
-      // the pubkey. The transport is supposed to then trigger the reverse
-      // leg against an advertising MAC we already know works.
+      // ANNOUNCE arrives over the peripheral path. The router dispatches
+      // PeerAnnounceReceivedAction (recording the attachment) and then
+      // invokes onPeerIdentified. The transport must then trigger the
+      // reverse leg against an advertising MAC we already know works.
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peerIdentity.publicKey,
         nickname: 'Remote',
         protocolVersion: 1,
+        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.associatePeerWithPubkey(
+      transport.onPeerIdentified(
         'peripheral:$connectionMac',
         peerIdentity.publicKey,
+        PeerPlatform.other,
       );
       await Future<void>.delayed(Duration.zero);
 
@@ -1062,7 +1066,8 @@ void main() {
           reason: 'Non-initiator must not first-mover-dial.');
 
       // The initiator dials us → inbound peripheral leg, then ANNOUNCE
-      // identifies it.
+      // identifies it. (The path event must deliver first — in production
+      // the ANNOUNCE payload is only forwarded once the path is ready.)
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -1071,16 +1076,19 @@ void main() {
         mtu: 517,
         canSend: true,
       ));
+      await Future<void>.delayed(Duration.zero);
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peer.publicKey,
         nickname: 'Peer',
         protocolVersion: 1,
+        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
-      transport.associatePeerWithPubkey(
+      transport.onPeerIdentified(
         'peripheral:$connectionMac',
         peer.publicKey,
+        PeerPlatform.other,
       );
       await Future<void>.delayed(Duration.zero);
 
@@ -1225,6 +1233,7 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'iPhone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:IPHONE_CONN',
       ));
@@ -1343,19 +1352,21 @@ void main() {
         mtu: 517,
         canSend: true,
       ));
-      // Let the path event deliver before associating — associate reads the
+      // Let the path event deliver before identifying — the hook reads the
       // transport's live path mirror synchronously.
       await Future<void>.delayed(Duration.zero);
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: androidPeer.publicKey,
         nickname: 'Pixel',
         protocolVersion: 1,
+        platform: PeerPlatform.other,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:PIXEL_CONN',
       ));
-      transport.associatePeerWithPubkey(
+      transport.onPeerIdentified(
         'peripheral:PIXEL_CONN',
         androidPeer.publicKey,
+        PeerPlatform.other,
       );
       await Future<void>.delayed(Duration.zero);
 
@@ -1455,12 +1466,14 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'OtherIphone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:IOS_PEER_CONN',
       ));
-      transport.associatePeerWithPubkey(
+      transport.onPeerIdentified(
         'peripheral:IOS_PEER_CONN',
         iosPeer.publicKey,
+        PeerPlatform.ios,
       );
       await Future<void>.delayed(Duration.zero);
 
@@ -1519,12 +1532,14 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'OtherIphone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:IOS_PEER_CONN',
       ));
-      transport.associatePeerWithPubkey(
+      transport.onPeerIdentified(
         'peripheral:IOS_PEER_CONN',
         iosPeer.publicKey,
+        PeerPlatform.ios,
       );
       await Future<void>.delayed(Duration.zero);
 
@@ -1596,6 +1611,7 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'iPhone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'central:IPHONE_ADV',
       ));
@@ -1667,6 +1683,7 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'iPhone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'central:IPHONE_ADV',
       ));
@@ -1743,6 +1760,7 @@ void main() {
         publicKey: iosPeer.publicKey,
         nickname: 'iPhone',
         protocolVersion: 1,
+        platform: PeerPlatform.ios,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'central:IPHONE_ADV',
         blePeripheralDeviceId: 'peripheral:IPHONE_CONN',

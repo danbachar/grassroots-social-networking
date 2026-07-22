@@ -5,6 +5,7 @@ import 'package:grassroots_networking/src/store/peers_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart';
 import 'package:grassroots_networking/src/store/peers_reducer.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/models/platform.dart';
 
 /// Generate a deterministic 32-byte public key from a seed value.
 Uint8List _testPubkey(int seed) {
@@ -93,42 +94,56 @@ void main() {
   });
 
   // =========================================================================
-  // BleDeviceRssiUpdatedAction
+  // BleDeviceDiscoveredAction — re-advertisement merge
   // =========================================================================
 
-  group('BleDeviceRssiUpdatedAction', () {
-    test('updates RSSI of existing discovered peer', () {
-      final now = DateTime.now();
+  group('BleDeviceDiscoveredAction re-advertisement merge', () {
+    test('refreshes RSSI and preserves discoveredAt for existing entry', () {
+      final firstSeen = DateTime.now().subtract(const Duration(seconds: 30));
       final initial = PeersState(
         discoveredBlePeers: {
           'device-1': DiscoveredPeerState(
             transportId: 'device-1',
             rssi: -80,
-            discoveredAt: now,
-            lastSeen: now,
+            discoveredAt: firstSeen,
+            lastSeen: firstSeen,
           ),
         },
       );
-      final action = BleDeviceRssiUpdatedAction(
+      final action = BleDeviceDiscoveredAction(
         deviceId: 'device-1',
         rssi: -45,
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.discoveredBlePeers['device-1']!.rssi, -45);
+      final entry = result.discoveredBlePeers['device-1']!;
+      expect(entry.rssi, -45);
+      expect(entry.discoveredAt, firstSeen);
+      expect(entry.lastSeen.isAfter(firstSeen), isTrue);
     });
 
-    test('is a no-op for unknown device', () {
+    test('isIosMarked is sticky: a marker-less re-advertisement keeps it',
+        () {
       const state = PeersState.initial;
-      final action = BleDeviceRssiUpdatedAction(
-        deviceId: 'nonexistent',
-        rssi: -45,
+      final marked = peersReducer(
+        state,
+        BleDeviceDiscoveredAction(
+          deviceId: 'device-1',
+          rssi: -60,
+          isIosMarked: true,
+        ),
       );
+      expect(marked.discoveredBlePeers['device-1']!.isIosMarked, isTrue);
 
-      final result = peersReducer(state, action);
-
-      expect(result, same(state));
+      // Backgrounded iOS drops the marker from later advertisements; the
+      // recorded platform must not decay with it.
+      final refreshed = peersReducer(
+        marked,
+        BleDeviceDiscoveredAction(deviceId: 'device-1', rssi: -50),
+      );
+      expect(refreshed.discoveredBlePeers['device-1']!.isIosMarked, isTrue);
+      expect(refreshed.discoveredBlePeers['device-1']!.rssi, -50);
     });
   });
 
@@ -360,6 +375,7 @@ void main() {
       final pubkey = _testPubkey(1);
       const state = PeersState.initial;
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
         protocolVersion: 2,
@@ -390,6 +406,7 @@ void main() {
       final pubkey = _testPubkey(1);
       const state = PeersState.initial;
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
         protocolVersion: 1,
@@ -417,6 +434,7 @@ void main() {
         var state = peersReducer(
           PeersState.initial,
           PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
             publicKey: pubkey,
             nickname: 'Alice',
             protocolVersion: 1,
@@ -433,6 +451,7 @@ void main() {
         state = peersReducer(
           state,
           PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
             publicKey: pubkey,
             nickname: 'Alice',
             protocolVersion: 1,
@@ -467,6 +486,7 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'NewNick',
         protocolVersion: 3,
@@ -512,6 +532,7 @@ void main() {
       final result = peersReducer(
         initial,
         PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
           publicKey: pubkey,
           nickname: 'NewNick',
           protocolVersion: 3,
@@ -534,6 +555,7 @@ void main() {
     test('sets connectionState to connected', () {
       final pubkey = _testPubkey(2);
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Bob',
         protocolVersion: 1,
@@ -561,6 +583,7 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Alice',
         protocolVersion: 1,
@@ -581,6 +604,7 @@ void main() {
     test('UDP ANNOUNCE records lastUdpSeen', () {
       final pubkey = _testPubkey(3);
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Carol',
         protocolVersion: 1,
@@ -612,6 +636,7 @@ void main() {
         },
       );
       final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
         nickname: 'Dana',
         protocolVersion: 1,
@@ -624,6 +649,8 @@ void main() {
 
       expect(result.peers[hex]!.lastUdpSeen, equals(udpSeenAt));
     });
+
+    // The "preserve RV servers across ANNOUNCE updates" invariant moved with
   });
 
   // =========================================================================
@@ -944,20 +971,22 @@ void main() {
   });
 
   // =========================================================================
-  // AssociateBleDeviceAction — role-based
+  // PeerAnnounceReceivedAction — role attachment + platform
   // =========================================================================
 
-  group('AssociateBleDeviceAction', () {
-    test('sets bleCentralDeviceId when role=central', () {
+  group('PeerAnnounceReceivedAction role attachment', () {
+    test('central announce sets bleCentralDeviceId only', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
         peers: {hex: PeerState(publicKey: pubkey, nickname: 'Alice')},
       );
-      final action = AssociateBleDeviceAction(
+      final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
-        deviceId: 'ble-central-99',
-        role: BleRole.central,
+        nickname: 'Alice',
+        protocolVersion: 1,
+        bleCentralDeviceId: 'ble-central-99',
       );
 
       final result = peersReducer(initial, action);
@@ -966,35 +995,81 @@ void main() {
       expect(result.peers[hex]!.blePeripheralDeviceId, isNull);
     });
 
-    test('sets blePeripheralDeviceId when role=peripheral', () {
+    test('peripheral announce sets blePeripheralDeviceId and keeps central',
+        () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
-        peers: {hex: PeerState(publicKey: pubkey, nickname: 'Alice')},
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            bleCentralDeviceId: 'ble-central-99',
+          ),
+        },
       );
-      final action = AssociateBleDeviceAction(
+      final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
         publicKey: pubkey,
-        deviceId: 'ble-peripheral-99',
-        role: BleRole.peripheral,
+        nickname: 'Alice',
+        protocolVersion: 1,
+        blePeripheralDeviceId: 'ble-peripheral-99',
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.peers[hex]!.bleCentralDeviceId, isNull);
+      expect(result.peers[hex]!.bleCentralDeviceId, 'ble-central-99');
       expect(result.peers[hex]!.blePeripheralDeviceId, 'ble-peripheral-99');
     });
 
-    test('is a no-op for unknown peer', () {
-      const state = PeersState.initial;
-      final action = AssociateBleDeviceAction(
-        publicKey: _testPubkey(99),
-        deviceId: 'ble-device-99',
-        role: BleRole.central,
+    test('records the announced platform pubkey-keyed', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      final action = PeerAnnounceReceivedAction(
+        platform: PeerPlatform.ios,
+        publicKey: pubkey,
+        nickname: 'Alice',
+        protocolVersion: 1,
       );
 
-      final result = peersReducer(state, action);
+      final result = peersReducer(PeersState.initial, action);
 
-      expect(result, same(state));
+      expect(result.peers[hex]!.platform, PeerPlatform.ios);
+    });
+
+    test(
+        'platform survives disconnects and association updates — null only '
+        'before the first ANNOUNCE', () {
+      final pubkey = _testPubkey(1);
+      final hex = _pubkeyHex(pubkey);
+      var state = peersReducer(
+        PeersState.initial,
+        PeerAnnounceReceivedAction(
+          platform: PeerPlatform.ios,
+          publicKey: pubkey,
+          nickname: 'Alice',
+          protocolVersion: 1,
+          bleCentralDeviceId: 'central:AA',
+        ),
+      );
+
+      // The platform is BLE leg-ordering input for the peer's NEXT
+      // appearance — precisely the moment no fresh ANNOUNCE is available —
+      // so no disconnect or address update may wipe it.
+      state = peersReducer(state, PeerBleDisconnectedAction(pubkey));
+      expect(state.peers[hex]!.platform, PeerPlatform.ios,
+          reason: 'BLE disconnect must not wipe the authenticated platform.');
+
+      state = peersReducer(state, PeerUdpDisconnectedAction(pubkey));
+      expect(state.peers[hex]!.platform, PeerPlatform.ios,
+          reason: 'UDP disconnect must not wipe the authenticated platform.');
+
+      state = peersReducer(
+        state,
+        AssociateUdpAddressAction(publicKey: pubkey, address: '1.2.3.4:5'),
+      );
+      expect(state.peers[hex]!.platform, PeerPlatform.ios,
+          reason: 'Address association must not wipe the platform.');
     });
   });
 

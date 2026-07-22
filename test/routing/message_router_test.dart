@@ -10,6 +10,7 @@ import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
@@ -63,9 +64,9 @@ void main() {
         initialState: const AppState(),
       );
 
-      protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
+      protocolHandler = ProtocolHandler(identity: identity, platform: PeerPlatform.other, sodium: sodium);
       otherProtocolHandler =
-          ProtocolHandler(identity: otherIdentity, sodium: sodium);
+          ProtocolHandler(identity: otherIdentity, platform: PeerPlatform.other, sodium: sodium);
       fragmentHandler = FragmentHandler();
 
       router = MessageRouter(
@@ -563,6 +564,7 @@ void main() {
         await establishSession();
 
         store.dispatch(PeerAnnounceReceivedAction(
+        platform: PeerPlatform.other,
           publicKey: otherPubkey,
           nickname: 'Alice',
           protocolVersion: 1,

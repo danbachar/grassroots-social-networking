@@ -76,6 +76,14 @@ class SettingsState {
   /// Whether unsolicited nearby BLE peers may complete first-contact ANNOUNCE.
   final ColdCallTrustLevel coldCallTrustLevel;
 
+  /// Whether this device volunteers to **introduce strangers** — coordinate a
+  /// first-contact hole-punch for an invitee redeeming an invite one of our
+  /// friends issued. A deliberate privacy choice, never auto-enabled and
+  /// AND-gated by [coldCallTrustLevel] (see [willingToFacilitateInvites]):
+  /// introducing strangers is a strictly more-open stance than accepting
+  /// cold calls, so you cannot do it while closed to cold calls.
+  final bool facilitateInvites;
+
   // ===== Trace logging (opt-in research telemetry) =====
 
   /// Whether the user has opted in to local trace logging + upload.
@@ -94,6 +102,7 @@ class SettingsState {
     ],
     this.bleRoleMode = BleRoleMode.auto,
     this.coldCallTrustLevel = ColdCallTrustLevel.closed,
+    this.facilitateInvites = false,
     this.traceLoggingConsent = false,
     this.consentTimestamp,
   });
@@ -116,12 +125,20 @@ class SettingsState {
     return null;
   }
 
+  /// Effective willingness to introduce strangers: the opt-in toggle AND an
+  /// open cold-call posture (introducing is strictly more open than accepting
+  /// cold calls). The UI disables the toggle while cold-call is closed, but
+  /// this getter is the authority the transport layer consults.
+  bool get willingToFacilitateInvites =>
+      facilitateInvites && coldCallTrustLevel == ColdCallTrustLevel.open;
+
   SettingsState copyWith({
     bool? bluetoothEnabled,
     bool? udpEnabled,
     List<TransportProtocol>? transportPriority,
     BleRoleMode? bleRoleMode,
     ColdCallTrustLevel? coldCallTrustLevel,
+    bool? facilitateInvites,
     bool? traceLoggingConsent,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? consentTimestamp = _sentinel,
@@ -132,6 +149,7 @@ class SettingsState {
       transportPriority: transportPriority ?? this.transportPriority,
       bleRoleMode: bleRoleMode ?? this.bleRoleMode,
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
+      facilitateInvites: facilitateInvites ?? this.facilitateInvites,
       traceLoggingConsent: traceLoggingConsent ?? this.traceLoggingConsent,
       consentTimestamp: identical(consentTimestamp, _sentinel)
           ? this.consentTimestamp
@@ -145,6 +163,7 @@ class SettingsState {
         'transportPriority': transportPriority.map((t) => t.name).toList(),
         'bleRoleMode': bleRoleMode.name,
         'coldCallTrustLevel': coldCallTrustLevel.name,
+        'facilitateInvites': facilitateInvites,
         'traceLoggingConsent': traceLoggingConsent,
         'consentTimestamp': consentTimestamp,
       };
@@ -173,6 +192,7 @@ class SettingsState {
           const [TransportProtocol.bluetooth, TransportProtocol.udp],
       bleRoleMode: bleRoleMode,
       coldCallTrustLevel: coldCallTrustLevel,
+      facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       traceLoggingConsent: json['traceLoggingConsent'] as bool? ?? false,
       consentTimestamp: json['consentTimestamp'] as String?,
     );
@@ -188,6 +208,7 @@ class SettingsState {
           listEquals(transportPriority, other.transportPriority) &&
           bleRoleMode == other.bleRoleMode &&
           coldCallTrustLevel == other.coldCallTrustLevel &&
+          facilitateInvites == other.facilitateInvites &&
           traceLoggingConsent == other.traceLoggingConsent &&
           consentTimestamp == other.consentTimestamp;
 
@@ -198,6 +219,7 @@ class SettingsState {
         Object.hashAll(transportPriority),
         bleRoleMode,
         coldCallTrustLevel,
+        facilitateInvites,
         traceLoggingConsent,
         consentTimestamp,
       );

@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import '../models/peer.dart';
+import '../models/platform.dart';
 
 /// Which BLE role our device played in the connection.
 /// - central: we scanned and connected to the remote peer
@@ -11,27 +12,27 @@ abstract class PeerAction {}
 
 // ===== BLE Discovery Actions =====
 
-/// A BLE device was discovered during scan
+/// A BLE device was discovered during scan (also dispatched on every
+/// subsequent advertisement to refresh RSSI/lastSeen — the reducer merges).
 class BleDeviceDiscoveredAction extends PeerAction {
   final String deviceId;
   final String? displayName;
   final int rssi;
   final String? serviceUuid;
 
+  /// Whether THIS advertisement carried the iOS platform marker
+  /// (`grs-ios` local name). Sticky per discovery entry in the reducer: the
+  /// marker comes and goes with iOS foregrounding, but a peer's platform
+  /// never changes.
+  final bool isIosMarked;
+
   BleDeviceDiscoveredAction({
     required this.deviceId,
     this.displayName,
     required this.rssi,
     this.serviceUuid,
+    this.isIosMarked = false,
   });
-}
-
-/// RSSI updated for a discovered BLE device
-class BleDeviceRssiUpdatedAction extends PeerAction {
-  final String deviceId;
-  final int rssi;
-
-  BleDeviceRssiUpdatedAction({required this.deviceId, required this.rssi});
 }
 
 /// Mark a discovered BLE device as connecting
@@ -92,6 +93,14 @@ class PeerAnnounceReceivedAction extends PeerAction {
   final String nickname;
   final int protocolVersion;
 
+  /// The peer's OS platform from the signed ANNOUNCE payload. Pubkey-keyed
+  /// and rotation-stable — the substrate for BLE dual-role leg ordering.
+  final PeerPlatform platform;
+
+  /// Whether the peer advertised willingness to introduce strangers (from the
+  /// signed ANNOUNCE flags).
+  final bool willingToFacilitate;
+
   /// BLE signal strength in dBm. Non-null only when the ANNOUNCE arrived over
   /// BLE (carries `payload.rssi` from the plugin). Null for UDP ANNOUNCEs —
   /// the reducer keeps any existing RSSI in that case rather than clobbering.
@@ -113,6 +122,8 @@ class PeerAnnounceReceivedAction extends PeerAction {
     required this.publicKey,
     required this.nickname,
     required this.protocolVersion,
+    required this.platform,
+    this.willingToFacilitate = false,
     this.rssi,
     this.transport = PeerTransport.bleDirect,
     this.bleCentralDeviceId,
@@ -205,19 +216,6 @@ class StalePeersRemovedAction extends PeerAction {
 class ClearAllPeersAction extends PeerAction {}
 
 // ===== Association Actions =====
-
-/// Associate a BLE device ID with a pubkey for a specific role
-class AssociateBleDeviceAction extends PeerAction {
-  final Uint8List publicKey;
-  final String deviceId;
-  final BleRole role;
-
-  AssociateBleDeviceAction({
-    required this.publicKey,
-    required this.deviceId,
-    required this.role,
-  });
-}
 
 /// Associate a UDP address with a pubkey
 class AssociateUdpAddressAction extends PeerAction {

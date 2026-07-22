@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:sodium_libs/sodium_libs.dart';
 
@@ -14,11 +13,7 @@ import 'package:sodium_libs/sodium_libs.dart';
 class ProtocolHandler {
   final GrassrootsIdentity identity;
 
-  /// The local device's OS platform, embedded in every ANNOUNCE we create.
-  final PeerPlatform platform;
-
   final Sodium _sodium;
-  static const int protocolVersion = 1;
 
   /// ANNOUNCE flags-byte bit 0: the peer volunteers to introduce strangers
   /// redeeming a friend's invite (see [createAnnouncePayload]).
@@ -26,7 +21,6 @@ class ProtocolHandler {
 
   ProtocolHandler({
     required this.identity,
-    required this.platform,
     required Sodium sodium,
   }) : _sodium = sodium;
 
@@ -41,7 +35,7 @@ class ProtocolHandler {
   /// it, verifiable against the embedded pubkey ([decodeAnnounce] enforces it).
   ///
   /// Format:
-  /// [pubkey(32) + version(2) + platform(1) + flags(1) + nickLen(1) + nick
+  /// [pubkey(32) + flags(1) + nickLen(1) + nick
   ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)
   ///  + signature(64)]
   ///
@@ -65,15 +59,6 @@ class ProtocolHandler {
 
     // Pubkey (32 bytes)
     buffer.add(identity.publicKey);
-
-    // Protocol version (2 bytes)
-    final versionBytes = ByteData(2);
-    versionBytes.setUint16(0, protocolVersion, Endian.big);
-    buffer.add(versionBytes.buffer.asUint8List());
-
-    // Platform (1 byte) — see [PeerPlatform]. Inside the signed body, so
-    // neighbors cannot forge a peer's platform.
-    buffer.addByte(platform.wireByte);
 
     // Flags (1 byte): bit 0 = willing to facilitate invites.
     buffer.addByte(willingToFacilitate ? _flagWillingToFacilitate : 0);
@@ -155,7 +140,7 @@ class ProtocolHandler {
   /// Decode ANNOUNCE payload
   ///
   /// Format:
-  /// [pubkey(32) + version(2) + platform(1) + flags(1) + nickLen(1) + nick
+  /// [pubkey(32) + flags(1) + nickLen(1) + nick
   ///  + candidateCount(2) + repeated(candidateLen(2) + candidate)]
   AnnounceData decodeAnnounce(Uint8List data) {
     if (data.length < 32 + 64) {
@@ -172,15 +157,6 @@ class ProtocolHandler {
     }
 
     var offset = 32; // pubkey extracted above
-
-    // Version (2 bytes)
-    final version = ByteData.view(body.buffer, body.offsetInBytes + offset, 2)
-        .getUint16(0, Endian.big);
-    offset += 2;
-
-    // Platform (1 byte) — required; an unknown value is malformed.
-    final peerPlatform = PeerPlatform.fromWireByte(body[offset]);
-    offset += 1;
 
     // Flags (1 byte).
     final flags = body[offset];
@@ -232,8 +208,6 @@ class ProtocolHandler {
     return AnnounceData(
       publicKey: Uint8List.fromList(pubkey),
       nickname: nickname,
-      protocolVersion: version,
-      platform: peerPlatform,
       willingToFacilitate: willingToFacilitate,
       udpAddress: address,
       linkLocalAddress: linkLocalAddress,
@@ -350,8 +324,6 @@ class ProtocolHandler {
 class AnnounceData {
   final Uint8List publicKey;
   final String nickname;
-  final int protocolVersion;
-  final PeerPlatform platform;
 
   /// Whether the peer advertises willingness to introduce strangers redeeming
   /// a friend's invite (authenticated by the ANNOUNCE signature).
@@ -364,8 +336,6 @@ class AnnounceData {
   const AnnounceData({
     required this.publicKey,
     required this.nickname,
-    required this.protocolVersion,
-    required this.platform,
     this.willingToFacilitate = false,
     this.udpAddress,
     this.linkLocalAddress,
@@ -373,8 +343,7 @@ class AnnounceData {
   });
 
   @override
-  String toString() => 'AnnounceData($nickname, v$protocolVersion, '
-      '${platform.name}'
+  String toString() => 'AnnounceData($nickname'
       '${udpAddress != null ? ", addr: $udpAddress" : ""}'
       '${linkLocalAddress != null ? ", ll: $linkLocalAddress" : ""}'
       '${addressCandidates.isNotEmpty ? ", candidates: $addressCandidates" : ""})';

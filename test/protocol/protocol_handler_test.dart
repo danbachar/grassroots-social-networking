@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
-import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:cryptography/cryptography.dart';
@@ -31,39 +30,29 @@ void main() {
         keyPair: keyPair,
         nickname: 'TestUser',
       );
-      handler = ProtocolHandler(identity: testIdentity, platform: PeerPlatform.other, sodium: sodium);
+      handler = ProtocolHandler(identity: testIdentity, sodium: sodium);
     });
 
     group('createAnnouncePayload', () {
-      test('encodes public key, version, platform, and nickname correctly',
-          () {
+      test('encodes public key, flags, and nickname correctly', () {
         final payload = handler.createAnnouncePayload();
 
         // Verify payload structure
         expect(payload.length,
-            greaterThanOrEqualTo(32 + 2 + 1 + 1 + 1 + 'TestUser'.length + 2));
+            greaterThanOrEqualTo(32 + 1 + 1 + 'TestUser'.length + 2));
 
         // Public key (first 32 bytes)
         final pubkeyFromPayload = payload.sublist(0, 32);
         expect(pubkeyFromPayload, equals(testIdentity.publicKey));
 
-        // Protocol version (next 2 bytes)
-        final versionData =
-            ByteData.view(payload.buffer, payload.offsetInBytes + 32, 2);
-        final version = versionData.getUint16(0, Endian.big);
-        expect(version, equals(1)); // Protocol version 1
-
-        // Platform (1 byte)
-        expect(payload[34], equals(PeerPlatform.other.wireByte));
-
         // Flags (1 byte) — willing-to-facilitate bit, off by default.
-        expect(payload[35], equals(0));
+        expect(payload[32], equals(0));
 
         // Nickname length and nickname
-        final nickLen = payload[36];
+        final nickLen = payload[33];
         expect(nickLen, equals('TestUser'.length));
         final nickname =
-            String.fromCharCodes(payload.sublist(37, 37 + nickLen));
+            String.fromCharCodes(payload.sublist(34, 34 + nickLen));
         expect(nickname, equals('TestUser'));
       });
 
@@ -71,7 +60,7 @@ void main() {
         final payload = handler.createAnnouncePayload();
 
         // Candidate count should be 0 after the nickname.
-        const offset = 32 + 2 + 1 + 1 + 1 + 'TestUser'.length;
+        const offset = 32 + 1 + 1 + 'TestUser'.length;
         final candidateCountData =
             ByteData.view(payload.buffer, payload.offsetInBytes + offset, 2);
         final candidateCount = candidateCountData.getUint16(0, Endian.big);
@@ -95,15 +84,14 @@ void main() {
           nickname: '',
         );
         final emptyHandler =
-            ProtocolHandler(identity: emptyNickIdentity, platform: PeerPlatform.other, sodium: sodium);
+            ProtocolHandler(identity: emptyNickIdentity, sodium: sodium);
 
         final payload = emptyHandler.createAnnouncePayload();
 
         // Should have valid structure with 0-length nickname.
-        // pubkey + version + platform + flags + nickLen(0)
-        // + candidateCount(0) + signature(64)
-        expect(payload.length, equals(32 + 2 + 1 + 1 + 1 + 2 + 64));
-        expect(payload[36], equals(0)); // nickname length = 0
+        // pubkey + flags + nickLen(0) + candidateCount(0) + signature(64)
+        expect(payload.length, equals(32 + 1 + 1 + 2 + 64));
+        expect(payload[33], equals(0)); // nickname length = 0
       });
 
       test('includes UDP address candidates when provided', () {
@@ -133,36 +121,14 @@ void main() {
           nickname: fancyNick,
         );
         final fancyHandler =
-            ProtocolHandler(identity: fancyIdentity, platform: PeerPlatform.other, sodium: sodium);
+            ProtocolHandler(identity: fancyIdentity, sodium: sodium);
 
         final payload = fancyHandler.createAnnouncePayload();
         final decoded = fancyHandler.decodeAnnounce(payload);
 
         expect(decoded.nickname, equals(fancyNick));
         // The 1-byte length prefix counts UTF-8 bytes, not characters.
-        expect(payload[36], equals(utf8.encode(fancyNick).length));
-      });
-
-      test('round-trips the platform byte and rejects unknown values', () {
-        final iosHandler = ProtocolHandler(
-          identity: testIdentity,
-          platform: PeerPlatform.ios,
-          sodium: sodium,
-        );
-        final decoded =
-            iosHandler.decodeAnnounce(iosHandler.createAnnouncePayload());
-        expect(decoded.platform, equals(PeerPlatform.ios));
-
-        expect(
-          handler
-              .decodeAnnounce(handler.createAnnouncePayload())
-              .platform,
-          equals(PeerPlatform.other),
-        );
-
-        // An unknown platform byte is malformed — no tolerant decoding.
-        expect(() => PeerPlatform.fromWireByte(7),
-            throwsA(isA<FormatException>()));
+        expect(payload[33], equals(utf8.encode(fancyNick).length));
       });
 
       test('round-trips the willing-to-facilitate flag', () {
@@ -184,7 +150,6 @@ void main() {
 
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
-        expect(decoded.protocolVersion, equals(1));
         expect(decoded.udpAddress, isNull);
         expect(decoded.addressCandidates, isEmpty);
       });
@@ -196,7 +161,6 @@ void main() {
 
         expect(decoded.publicKey, equals(testIdentity.publicKey));
         expect(decoded.nickname, equals('TestUser'));
-        expect(decoded.protocolVersion, equals(1));
         expect(decoded.udpAddress, equals(testAddress));
         expect(decoded.addressCandidates, contains(testAddress));
       });
@@ -243,7 +207,7 @@ void main() {
           nickname: '',
         );
         final emptyHandler =
-            ProtocolHandler(identity: emptyNickIdentity, platform: PeerPlatform.other, sodium: sodium);
+            ProtocolHandler(identity: emptyNickIdentity, sodium: sodium);
 
         final payload = emptyHandler.createAnnouncePayload();
         final decoded = emptyHandler.decodeAnnounce(payload);
@@ -473,7 +437,7 @@ void main() {
           nickname: 'Other',
         );
         final otherHandler =
-            ProtocolHandler(identity: otherIdentity, platform: PeerPlatform.other, sodium: sodium);
+            ProtocolHandler(identity: otherIdentity, sodium: sodium);
 
         final genuine = handler.createAnnouncePayload();
         final forged = otherHandler.createAnnouncePayload();
@@ -524,7 +488,7 @@ void main() {
           'nickname': decoded.nickname,
         });
         final reEncodedHandler =
-            ProtocolHandler(identity: reEncodedIdentity, platform: PeerPlatform.other, sodium: sodium);
+            ProtocolHandler(identity: reEncodedIdentity, sodium: sodium);
         final reEncodedPayload = reEncodedHandler.createAnnouncePayload(
           address: decoded.udpAddress,
         );

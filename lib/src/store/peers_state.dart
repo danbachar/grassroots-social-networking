@@ -1,6 +1,5 @@
 import 'package:flutter/foundation.dart';
 import '../models/peer.dart';
-import '../models/platform.dart';
 import '../transport/address_utils.dart';
 
 /// A discovered BLE peer before identity (ANNOUNCE) is exchanged.
@@ -117,13 +116,6 @@ class PeerState {
   final PeerConnectionState connectionState;
   final PeerTransport transport;
 
-  /// The peer's OS platform, from the signed ANNOUNCE payload. Null only
-  /// before the first ANNOUNCE identifies the peer (e.g. a peer restored
-  /// from persistence that has not announced this session). Pubkey-keyed and
-  /// therefore stable across MAC/slot rotations and backgrounding — the
-  /// authoritative input to BLE dual-role leg ordering.
-  final PeerPlatform? platform;
-
   /// Whether the peer advertises willingness to introduce strangers redeeming
   /// a friend's invite (from its signed ANNOUNCE). Used to pick eligible
   /// introducers when creating an invite.
@@ -137,7 +129,6 @@ class PeerState {
   /// BLE path drops.
   final int? rssi;
 
-  final int protocolVersion;
   final DateTime? lastSeen;
 
   /// PathId of our central → their peripheral path, when one is currently
@@ -198,10 +189,8 @@ class PeerState {
     required this.nickname,
     this.connectionState = PeerConnectionState.discovered,
     this.transport = PeerTransport.bleDirect,
-    this.platform,
     this.willingToFacilitate = false,
     this.rssi,
-    this.protocolVersion = 1,
     this.lastSeen,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
@@ -300,10 +289,8 @@ class PeerState {
     String? nickname,
     PeerConnectionState? connectionState,
     PeerTransport? transport,
-    PeerPlatform? platform,
     bool? willingToFacilitate,
     int? rssi,
-    int? protocolVersion,
     DateTime? lastSeen,
     String? bleCentralDeviceId,
     String? blePeripheralDeviceId,
@@ -323,10 +310,8 @@ class PeerState {
       nickname: nickname ?? this.nickname,
       connectionState: connectionState ?? this.connectionState,
       transport: transport ?? this.transport,
-      platform: platform ?? this.platform,
       willingToFacilitate: willingToFacilitate ?? this.willingToFacilitate,
       rssi: rssi ?? this.rssi,
-      protocolVersion: protocolVersion ?? this.protocolVersion,
       lastSeen: lastSeen ?? this.lastSeen,
       bleCentralDeviceId: bleCentralDeviceId ?? this.bleCentralDeviceId,
       blePeripheralDeviceId:
@@ -354,7 +339,6 @@ class PeerState {
           nickname == other.nickname &&
           connectionState == other.connectionState &&
           transport == other.transport &&
-          platform == other.platform &&
           willingToFacilitate == other.willingToFacilitate &&
           rssi == other.rssi &&
           bleCentralDeviceId == other.bleCentralDeviceId &&
@@ -372,7 +356,6 @@ class PeerState {
         nickname,
         connectionState,
         transport,
-        platform,
         willingToFacilitate,
         rssi,
         bleCentralDeviceId,

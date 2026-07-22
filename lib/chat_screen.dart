@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
@@ -14,6 +16,12 @@ import 'theme/grasslink_tokens.dart';
 import 'theme/grasslink_widgets.dart';
 
 /// Chat screen for a conversation with a specific peer
+String _humanSize(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
 class ChatScreen extends StatefulWidget {
   final GrassrootsNetwork grassroots;
   final PeerState peer;
@@ -275,6 +283,15 @@ class _ChatScreenState extends State<ChatScreen> {
                   title: const Text('Photo library'),
                   onTap: () => Navigator.pop(sheetContext, ImageSource.gallery),
                 ),
+                ListTile(
+                  leading: const Icon(Icons.attach_file),
+                  title: const Text('File'),
+                  subtitle: const Text('Send any file over the mesh'),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    unawaited(_pickAndSendFile());
+                  },
+                ),
                 const Divider(height: 1),
                 SwitchListTile(
                   secondary: const Icon(Icons.local_fire_department),
@@ -402,6 +419,95 @@ class _ChatScreenState extends State<ChatScreen> {
             content: Text('Failed to send picture: $e'),
             duration: const Duration(seconds: 3),
           ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sendingMedia = false);
+    }
+  }
+
+  /// BLE fragments at ~132 B every 20 ms (see FragmentHandler), and the
+  /// receiver drops a partial reassembly after 4 min — so a transfer must
+  /// finish well inside that. 1 MB ≈ 8k fragments ≈ 160 s, comfortably under.
+  /// Bigger files won't complete over BLE (the link won't hold long enough),
+  /// so we cap rather than let them fail silently.
+  static const int _maxFileBytes = 1 * 1024 * 1024;
+
+  Future<void> _pickAndSendFile() async {
+    if (_sendingMedia) return;
+    FilePickerResult? result;
+    try {
+      result = await FilePicker.platform.pickFiles(withData: false);
+    } catch (e, st) {
+      _log.e('[file-send] pickFiles threw', error: e, stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('File picker failed: $e')),
+        );
+      }
+      return;
+    }
+    final picked = result?.files.singleOrNull;
+    if (picked == null || picked.path == null) {
+      debugPrint('[file-send] no file chosen');
+      return;
+    }
+    await _sendFile(File(picked.path!), picked.name);
+  }
+
+  Future<void> _sendFile(File file, String fileName) async {
+    if (_sendingMedia) return;
+    setState(() => _sendingMedia = true);
+    try {
+      final bytes = await file.readAsBytes();
+      if (bytes.length > _maxFileBytes) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('File is ${_humanSize(bytes.length)} — too large to '
+                'send over the mesh (max ${_humanSize(_maxFileBytes)}).'),
+            duration: const Duration(seconds: 4),
+          ));
+        }
+        return;
+      }
+      // MIME is unknown for arbitrary files; the original name (with its
+      // extension) is what makes the received file openable, so we lean on
+      // that and keep a generic type.
+      const mime = 'application/octet-stream';
+      final localCopy = await writeNamedMediaFile(bytes, fileName);
+      final messageId = _uuid.v4();
+
+      widget.store.dispatch(SaveChatMessageAction(
+        senderPubkeyHex: _myHex,
+        recipientPubkeyHex: _peerHex,
+        content: fileName,
+        isOutgoing: true,
+        messageId: messageId,
+        messageType: ChatMessageType.file.index,
+        mediaPath: localCopy.path,
+        mediaMime: mime,
+      ));
+      _scrollToBottom();
+
+      final block = FileSayBlock(fileName: fileName, mime: mime, bytes: bytes);
+      final sentMessageId = await widget.grassroots
+          .send(widget.peer.publicKey, block.serialize(), messageId: messageId);
+
+      if (sentMessageId == null) {
+        widget.store.dispatch(MessageFailedAction(messageId: messageId));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not queue "$fileName".')),
+          );
+        }
+      } else {
+        debugPrint('[file-send] sent "$fileName" (${bytes.length} bytes)');
+      }
+    } catch (e, st) {
+      _log.e('Failed to send file', error: e, stackTrace: st);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to send file: $e')),
         );
       }
     } finally {
@@ -969,6 +1075,8 @@ class _MessageBubble extends StatelessWidget {
             children: [
               if (message.isPicture)
                 _buildPictureContent(context)
+              else if (message.isFile)
+                _buildFileContent(context)
               else
                 Text(
                   message.content,
@@ -1005,6 +1113,65 @@ class _MessageBubble extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  /// File attachment card: icon + name + size, tap to open/share via the OS.
+  Widget _buildFileContent(BuildContext context) {
+    final onPrimary = message.isOutgoing;
+    final path = message.mediaPath;
+    final fileName = message.content.isEmpty ? 'file' : message.content;
+    int? size;
+    if (path != null) {
+      try {
+        final f = File(path);
+        if (f.existsSync()) size = f.lengthSync();
+      } catch (_) {}
+    }
+    final subtitle = size != null
+        ? _humanSize(size)
+        : (path == null ? 'unavailable' : 'tap to open');
+    final color = onPrimary ? GlColors.textOnPrimary : GlColors.textBody;
+    final subColor = onPrimary ? GlColors.moss100 : GlColors.textSubtle;
+
+    return GestureDetector(
+      onTap: path == null
+          ? null
+          : () async {
+              try {
+                await Share.shareXFiles([XFile(path)], subject: fileName);
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Could not open "$fileName": $e')),
+                  );
+                }
+              }
+            },
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.insert_drive_file_rounded, color: color, size: 32),
+          const SizedBox(width: GlSpace.s2),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  fileName,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color: color, fontWeight: FontWeight.w600),
+                ),
+                Text(subtitle,
+                    style: TextStyle(color: subColor, fontSize: 11)),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

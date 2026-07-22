@@ -91,6 +91,26 @@ Future<File> writeMediaFile(Uint8List bytes, String mime) async {
   return file;
 }
 
+/// Write [bytes] to disk under `<contentHash>_<sanitizedName>`, PRESERVING the
+/// original file name (and thus its extension) so the OS share/open chooser
+/// treats it correctly. Used for arbitrary file attachments where the MIME is
+/// unknown but the name matters. Content-addressed prefix keeps it deduped.
+Future<File> writeNamedMediaFile(Uint8List bytes, String fileName) async {
+  final dir = await _ensureMediaDir();
+  final hash = await Sha256().hash(bytes);
+  final hex = hash.bytes
+      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+      .join()
+      .substring(0, 16);
+  final safe = fileName.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+  final name = safe.isEmpty ? 'file' : safe;
+  final file = File('${dir.path}/${hex}_$name');
+  if (!await file.exists()) {
+    await file.writeAsBytes(bytes, flush: true);
+  }
+  return file;
+}
+
 /// Delete a media file at [path]. Silently ignores `FileSystemException` —
 /// the file was already gone, which is the desired end state anyway.
 Future<void> deleteMediaFile(String path) async {

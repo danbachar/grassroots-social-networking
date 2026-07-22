@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:redux/redux.dart';
 import 'debug_log_screen.dart';
+import 'testbed_screen.dart';
 import 'theme/grasslink_tokens.dart';
 import 'theme/grasslink_widgets.dart';
 import 'src/store/app_state.dart';
@@ -29,6 +30,13 @@ class SettingsScreen extends StatefulWidget {
   /// Returns a short user-facing status message to surface in a snackbar.
   final Future<String> Function()? onUploadTracesNow;
 
+  /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
+  /// is not up. [myPubkeyHex] is this device's hex identity.
+  final String? myPubkeyHex;
+  final Future<void> Function()? onStartWorkload;
+  final VoidCallback? onStopWorkload;
+  final WorkloadStatus Function()? workloadStatus;
+
   const SettingsScreen({
     super.key,
     required this.store,
@@ -36,6 +44,10 @@ class SettingsScreen extends StatefulWidget {
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
     this.onUploadTracesNow,
+    this.myPubkeyHex,
+    this.onStartWorkload,
+    this.onStopWorkload,
+    this.workloadStatus,
   });
 
   @override
@@ -231,6 +243,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   context,
                   MaterialPageRoute(
                     builder: (context) => const DebugLogScreen(),
+                  ),
+                );
+              },
+            ),
+          ),
+
+          // Testbed (debug harnesses)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(GlSpace.s2),
+                decoration: BoxDecoration(
+                  color: GlColors.infoSoft,
+                  borderRadius: GlRadius.rSm,
+                ),
+                child: const Icon(Icons.science_outlined, color: GlColors.info),
+              ),
+              title: const Text(
+                'Testbed',
+                style: TextStyle(fontWeight: FontWeight.w600),
+              ),
+              subtitle: const Text(
+                'Neighbour allowlist + workload driver',
+                style: TextStyle(
+                    color: GlColors.textMuted, fontSize: GlType.textSm),
+              ),
+              trailing: const Icon(Icons.chevron_right_rounded,
+                  color: GlColors.textSubtle),
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => TestbedScreen(
+                      store: widget.store,
+                      myPubkeyHex: widget.myPubkeyHex,
+                      onStartWorkload: widget.onStartWorkload,
+                      onStopWorkload: widget.onStopWorkload,
+                      workloadStatus: widget.workloadStatus,
+                    ),
                   ),
                 );
               },

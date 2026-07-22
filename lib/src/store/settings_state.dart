@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import '../testbed/testbed_config.dart';
+
 /// Available transport protocols
 enum TransportProtocol {
   bluetooth,
@@ -93,6 +95,16 @@ class SettingsState {
   /// site — reducers are pure and must not synthesize time).
   final String? consentTimestamp;
 
+  // ===== Testbed harnesses (debug-only; null/off in production) =====
+
+  /// DEBUG-ONLY software-defined BLE topology. Null or `enabled == false`
+  /// means no filtering — normal behaviour. Never set in production builds.
+  final NeighborAllowlist? neighborAllowlist;
+
+  /// DEBUG-ONLY deterministic offered-load config. Presence does NOT start the
+  /// driver — it is only executed when explicitly launched from a debug screen.
+  final WorkloadConfig? workloadConfig;
+
   const SettingsState({
     this.bluetoothEnabled = true,
     this.udpEnabled = true,
@@ -105,6 +117,8 @@ class SettingsState {
     this.facilitateInvites = false,
     this.traceLoggingConsent = false,
     this.consentTimestamp,
+    this.neighborAllowlist,
+    this.workloadConfig,
   });
 
   static const SettingsState initial = SettingsState();
@@ -142,6 +156,8 @@ class SettingsState {
     bool? traceLoggingConsent,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? consentTimestamp = _sentinel,
+    Object? neighborAllowlist = _sentinel,
+    Object? workloadConfig = _sentinel,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -154,6 +170,12 @@ class SettingsState {
       consentTimestamp: identical(consentTimestamp, _sentinel)
           ? this.consentTimestamp
           : consentTimestamp as String?,
+      neighborAllowlist: identical(neighborAllowlist, _sentinel)
+          ? this.neighborAllowlist
+          : neighborAllowlist as NeighborAllowlist?,
+      workloadConfig: identical(workloadConfig, _sentinel)
+          ? this.workloadConfig
+          : workloadConfig as WorkloadConfig?,
     );
   }
 
@@ -166,6 +188,8 @@ class SettingsState {
         'facilitateInvites': facilitateInvites,
         'traceLoggingConsent': traceLoggingConsent,
         'consentTimestamp': consentTimestamp,
+        'neighborAllowlist': neighborAllowlist?.toJson(),
+        'workloadConfig': workloadConfig?.toJson(),
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -195,6 +219,14 @@ class SettingsState {
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       traceLoggingConsent: json['traceLoggingConsent'] as bool? ?? false,
       consentTimestamp: json['consentTimestamp'] as String?,
+      neighborAllowlist: json['neighborAllowlist'] == null
+          ? null
+          : NeighborAllowlist.fromJson(
+              json['neighborAllowlist'] as Map<String, dynamic>),
+      workloadConfig: json['workloadConfig'] == null
+          ? null
+          : WorkloadConfig.fromJson(
+              json['workloadConfig'] as Map<String, dynamic>),
     );
   }
 
@@ -210,7 +242,9 @@ class SettingsState {
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
           traceLoggingConsent == other.traceLoggingConsent &&
-          consentTimestamp == other.consentTimestamp;
+          consentTimestamp == other.consentTimestamp &&
+          neighborAllowlist == other.neighborAllowlist &&
+          workloadConfig == other.workloadConfig;
 
   @override
   int get hashCode => Object.hash(
@@ -222,6 +256,8 @@ class SettingsState {
         facilitateInvites,
         traceLoggingConsent,
         consentTimestamp,
+        neighborAllowlist,
+        workloadConfig,
       );
 
   @override

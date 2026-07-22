@@ -177,6 +177,15 @@ class PeerUdpSeenAction extends PeerAction {
   PeerUdpSeenAction(this.publicKey);
 }
 
+/// Any authenticated packet arrived DIRECT from this peer over BLE.
+/// Refreshes BLE liveness so the stale sweep doesn't kill a working link
+/// whose ANNOUNCEs are getting lost (marginal range).
+class PeerBleSeenAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerBleSeenAction(this.publicKey);
+}
+
 /// Mark peer as disconnected from UDP
 class PeerUdpDisconnectedAction extends PeerAction {
   final Uint8List publicKey;

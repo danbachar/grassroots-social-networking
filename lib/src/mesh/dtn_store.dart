@@ -67,6 +67,31 @@ class DtnStore {
     }
   }
 
+  /// All (non-expired) packetIds currently carried, across recipients —
+  /// the custody summary offered to a newly-connected neighbor during
+  /// sync-on-connect. Non-destructive: sync replicates custody, it does not
+  /// transfer it.
+  List<String> carriedPacketIds({DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    return [
+      for (final list in _byRecipient.values)
+        for (final e in list) e.packet.packetId,
+    ];
+  }
+
+  /// Look up a carried packet by [packetId] without removing it — used to
+  /// convey a copy to a neighbor that requested it from our sync offer.
+  /// Returns null if expired/evicted since the offer.
+  GrassrootsPacket? packetById(String packetId, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    for (final list in _byRecipient.values) {
+      for (final e in list) {
+        if (e.packet.packetId == packetId) return e.packet;
+      }
+    }
+    return null;
+  }
+
   /// Remove and return all (non-expired) cached packets for [recipientHex],
   /// called when that recipient reappears so the relay can re-flood toward them.
   List<GrassrootsPacket> takeFor(String recipientHex, {DateTime? now}) {

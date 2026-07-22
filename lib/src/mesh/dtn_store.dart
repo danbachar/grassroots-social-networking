@@ -92,14 +92,23 @@ class DtnStore {
     return null;
   }
 
-  /// Remove and return all (non-expired) cached packets for [recipientHex],
-  /// called when that recipient reappears so the relay can re-flood toward them.
-  List<GrassrootsPacket> takeFor(String recipientHex, {DateTime? now}) {
-    final at = now ?? DateTime.now();
-    _prune(at);
-    final list = _byRecipient.remove(recipientHex);
+  /// All (non-expired) packets held for [recipientHex] — non-destructive.
+  /// Used to convey a reconnecting recipient's messages directly over a
+  /// freshly established session (custody is kept until ACKed or expired).
+  List<GrassrootsPacket> packetsFor(String recipientHex, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    final list = _byRecipient[recipientHex];
     if (list == null || list.isEmpty) return const [];
     return list.map((e) => e.packet).toList(growable: false);
+  }
+
+  /// Drop the packet with [packetId] wherever it is held — called when the
+  /// end-to-end ACK proves delivery, ending our custody of it.
+  void removeById(String packetId) {
+    _byRecipient.removeWhere((_, list) {
+      list.removeWhere((e) => e.packet.packetId == packetId);
+      return list.isEmpty;
+    });
   }
 
   void _prune(DateTime now) {

@@ -24,7 +24,6 @@ import 'testbed/workload_driver.dart';
 import 'trace/trace_logger.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
-import 'models/platform.dart';
 import 'models/secure_frame.dart';
 import 'protocol/protocol_handler.dart';
 import 'protocol/fragment_handler.dart';
@@ -99,63 +98,16 @@ class _BurnedNonce {
   const _BurnedNonce({required this.uses, required this.expiry});
 }
 
-class _QueuedOutboundMessage {
-  final String messageId;
-  final Uint8List recipientPubkey;
-  final Uint8List payload;
-  final DateTime queuedAt;
-  final int attempts;
-
-  _QueuedOutboundMessage({
-    required this.messageId,
-    required Uint8List recipientPubkey,
-    required Uint8List payload,
-    DateTime? queuedAt,
-    this.attempts = 0,
-  })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
-        payload = Uint8List.fromList(payload),
-        queuedAt = queuedAt ?? DateTime.now();
-
-  String get recipientPubkeyHex =>
-      GrassrootsNetwork._pubkeyToHex(recipientPubkey);
-
-  _QueuedOutboundMessage incrementAttempts() => _QueuedOutboundMessage(
-        messageId: messageId,
-        recipientPubkey: recipientPubkey,
-        payload: payload,
-        queuedAt: queuedAt,
-        attempts: attempts + 1,
-      );
-}
-
-/// Tracks an outgoing message that left the device but has not yet been
-/// ACK'd. Drives both the ack-timeout watchdog and the BLE-disconnect
-/// re-queue: when either fires, we push the payload back onto
-/// [GrassrootsNetwork._outboundMessageQueue] so the next drain re-sends it.
-///
-/// Kept in plain memory rather than Redux because the payload bytes
-/// themselves live here — Redux only stores delivery metadata
-/// ([OutgoingMessage]). Lifecycle: created when `_trySendMessageNow`
-/// dispatches `MessageSentAction`, dropped on `MessageDeliveredAction`
-/// (ACK) or on re-queue (timeout / BLE disconnect).
-class _AckPendingMessage {
-  final String messageId;
+/// A message created before any Noise session with its recipient exists —
+/// held as plaintext until the eager handshake on an accepted pairing makes
+/// it sealable into custody.
+class _PendingSealMessage {
   final Uint8List recipientPubkey;
   final Uint8List payload;
 
-  /// The BLE pathId the message was written to, or null if it went via UDP.
-  /// Used by the disconnect handler to find which pending messages were on
-  /// a path that just dropped.
-  final String? bleDeviceId;
-
-  /// Watchdog timer; null while paused (e.g. during re-queue or shutdown).
-  Timer? ackTimer;
-
-  _AckPendingMessage({
-    required this.messageId,
+  _PendingSealMessage({
     required Uint8List recipientPubkey,
     required Uint8List payload,
-    required this.bleDeviceId,
   })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
         payload = Uint8List.fromList(payload);
 }
@@ -485,14 +437,15 @@ class GrassrootsNetwork {
   /// These hold application payloads that could not be sent because no live
   /// BLE/UDP path was available. They drain when the peer announces or a UDP
   /// connection event reports the peer as connected.
-  final Map<String, List<_QueuedOutboundMessage>> _outboundMessageQueue = {};
-  final Set<String> _outboundQueueDrainsInProgress = {};
+  /// Messages awaiting their first Noise session with the recipient — the
+  /// plaintext cannot be sealed into custody until the eager handshake on an
+  /// accepted pairing completes. Keyed by messageId.
+  final Map<String, _PendingSealMessage> _pendingSeal = {};
 
-  /// Messages that left the device but have not been ACK'd yet. Keyed by
-  /// `messageId`. The ack-timeout watchdog and the BLE-disconnect re-queue
-  /// path both consult this map; ACK handling drops the entry. See
-  /// [_AckPendingMessage] for the full rationale.
-  final Map<String, _AckPendingMessage> _ackPendingMessages = {};
+  /// messageId → the sealed custody packetIds belonging to it (one for a
+  /// single-packet message, N for fragments) so the ACK can end custody.
+  final Map<String, List<String>> _custodyPacketIds = {};
+
 
   // ===== Public callbacks =====
 
@@ -567,9 +520,6 @@ class GrassrootsNetwork {
   }) {
     _protocolHandler = ProtocolHandler(
       identity: identity,
-      platform: defaultTargetPlatform == TargetPlatform.iOS
-          ? PeerPlatform.ios
-          : PeerPlatform.other,
       sodium: sodium,
     );
     _fragmentHandler = FragmentHandler();
@@ -1411,10 +1361,18 @@ class GrassrootsNetwork {
       return messageId;
     }
 
-    _queueOutboundMessage(
+    // No Noise session with the recipient yet, so the message cannot be
+    // sealed into custody. Hold the plaintext until the eager handshake on
+    // the next accepted pairing establishes the session —
+    // [_onNoiseSessionEstablished] then seals, stores custody, and floods.
+    _pendingSeal[messageId] = _PendingSealMessage(
       recipientPubkey: recipientPubkey,
       payload: payload,
-      messageId: messageId,
+    );
+    store.dispatch(MessageQueuedAction(messageId: messageId));
+    debugPrint(
+      '[custody] No session for ${_pubkeyToHex(recipientPubkey).substring(0, 8)} '
+      'yet; holding ${_pendingSeal.length} message(s) until pairing',
     );
     return messageId;
   }
@@ -1461,32 +1419,45 @@ class GrassrootsNetwork {
       );
       if (ready) {
         debugPrint('Flooding message into BLE mesh for ${peer.displayName}');
-        bool success;
-        if (_fragmentHandler.needsFragmentation(payload)) {
-          success = await _sendFragmentedViaBle(
-            payload: payload,
-            recipientPubkey: recipientPubkey,
-            messageId: messageId,
-          );
-        } else {
-          final sealed = await _noiseSessions.encryptPacket(
-            packet,
-            remotePubkey: recipientPubkey,
-          );
-          success = await _floodViaBle(sealed.serialize()) > 0;
+        // Seal ONCE; the sealed packets are simultaneously the wire bytes and
+        // our custody copies. The sender is the message's first custodian:
+        // custody is offered in sync-on-connect and kept until the ACK.
+        final sealedPackets = _fragmentHandler.needsFragmentation(payload)
+            ? await _sealFragments(
+                payload: payload,
+                recipientPubkey: recipientPubkey,
+                messageId: messageId,
+              )
+            : [
+                await _noiseSessions.encryptPacket(
+                  packet,
+                  remotePubkey: recipientPubkey,
+                ),
+              ];
+        _custodyPacketIds[messageId] = [
+          for (final p in sealedPackets) p.packetId,
+        ];
+        for (final p in sealedPackets) {
+          _messageRouter.storeCustody(recipientPubkey, p);
         }
 
-        if (success) {
-          _markSentAndTrackForAck(
-            messageId: messageId,
-            recipientPubkey: recipientPubkey,
-            payload: payload,
-            transport: MessageTransport.ble,
-            bleDeviceId: bleDeviceId,
-          );
-          // Delivery confirmed by ACK, not by flood success.
-          return true;
+        var reachedNeighbors = false;
+        for (final p in sealedPackets) {
+          reachedNeighbors |= await _floodViaBle(p.serialize()) > 0;
+          if (sealedPackets.length > 1) {
+            await Future.delayed(FragmentHandler.fragmentDelay);
+          }
         }
+
+        // Custody established either way; on-air reach only affects status.
+        _markSent(
+          messageId: messageId,
+          recipientPubkey: recipientPubkey,
+          payload: payload,
+          transport: MessageTransport.ble,
+          aired: reachedNeighbors,
+        );
+        return true;
       }
       debugPrint('BLE mesh send unavailable, falling back to UDP...');
     }
@@ -1509,12 +1480,12 @@ class GrassrootsNetwork {
           // debugPrint(
           //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
           // );
-          _markSentAndTrackForAck(
+          _markSent(
             messageId: messageId,
             recipientPubkey: recipientPubkey,
             payload: payload,
             transport: MessageTransport.udp,
-            bleDeviceId: null,
+            aired: true,
           );
           return true;
         }
@@ -1533,12 +1504,12 @@ class GrassrootsNetwork {
           packet: packet,
           recipientPubkey: recipientPubkey,
         )) {
-          _markSentAndTrackForAck(
+          _markSent(
             messageId: messageId,
             recipientPubkey: recipientPubkey,
             payload: payload,
             transport: MessageTransport.udp,
-            bleDeviceId: null,
+            aired: true,
           );
           return true;
         }
@@ -1563,12 +1534,12 @@ class GrassrootsNetwork {
               packet: packet,
               recipientPubkey: recipientPubkey,
             )) {
-              _markSentAndTrackForAck(
+              _markSent(
                 messageId: messageId,
                 recipientPubkey: recipientPubkey,
                 payload: payload,
                 transport: MessageTransport.udp,
-                bleDeviceId: null,
+                aired: true,
               );
               return true;
             }
@@ -1584,166 +1555,36 @@ class GrassrootsNetwork {
     return false;
   }
 
-  void _queueOutboundMessage({
-    required Uint8List recipientPubkey,
-    required Uint8List payload,
-    required String messageId,
-  }) {
-    final pubkeyHex = _pubkeyToHex(recipientPubkey);
-    final queue = _outboundMessageQueue.putIfAbsent(pubkeyHex, () => []);
-    final existingIndex = queue.indexWhere((msg) => msg.messageId == messageId);
-    final queued = _QueuedOutboundMessage(
-      messageId: messageId,
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-      queuedAt: existingIndex >= 0 ? queue[existingIndex].queuedAt : null,
-      attempts: existingIndex >= 0 ? queue[existingIndex].attempts : 0,
-    );
-
-    if (existingIndex >= 0) {
-      queue[existingIndex] = queued;
-    } else {
-      queue.add(queued);
-    }
-
-    store.dispatch(MessageQueuedAction(messageId: messageId));
-    debugPrint(
-      '[queue] Queued message $messageId for ${pubkeyHex.substring(0, 8)} '
-      '(${queue.length} pending)',
-    );
-  }
-
-  void _drainQueuedMessagesForPeer(Uint8List recipientPubkey) {
-    final pubkeyHex = _pubkeyToHex(recipientPubkey);
-    final queue = _outboundMessageQueue[pubkeyHex];
-    if (queue == null || queue.isEmpty) return;
-    if (_outboundQueueDrainsInProgress.contains(pubkeyHex)) return;
-
-    _outboundQueueDrainsInProgress.add(pubkeyHex);
-    unawaited(() async {
-      try {
-        while (queue.isNotEmpty) {
-          final queued = queue.first;
-
-          // Skip messages whose Redux status is already past `sent` (i.e.
-          // delivered/read/failed). The race that gets us here: an ACK
-          // arrived after the watchdog timer fired and re-queued the
-          // message, so the message is both `delivered` in Redux AND
-          // present in the outbound queue. Re-sending would burn a round
-          // trip and trigger duplicate-drop on the recipient.
-          final current =
-              store.state.messages.outgoingMessages[queued.messageId];
-          if (current != null &&
-              (current.status == MessageStatus.delivered ||
-                  current.status == MessageStatus.read ||
-                  current.status == MessageStatus.failed)) {
-            debugPrint(
-              '[queue] Skipping ${queued.messageId} for '
-              '${pubkeyHex.substring(0, 8)} — already ${current.status.name}',
-            );
-            queue.removeAt(0);
-            continue;
-          }
-
-          final attemptCounted = queued.incrementAttempts();
-          queue[0] = attemptCounted;
-
-          store.dispatch(
-            MessageSendingAction(
-              messageId: attemptCounted.messageId,
-              transport: MessageTransport.ble,
-              recipientPubkey: attemptCounted.recipientPubkey,
-              payloadSize: attemptCounted.payload.length,
-            ),
-          );
-
-          final sent = await _trySendMessageNow(
-            recipientPubkey: attemptCounted.recipientPubkey,
-            payload: attemptCounted.payload,
-            messageId: attemptCounted.messageId,
-          );
-
-          if (!sent) {
-            store.dispatch(
-                MessageQueuedAction(messageId: attemptCounted.messageId));
-            debugPrint(
-              '[queue] Drain paused for ${pubkeyHex.substring(0, 8)} after '
-              '${attemptCounted.attempts} attempt(s)',
-            );
-            break;
-          }
-
-          queue.removeAt(0);
-          debugPrint(
-            '[queue] Sent queued message ${attemptCounted.messageId} to '
-            '${pubkeyHex.substring(0, 8)} (${queue.length} remaining)',
-          );
-        }
-
-        if (queue.isEmpty) {
-          _outboundMessageQueue.remove(pubkeyHex);
-        }
-      } finally {
-        _outboundQueueDrainsInProgress.remove(pubkeyHex);
-      }
-    }());
-  }
-
-  void _drainQueuedMessagesForLivePeers() {
-    final queuedPeerHexes = List<String>.from(_outboundMessageQueue.keys);
-    for (final pubkeyHex in queuedPeerHexes) {
-      final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
-      if (peer == null || !_canAttemptSend(peer)) continue;
-      _drainQueuedMessagesForPeer(peer.publicKey);
-    }
-  }
-
-  // ===== ACK-pending tracker =====
+  // ===== Delivery status + custody lifecycle =====
   //
-  // `sendToPeer` (BLE) and `_sendPacketViaUdp` return success the moment the
-  // OS accepts the bytes — they cannot tell whether the recipient actually
-  // got them. Two failure modes leak through:
-  //
-  //   - **Stale link.** The remote turns BLE off; Android keeps the central
-  //     GATT connection "open" until link-supervision times out (~20–30 s).
-  //     Writes during that window queue at the OS layer and silently die.
-  //   - **UDP loss.** UDX doesn't surface per-packet delivery.
-  //
-  // For every successful send we register the messageId+payload in
-  // `_ackPendingMessages` along with a watchdog timer. The recipient's ACK
-  // cancels the timer; if it doesn't arrive, the timer fires and pushes the
-  // payload back onto the outbound queue for the next drain. The BLE
-  // disconnect listener also walks the map and re-queues anything that was
-  // in flight on the dropped path — that path it doesn't even need to wait
-  // for the timeout.
-  //
-  // Note: this is a watchdog in `GrassrootsNetwork` (the coordinator), not
-  // a reducer-side heuristic. Per `CLAUDE.md`, reducers must only project
-  // transport-emitted facts; inference about "I haven't heard back" lives
-  // here and surfaces as an explicit `MessageQueuedAction` when it triggers.
+  // Epidemic model: a sent message's sealed packets live in custody (the
+  // DTN store) until the recipient's end-to-end ACK arrives. There is no
+  // sender-side retry machinery — redelivery happens through the custody
+  // vector exchange (sync-on-connect) each time a pairing forms, and
+  // through relays conveying custody onward. The ACK's only jobs are the
+  // Redux status flip (checkmarks) and ending custody.
 
-  /// Dispatches `MessageSentAction` and registers the message in
-  /// [_ackPendingMessages] with a fresh ack-timeout watchdog.
   /// Number of currently-reachable peers — the temporal node degree recorded
   /// on trace records at send/deliver time.
   int _reachablePeerCount() =>
       store.state.peers.peers.values.where((p) => p.isReachable).length;
 
-  void _markSentAndTrackForAck({
+  void _markSent({
     required String messageId,
     required Uint8List recipientPubkey,
     required Uint8List payload,
     required MessageTransport transport,
-    required String? bleDeviceId,
+    required bool aired,
   }) {
-    store.dispatch(
-      MessageSentAction(
-        messageId: messageId,
-        transport: transport,
-        recipientPubkey: recipientPubkey,
-        payloadSize: payload.length,
-      ),
-    );
+    // Custody exists either way; `aired` only drives the status shown.
+    store.dispatch(aired
+        ? MessageSentAction(
+            messageId: messageId,
+            transport: transport,
+            recipientPubkey: recipientPubkey,
+            payloadSize: payload.length,
+          )
+        : MessageQueuedAction(messageId: messageId));
     if (trace?.enabled ?? false) {
       final now = DateTime.now().millisecondsSinceEpoch;
       unawaited(trace!.log({
@@ -1755,126 +1596,58 @@ class GrassrootsNetwork {
         'transport': transport == MessageTransport.udp ? 'udp' : 'ble',
         'payloadSize': payload.length,
         'degreeAtEvent': _reachablePeerCount(),
-        'queueDepthAtSend': queuedMessageCountForPeer(recipientPubkey),
         'sentAt': now,
       }));
     }
-    _trackAckPending(
-      messageId: messageId,
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-      bleDeviceId: bleDeviceId,
-    );
   }
 
-  void _trackAckPending({
-    required String messageId,
-    required Uint8List recipientPubkey,
-    required Uint8List payload,
-    required String? bleDeviceId,
-  }) {
-    // Cancel any previous in-flight tracking for this messageId so a quick
-    // resend-after-drain doesn't leak two timers for the same id.
-    _ackPendingMessages.remove(messageId)?.ackTimer?.cancel();
-
-    final pending = _AckPendingMessage(
-      messageId: messageId,
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-      bleDeviceId: bleDeviceId,
-    );
-    pending.ackTimer = Timer(
-      config.ackTimeout,
-      () => _onAckTimedOut(messageId),
-    );
-    _ackPendingMessages[messageId] = pending;
-  }
-
-  /// ACK arrived for a message — drop the watchdog. Called from the ACK
-  /// handler after `MessageDeliveredAction` is dispatched.
-  void _clearAckPending(String messageId) {
-    _ackPendingMessages.remove(messageId)?.ackTimer?.cancel();
-  }
-
-  void _onAckTimedOut(String messageId) {
-    final pending = _ackPendingMessages.remove(messageId);
-    if (pending == null) return;
-    pending.ackTimer = null;
-
-    // Race guard: if the ACK arrived between `_clearAckPending` and the
-    // timer firing — or before `_markSentAndTrackForAck` even registered
-    // this entry, in which case `_clearAckPending` was a no-op — the
-    // message is already delivered in Redux. Re-queueing would silently
-    // burn a redundant retry.
-    final current = store.state.messages.outgoingMessages[messageId];
-    if (current != null &&
-        (current.status == MessageStatus.delivered ||
-            current.status == MessageStatus.read)) {
-      return;
-    }
-
-    debugPrint(
-      '[ack-timeout] No ACK for $messageId within '
-      '${config.ackTimeout.inMilliseconds}ms; re-queueing.',
-    );
-    if (trace?.enabled ?? false) {
-      unawaited(trace!.log({
-        'type': 'message',
-        't': DateTime.now().millisecondsSinceEpoch,
-        'dir': 'ack_timeout',
-        'messageId': messageId,
-        'deliverySuccess': false,
-      }));
-    }
-    _requeueAckPendingMessage(pending);
-  }
-
-  /// BLE path dropped — re-queue every message we sent on that path that
-  /// is still waiting for an ACK. The watchdog would catch them eventually,
-  /// but the disconnect is hard evidence the bytes never landed, so don't
-  /// make the user wait.
-  void _requeueMessagesOnBleDisconnect(String bleDeviceId) {
-    // Snapshot before mutating: re-queueing pushes into a different map but
-    // we also remove from `_ackPendingMessages`, and direct iteration would
-    // throw on concurrent modification.
-    final affected = _ackPendingMessages.values
-        .where((p) => p.bleDeviceId == bleDeviceId)
+  /// Seal-and-dispatch every [_pendingSeal] message destined for [pubkey] —
+  /// their first Noise session just formed, so custody can finally exist.
+  void _sealPendingFor(Uint8List pubkey) {
+    final hex = _pubkeyToHex(pubkey);
+    final ready = _pendingSeal.entries
+        .where((e) => _pubkeyToHex(e.value.recipientPubkey) == hex)
         .toList(growable: false);
-    for (final pending in affected) {
-      _ackPendingMessages.remove(pending.messageId);
-      pending.ackTimer?.cancel();
-      pending.ackTimer = null;
-
-      // Skip re-queue if the ACK already landed (Redux says delivered/read).
-      // The disconnect fires after the link supervision detects the drop,
-      // which can be several seconds late on Android — plenty of room for
-      // an ACK to have arrived in the interim.
-      final current =
-          store.state.messages.outgoingMessages[pending.messageId];
-      if (current != null &&
-          (current.status == MessageStatus.delivered ||
-              current.status == MessageStatus.read)) {
-        continue;
-      }
-
-      debugPrint(
-        '[ble-disconnect] Re-queueing in-flight message '
-        '${pending.messageId} after $bleDeviceId dropped.',
-      );
-      _requeueAckPendingMessage(pending);
+    for (final entry in ready) {
+      _pendingSeal.remove(entry.key);
+      debugPrint('[custody] Session up — sealing held message ${entry.key}');
+      unawaited(_trySendMessageNow(
+        recipientPubkey: entry.value.recipientPubkey,
+        payload: entry.value.payload,
+        messageId: entry.key,
+      ));
     }
   }
 
-  void _requeueAckPendingMessage(_AckPendingMessage pending) {
-    // Pushes back into `_outboundMessageQueue`, which also dispatches
-    // `MessageQueuedAction` (status `sent` → `queued`). The next drain
-    // trigger (ANNOUNCE / UDP connect / app resume / stale-peer tick) will
-    // attempt redelivery.
-    _queueOutboundMessage(
-      recipientPubkey: pending.recipientPubkey,
-      payload: pending.payload,
-      messageId: pending.messageId,
+  /// Send every custody packet destined for [pubkey] directly over the
+  /// just-established link. The recipient dedups; custody is kept until the
+  /// ACK ends it.
+  void _conveyCustodyTo(PeerTransport transport, Uint8List pubkey) {
+    final packets = _messageRouter.custodyFor(pubkey);
+    if (packets.isEmpty) return;
+    debugPrint(
+      '[custody] Conveying ${packets.length} held packet(s) to '
+      '${_pubkeyToHex(pubkey).substring(0, 8)} over ${transport.name}',
     );
+    unawaited(() async {
+      for (final packet in packets) {
+        final bytes = packet.serialize();
+        if (transport == PeerTransport.udp) {
+          await _udpService?.sendToPeer(_pubkeyToHex(pubkey), bytes);
+        } else {
+          await _floodViaBle(bytes);
+        }
+        await Future.delayed(FragmentHandler.fragmentDelay);
+      }
+    }());
+  }
+
+  /// The recipient confirmed delivery (ACK or read receipt): end our custody
+  /// of every sealed packet belonging to [messageId].
+  void _endCustodyForMessage(String messageId) {
+    _pendingSeal.remove(messageId);
+    final ids = _custodyPacketIds.remove(messageId);
+    _messageRouter.removeCustody(ids ?? [messageId]);
   }
 
   // ===== Testbed workload driver (debug-only; inert until started) =====
@@ -1903,25 +1676,15 @@ class GrassrootsNetwork {
   /// DEBUG/TESTBED ONLY. Stop the workload driver.
   void stopWorkload() => _workloadDriver?.stop();
 
-  @visibleForTesting
-  int queuedMessageCountForPeer(Uint8List pubkey) =>
-      _outboundMessageQueue[_pubkeyToHex(pubkey)]?.length ?? 0;
-
-  @visibleForTesting
-  int get queuedMessageCount => _outboundMessageQueue.values.fold<int>(
-        0,
-        (count, queue) => count + queue.length,
-      );
-
-  /// Sealed packets currently held in the DTN store-carry-forward cache.
+  /// Sealed packets currently held in custody (own un-ACK'd + relayed DTN).
   int get dtnBufferedCount => _messageRouter.dtnBufferedCount;
 
-  /// Messages waiting in the sender-local outbound queue (couldn't be flooded
-  /// yet). Public accessor for trace sampling.
-  int get outboundQueuedCount => queuedMessageCount;
+  /// Messages held un-sealable (no Noise session with the recipient yet).
+  /// Public accessor for trace sampling.
+  int get outboundQueuedCount => _pendingSeal.length;
 
   @visibleForTesting
-  int get ackPendingMessageCount => _ackPendingMessages.length;
+  int get pendingSealCount => _pendingSeal.length;
 
   /// Send a read receipt to the original sender of a message.
   /// Call this when the user has read/viewed a message.
@@ -1990,11 +1753,15 @@ class GrassrootsNetwork {
           final pubkey = _bleService!.getPubkeyForPeerId(peerId);
           if (pubkey == null) continue;
           if (_fragmentHandler.needsFragmentation(payload)) {
-            await _sendFragmentedViaBle(
+            if (!_noiseSessions.hasSession(pubkey)) continue;
+            for (final sealed in await _sealFragments(
               payload: payload,
               recipientPubkey: pubkey,
               messageId: _uuid.v4(),
-            );
+            )) {
+              await _floodViaBle(sealed.serialize());
+              await Future.delayed(FragmentHandler.fragmentDelay);
+            }
           } else {
             final packet = _protocolHandler.createMessagePacket(
               payload: payload,
@@ -2230,27 +1997,6 @@ class GrassrootsNetwork {
   bool _hasLiveBlePath(PeerState? peer) =>
       _connectedBleDeviceIdForPeer(peer) != null;
 
-  bool _hasLiveSendPath(PeerState? peer) {
-    if (peer == null) return false;
-    if (_hasLiveBlePath(peer)) return true;
-    return _udpService?.getPeerIdForPubkey(peer.publicKey) != null;
-  }
-
-  /// Any path — direct (BLE/UDP) or BLE **mesh** — over which a queued message
-  /// could plausibly be sent right now. The mesh case is what fixes the
-  /// "queued message waits for a direct link" bug: a fresh `send()` floods to
-  /// any recipient we hold a Noise session with (reaching them via relays), so
-  /// a queued message must be allowed to ride that same relay path rather than
-  /// sitting until the recipient itself reconnects directly.
-  bool _canAttemptSend(PeerState? peer) {
-    if (peer == null) return false;
-    return canAttemptQueuedSend(
-      hasDirectSendPath: _hasLiveSendPath(peer),
-      bleUsable: _isBleEnabledInSettings && _bleAvailable && _bleService != null,
-      hasNoiseSession: _noiseSessions.hasSession(peer.publicKey),
-    );
-  }
-
   static String _pubkeyToHex(Uint8List pubkey) =>
       pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
@@ -2296,8 +2042,9 @@ class GrassrootsNetwork {
   /// [onPeerConnected] — is gated on this: a transport counts toward
   /// `isReachable` only once its session is authenticated (spec
   /// `docs/GLP_Networking_API/sections/ip.tex` §IP Connection, "established and
-  /// authenticated"). Also drains any queued messages now that an encrypted
-  /// channel exists.
+  /// authenticated"). The session is also the gate for all custody flow with
+  /// this peer: pending messages become sealable, their custody is conveyed,
+  /// and the sync-on-connect vector exchange runs — never before the session.
   void _onNoiseSessionEstablished(PeerTransport transport, Uint8List pubkey) {
     switch (transport) {
       case PeerTransport.udp:
@@ -2312,7 +2059,20 @@ class GrassrootsNetwork {
         store.dispatch(PeerBleAuthenticatedAction(pubkey));
         break;
     }
-    _drainQueuedMessagesForPeer(pubkey);
+
+    // Messages created before this session existed can now be sealed into
+    // custody and flooded.
+    _sealPendingFor(pubkey);
+
+    // Convey every custody packet destined FOR this peer directly over the
+    // fresh authenticated link (they dedup); over BLE additionally run the
+    // custody vector exchange so relayed custody spreads.
+    _conveyCustodyTo(transport, pubkey);
+    if (transport == PeerTransport.bleDirect) {
+      final bleDeviceId =
+          _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
+      if (bleDeviceId != null) _sendSyncOffers(bleDeviceId);
+    }
 
     // Cold-bootstrap invitee: if this session is with an inviter whose invite
     // we're redeeming, we've now punched through to them — present the invite
@@ -3414,13 +3174,15 @@ class GrassrootsNetwork {
         }));
       }
       store.dispatch(MessageDeliveredAction(messageId: messageId));
-      _clearAckPending(messageId);
+      _endCustodyForMessage(messageId);
     };
 
     // Read receipt received
     _messageRouter.onReadReceiptReceived = (messageId) {
       debugPrint('Read receipt received for message $messageId');
       store.dispatch(MessageReadAction(messageId: messageId));
+      // A read receipt implies delivery — end custody even if the ACK was lost.
+      _endCustodyForMessage(messageId);
     };
 
     // Map incoming UDP connections from any verified packet's senderPubkey.
@@ -3615,10 +3377,21 @@ class GrassrootsNetwork {
         onPeerUpdated?.call(peerState);
       }
 
-      // A peer reappeared: drain our own queued messages AND re-flood any
-      // store-carry-forward packets we are holding for them.
-      _drainQueuedMessagesForPeer(data.publicKey);
-      _messageRouter.flushDtnFor(data.publicKey);
+      // Eager pairing: every accepted announce leads straight to a Noise
+      // session (custody flow is session-gated). Deterministic initiator —
+      // the lower pubkey dials the handshake; the higher side responds. The
+      // 10s periodic announce is the natural retry if a handshake is lost.
+      if (!_noiseSessions.hasSession(data.publicKey) &&
+          _pubkeyToHex(identity.publicKey).compareTo(pubkeyHex) < 0) {
+        final peer = _peersState.getPeerByPubkey(data.publicKey);
+        unawaited(_ensureNoiseSession(
+          transport: transport,
+          recipientPubkey: data.publicKey,
+          peerId: transport == PeerTransport.udp
+              ? udpPeerId
+              : _connectedBleDeviceIdForPeer(peer),
+        ));
+      }
     };
 
     // ACK request: the router recovered the original sender by trial-decrypt and
@@ -3859,8 +3632,8 @@ class GrassrootsNetwork {
     // A verified BLE ANNOUNCE identified the peer behind a path (the router
     // has already applied it to Redux). Let the transport act on the pair's
     // reverse leg — cancel a doomed dial (iOS) or open the central direction.
-    _messageRouter.onBlePeerIdentified = (pathId, pubkey, platform) {
-      _bleService?.onPeerIdentified(pathId, pubkey, platform);
+    _messageRouter.onBlePeerIdentified = (pathId, pubkey) {
+      _bleService?.onPeerIdentified(pathId, pubkey);
     };
 
     // BLE-level disconnect cleans up the per-transport Noise session.
@@ -3883,18 +3656,12 @@ class GrassrootsNetwork {
     _bleService!.connectionStream.listen((event) {
       if (event.connected) {
         unawaited(_sendAnnounceToDevice(event.peerId));
-        // A new neighbor is a new mesh relay: any queued message for a
-        // recipient we hold a Noise session with can now ride this path,
-        // even if that recipient never links to us directly. Drain across
-        // all mesh-reachable recipients, not just the one that connected.
-        _drainQueuedMessagesForLivePeers();
-        // Sync-on-connect: offer this neighbor the packetIds our DTN store
-        // carries so custody spreads epidemically through mobile relays.
-        _sendSyncOffers(event.peerId);
+        // Custody exchange happens later, once the pairing's Noise session is
+        // established (see [_onNoiseSessionEstablished]) — never on the raw
+        // link.
       } else {
         debugPrint('BLE device disconnected: ${event.peerId}');
         _bleFriendAnnounceSent.remove(event.peerId);
-        _requeueMessagesOnBleDisconnect(event.peerId);
       }
     });
   }
@@ -4052,9 +3819,6 @@ class GrassrootsNetwork {
             connected: false,
           ),
         );
-      }
-      if (event.connected) {
-        _drainQueuedMessagesForPeer(_hexToBytes(event.peerId));
       }
     });
   }
@@ -4436,7 +4200,6 @@ class GrassrootsNetwork {
         debugPrint('[lifecycle] UDP transport rebound after foreground probe');
       }
     }
-    _drainQueuedMessagesForLivePeers();
   }
 
   /// Clean up resources
@@ -4469,17 +4232,13 @@ class GrassrootsNetwork {
     _introducedNonceUses.clear();
     _issuedNonceUses.clear();
     _invitedContacts.clear();
-    _outboundMessageQueue.clear();
-    _outboundQueueDrainsInProgress.clear();
-
-    for (final pending in _ackPendingMessages.values) {
-      pending.ackTimer?.cancel();
-    }
-    _ackPendingMessages.clear();
+    _pendingSeal.clear();
+    _custodyPacketIds.clear();
 
     _messageRouter.dispose();
     _signalingService.dispose();
     _noiseSessions.dispose();
+    _fragmentHandler.dispose();
 
     if (_bleService != null) {
       await _bleService!.dispose();
@@ -4503,7 +4262,6 @@ class GrassrootsNetwork {
       _broadcastAnnounceViaUdp();
       _removeStalePeers();
       _discoverUnreachableFriends();
-      _drainQueuedMessagesForLivePeers();
     });
   }
 
@@ -4854,36 +4612,31 @@ class GrassrootsNetwork {
 
   /// Send a large payload via BLE using fragmentation.
   /// Each fragment is individually encrypted and signed.
-  Future<bool> _sendFragmentedViaBle({
+  /// Seal every fragment of [payload] to the recipient's session, returning
+  /// the sealed packets. Requires an existing session. The caller floods them
+  /// and (for tracked messages) stores them as custody.
+  Future<List<GrassrootsPacket>> _sealFragments({
     required Uint8List payload,
     required Uint8List recipientPubkey,
     required String messageId,
   }) async {
-    // A session must already exist (we seal each fragment to it). Each fragment
-    // is sealed individually and flooded into the BLE mesh.
-    if (!_noiseSessions.hasSession(recipientPubkey)) return false;
-
     final frames = _fragmentHandler.framesFor(
       payload: payload,
       messageId: messageId,
     );
-
-    var anySent = false;
+    final sealed = <GrassrootsPacket>[];
     for (final frame in frames) {
       final packet = GrassrootsPacket(
         type: PacketType.secure,
         recipientPubkey: recipientPubkey,
         payload: frame.encode(),
       );
-      final sealed = await _noiseSessions.encryptPacket(
+      sealed.add(await _noiseSessions.encryptPacket(
         packet,
         remotePubkey: recipientPubkey,
-      );
-      if (await _floodViaBle(sealed.serialize()) == 0) return false;
-      anySent = true;
-      await Future.delayed(FragmentHandler.fragmentDelay);
+      ));
     }
-    return anySent;
+    return sealed;
   }
 
   /// Flood a serialized packet into the BLE mesh (managed flooding). Returns the
@@ -4916,27 +4669,6 @@ class GrassrootsNetwork {
 ///     state is gone.
 ///   - state unchanged or one-of-two transports flipping while the other
 ///     stays live: no fire.
-/// Whether a queued outbound message for a recipient can be attempted right
-/// now, given the recipient's currently available paths.
-///
-/// Returns true when either:
-///   - [hasDirectSendPath] — a direct BLE link or a live UDP connection to the
-///     recipient, OR
-///   - [bleUsable] AND [hasNoiseSession] — BLE is on/available and we hold an
-///     established Noise session with the recipient, so a flood can reach them
-///     over the **mesh** via relays even with no direct link.
-///
-/// The mesh clause is the fix for queued messages sitting until the recipient
-/// reconnects directly: a fresh `send()` already floods to any session peer, so
-/// a drained message rides the same relay path. See `_canAttemptSend`.
-@visibleForTesting
-bool canAttemptQueuedSend({
-  required bool hasDirectSendPath,
-  required bool bleUsable,
-  required bool hasNoiseSession,
-}) =>
-    hasDirectSendPath || (bleUsable && hasNoiseSession);
-
 @visibleForTesting
 void processReachabilityTransitions({
   required PeersState peersState,

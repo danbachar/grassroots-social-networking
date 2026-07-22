@@ -74,8 +74,10 @@ export 'src/transport/transport.dart';
 export 'src/models/identity.dart';
 export 'src/identity_store.dart';
 export 'src/models/peer.dart';
+export 'src/models/platform.dart';
 export 'src/models/packet.dart';
 export 'src/models/block.dart';
+export 'src/signaling/invite.dart' show InviteRedeemResult;
 
 // Redux Store (includes friendships_state, settings_state, persistence_service)
 export 'src/store/store.dart';

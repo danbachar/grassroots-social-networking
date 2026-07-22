@@ -1,9 +1,10 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:redux/redux.dart';
 import 'debug_log_screen.dart';
+import 'theme/grasslink_tokens.dart';
+import 'theme/grasslink_widgets.dart';
 import 'src/store/app_state.dart';
 import 'src/store/settings_actions.dart';
 import 'src/store/settings_state.dart';
@@ -81,37 +82,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Settings'),
-        backgroundColor: const Color(0xFF1B3D2F),
       ),
       body: ListView(
         children: [
           const SizedBox(height: 16),
 
           // Transport Section Header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                const Icon(Icons.swap_horiz, color: Color(0xFFE8A33C)),
-                const SizedBox(width: 8),
-                const Text(
-                  'Transport Protocols',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFFE8A33C),
-                  ),
-                ),
-              ],
-            ),
+          const Padding(
+            padding: EdgeInsets.symmetric(
+                horizontal: GlSpace.s4, vertical: GlSpace.s2),
+            child: EyebrowLabel('Your links', color: GlColors.accentOnSoft),
           ),
 
           const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 16),
+            padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
             child: Text(
-              'Choose which protocols to use for peer communication. '
-              'Bluetooth is preferred when peers are nearby.',
-              style: TextStyle(color: Colors.grey, fontSize: 13),
+              'Choose how you reach your peers. Bluetooth carries messages '
+              'when neighbours are nearby.',
+              style:
+                  TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
             ),
           ),
 
@@ -119,10 +108,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // Bluetooth Toggle
           _buildTransportTile(
-            icon: Icons.bluetooth,
-            iconColor: Colors.blue,
+            icon: Icons.bluetooth_rounded,
+            iconColor: GlColors.primary,
             title: 'Bluetooth',
-            subtitle: 'Connect to nearby peers via BLE',
+            subtitle: 'Reach neighbours nearby, no Internet needed',
             value: _bluetoothEnabled,
             available:
                 widget.store.state.transports.bleState != TransportState.error,
@@ -138,10 +127,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // UDP Toggle
           _buildTransportTile(
-            icon: Icons.public,
-            iconColor: Colors.green,
+            icon: Icons.public_rounded,
+            iconColor: GlColors.info,
             title: 'Internet',
-            subtitle: 'Connect to peers over the Internet',
+            subtitle: 'Reach peers anywhere in the world',
             value: _udpEnabled,
             available:
                 widget.store.state.transports.udpState != TransportState.error,
@@ -155,6 +144,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const Divider(height: 32),
 
+          // Introduce strangers (invite facilitation)
+          _buildFacilitateInvitesSection(),
+
+          const Divider(height: 32),
+
           // Diagnostic traces (opt-in research telemetry)
           _buildTraceLoggingSection(),
 
@@ -163,33 +157,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // Warning if no transport enabled
           if (!_bluetoothEnabled && !_udpEnabled)
             Container(
-              margin: const EdgeInsets.symmetric(horizontal: 16),
-              padding: const EdgeInsets.all(16),
+              margin: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
+              padding: const EdgeInsets.all(GlSpace.s4),
               decoration: BoxDecoration(
-                color: Colors.red.withOpacity(0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.red.withOpacity(0.3)),
+                color: GlColors.dangerSoft,
+                borderRadius: GlRadius.rMd,
               ),
-              child: Row(
+              child: const Row(
                 children: [
-                  const Icon(Icons.warning, color: Colors.red),
-                  const SizedBox(width: 12),
+                  Icon(Icons.warning_amber_rounded, color: GlColors.danger),
+                  SizedBox(width: GlSpace.s3),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      children: const [
+                      children: [
                         Text(
-                          'No transport enabled',
+                          'No link is on',
                           style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.red,
+                            fontWeight: FontWeight.w700,
+                            color: GlColors.danger,
                           ),
                         ),
-                        SizedBox(height: 4),
+                        SizedBox(height: GlSpace.s1),
                         Text(
-                          'You won\'t be able to communicate with other peers. '
-                          'Enable at least one transport protocol.',
-                          style: TextStyle(color: Colors.red, fontSize: 13),
+                          'You can\'t reach anyone right now. '
+                          'Turn on at least one link.',
+                          style: TextStyle(
+                              color: GlColors.danger, fontSize: GlType.textSm),
                         ),
                       ],
                     ),
@@ -213,22 +207,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: ListTile(
               leading: Container(
-                padding: const EdgeInsets.all(8),
+                padding: const EdgeInsets.all(GlSpace.s2),
                 decoration: BoxDecoration(
-                  color: Colors.purple.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(8),
+                  color: GlColors.infoSoft,
+                  borderRadius: GlRadius.rSm,
                 ),
-                child: const Icon(Icons.bug_report, color: Colors.purple),
+                child: const Icon(Icons.bug_report_outlined,
+                    color: GlColors.info),
               ),
               title: const Text(
-                'Debug Logs',
+                'Debug logs',
                 style: TextStyle(fontWeight: FontWeight.w600),
               ),
-              subtitle: Text(
-                'View live transport logs',
-                style: TextStyle(color: Colors.grey[400], fontSize: 13),
+              subtitle: const Text(
+                'Live transport logs',
+                style: TextStyle(
+                    color: GlColors.textMuted, fontSize: GlType.textSm),
               ),
-              trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+              trailing: const Icon(Icons.chevron_right_rounded,
+                  color: GlColors.textSubtle),
               onTap: () {
                 Navigator.push(
                   context,
@@ -259,18 +256,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final isEnabled = value && available;
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      color: isEnabled ? const Color(0xFF1B3D2F) : null,
       child: ListTile(
         leading: Container(
-          padding: const EdgeInsets.all(8),
+          padding: const EdgeInsets.all(GlSpace.s2),
           decoration: BoxDecoration(
-            color: iconColor.withOpacity(isEnabled ? 0.2 : 0.1),
-            borderRadius: BorderRadius.circular(8),
+            color: isEnabled ? GlColors.primarySoft : GlColors.bgSunken,
+            borderRadius: GlRadius.rSm,
           ),
           child: Icon(
             icon,
-            color: isEnabled ? iconColor : Colors.grey,
+            color: isEnabled ? iconColor : GlColors.textSubtle,
           ),
         ),
         title: Row(
@@ -280,37 +275,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 title,
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
-                  color: isEnabled ? Colors.white : Colors.grey,
+                  color:
+                      isEnabled ? GlColors.textStrong : GlColors.textMuted,
                 ),
               ),
             ),
             if (!available)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: GlSpace.s2, vertical: 2),
                 decoration: BoxDecoration(
-                  color: Colors.orange.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(4),
+                  color: GlColors.warningSoft,
+                  borderRadius: GlRadius.rPill,
                 ),
                 child: const Text(
-                  'Unavailable',
+                  'Out of reach',
                   style: TextStyle(
-                    fontSize: 10,
-                    color: Colors.orange,
+                    fontSize: GlType.text2xs,
+                    fontWeight: FontWeight.w600,
+                    color: GlColors.warning,
                   ),
                 ),
               ),
             if (available && isEnabled)
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: GlSpace.s2, vertical: 2),
                 decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(4),
+                  color: GlColors.successSoft,
+                  borderRadius: GlRadius.rPill,
                 ),
                 child: Text(
                   'Priority $priority',
                   style: const TextStyle(
-                    fontSize: 10,
-                    color: Colors.green,
+                    fontSize: GlType.text2xs,
+                    fontWeight: FontWeight.w600,
+                    color: GlColors.success,
                   ),
                 ),
               ),
@@ -319,14 +319,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         subtitle: Text(
           !available ? 'Not available on this device' : subtitle,
           style: TextStyle(
-            color: isEnabled ? Colors.grey[400] : Colors.grey,
-            fontSize: 13,
+            color: isEnabled ? GlColors.textMuted : GlColors.textSubtle,
+            fontSize: GlType.textSm,
           ),
         ),
         trailing: Switch(
           value: value,
           onChanged: available ? onChanged : null,
-          activeColor: const Color(0xFFE8A33C),
         ),
         onTap: available ? () => onChanged(!value) : null,
       ),
@@ -340,22 +339,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.bug_report_outlined,
-                  size: 16, color: Colors.orange),
-              const SizedBox(width: 6),
+              Icon(Icons.bug_report_outlined,
+                  size: 16, color: GlColors.warning),
+              SizedBox(width: 6),
               Text(
                 'BLE role (debug)',
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: GlType.textSm,
                   fontWeight: FontWeight.w600,
-                  color: Colors.orange[700],
+                  color: GlColors.warning,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: GlSpace.s1),
           Text(
             switch (mode) {
               BleRoleMode.auto =>
@@ -365,7 +364,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               BleRoleMode.peripheralOnly =>
                 'Advertise only — we never dial; peers reach us as peripheral.',
             },
-            style: const TextStyle(fontSize: 12, color: Colors.black54),
+            style: const TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
           ),
           const SizedBox(height: 8),
           SegmentedButton<BleRoleMode>(
@@ -399,40 +399,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildFacilitateInvitesSection() {
+    final settings = widget.store.state.settings;
+    final coldCallOpen = settings.coldCallTrustLevel == ColdCallTrustLevel.open;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.symmetric(
+              horizontal: GlSpace.s4, vertical: GlSpace.s2),
+          child: EyebrowLabel('Introductions', color: GlColors.accentOnSoft),
+        ),
+        const Padding(
+          padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
+          child: Text(
+            'Lend a hand so a friend can reach someone new: help connect a '
+            'stranger who is redeeming an invite one of your friends sent. '
+            'You never learn their messages — only pass along a first hello.',
+            style:
+                TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
+          ),
+        ),
+        SwitchListTile(
+          value: settings.facilitateInvites && coldCallOpen,
+          onChanged: coldCallOpen
+              ? (v) => widget.store.dispatch(SetFacilitateInvitesAction(v))
+              : null,
+          title: const Text('Help introduce newcomers'),
+          subtitle: Text(
+            coldCallOpen
+                ? (settings.facilitateInvites ? 'On' : 'Off')
+                : 'Turn on “meeting new peers” first',
+            style: TextStyle(
+              color: coldCallOpen ? GlColors.textMuted : GlColors.textSubtle,
+              fontSize: GlType.textSm,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildTraceLoggingSection() {
     final settings = widget.store.state.settings;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            children: [
-              Icon(Icons.insights, color: Color(0xFFE8A33C)),
-              SizedBox(width: 8),
-              Text(
-                'Diagnostic Traces',
-                style: TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFFE8A33C),
-                ),
-              ),
-            ],
-          ),
+          padding: EdgeInsets.symmetric(
+              horizontal: GlSpace.s4, vertical: GlSpace.s2),
+          child:
+              EyebrowLabel('Diagnostic traces', color: GlColors.accentOnSoft),
         ),
         const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
+          padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
           child: Text(
             'Opt in to collect anonymous diagnostic traces on this device. '
             'The app asks on every start before uploading, or upload manually '
             'below.',
-            style: TextStyle(color: Colors.grey, fontSize: 13),
+            style:
+                TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
           ),
         ),
         SwitchListTile(
           value: settings.traceLoggingConsent,
-          activeColor: const Color(0xFFE8A33C),
           title: const Text('Collect diagnostic traces'),
           subtitle: Text(settings.traceLoggingConsent ? 'On' : 'Off'),
           onChanged: (value) => widget.store.dispatch(
@@ -490,49 +520,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.verified_user_outlined,
-                  size: 16, color: Color(0xFF1B3D2F)),
-              const SizedBox(width: 6),
+              Icon(Icons.verified_user_outlined,
+                  size: 16, color: GlColors.primary),
+              SizedBox(width: 6),
               Text(
-                'Cold calls',
+                'Meeting new peers',
                 style: TextStyle(
-                  fontSize: 13,
+                  fontSize: GlType.textSm,
                   fontWeight: FontWeight.w600,
-                  color: Colors.green[800],
+                  color: GlColors.primaryOnSoft,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 4),
+          const SizedBox(height: GlSpace.s1),
           const Text(
-            'A "cold call" is an unsolicited BLE first-contact attempt from a '
-            'nearby peer you have not friended yet. This setting controls '
-            'whether you reply.\n\n'
-            '• Open — anyone in range can complete the signed ANNOUNCE '
-            'handshake, so you can discover and meet new peers. Strangers '
-            'learn your public key and nickname, but never your address '
-            'or any friend-only metadata.\n'
-            '• Closed — first contact from non-friends is refused. Nearby '
-            'devices still see your service advertisement, but ANNOUNCE is '
-            'not sent and incoming ANNOUNCEs from strangers are dropped, '
-            'so unknown peers cannot learn your nickname over BLE.',
-            style: TextStyle(fontSize: 12, color: Colors.black54),
+            'Controls whether you reply when a nearby peer you have not '
+            'friended yet says hello over Bluetooth.\n\n'
+            '• Open — anyone in range can introduce themselves, so you can '
+            'meet new peers. Strangers learn your public key and nickname, '
+            'but never your address or any friend-only details.\n'
+            '• Closed — introductions from non-friends are refused. Nearby '
+            'devices still see your advertisement, but strangers cannot '
+            'learn your nickname over Bluetooth.',
+            style: TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           Text(
             switch (level) {
               ColdCallTrustLevel.open =>
-                'Currently open: nearby unknown peers can complete first '
-                    'contact.',
+                'Currently open: nearby unknown peers can introduce '
+                    'themselves.',
               ColdCallTrustLevel.closed =>
-                'Currently closed: only accepted friends complete BLE first '
-                    'contact.',
+                'Currently closed: only accepted friends can say hello over '
+                    'Bluetooth.',
             },
-            style: TextStyle(
-              fontSize: 12,
-              color: Colors.green[800],
+            style: const TextStyle(
+              fontSize: GlType.textXs,
+              color: GlColors.primaryOnSoft,
               fontWeight: FontWeight.w600,
             ),
           ),
@@ -575,17 +603,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             publicIp == null;
 
     return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: isWellConnected
-          ? Colors.green.withOpacity(0.1)
-          : Colors.grey.withOpacity(0.1),
+      color: isWellConnected ? GlColors.successSoft : GlColors.bgSunken,
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(GlSpace.s3),
         child: Row(
           children: [
             Icon(
-              isWellConnected ? Icons.language : Icons.shield_outlined,
-              color: isWellConnected ? Colors.green : Colors.grey,
+              isWellConnected ? Icons.language_rounded : Icons.shield_outlined,
+              color: isWellConnected ? GlColors.success : GlColors.textSubtle,
               size: 20,
             ),
             const SizedBox(width: 10),
@@ -594,21 +619,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    isWellConnected ? 'Well-connected' : 'Standard connection',
+                    isWellConnected
+                        ? 'Well-connected'
+                        : 'Standard connection',
                     style: TextStyle(
                       fontWeight: FontWeight.w600,
-                      fontSize: 13,
-                      color: isWellConnected ? Colors.green : Colors.grey[400],
+                      fontSize: GlType.textSm,
+                      color: isWellConnected
+                          ? GlColors.moss700
+                          : GlColors.textMuted,
                     ),
                   ),
                   const SizedBox(height: 2),
                   Text(
                     isWellConnected
-                        ? 'Your device has a globally routable address and can help friends connect'
-                        : 'Your device is behind NAT — connections to friends may require hole-punching',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: Colors.grey[500],
+                        ? 'Anyone can reach you directly — you can lend your link to help friends connect'
+                        : 'You are behind NAT — a well-connected friend helps your connections find their way',
+                    style: const TextStyle(
+                      fontSize: GlType.text2xs,
+                      color: GlColors.textMuted,
                     ),
                   ),
                   const SizedBox(height: 6),
@@ -617,14 +646,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Icon(
                         _networkTypeIcon(connectionType),
                         size: 14,
-                        color: Colors.grey[400],
+                        color: GlColors.textSubtle,
                       ),
                       const SizedBox(width: 6),
                       Text(
                         'Connection type: ${connectionType.displayName}',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey[400],
+                        style: const TextStyle(
+                          fontSize: GlType.text2xs,
+                          color: GlColors.textSubtle,
                         ),
                       ),
                     ],
@@ -633,11 +662,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     const SizedBox(height: 6),
                     Text(
                       publicAddress ?? publicIp!,
-                      style: TextStyle(
-                        fontFamily: 'monospace',
-                        fontSize: 11,
-                        color: Colors.grey[400],
-                      ),
+                      style: GlType.monoStyle(GlType.text2xs,
+                          color: GlColors.textSubtle),
                     ),
                   ] else if (showDiscoveryFailedWarning) ...[
                     const SizedBox(height: 6),
@@ -655,23 +681,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Widget _buildNoPublicAddressWarning() {
     return Row(
       children: [
-        Icon(
+        const Icon(
           Icons.warning_amber_rounded,
           size: 14,
-          color: Colors.orange[700],
+          color: GlColors.warning,
         ),
         const SizedBox(width: 6),
-        Expanded(
+        const Expanded(
           child: Text(
             'No public IP address available',
             style: TextStyle(
-              fontSize: 11,
-              color: Colors.orange[700],
+              fontSize: GlType.text2xs,
+              color: GlColors.warning,
               fontWeight: FontWeight.w500,
             ),
           ),
         ),
-        const SizedBox(width: 4),
+        const SizedBox(width: GlSpace.s1),
         SizedBox(
           height: 24,
           child: TextButton.icon(
@@ -685,8 +711,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     height: 12,
                     child: CircularProgressIndicator(strokeWidth: 1.5),
                   )
-                : const Icon(Icons.refresh, size: 14),
-            label: const Text('Retry', style: TextStyle(fontSize: 11)),
+                : const Icon(Icons.refresh_rounded, size: 14),
+            label: const Text(
+              'Retry',
+              style: TextStyle(fontSize: GlType.text2xs),
+            ),
             style: TextButton.styleFrom(
               padding: const EdgeInsets.symmetric(horizontal: 8),
               minimumSize: Size.zero,
@@ -735,46 +764,44 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Widget _buildInfoCard() {
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(GlSpace.s4),
       decoration: BoxDecoration(
-        color: Colors.blue.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.blue.withOpacity(0.2)),
+        color: GlColors.primarySoft,
+        borderRadius: GlRadius.rLg,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: const [
-              Icon(Icons.info_outline, color: Colors.blue, size: 20),
-              SizedBox(width: 8),
+          const Row(
+            children: [
+              SignalDot(size: 12),
+              SizedBox(width: GlSpace.s2),
               Text(
-                'How it works',
+                'How the mesh works',
                 style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  color: Colors.blue,
+                  fontWeight: FontWeight.w700,
+                  color: GlColors.primaryOnSoft,
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: GlSpace.s3),
           _buildInfoRow(
-            icon: Icons.bluetooth,
-            iconColor: Colors.blue,
-            text: 'Bluetooth connects you to nearby peers without Internet',
+            icon: Icons.bluetooth_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'Bluetooth reaches neighbours nearby — no Internet needed',
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           _buildInfoRow(
-            icon: Icons.public,
-            iconColor: Colors.green,
-            text: 'Internet connects you to peers anywhere in the world',
+            icon: Icons.public_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'Internet reaches peers anywhere in the world',
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s2),
           _buildInfoRow(
-            icon: Icons.priority_high,
-            iconColor: const Color(0xFFE8A33C),
-            text:
-                'When both are available, Bluetooth is preferred for faster communication',
+            icon: Icons.route_rounded,
+            iconColor: GlColors.primaryOnSoft,
+            text: 'When both are on, messages take the nearest path first',
           ),
         ],
       ),
@@ -835,9 +862,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Cannot Disable'),
+        title: const Text('Keep one link on'),
         content: const Text(
-          'At least one transport protocol must be enabled to communicate with peers.',
+          'You need at least one way to reach your peers — Bluetooth or '
+          'Internet.',
         ),
         actions: [
           TextButton(

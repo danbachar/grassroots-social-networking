@@ -9,6 +9,7 @@ import 'package:sodium_libs/sodium_libs.dart';
 import 'package:grassroots_networking/src/transport/udp_transport_service.dart';
 import 'package:grassroots_networking/src/transport/transport_service.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
+import 'package:grassroots_networking/src/models/platform.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
@@ -53,7 +54,7 @@ void main() {
     setUp(() async {
       identity = await _createTestIdentity('TestPeer');
       store = _createTestStore();
-      protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
+      protocolHandler = ProtocolHandler(identity: identity, platform: PeerPlatform.other, sodium: sodium);
     });
 
     // =========================================================================
@@ -369,8 +370,8 @@ void main() {
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
         final aliceProto =
-            ProtocolHandler(identity: aliceIdentity, sodium: sodium);
-        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
+            ProtocolHandler(identity: aliceIdentity, platform: PeerPlatform.other, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, platform: PeerPlatform.other, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -448,8 +449,8 @@ void main() {
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
         final aliceProto =
-            ProtocolHandler(identity: aliceIdentity, sodium: sodium);
-        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
+            ProtocolHandler(identity: aliceIdentity, platform: PeerPlatform.other, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, platform: PeerPlatform.other, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -511,8 +512,8 @@ void main() {
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
         final aliceProto =
-            ProtocolHandler(identity: aliceIdentity, sodium: sodium);
-        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
+            ProtocolHandler(identity: aliceIdentity, platform: PeerPlatform.other, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, platform: PeerPlatform.other, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,
@@ -573,8 +574,8 @@ void main() {
         final aliceStore = _createTestStore();
         final bobStore = _createTestStore();
         final aliceProto =
-            ProtocolHandler(identity: aliceIdentity, sodium: sodium);
-        final bobProto = ProtocolHandler(identity: bobIdentity, sodium: sodium);
+            ProtocolHandler(identity: aliceIdentity, platform: PeerPlatform.other, sodium: sodium);
+        final bobProto = ProtocolHandler(identity: bobIdentity, platform: PeerPlatform.other, sodium: sodium);
 
         final alice = UdpTransportService(
           identity: aliceIdentity,

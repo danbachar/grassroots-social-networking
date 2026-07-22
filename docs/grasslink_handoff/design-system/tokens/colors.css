@@ -1,0 +1,89 @@
+/* grasslink color system — warm, earthy, humane.
+   Base ramps first, then semantic aliases. */
+:root {
+  /* Clay — warm neutral ramp (the "earth" the brand sits on) */
+  --clay-50:  #FBF6EE;
+  --clay-100: #F4EDE1;
+  --clay-200: #E9DBC7;
+  --clay-300: #D9C6AC;
+  --clay-400: #BCA684;
+  --clay-500: #94805F;
+  --clay-600: #6E5C41;
+  --clay-700: #4F4130;
+  --clay-800: #3A2E24;
+  --clay-900: #241C15;
+
+  /* Moss — primary. Grass, growth, connection. */
+  --moss-50:  #EFF2E5;
+  --moss-100: #DCE4C4;
+  --moss-200: #BFCB95;
+  --moss-300: #A1B067;
+  --moss-400: #849449;
+  --moss-500: #6B7B37;
+  --moss-600: #55632B;
+  --moss-700: #414C22;
+  --moss-800: #2F3819;
+  --moss-900: #1E2410;
+
+  /* Terracotta — secondary accent. Warmth, people, signal. */
+  --terra-50:  #FBEDE4;
+  --terra-100: #F6D8C5;
+  --terra-200: #EDB79A;
+  --terra-300: #E1926D;
+  --terra-400: #D2703F;
+  --terra-500: #BE5A2C;
+  --terra-600: #9E4622;
+  --terra-700: #79351A;
+  --terra-800: #572514;
+  --terra-900: #38180D;
+
+  /* Semantic hues */
+  --amber-400: #E0A93B;
+  --amber-500: #D08E1E;
+  --sky-400:   #4E8C84;
+  --sky-500:   #3F7C74;
+  --rust-400:  #CE5340;
+  --rust-500:  #B8402D;
+
+  /* ---- Semantic aliases (use these in product code) ---- */
+  --bg-page:        var(--clay-50);
+  --bg-sunken:      var(--clay-100);
+  --surface-card:   #FFFFFF;
+  --surface-raised: #FFFFFF;
+  --surface-inset:  var(--clay-100);
+  --surface-inverse:var(--clay-800);
+
+  --text-strong:  var(--clay-900);
+  --text-body:    var(--clay-800);
+  --text-muted:   var(--clay-600);
+  --text-subtle:  var(--clay-500);
+  --text-inverse: var(--clay-50);
+  --text-on-primary: #FFFFFF;
+
+  --border-subtle: var(--clay-200);
+  --border-default:var(--clay-300);
+  --border-strong: var(--clay-400);
+
+  --primary:        var(--moss-500);
+  --primary-hover:  var(--moss-600);
+  --primary-active: var(--moss-700);
+  --primary-soft:   var(--moss-100);
+  --primary-on-soft:var(--moss-700);
+
+  --accent:        var(--terra-500);
+  --accent-hover:  var(--terra-600);
+  --accent-active: var(--terra-700);
+  --accent-soft:   var(--terra-100);
+  --accent-on-soft:var(--terra-700);
+
+  --success:      var(--moss-500);
+  --success-soft: var(--moss-100);
+  --warning:      var(--amber-500);
+  --warning-soft: #F7E7C4;
+  --danger:       var(--rust-500);
+  --danger-soft:  #F5D8D2;
+  --info:         var(--sky-500);
+  --info-soft:    #D5E5E3;
+
+  --focus-ring: var(--terra-400);
+}

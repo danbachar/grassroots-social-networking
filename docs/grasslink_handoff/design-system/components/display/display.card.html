@@ -1,0 +1,32 @@
+<!-- @dsCard group="Components" viewport="700x220" name="Display" subtitle="Card, Avatar, Badge, Tag" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>body{margin:0;font-family:var(--font-sans);background:var(--bg-page);padding:20px 24px}
+.grp{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.ico{width:14px;height:14px}</style></head><body>
+<div id="root"></div>
+<script type="text/babel">
+const { Card, Avatar, Badge, Tag } = window.GrasslinkDesignSystem_e1de82;
+const I=({n})=>{const r=React.useRef();React.useEffect(()=>{if(window.lucide&&r.current){r.current.innerHTML='';const e=document.createElement('i');e.setAttribute('data-lucide',n);r.current.appendChild(e);window.lucide.createIcons({attrs:{class:'ico'}});}});return <span ref={r} style={{display:'flex'}}/>;};
+function App(){return(<div>
+<div className="grp">
+<Avatar name="Willow Adeyemi" status="online"/>
+<Avatar name="Rafi Okoro" status="relaying" size="lg"/>
+<Avatar name="Mara Vidal" status="offline" size="sm"/>
+</div>
+<div className="grp">
+<Badge tone="success">Relayed</Badge><Badge tone="accent" variant="solid">3 hops</Badge>
+<Badge tone="warning">Low signal</Badge><Badge tone="info">Nearby</Badge><Badge tone="neutral">Draft</Badge>
+<Tag icon={<I n="hash"/>}>market-square</Tag><Tag onRemove={()=>{}}>flood-watch</Tag>
+</div>
+<div className="grp" style={{alignItems:'stretch'}}>
+<Card style={{width:240}}><div style={{fontFamily:'var(--font-display)',fontWeight:700,fontSize:18,color:'var(--text-strong)'}}>Market Square</div><div style={{fontSize:14,color:'var(--text-muted)',marginTop:4}}>12 peers relaying · strong mesh</div></Card>
+<Card interactive elevation="md" style={{width:200}}><div style={{fontSize:14,color:'var(--text-body)'}}>Interactive card — hover to lift.</div></Card>
+</div>
+</div>);}
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+<script src="https://unpkg.com/lucide@0.544.0/dist/umd/lucide.js"></script>
+</body></html>

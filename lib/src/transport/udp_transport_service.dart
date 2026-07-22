@@ -96,9 +96,9 @@ class UdpTransportService extends TransportService {
   // Per-multiplexer monotonic stream-id counter. UDX peers refuse new SYNs
   // for a stream-id whose prior stream just closed (the id is in tear-down
   // state for some time). If we reused id=1 for every reconnect to the same
-  // remote, the second add of a rendezvous server would be silently dropped
-  // by the server's UDX layer. Bumping the id per connect avoids the
-  // collision entirely.
+  // remote, a quick disconnect + reconnect would be silently dropped by the
+  // remote's UDX layer. Bumping the id per connect avoids the collision
+  // entirely.
   int _nextStreamId = 1;
 
   // --- Stream controllers ---
@@ -614,13 +614,6 @@ class UdpTransportService extends TransportService {
     ));
 
     debugPrint('Disconnected from peer $pubkeyHex');
-  }
-
-  @override
-  void associatePeerWithPubkey(String peerId, Uint8List pubkey) {
-    // Peer connections are already keyed by pubkey hex.
-    // This is used for incoming connections where we learn the pubkey from ANNOUNCE.
-    debugPrint('associatePeerWithPubkey: $peerId (managed via ANNOUNCE)');
   }
 
   @override

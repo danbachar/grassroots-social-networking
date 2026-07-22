@@ -1,5 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:redux/redux.dart';
@@ -7,6 +10,7 @@ import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:uuid/uuid.dart';
 import 'ble/permission_handler.dart';
 import 'platform/transport_foreground_service.dart';
+import 'signaling/invite.dart';
 import 'signaling/signaling_service.dart';
 import 'transport/address_utils.dart';
 import 'transport/ble_transport_service.dart';
@@ -18,6 +22,7 @@ import 'models/identity.dart';
 import 'trace/trace_logger.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
+import 'models/platform.dart';
 import 'models/secure_frame.dart';
 import 'protocol/protocol_handler.dart';
 import 'protocol/fragment_handler.dart';
@@ -81,6 +86,15 @@ class GrassrootsNetworkConfig {
     this.enableUdp = true,
     this.ackTimeout = const Duration(seconds: 5),
   });
+}
+
+/// A burned invite nonce: how many redemptions we've accepted, and the
+/// invite's expiry (unix secs) so the entry can be pruned once it can no
+/// longer be presented.
+class _BurnedNonce {
+  final int uses;
+  final int expiry;
+  const _BurnedNonce({required this.uses, required this.expiry});
 }
 
 class _QueuedOutboundMessage {
@@ -397,6 +411,32 @@ class GrassrootsNetwork {
   /// to true (connected) or false (failed) when the punch finishes.
   final Map<String, Completer<bool>> _holePunchCompleters = {};
 
+  // ===== Invite / cold-bootstrap state =====
+
+  /// Invites we are redeeming, keyed by inviter pubkey hex → the signed
+  /// invite blob. When our Noise session to the inviter establishes (after
+  /// the introducer coordinates the punch), we send an INTRODUCE to the
+  /// inviter so it burns the nonce and authorizes us. Cleared on send.
+  final Map<String, Uint8List> _pendingInviteRedemptions = {};
+
+  /// As an introducer: how many times we've coordinated each invite nonce
+  /// (nonceHex → count), to enforce the invite's `maxUses` locally and bound
+  /// abuse. LRU-evicted at capacity.
+  final Map<String, int> _introducedNonceUses = {};
+  static const int _maxTrackedNonces = 1024;
+
+  /// As an inviter: our own invites we've accepted redemptions for
+  /// (nonceHex → use count), so the single-use nonce and `maxUses` are
+  /// durably enforced. Persisted (see [_inviteNonceLedgerKey]) so a restart
+  /// does not un-burn a still-unexpired invite.
+  final Map<String, _BurnedNonce> _issuedNonceUses = {};
+
+  /// Pubkey hexes of peers authorized via an invite we issued → the invite's
+  /// expiry (unix secs). They may complete first contact even under a closed
+  /// cold-call posture, but only until the invite that authorized them
+  /// expires (the grant is time-boxed to the capability, not the session).
+  final Map<String, int> _invitedContacts = {};
+
   /// The target address we last punched toward for each peer.
   final Map<String, AddressInfo> _holePunchTargets = {};
 
@@ -427,17 +467,6 @@ class GrassrootsNetwork {
 
   /// Minimum interval between discovery attempts for the same peer.
   static const _discoveryRetryInterval = Duration(seconds: 60);
-
-  /// When we last fan-ed out an AVAILABLE for each unreachable friend.
-  /// Used to periodically re-fire AVAILABLE on the next announce tick so the
-  /// pairing window at the friend's RV stays open while the friend is mid-
-  /// reconnect (their stale-cache may stall their RECONNECT for tens of
-  /// seconds). Cleared when the friend becomes UDP-reachable again.
-  final Map<String, DateTime> _availableFanOutLastFiredAt = {};
-
-  /// Minimum interval between AVAILABLE re-fires for the same friend while
-  /// they remain UDP-unreachable.
-  static const _availableRefireInterval = Duration(minutes: 5);
 
   /// Back off briefly after a failed proactive UDP attempt so repeated BLE
   /// ANNOUNCEs don't start a fresh UDX handshake every few seconds.
@@ -511,7 +540,7 @@ class GrassrootsNetwork {
   /// (named `onConnectivityStatusChanged` here — the spec name reads like a
   /// status getter; this is a change-event callback).
   /// "Callback when the networking layer detects a change in the agent's
-  /// public IP address. Triggers the rendezvous protocol. Fired on startup
+  /// public IP address. Triggers the reconnection protocol. Fired on startup
   /// and on address change."
   ///
   /// Receives `(oldAddress, newAddress)` as `ip:port` strings (or null when
@@ -534,7 +563,13 @@ class GrassrootsNetwork {
     required this.sodium,
     this.trace,
   }) {
-    _protocolHandler = ProtocolHandler(identity: identity, sodium: sodium);
+    _protocolHandler = ProtocolHandler(
+      identity: identity,
+      platform: defaultTargetPlatform == TargetPlatform.iOS
+          ? PeerPlatform.ios
+          : PeerPlatform.other,
+      sodium: sodium,
+    );
     _fragmentHandler = FragmentHandler();
     _noiseSessions = NoiseSessionManager(identity: identity, sodium: sodium);
     _messageRouter = MessageRouter(
@@ -672,6 +707,10 @@ class GrassrootsNetwork {
 
     _initialized = true;
     debugPrint('Initializing Grassroots transport');
+
+    // Restore the burned-invite-nonce ledger so a restart doesn't un-burn a
+    // still-unexpired invite we issued.
+    unawaited(_loadInviteNonceLedger());
 
     bool anyTransportInitialized = false;
 
@@ -1136,8 +1175,7 @@ class GrassrootsNetwork {
     // Fan out RECONNECT for friends still unreachable. Eligible friend
     // mediators are selected through the friends-of-friends map and
     // coordinate directly.
-    final facilitatorCount = store.state.peers.wellConnectedFriends.length;
-    if (facilitatorCount == 0) return;
+    if (store.state.peers.wellConnectedFriends.isEmpty) return;
 
     for (final friend in udpFriends) {
       if (_udpService?.getPeerIdForPubkey(friend.publicKey) != null) continue;
@@ -2175,6 +2213,21 @@ class GrassrootsNetwork {
     return store.state.friendships.isFriend(hex);
   }
 
+  /// Whether [pubkey] is currently authorized by an invite we issued — an
+  /// invitee we accepted a redemption from, whose authorizing invite has not
+  /// yet expired. Such a peer completes first contact even under a closed
+  /// cold-call posture, but only for the invite's lifetime.
+  bool _isInvitedContact(Uint8List pubkey) {
+    final hex = _pubkeyToHex(pubkey);
+    final expiry = _invitedContacts[hex];
+    if (expiry == null) return false;
+    if (DateTime.now().millisecondsSinceEpoch ~/ 1000 >= expiry) {
+      _invitedContacts.remove(hex);
+      return false;
+    }
+    return true;
+  }
+
   /// Fired when a Noise XX session for [transport] with [pubkey] completes
   /// authentication. Consolidated reachability — and therefore
   /// [onPeerConnected] — is gated on this: a transport counts toward
@@ -2197,6 +2250,18 @@ class GrassrootsNetwork {
         break;
     }
     _drainQueuedMessagesForPeer(pubkey);
+
+    // Cold-bootstrap invitee: if this session is with an inviter whose invite
+    // we're redeeming, we've now punched through to them — present the invite
+    // so they burn the nonce and authorize us.
+    final blob = _pendingInviteRedemptions.remove(_pubkeyToHex(pubkey));
+    if (blob != null) {
+      debugPrint(
+        '[invite] Connected to inviter ${_pubkeyToHex(pubkey).substring(0, 8)}'
+        ' — sending INTRODUCE to complete redemption',
+      );
+      unawaited(_signalingService.sendIntroduce(pubkey, blob));
+    }
   }
 
   Future<void> _startNoiseHandshakeForPeer({
@@ -3071,11 +3136,11 @@ class GrassrootsNetwork {
     }
   }
 
-  /// Try to reach a peer through available friend-of-friend facilitators.
+  /// Try to reach a peer through friends-of-friends mediators.
   ///
-  /// Reconnected common friends receive explicit mediation requests; eligible
-  /// well-connected friends receive RECONNECT and coordinate the punch. We then
-  /// wait for the coordinated punch to complete.
+  /// Reconnected common friends receive explicit mediation requests;
+  /// well-connected mutual friends receive RECONNECT fan-out. We then wait
+  /// for the coordinated punch to complete.
   ///
   /// Returns true if a UDP path to the peer was established.
   Future<bool> _discoverPeerViaFriends(PeerState peer) async {
@@ -3156,8 +3221,8 @@ class GrassrootsNetwork {
 
   // ===== Internal setup =====
 
-  /// Periodically try to discover unreachable friends via friend-of-friend
-  /// facilitators.
+  /// Periodically try to discover unreachable friends via friends-of-friends
+  /// mediators.
   ///
   /// On each announce tick, find friends that we know about but can't currently
   /// reach via any transport. Common reconnected friends are asked to mediate
@@ -3355,8 +3420,6 @@ class GrassrootsNetwork {
         (data, transport, {bool isNew = false, String? udpPeerId}) {
       final pubkeyHex =
           data.publicKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-      // debugPrint('Announce inc');
-
       // When we are well-connected and receive an ANNOUNCE from a friend
       // with a UDP address, register it in our address table. This is used
       // by the direct-punch path ([requestDirectPunch]) when we want a
@@ -3521,6 +3584,18 @@ class GrassrootsNetwork {
         observedPort: observedPort,
       );
     };
+
+    // An invitee presented a signed invite (INTRODUCE). We own verification
+    // and the local-role decision.
+    _signalingService.onIntroduceReceived =
+        (senderPubkey, inviteBlob, observedIp, observedPort) {
+      _handleIntroduceReceived(
+        senderPubkey,
+        inviteBlob,
+        observedIp,
+        observedPort,
+      );
+    };
   }
 
   /// Set up SignalingService callbacks
@@ -3681,12 +3756,22 @@ class GrassrootsNetwork {
       if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.open) {
         return true;
       }
-      return _isAcceptedFriendPubkey(senderPubkey);
+      // An invitee we issued an invite to may complete first contact even
+      // while closed to cold calls.
+      return _isAcceptedFriendPubkey(senderPubkey) ||
+          _isInvitedContact(senderPubkey);
     };
 
     _messageRouter.onBleAnnounceRejected = (senderPubkey, bleDeviceId) {
       if (bleDeviceId == null) return;
       unawaited(_bleService?.disconnectDevice(bleDeviceId));
+    };
+
+    // A verified BLE ANNOUNCE identified the peer behind a path (the router
+    // has already applied it to Redux). Let the transport act on the pair's
+    // reverse leg — cancel a doomed dial (iOS) or open the central direction.
+    _messageRouter.onBlePeerIdentified = (pathId, pubkey, platform) {
+      _bleService?.onPeerIdentified(pathId, pubkey, platform);
     };
 
     // BLE-level disconnect cleans up the per-transport Noise session.
@@ -3745,10 +3830,9 @@ class GrassrootsNetwork {
       if (event.connected) {
         debugPrint('UDP peer connected: ${event.peerId}');
         store.dispatch(PeerUdpSeenAction(_hexToBytes(event.peerId)));
-        // The friend is reachable again — reset the AVAILABLE re-fire clock so
-        // the next disconnect triggers a fresh fan-out immediately rather than
-        // waiting out the previous-cycle backoff.
-        _availableFanOutLastFiredAt.remove(event.peerId);
+        // A friend just came back online with us. Tell them our friend list
+        // (so they can pick us as a mediator), then, as a mediator ourselves,
+        // proactively pair them with every common friend we're also live with.
         _sendFriendListToFriendIfEligible(event.peerId);
         _mediateCommonFriendsFor(event.peerId);
 
@@ -3862,10 +3946,6 @@ class GrassrootsNetwork {
         } else {
           _clearHolePunchState(event.peerId);
         }
-        final disconnectedPeer = _peersState.getPeerByPubkeyHex(event.peerId);
-        if (disconnectedPeer != null) {
-          _onUdpPeerDisconnected(disconnectedPeer);
-        }
       }
       if (!event.connected) {
         // Disconnect is immediate — drop reachability now.
@@ -3880,6 +3960,333 @@ class GrassrootsNetwork {
         _drainQueuedMessagesForPeer(_hexToBytes(event.peerId));
       }
     });
+  }
+
+  // ===== Cold bootstrap via invite links =====
+  //
+  // See `docs/rv-removal-and-invite-links.md` §Cold bootstrap. An inviter
+  // issues a signed [Invite] naming well-connected, willing friends as
+  // introducers. An invitee redeems it: it presents the invite (INTRODUCE)
+  // to an introducer, which coordinates an invitee↔inviter hole-punch, then
+  // presents it to the inviter, which accepts first contact and burns the
+  // nonce.
+
+  /// Well-connected friends eligible to introduce for us: they have a
+  /// globally-routable address the invitee can reach AND they advertised
+  /// willingness to facilitate (the signed ANNOUNCE flag). The inviter can't
+  /// see a friend's local toggle, so willingness travels over the wire — only
+  /// willing friends are offered as introducers.
+  List<PeerState> get invitableIntroducers => [
+        for (final friend in store.state.peers.wellConnectedFriends)
+          if (friend.willingToFacilitate &&
+              friend.allUdpAddressCandidates.any(isGloballyRoutableAddress))
+            friend,
+      ];
+
+  /// The introducers to name in an invite, built from [invitableIntroducers].
+  /// [only], when given, restricts to those friend pubkey hexes.
+  List<InviteIntroducer> _availableIntroducers({Set<String>? only}) {
+    final result = <InviteIntroducer>[];
+    for (final friend in invitableIntroducers) {
+      final hex = friend.pubkeyHex;
+      if (only != null && !only.contains(hex)) continue;
+      final addresses = friend.allUdpAddressCandidates
+          .where(isGloballyRoutableAddress)
+          .toList();
+      result.add(
+          InviteIntroducer(pubkey: friend.publicKey, addresses: addresses));
+    }
+    return result;
+  }
+
+  /// Whether any friend can currently act as an invite introducer.
+  bool get canCreateInvite => invitableIntroducers.isNotEmpty;
+
+  /// Create and sign an invite link for cold bootstrap.
+  ///
+  /// [introducerPubkeyHexes], when given, restricts the named introducers to
+  /// that subset of our well-connected friends; otherwise every eligible
+  /// friend is named for redundancy. Returns the `grassroots://invite?d=...`
+  /// link, or null if we have no eligible introducer.
+  String? createInvite({
+    Set<String>? introducerPubkeyHexes,
+    Duration ttl = const Duration(hours: 24),
+    int maxUses = 1,
+  }) {
+    final introducers = _availableIntroducers(only: introducerPubkeyHexes);
+    if (introducers.isEmpty) {
+      debugPrint('[invite] Cannot create invite — no eligible introducers');
+      return null;
+    }
+    final nonce = Uint8List.fromList(
+      List<int>.generate(Invite.nonceLength, (_) => _secureRandom.nextInt(256)),
+    );
+    final expiry = DateTime.now().add(ttl).millisecondsSinceEpoch ~/ 1000;
+    final invite = InviteSigner(sodium).sign(
+      inviter: identity.publicKey,
+      privateKey: identity.privateKey,
+      introducers: introducers,
+      expiry: expiry,
+      nonce: nonce,
+      maxUses: maxUses < 1 ? 1 : maxUses,
+    );
+    debugPrint(
+      '[invite] Issued invite (nonce ${invite.nonceHex.substring(0, 8)}, '
+      '${introducers.length} introducer(s), maxUses $maxUses)',
+    );
+    return invite.toLink();
+  }
+
+  final Random _secureRandom = Random.secure();
+
+  /// Redeem an invite link: reach the inviter via one of its introducers.
+  ///
+  /// Parses + verifies the link, then for each named introducer connects over
+  /// UDP, announces (so the introducer can bind our identity), and sends an
+  /// INTRODUCE. The introducer coordinates the punch; the existing punch
+  /// machinery connects us to the inviter, and [_onNoiseSessionEstablished]
+  /// then sends the inviter its own INTRODUCE. Returns an
+  /// [InviteRedeemResult] describing the outcome.
+  Future<InviteRedeemResult> redeemInvite(String link) async {
+    if (_udpService == null || !_udpAvailable) {
+      return InviteRedeemResult.failure('Internet transport is off');
+    }
+    final Invite invite;
+    try {
+      invite = Invite.parseLink(link, sodium);
+    } on FormatException catch (e) {
+      return InviteRedeemResult.failure('Not a valid invite: ${e.message}');
+    }
+    if (invite.isExpiredAt(DateTime.now())) {
+      return InviteRedeemResult.failure('This invite has expired');
+    }
+    if (listEquals(invite.inviter, identity.publicKey)) {
+      return InviteRedeemResult.failure('This is your own invite');
+    }
+    if (_isAcceptedFriendPubkey(invite.inviter)) {
+      return InviteRedeemResult.failure('You are already friends');
+    }
+
+    final inviterHex = invite.inviterHex;
+    final blob = invite.encode();
+    // Remember the redemption so the post-punch session-established hook can
+    // present the invite to the inviter.
+    _pendingInviteRedemptions[inviterHex] = blob;
+
+    // Transiently trust the introducers' signaling: we are not their friend,
+    // so without this their PUNCH_INITIATE / PUNCH_READY (which drive our leg
+    // of the punch) would be dropped by the friend gate. Scoped to this
+    // redemption.
+    final introHexes = invite.introducers
+        .map((i) => i.pubkeyHex)
+        .toList(growable: false);
+    for (final hex in introHexes) {
+      _signalingService.trustTransientSignalingPeer(hex);
+    }
+    try {
+      var reached = 0;
+      for (final intro in invite.introducers) {
+        for (final address in intro.addresses) {
+          final ok =
+              await _sendIntroduceToIntroducer(intro.pubkey, address, blob);
+          if (ok) {
+            reached++;
+            break; // first reachable address for this introducer is enough
+          }
+        }
+      }
+
+      if (reached == 0) {
+        _pendingInviteRedemptions.remove(inviterHex);
+        return InviteRedeemResult.failure('Could not reach any introducer');
+      }
+
+      // The punch + connect is asynchronous; wait for a session to the inviter.
+      _beginHolePunchAttempt(inviterHex, dispatchStarted: false);
+      final completer = _holePunchCompleters[inviterHex];
+      final connected =
+          await (completer?.future ?? Future.value(false)).timeout(
+        const Duration(seconds: 20),
+        onTimeout: () => false,
+      );
+      if (!connected && !_isReachableHex(inviterHex)) {
+        _pendingInviteRedemptions.remove(inviterHex);
+        return InviteRedeemResult.failure(
+          'Reached an introducer, but the hole-punch to your contact timed out',
+        );
+      }
+      return InviteRedeemResult.success(invite.inviter);
+    } finally {
+      for (final hex in introHexes) {
+        _signalingService.untrustTransientSignalingPeer(hex);
+      }
+    }
+  }
+
+  bool _isReachableHex(String pubkeyHex) {
+    final peer = _peersState.getPeerByPubkeyHex(pubkeyHex);
+    return peer?.isReachable ?? false;
+  }
+
+  /// SharedPreferences key for the burned-invite-nonce ledger. Versioned and
+  /// identity-scoped so regenerating the keypair starts fresh.
+  String get _inviteNonceLedgerKey =>
+      'grassroots_invite_nonces_v1_${identity.publicKey.take(4).map((b) => b.toRadixString(16).padLeft(2, '0')).join()}';
+
+  /// Load the burned-nonce ledger so a restart does not un-burn a
+  /// still-unexpired invite. Prunes entries whose invite has expired.
+  Future<void> _loadInviteNonceLedger() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_inviteNonceLedgerKey);
+      if (raw == null) return;
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      _issuedNonceUses.clear();
+      decoded.forEach((nonceHex, v) {
+        final m = v as Map<String, dynamic>;
+        final expiry = m['e'] as int;
+        if (expiry <= now) return; // expired — drop
+        _issuedNonceUses[nonceHex] =
+            _BurnedNonce(uses: m['u'] as int, expiry: expiry);
+      });
+    } catch (e) {
+      debugPrint('[invite] Failed to load nonce ledger: $e');
+    }
+  }
+
+  /// Persist the burned-nonce ledger, pruning expired entries.
+  Future<void> _saveInviteNonceLedger() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      _issuedNonceUses.removeWhere((_, n) => n.expiry <= now);
+      final map = {
+        for (final e in _issuedNonceUses.entries)
+          e.key: {'u': e.value.uses, 'e': e.value.expiry},
+      };
+      await prefs.setString(_inviteNonceLedgerKey, jsonEncode(map));
+    } catch (e) {
+      debugPrint('[invite] Failed to save nonce ledger: $e');
+    }
+  }
+
+  /// Connect to an introducer over UDP and present an invite (INTRODUCE).
+  Future<bool> _sendIntroduceToIntroducer(
+    Uint8List introducerPubkey,
+    String address,
+    Uint8List inviteBlob,
+  ) async {
+    final introHex = _pubkeyToHex(introducerPubkey);
+    // Announce first so the introducer learns our identity and can bind the
+    // Noise handshake that carries the INTRODUCE.
+    final announce = await _createSignedAnnounce(address: udpAddress);
+    final announced = await _sendViaUdp(introHex, address, announce);
+    if (!announced) {
+      debugPrint(
+        '[invite] Could not reach introducer ${introHex.substring(0, 8)} '
+        'at $address',
+      );
+      return false;
+    }
+    final sent = await _signalingService.sendIntroduce(
+      introducerPubkey,
+      inviteBlob,
+    );
+    debugPrint(
+      '[invite] INTRODUCE to introducer ${introHex.substring(0, 8)}: '
+      '${sent ? "sent" : "failed"}',
+    );
+    return sent;
+  }
+
+  /// Handle an inbound INTRODUCE. Decide our role from the verified invite:
+  /// inviter (we signed it) → accept + burn nonce; introducer (we're named)
+  /// → coordinate the punch. Silently drops otherwise.
+  void _handleIntroduceReceived(
+    Uint8List senderPubkey,
+    Uint8List inviteBlob,
+    String? observedIp,
+    int? observedPort,
+  ) {
+    final Invite invite;
+    try {
+      invite = Invite.decode(inviteBlob, sodium);
+    } on FormatException catch (e) {
+      debugPrint('[invite] Dropping INTRODUCE with bad invite: ${e.message}');
+      return;
+    }
+    if (invite.isExpiredAt(DateTime.now())) {
+      debugPrint('[invite] Dropping INTRODUCE — invite expired');
+      return;
+    }
+
+    // Inviter role: we signed this invite.
+    if (listEquals(invite.inviter, identity.publicKey)) {
+      final entry = _issuedNonceUses[invite.nonceHex];
+      final used = entry?.uses ?? 0;
+      if (used >= invite.maxUses) {
+        debugPrint('[invite] Refusing redemption — nonce exhausted');
+        return;
+      }
+      _issuedNonceUses[invite.nonceHex] =
+          _BurnedNonce(uses: used + 1, expiry: invite.expiry);
+      _invitedContacts[_pubkeyToHex(senderPubkey)] = invite.expiry;
+      unawaited(_saveInviteNonceLedger());
+      debugPrint(
+        '[invite] Accepted invite redemption from '
+        '${_pubkeyToHex(senderPubkey).substring(0, 8)} '
+        '(nonce use ${used + 1}/${invite.maxUses})',
+      );
+      return;
+    }
+
+    // Introducer role: we must be named, the inviter must be our friend, and
+    // both introduce toggles must be open.
+    final named = invite.introducers
+        .any((i) => listEquals(i.pubkey, identity.publicKey));
+    if (!named) {
+      debugPrint('[invite] Dropping INTRODUCE — we are not a named introducer');
+      return;
+    }
+    if (!store.state.settings.willingToFacilitateInvites) {
+      debugPrint('[invite] Declining introduction — not willing to facilitate');
+      return;
+    }
+    if (!_isAcceptedFriendPubkey(invite.inviter)) {
+      debugPrint(
+        '[invite] Declining introduction — inviter '
+        '${invite.inviterHex.substring(0, 8)} is not our friend',
+      );
+      return;
+    }
+    if (observedIp == null || observedPort == null) {
+      debugPrint('[invite] Cannot introduce — no observed invitee address');
+      return;
+    }
+    // Enforce the inviter's maxUses locally to bound abuse.
+    final used = _introducedNonceUses[invite.nonceHex] ?? 0;
+    if (used >= invite.maxUses) {
+      debugPrint('[invite] Declining introduction — nonce budget exhausted');
+      return;
+    }
+    // LRU-evict the oldest entry at capacity rather than flushing all budgets
+    // (a wholesale clear would momentarily un-bound every in-flight invite).
+    if (_introducedNonceUses.length >= _maxTrackedNonces) {
+      _introducedNonceUses.remove(_introducedNonceUses.keys.first);
+    }
+    _introducedNonceUses[invite.nonceHex] = used + 1;
+
+    debugPrint(
+      '[invite] Introducing ${_pubkeyToHex(senderPubkey).substring(0, 8)} '
+      '→ inviter ${invite.inviterHex.substring(0, 8)}',
+    );
+    _signalingService.coordinateIntroduction(
+      inviteePubkey: senderPubkey,
+      inviteeIp: observedIp,
+      inviteePort: observedPort,
+      inviterPubkey: invite.inviter,
+    );
   }
 
   /// Send our current accepted friend set to a friend after a live connection
@@ -3946,55 +4353,6 @@ class GrassrootsNetwork {
     }
   }
 
-  void _onUdpPeerDisconnected(PeerState peer) {
-    // Session kept: end-to-end Noise sessions are path-independent.
-    if (!peer.isFriend) return;
-
-    // Overall reachability is tracked by the reachability subscriber on the
-    // store, which fires the consolidated onPeerDisconnected when the last
-    // live transport drops. This handler only owns UDP-specific recovery —
-    // fanning out AVAILABLE so signaling mediators can help re-establish.
-
-    final facilitatorCount = store.state.peers.wellConnectedFriends.length;
-    if (facilitatorCount == 0) return;
-
-    debugPrint(
-      '[reconnect] UDP path to ${peer.displayName} dropped — fanning out AVAILABLE',
-    );
-    _availableFanOutLastFiredAt[peer.pubkeyHex] = DateTime.now();
-    unawaited(_signalingService.fanOutAvailable(peer.publicKey));
-  }
-
-  /// Periodically re-fire AVAILABLE for friends that remain UDP-unreachable.
-  ///
-  /// A mediating friend only holds our AVAILABLE while both sides are
-  /// connected to it. If the target friend takes a while to deliver their
-  /// matching RECONNECT (e.g. their client is stalled on a stale-cache
-  /// false-positive direct dial), the pairing can lapse. Re-firing every
-  /// cycle keeps the pairing window open until the friend is reachable or we
-  /// give up the path.
-  void _refireAvailableForUnreachableFriends({bool force = false}) {
-    if (_udpService == null || !_udpAvailable) return;
-    final now = DateTime.now();
-    for (final friend in _peersState.friends) {
-      // Skip friends we already have a live UDP connection to.
-      if (_udpService!.getPeerIdForPubkey(friend.publicKey) != null) continue;
-
-      final last = _availableFanOutLastFiredAt[friend.pubkeyHex];
-      if (!force &&
-          last != null &&
-          now.difference(last) < _availableRefireInterval) {
-        continue;
-      }
-      debugPrint(
-        '[reconnect] Re-firing AVAILABLE for ${friend.displayName} '
-        '(UDP-unreachable for ${last == null ? "unknown" : "${now.difference(last).inSeconds}s"}${force ? ", forced" : ""})',
-      );
-      _availableFanOutLastFiredAt[friend.pubkeyHex] = now;
-      unawaited(_signalingService.fanOutAvailable(friend.publicKey));
-    }
-  }
-
   /// Called by the host app when it returns to the foreground.
   ///
   /// Three steps, in order:
@@ -4002,18 +4360,16 @@ class GrassrootsNetwork {
   ///      poisoned them while we were backgrounded (Android in particular
   ///      EPERMs background sends and leaves the socket FD in a permanently
   ///      broken state — fixable only by close + bind).
-  ///   2. Force-refire AVAILABLE for unreachable friends, bypassing the
-  ///      5-minute throttle. Waking up is a strong signal the user is about
-  ///      to interact; latency matters more than bandwidth here.
+  ///   2. Drain any messages queued while backgrounded toward peers that
+  ///      are still live. (Friend rediscovery runs on the announce tick.)
   Future<void> onAppResumed() async {
-    debugPrint('[lifecycle] App resumed — probing sockets, refiring AVAILABLE');
+    debugPrint('[lifecycle] App resumed — probing sockets');
     if (_udpService != null && _udpAvailable) {
       final rebound = await _udpService!.probeAndRebindIfDead();
       if (rebound) {
         debugPrint('[lifecycle] UDP transport rebound after foreground probe');
       }
     }
-    _refireAvailableForUnreachableFriends(force: true);
     _drainQueuedMessagesForLivePeers();
   }
 
@@ -4043,7 +4399,10 @@ class GrassrootsNetwork {
     _holePunchLocalReady.clear();
     _holePunchRemoteReady.clear();
     _holePunchConnectionInProgress.clear();
-    _availableFanOutLastFiredAt.clear();
+    _pendingInviteRedemptions.clear();
+    _introducedNonceUses.clear();
+    _issuedNonceUses.clear();
+    _invitedContacts.clear();
     _outboundMessageQueue.clear();
     _outboundQueueDrainsInProgress.clear();
 
@@ -4078,7 +4437,6 @@ class GrassrootsNetwork {
       _broadcastAnnounceViaUdp();
       _removeStalePeers();
       _discoverUnreachableFriends();
-      _refireAvailableForUnreachableFriends();
       _drainQueuedMessagesForLivePeers();
     });
   }
@@ -4240,6 +4598,7 @@ class GrassrootsNetwork {
       address: normalizedAddress,
       linkLocalAddress: normalizedLinkLocal,
       addressCandidates: normalizedCandidates,
+      willingToFacilitate: store.state.settings.willingToFacilitateInvites,
     );
     final packet = GrassrootsPacket(
       type: PacketType.announce,
@@ -4271,6 +4630,7 @@ class GrassrootsNetwork {
     final payload = _protocolHandler.createAnnouncePayload(
       address: normalizedAddress,
       addressCandidates: _candidateAddresses(),
+      willingToFacilitate: store.state.settings.willingToFacilitateInvites,
     );
     final packet = GrassrootsPacket(
       type: PacketType.announce,

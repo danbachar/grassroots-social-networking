@@ -10,6 +10,8 @@ import 'package:redux/redux.dart';
 import 'chat_models.dart';
 import 'package:logger/logger.dart';
 import 'package:uuid/uuid.dart';
+import 'theme/grasslink_tokens.dart';
+import 'theme/grasslink_widgets.dart';
 
 /// Chat screen for a conversation with a specific peer
 class ChatScreen extends StatefulWidget {
@@ -546,12 +548,12 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             if (_isFriend)
               const Padding(
-                padding: EdgeInsets.only(left: 4),
-                child: Icon(Icons.people, size: 18, color: Colors.blue),
+                padding: EdgeInsets.only(left: GlSpace.s1),
+                child:
+                    Icon(Icons.spa_rounded, size: 18, color: GlColors.primary),
               ),
           ],
         ),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: _buildAppBarActions(),
       ),
       body: Column(
@@ -648,9 +650,9 @@ class _ChatScreenState extends State<ChatScreen> {
             value: 'info',
             child: Row(
               children: [
-                Icon(Icons.info_outline),
-                SizedBox(width: 12),
-                Text('Peer Info'),
+                Icon(Icons.info_outline_rounded),
+                SizedBox(width: GlSpace.s3),
+                Text('Peer info'),
               ],
             ),
           ),
@@ -659,9 +661,9 @@ class _ChatScreenState extends State<ChatScreen> {
               value: 'unfriend',
               child: Row(
                 children: [
-                  Icon(Icons.person_remove, color: Colors.red),
-                  SizedBox(width: 12),
-                  Text('Unfriend', style: TextStyle(color: Colors.red)),
+                  Icon(Icons.person_remove_rounded, color: GlColors.danger),
+                  SizedBox(width: GlSpace.s3),
+                  Text('Unfriend', style: TextStyle(color: GlColors.danger)),
                 ],
               ),
             ),
@@ -676,10 +678,11 @@ class _ChatScreenState extends State<ChatScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Unfriend'),
+        title: const Text('Unfriend?'),
         content: Text(
-          'Are you sure you want to remove ${widget.peer.displayName} from your friends?\n\n'
-          'You will only be able to contact them via Bluetooth when they are nearby.',
+          'Remove ${widget.peer.displayName} from your friends?\n\n'
+          'You will only be able to reach them over Bluetooth when they are '
+          'nearby.',
         ),
         actions: [
           TextButton(
@@ -692,7 +695,7 @@ class _ChatScreenState extends State<ChatScreen> {
               widget.onUnfriend?.call();
               Navigator.pop(context); // Close chat screen
             },
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            style: TextButton.styleFrom(foregroundColor: GlColors.danger),
             child: const Text('Unfriend'),
           ),
         ],
@@ -702,16 +705,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildFriendRequestBanner() {
     return Container(
-      padding: const EdgeInsets.all(12),
-      color: const Color(0xFF1B3D2F),
+      padding: const EdgeInsets.all(GlSpace.s3),
+      color: GlColors.accentSoft,
       child: Row(
         children: [
-          const Icon(Icons.person_add, color: Color(0xFFE8A33C)),
-          const SizedBox(width: 12),
+          const Icon(Icons.person_add_alt_rounded,
+              color: GlColors.accentOnSoft),
+          const SizedBox(width: GlSpace.s3),
           Expanded(
             child: Text(
-              '${widget.peer.displayName} wants to be friends!',
-              style: const TextStyle(fontWeight: FontWeight.w500),
+              '${widget.peer.displayName} wants to be friends',
+              style: const TextStyle(
+                  fontWeight: FontWeight.w600, color: GlColors.accentOnSoft),
             ),
           ),
           TextButton(
@@ -719,15 +724,16 @@ class _ChatScreenState extends State<ChatScreen> {
               // Decline
               widget.store.dispatch(DeclineFriendRequestAction(_peerHex));
             },
+            style: TextButton.styleFrom(foregroundColor: GlColors.textMuted),
             child: const Text('Decline'),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: GlSpace.s2),
           ElevatedButton(
             onPressed: widget.onAcceptFriendRequest,
             style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFE8A33C),
+              backgroundColor: GlColors.accent,
             ),
-            child: const Text('Accept', style: TextStyle(color: Colors.black)),
+            child: const Text('Accept'),
           ),
         ],
       ),
@@ -823,8 +829,8 @@ class _ChatScreenState extends State<ChatScreen> {
               _buildInfoRow('Internet',
                   peer.udpAddress != null ? peer.udpAddress! : 'No address'),
               if (_isFriend) ...[
-                const SizedBox(height: 8),
-                _buildInfoRow('Friendship', 'Friends ✓'),
+                const SizedBox(height: GlSpace.s2),
+                _buildInfoRow('Friendship', 'Friends'),
               ],
             ],
           ),
@@ -856,13 +862,13 @@ class _ChatScreenState extends State<ChatScreen> {
           width: 80,
           child: Text(
             '$label:',
-            style: const TextStyle(color: Colors.grey),
+            style: const TextStyle(color: GlColors.textMuted),
           ),
         ),
         Expanded(
           child: Text(
             value,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            style: GlType.monoStyle(GlType.textXs),
           ),
         ),
       ],
@@ -871,22 +877,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildMessageInput() {
     return Container(
-      decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surface,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.1),
-            blurRadius: 4,
-            offset: const Offset(0, -2),
-          ),
-        ],
+      decoration: const BoxDecoration(
+        color: GlColors.surfaceCard,
+        border: Border(top: BorderSide(color: GlColors.borderSubtle)),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           if (_sendingMedia) const LinearProgressIndicator(minHeight: 2),
           Padding(
-            padding: const EdgeInsets.all(8),
+            padding: const EdgeInsets.all(GlSpace.s2),
             child: Row(
               children: [
                 IconButton(
@@ -898,17 +898,20 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: TextField(
                     controller: _messageController,
                     decoration: const InputDecoration(
-                      hintText: 'Type a message...',
-                      border: OutlineInputBorder(),
-                      contentPadding:
-                          EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      hintText: 'Write a message…',
+                      contentPadding: EdgeInsets.symmetric(
+                          horizontal: GlSpace.s4, vertical: GlSpace.s2),
                     ),
                     onSubmitted: (_) => _sendMessage(),
                   ),
                 ),
-                const SizedBox(width: 8),
-                IconButton(
-                  icon: const Icon(Icons.send),
+                const SizedBox(width: GlSpace.s2),
+                IconButton.filled(
+                  icon: const Icon(Icons.arrow_upward_rounded),
+                  style: IconButton.styleFrom(
+                    backgroundColor: GlColors.primary,
+                    foregroundColor: GlColors.textOnPrimary,
+                  ),
                   onPressed: _sendMessage,
                 ),
               ],
@@ -954,9 +957,12 @@ class _MessageBubble extends StatelessWidget {
           ),
           decoration: BoxDecoration(
             color: message.isOutgoing
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).colorScheme.surfaceContainerHighest,
-            borderRadius: BorderRadius.circular(16),
+                ? GlColors.primary
+                : GlColors.surfaceCard,
+            borderRadius: GlRadius.rLg,
+            border: message.isOutgoing
+                ? null
+                : Border.all(color: GlColors.borderSubtle),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -967,10 +973,12 @@ class _MessageBubble extends StatelessWidget {
                 Text(
                   message.content,
                   style: TextStyle(
-                    color: message.isOutgoing ? Colors.white : null,
+                    color: message.isOutgoing
+                        ? GlColors.textOnPrimary
+                        : GlColors.textBody,
                   ),
                 ),
-              const SizedBox(height: 4),
+              const SizedBox(height: GlSpace.s1),
               Padding(
                 padding: message.isPicture
                     ? const EdgeInsets.symmetric(horizontal: 6)
@@ -983,11 +991,8 @@ class _MessageBubble extends StatelessWidget {
                       style: TextStyle(
                         fontSize: 10,
                         color: message.isOutgoing
-                            ? Colors.white70
-                            : Theme.of(context)
-                                .colorScheme
-                                .onSurface
-                                .withValues(alpha: 0.5),
+                            ? GlColors.moss100
+                            : GlColors.textSubtle,
                       ),
                     ),
                     if (message.isOutgoing) ...[
@@ -1057,19 +1062,19 @@ class _MessageBubble extends StatelessWidget {
               child: Container(
                 width: 240,
                 height: 240,
-                color: Colors.black.withValues(alpha: 0.15),
+                color: GlColors.clay900.withValues(alpha: 0.2),
                 alignment: Alignment.center,
                 child: const Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.local_fire_department,
-                        color: Colors.white, size: 36),
-                    SizedBox(height: 8),
+                    Icon(Icons.local_fire_department_rounded,
+                        color: GlColors.textInverse, size: 36),
+                    SizedBox(height: GlSpace.s2),
                     Text(
                       'Tap to view once',
                       style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
+                        color: GlColors.textInverse,
+                        fontWeight: FontWeight.w700,
                       ),
                     ),
                   ],
@@ -1087,18 +1092,19 @@ class _MessageBubble extends StatelessWidget {
       width: 240,
       height: 120,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        color: Colors.black26,
+        borderRadius: GlRadius.rMd,
+        color: GlColors.bgSunken,
       ),
       alignment: Alignment.center,
       child: const Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.visibility_off, color: Colors.white70),
-          SizedBox(height: 4),
+          Icon(Icons.visibility_off_rounded, color: GlColors.textSubtle),
+          SizedBox(height: GlSpace.s1),
           Text(
             'View-once photo expired',
-            style: TextStyle(color: Colors.white70, fontSize: 12),
+            style: TextStyle(
+                color: GlColors.textMuted, fontSize: GlType.textXs),
           ),
         ],
       ),
@@ -1144,47 +1150,47 @@ class _MessageBubble extends StatelessWidget {
       case MessageStatus.sending:
         // Clock icon (sending)
         return const Icon(
-          Icons.access_time,
+          Icons.access_time_rounded,
           size: 14,
-          color: Colors.white70,
+          color: GlColors.moss100,
         );
       case MessageStatus.queued:
-        // Clock icon (queued until the peer is reachable)
+        // Clock icon (queued until a neighbour can carry it)
         return const Icon(
-          Icons.schedule,
+          Icons.schedule_rounded,
           size: 14,
-          color: Colors.white70,
+          color: GlColors.moss100,
         );
       case MessageStatus.failed:
-        // Red exclamation (failed) - clickable for resend
+        // Exclamation (failed) - clickable for resend
         return GestureDetector(
           onTap: onResend,
           child: const Icon(
-            Icons.error_outline,
+            Icons.error_outline_rounded,
             size: 14,
-            color: Colors.redAccent,
+            color: GlColors.terra200,
           ),
         );
       case MessageStatus.sent:
         // 1 check (sent)
         return const Icon(
-          Icons.check,
+          Icons.check_rounded,
           size: 14,
-          color: Colors.white70,
+          color: GlColors.moss100,
         );
       case MessageStatus.delivered:
         // 2 checks (delivered)
         return const Icon(
-          Icons.done_all,
+          Icons.done_all_rounded,
           size: 14,
-          color: Colors.white70,
+          color: GlColors.moss100,
         );
       case MessageStatus.read:
-        // 2 blue checks (read)
+        // 2 terracotta checks (read) — the signal color
         return const Icon(
-          Icons.done_all,
+          Icons.done_all_rounded,
           size: 14,
-          color: Colors.blueAccent,
+          color: GlColors.terra300,
         );
     }
   }
@@ -1206,10 +1212,10 @@ class _FullscreenImageView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: GlColors.clay900,
       appBar: AppBar(
-        backgroundColor: Colors.black,
-        iconTheme: const IconThemeData(color: Colors.white),
+        backgroundColor: GlColors.clay900,
+        iconTheme: const IconThemeData(color: GlColors.textInverse),
       ),
       body: Center(
         child: InteractiveViewer(
@@ -1220,7 +1226,7 @@ class _FullscreenImageView extends StatelessWidget {
             errorBuilder: (_, __, ___) => const Center(
               child: Text(
                 'Image unavailable',
-                style: TextStyle(color: Colors.white70),
+                style: TextStyle(color: GlColors.clay300),
               ),
             ),
           ),
@@ -1255,21 +1261,15 @@ class _ForwardSheet extends StatelessWidget {
             child: Container(
               width: 40,
               height: 4,
-              margin: const EdgeInsets.only(bottom: 16),
+              margin: const EdgeInsets.only(bottom: GlSpace.s4),
               decoration: BoxDecoration(
-                color: Colors.grey[400],
+                color: GlColors.clay300,
                 borderRadius: BorderRadius.circular(2),
               ),
             ),
           ),
-          const Text(
-            'Forward to',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
+          Text('Pass it along', style: GlType.displayStyle(GlType.textLg)),
+          const SizedBox(height: GlSpace.s2),
           // Message preview
           Container(
             padding: const EdgeInsets.all(12),
@@ -1281,21 +1281,15 @@ class _ForwardSheet extends StatelessWidget {
               message.content.length > 100
                   ? '${message.content.substring(0, 100)}...'
                   : message.content,
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+              style: const TextStyle(
+                color: GlColors.textMuted,
                 fontStyle: FontStyle.italic,
               ),
             ),
           ),
-          const SizedBox(height: 16),
-          const Text(
-            'Select peer:',
-            style: TextStyle(
-              fontSize: 14,
-              color: Colors.grey,
-            ),
-          ),
-          const SizedBox(height: 8),
+          const SizedBox(height: GlSpace.s4),
+          const EyebrowLabel('Send to'),
+          const SizedBox(height: GlSpace.s2),
           // Peer list
           ConstrainedBox(
             constraints: BoxConstraints(
@@ -1306,30 +1300,24 @@ class _ForwardSheet extends StatelessWidget {
               itemCount: peers.length,
               itemBuilder: (context, index) {
                 final peer = peers[index];
+                final online =
+                    peer.connectionState == PeerConnectionState.connected;
                 return ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor: Colors.blueGrey,
-                    child: Text(
-                      peer.displayName.isNotEmpty
-                          ? peer.displayName[0].toUpperCase()
-                          : '?',
-                      style: const TextStyle(color: Colors.white),
-                    ),
+                  leading: PeerAvatar(
+                    name: peer.displayName,
+                    size: 40,
+                    presence:
+                        online ? PeerPresence.online : PeerPresence.offline,
                   ),
                   title: Text(peer.displayName),
                   subtitle: Text(
-                    peer.connectionState == PeerConnectionState.connected
-                        ? 'Online'
-                        : 'Offline',
+                    online ? 'In reach' : 'Out of reach',
                     style: TextStyle(
-                      color:
-                          peer.connectionState == PeerConnectionState.connected
-                              ? Colors.green
-                              : Colors.grey,
-                      fontSize: 12,
+                      color: online ? GlColors.success : GlColors.textSubtle,
+                      fontSize: GlType.textXs,
                     ),
                   ),
-                  trailing: const Icon(Icons.send, size: 20),
+                  trailing: const Icon(Icons.send_rounded, size: 20),
                   onTap: () => onForward(peer),
                 );
               },
@@ -1361,29 +1349,29 @@ class _FriendshipMessageBubble extends StatelessWidget {
 
     switch (message.messageType) {
       case ChatMessageType.friendRequestSent:
-        icon = Icons.person_add;
-        iconColor = const Color(0xFFE8A33C);
-        title = 'Friend Request Sent';
+        icon = Icons.person_add_alt_rounded;
+        iconColor = GlColors.accent;
+        title = 'Friend request sent';
         break;
       case ChatMessageType.friendRequestReceived:
-        icon = Icons.person_add;
-        iconColor = const Color(0xFFE8A33C);
-        title = 'Friend Request';
+        icon = Icons.person_add_alt_rounded;
+        iconColor = GlColors.accent;
+        title = 'Friend request';
         break;
       case ChatMessageType.friendRequestAccepted:
-        icon = Icons.check_circle;
-        iconColor = Colors.green;
-        title = 'Friend Request Accepted';
+        icon = Icons.check_circle_rounded;
+        iconColor = GlColors.success;
+        title = 'Friend request accepted';
         break;
       case ChatMessageType.friendRequestAcceptedByUs:
-        icon = Icons.check_circle;
-        iconColor = Colors.green;
-        title = 'You Accepted';
+        icon = Icons.check_circle_rounded;
+        iconColor = GlColors.success;
+        title = 'You accepted';
         break;
       default:
-        icon = Icons.info;
-        iconColor = Colors.grey;
-        title = 'System Message';
+        icon = Icons.info_rounded;
+        iconColor = GlColors.textMuted;
+        title = 'From the mesh';
     }
 
     return Align(
@@ -1394,20 +1382,20 @@ class _FriendshipMessageBubble extends StatelessWidget {
           maxWidth: MediaQuery.of(context).size.width * 0.75,
         ),
         decoration: BoxDecoration(
-          color: const Color(0xFF1B3D2F),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: iconColor.withOpacity(0.5)),
+          color: GlColors.surfaceCard,
+          borderRadius: GlRadius.rLg,
+          border: Border.all(color: iconColor.withValues(alpha: 0.5)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             // Header
             Container(
-              padding: const EdgeInsets.all(12),
+              padding: const EdgeInsets.all(GlSpace.s3),
               decoration: BoxDecoration(
-                color: iconColor.withOpacity(0.1),
+                color: iconColor.withValues(alpha: 0.1),
                 borderRadius:
-                    const BorderRadius.vertical(top: Radius.circular(15)),
+                    const BorderRadius.vertical(top: Radius.circular(19)),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
@@ -1434,21 +1422,21 @@ class _FriendshipMessageBubble extends StatelessWidget {
                 children: [
                   Text(
                     message.content,
-                    style: const TextStyle(fontSize: 14),
+                    style: const TextStyle(
+                        fontSize: 14, color: GlColors.textBody),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: GlSpace.s2),
                   // Accept button for pending incoming requests
                   if (message.canAccept && onAccept != null) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: GlSpace.s2),
                     SizedBox(
                       width: double.infinity,
                       child: ElevatedButton.icon(
                         onPressed: onAccept,
-                        icon: const Icon(Icons.check, size: 18),
-                        label: const Text('Accept Friend Request'),
+                        icon: const Icon(Icons.check_rounded, size: 18),
+                        label: const Text('Accept friend request'),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFE8A33C),
-                          foregroundColor: Colors.black,
+                          backgroundColor: GlColors.accent,
                         ),
                       ),
                     ),
@@ -1458,9 +1446,9 @@ class _FriendshipMessageBubble extends StatelessWidget {
                     alignment: Alignment.bottomRight,
                     child: Text(
                       _formatTime(message.timestamp),
-                      style: TextStyle(
+                      style: const TextStyle(
                         fontSize: 10,
-                        color: Colors.white.withOpacity(0.5),
+                        color: GlColors.textSubtle,
                       ),
                     ),
                   ),

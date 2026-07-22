@@ -13,17 +13,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
     final existing = state.discoveredBlePeers[action.deviceId];
     final now = DateTime.now();
 
-    // The marker is sticky per IDENTITY, not per radio MAC: a peer's
-    // platform never changes, but its advertising MAC rotates and the
-    // ghost-prune below deletes the rotated-away entry. Inherit the marker
-    // from any same-UUID sibling so the hint survives the rotation.
-    final actionUuid = action.serviceUuid?.toLowerCase();
-    final inheritedIosMark = actionUuid != null &&
-        state.discoveredBlePeers.values.any((p) =>
-            p.transportId != action.deviceId &&
-            p.serviceUuid?.toLowerCase() == actionUuid &&
-            p.isIosMarked);
-
     final DiscoveredPeerState newOrUpdated;
     if (existing == null) {
       newOrUpdated = DiscoveredPeerState(
@@ -33,7 +22,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         serviceUuid: action.serviceUuid,
         discoveredAt: now,
         lastSeen: now,
-        isIosMarked: action.isIosMarked || inheritedIosMark,
       );
     } else {
       newOrUpdated = existing.copyWith(
@@ -43,10 +31,6 @@ PeersState peersReducer(PeersState state, dynamic action) {
         displayName: (action.displayName?.isNotEmpty ?? false)
             ? action.displayName
             : existing.displayName,
-        // Sticky: the marker is dropped while the iOS app is backgrounded,
-        // but a peer's platform never changes.
-        isIosMarked:
-            existing.isIosMarked || action.isIosMarked || inheritedIosMark,
       );
     }
 

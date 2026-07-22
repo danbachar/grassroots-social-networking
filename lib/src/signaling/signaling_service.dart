@@ -169,21 +169,6 @@ class SignalingService {
         false;
   }
 
-  /// Proactively mediate two connected friends from the local address table.
-  void mediateFriends({
-    required Uint8List requesterPubkey,
-    required Uint8List targetPubkey,
-  }) {
-    final requesterHex = _pubkeyToHex(requesterPubkey);
-    _handleRendezvous(
-      senderPubkey: requesterPubkey,
-      senderHex: requesterHex,
-      targetPubkey: targetPubkey,
-      observedIp: null,
-      observedPort: null,
-    );
-  }
-
   Future<int> _fanOutCold(
     Uint8List targetPubkey,
     SignalingMessage msg, {

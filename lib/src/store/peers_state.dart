@@ -44,13 +44,6 @@ class DiscoveredPeerState {
   /// True iff the plugin's last path state was `ready` with `canSend=true`.
   final bool isConnected;
 
-  /// Whether any advertisement from this entry carried the iOS platform
-  /// marker (`grs-ios` local name). Sticky for the entry's lifetime — the
-  /// marker is only present while the iOS app is foregrounded, but a peer's
-  /// platform never changes. Identified peers use the authenticated
-  /// [PeerState.platform] instead; this is the pre-ANNOUNCE hint.
-  final bool isIosMarked;
-
   const DiscoveredPeerState({
     required this.transportId,
     this.displayName,
@@ -60,7 +53,6 @@ class DiscoveredPeerState {
     required this.lastSeen,
     this.isConnecting = false,
     this.isConnected = false,
-    this.isIosMarked = false,
   });
 
   /// Signal quality indicator (0.0 - 1.0), derived from rssi.
@@ -79,7 +71,6 @@ class DiscoveredPeerState {
     DateTime? lastSeen,
     bool? isConnecting,
     bool? isConnected,
-    bool? isIosMarked,
   }) {
     return DiscoveredPeerState(
       transportId: transportId ?? this.transportId,
@@ -90,7 +81,6 @@ class DiscoveredPeerState {
       lastSeen: lastSeen ?? this.lastSeen,
       isConnecting: isConnecting ?? this.isConnecting,
       isConnected: isConnected ?? this.isConnected,
-      isIosMarked: isIosMarked ?? this.isIosMarked,
     );
   }
 
@@ -103,8 +93,7 @@ class DiscoveredPeerState {
           rssi == other.rssi &&
           serviceUuid == other.serviceUuid &&
           isConnecting == other.isConnecting &&
-          isConnected == other.isConnected &&
-          isIosMarked == other.isIosMarked;
+          isConnected == other.isConnected;
 
   @override
   int get hashCode => Object.hash(
@@ -113,7 +102,6 @@ class DiscoveredPeerState {
         serviceUuid,
         isConnecting,
         isConnected,
-        isIosMarked,
       );
 
   @override
@@ -481,14 +469,6 @@ class PeersState {
   /// Direct accepted friend public keys.
   Set<String> get friendPubkeyHexes =>
       friends.map((friend) => friend.pubkeyHex).toSet();
-
-  /// Common friends between us and [friendPubkeyHex], based on the last
-  /// FRIEND_LIST received from that direct friend.
-  Set<String> commonFriendHexesWith(String friendPubkeyHex) {
-    final advertised = friendsOfFriends[friendPubkeyHex.toLowerCase()];
-    if (advertised == null || advertised.isEmpty) return const {};
-    return advertised.intersection(friendPubkeyHexes);
-  }
 
   /// Connected direct friends that can mediate to [targetPubkeyHex] because
   /// their advertised friend list contains the target.

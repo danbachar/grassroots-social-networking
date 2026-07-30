@@ -49,15 +49,23 @@ class FieldRunner extends ChangeNotifier {
   /// measures the full establishment ladder.
   final VoidCallback? onResetSessions;
 
-  /// Tears down every BLE link (per-step, when the plan asks) so each step
-  /// also re-runs discovery + connect — a fully independent trial.
-  final VoidCallback? onResetLinks;
+  /// Bounces the BLE transport (per-step, when the plan asks) so each step
+  /// re-runs discovery + connect from a cold start. Awaited: the step's
+  /// marker and sends wait until the transport is back up.
+  final Future<void> Function()? onResetLinks;
 
   /// Currently identified peers (pubkeys), consulted when the plan has NO
   /// roster: every known peer becomes a send target and labels are the 8-hex
   /// pubkey prefixes — the two-device case needs no manual pubkey entry.
   /// Resolved lazily at each send so a peer discovered mid-run still counts.
   final List<Uint8List> Function()? knownPeers;
+
+  /// Whether the pair with a peer is settled for data (session + converged
+  /// dual-leg link). When provided, each step's sends wait for a settled
+  /// target and then spread across the REMAINING dwell — messages never race
+  /// a re-forming link. If no target settles within the dwell, no sends fire
+  /// (correct at an out-of-range step). Null: legacy fixed-offset schedule.
+  final bool Function(Uint8List peer)? linkSettled;
 
   static const _uuid = Uuid();
 
@@ -78,6 +86,7 @@ class FieldRunner extends ChangeNotifier {
     this.onResetSessions,
     this.onResetLinks,
     this.knownPeers,
+    this.linkSettled,
     this.upload,
     this.onWindowElapsed,
   });
@@ -91,9 +100,15 @@ class FieldRunner extends ChangeNotifier {
   Timer? _tick;
   final List<Timer> _sendTimers = [];
   int _sentCount = 0;
+  bool _resetting = false;
 
   /// Messages fired by the plan so far (all steps).
   int get sentCount => _sentCount;
+
+  /// True while a step's BLE bounce is in flight (the dark gap + cold
+  /// re-init) — the screen shows a "resetting" notice instead of a stuck
+  /// positioning view.
+  bool get resetting => _resetting;
 
   FieldPlan? get plan => _plan;
   FieldPhase get phase => _phase;
@@ -141,7 +156,11 @@ class FieldRunner extends ChangeNotifier {
     _tick?.cancel(); // a manual tap pre-empts any auto-advance gap countdown
     _tick = null;
     if (_plan!.resetLinks && onResetLinks != null) {
-      onResetLinks!.call();
+      _resetting = true;
+      notifyListeners();
+      await onResetLinks!.call(); // BLE bounce; wait for the transport back up
+      _resetting = false;
+      notifyListeners();
       await recorder.logMarker('links-reset');
     }
     if (_plan!.resetSessions && onResetSessions != null) {
@@ -193,36 +212,61 @@ class FieldRunner extends ChangeNotifier {
     return me == null ? 'src' : me.substring(0, 8);
   }
 
-  /// Spread [FieldStep.sendCount] messages to every send target through the
-  /// dwell. The first fires ~1s in — after a session reset it is the
-  /// handshake trigger, so the establishment ladder starts immediately.
-  /// Targets resolve at fire time (a peer identified mid-dwell still
-  /// counts). Ids are the offline-reproducible UUIDv5 set
+  /// Schedule [FieldStep.sendCount] messages for this step. With a
+  /// [linkSettled] predicate: poll until some target's pair is settled
+  /// (session + converged dual-leg), stamp a `link-settled` marker, then
+  /// spread the sends across the REMAINING dwell — data never races a
+  /// re-forming link, and an out-of-range step sends nothing. Without the
+  /// predicate: legacy fixed offsets from dwell start. Targets resolve at
+  /// fire time; ids are the offline-reproducible UUIDv5 set
   /// `field|expId|src|dst|stepIndex|seq`.
   void _scheduleSends(FieldStep step) {
     final doSend = send;
-    final plan = _plan!;
     if (step.sendCount <= 0 || doSend == null) return;
-
-    final windowSec = step.dwellSec > 2 ? step.dwellSec - 2 : step.dwellSec;
-    final stepIdx = _stepIndex;
-    for (var seq = 0; seq < step.sendCount; seq++) {
-      final offsetSec = 1 + (seq * windowSec) ~/ step.sendCount;
-      final localSeq = seq;
-      _sendTimers.add(Timer(Duration(seconds: offsetSec), () {
-        for (final (dstLabel, pubkey) in _sendTargets()) {
-          final messageId = _uuid.v5(workloadUuidNamespace,
-              'field|${plan.expId}|$_srcLabel|$dstLabel|$stepIdx|$localSeq');
-          final payload = Uint8List(step.sendBytes);
-          for (var i = 0; i < payload.length; i++) {
-            payload[i] = (localSeq + i) & 0xff;
-          }
-          _sentCount++;
-          unawaited(doSend(pubkey, payload, messageId: messageId));
-        }
-        notifyListeners();
-      }));
+    final settled = linkSettled;
+    if (settled == null) {
+      final windowSec = step.dwellSec > 2 ? step.dwellSec - 2 : step.dwellSec;
+      for (var seq = 0; seq < step.sendCount; seq++) {
+        _queueSend(step, seq, 1 + (seq * windowSec) ~/ step.sendCount);
+      }
+      return;
     }
+    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
+      if (!_running || _phase != FieldPhase.dwelling) {
+        t.cancel();
+        return;
+      }
+      final ready =
+          _sendTargets().any((target) => settled(target.$2));
+      if (!ready) return;
+      t.cancel();
+      unawaited(recorder.logMarker('link-settled'));
+      // Spread the step's sends across what remains of the dwell.
+      final windowSec = _remainingSec > 2 ? _remainingSec - 2 : _remainingSec;
+      for (var seq = 0; seq < step.sendCount; seq++) {
+        _queueSend(step, seq, (seq * windowSec) ~/ step.sendCount);
+      }
+      notifyListeners();
+    });
+    _sendTimers.add(poll);
+  }
+
+  void _queueSend(FieldStep step, int seq, int offsetSec) {
+    final plan = _plan!;
+    final stepIdx = _stepIndex;
+    _sendTimers.add(Timer(Duration(seconds: offsetSec), () {
+      for (final (dstLabel, pubkey) in _sendTargets()) {
+        final messageId = _uuid.v5(workloadUuidNamespace,
+            'field|${plan.expId}|$_srcLabel|$dstLabel|$stepIdx|$seq');
+        final payload = Uint8List(step.sendBytes);
+        for (var i = 0; i < payload.length; i++) {
+          payload[i] = (seq + i) & 0xff;
+        }
+        _sentCount++;
+        unawaited(send!(pubkey, payload, messageId: messageId));
+      }
+      notifyListeners();
+    }));
   }
 
   static String _hex(Uint8List bytes) =>

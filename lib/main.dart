@@ -2415,9 +2415,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           sendMessage: _grassroots?.send,
           onResetSessions:
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
-          onResetLinks: _grassroots == null
+          onResetLinks:
+              _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
+          linkSettled: _grassroots == null
               ? null
-              : () => unawaited(_grassroots!.resetAllBleLinks()),
+              : (peer) => _grassroots!.isPeerLinkSettled(peer),
         ),
       ),
     );

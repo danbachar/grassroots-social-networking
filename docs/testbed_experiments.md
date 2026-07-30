@@ -83,12 +83,20 @@ devices need nothing shared — plans are rosterless.)
 }
 ```
 
-Per step the runner: tears down every BLE link when `resetLinks` is set
-(the line-sweep default — each step then re-runs discovery + connect, a
-fully independent trial), drops all Noise sessions (`resetSessions`, so the
+Per step the runner: bounces the BLE transport when `resetLinks` is set (the
+line-sweep default — a full disable/enable like the settings toggle, so the
+pair goes dark and re-establishes through the clean cold-start election
+rather than a chaotic same-identity redial; the step waits for the transport
+to come back), drops all Noise sessions (`resetSessions`, so the
 establishment ladder re-runs from a cold handshake every step), stamps the
 marker, and — when `sendCount` > 0 — sends that many `sendBytes`-sized
-messages (default 184), spread through the dwell. Targets: with **no
+messages (default 184). Sends are **gated on the link being settled**
+(authenticated session + converged dual-leg pair; a `link-settled` marker
+stamps the moment) and then spread across the remaining dwell — data never
+races a re-forming link, and a step where no peer settles sends nothing
+(the correct zero at an out-of-range distance). Sessionless peers
+re-handshake eagerly on ANNOUNCE from either side, so settling needs no
+data-send trigger. Targets: with **no
 `roster`** (the two-device default) every identified peer, labeled by 8-hex
 pubkey prefix — no manual pubkey entry; with a `roster`, every other roster
 row (roster labels name the ids), and a device not in the roster sends

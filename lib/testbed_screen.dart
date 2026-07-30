@@ -37,7 +37,8 @@ class TestbedScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final VoidCallback? onResetLinks;
+  final Future<void> Function()? onResetLinks;
+  final bool Function(Uint8List peer)? linkSettled;
 
   const TestbedScreen({
     super.key,
@@ -49,6 +50,7 @@ class TestbedScreen extends StatefulWidget {
     this.sendMessage,
     this.onResetSessions,
     this.onResetLinks,
+    this.linkSettled,
   });
 
   @override
@@ -227,6 +229,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       send: widget.sendMessage,
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
+      linkSettled: widget.linkSettled,
       // Rosterless plans (the two-device default) target every peer the
       // store currently knows.
       knownPeers: () => widget.store.state.peers.peersList

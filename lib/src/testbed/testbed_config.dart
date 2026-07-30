@@ -1,5 +1,15 @@
 import 'package:flutter/foundation.dart';
 
+import '../protocol/fragment_handler.dart';
+
+/// Default synthetic payload size: the largest that still fits ONE sealed
+/// packet at the BLE floor MTU. At this size one message *is* one packet, so
+/// message counts, delivery ratio and wire bytes all read per-packet with no
+/// hidden fragment multiplier. Anything above it is fragmented (a 184-byte
+/// message, the old default, was silently TWO packets — 132 + 52 — costing
+/// 392 wire bytes to move 184), which is worth measuring deliberately as a
+/// payload arm rather than baking into every experiment.
+const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 132
 
 /// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:
 /// [BulkFlowConfig] (sustained throughput) and [FieldPlan] (scripted field
@@ -144,14 +154,22 @@ class FieldStep {
   /// relayed or carried. Matching is case-insensitive on the hex prefix.
   final String sendTo;
 
-  /// Saturating send mode: instead of [sendCount] messages spread through
-  /// the dwell, keep [inFlight] messages outstanding and fire the next the
-  /// moment one is ACKed — as many as the link will carry for the whole
-  /// dwell. Throughput measurement; [sendCount] is ignored.
+  /// Saturating send mode: instead of [sendCount] messages spread through the
+  /// dwell, push continuously for the whole dwell. Throughput measurement;
+  /// [sendCount] is ignored.
   final bool saturate;
 
-  /// Outstanding-message window used while [saturate] is on.
-  final int inFlight;
+  /// How many sends are pushed CONCURRENTLY while [saturate] is on: that many
+  /// independent lanes, each looping "fire one, await it, fire the next".
+  /// Nothing is ACK-gated — the ACK never clocks a send — so the offered load
+  /// is set purely by lane count and how fast the send path drains.
+  ///
+  /// This is the saturation knob. One lane keeps exactly one message in the
+  /// send path at a time, which in the first arm delivered 100% at every
+  /// payload size — proof the sender never outran the link, so those rates are
+  /// a LOWER BOUND on capacity, not the ceiling. Raising the lane count raises
+  /// offered load until delivery breaks, and that break is the ceiling.
+  final int sendLanes;
 
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
@@ -164,10 +182,10 @@ class FieldStep {
     required this.dwellSec,
     this.bulk = false,
     this.sendCount = 0,
-    this.sendBytes = 184,
+    this.sendBytes = defaultSendBytes,
     this.autoAdvance = false,
     this.saturate = false,
-    this.inFlight = 8,
+    this.sendLanes = 1,
     this.sendTo = 'all',
   });
 
@@ -176,10 +194,12 @@ class FieldStep {
         'dwellSec': dwellSec,
         if (bulk) 'bulk': bulk,
         if (sendCount > 0) 'sendCount': sendCount,
-        if (sendCount > 0) 'sendBytes': sendBytes,
+        // Saturating steps carry no sendCount but DO have a payload size —
+        // it is the arm variable of the throughput experiment.
+        if (sendCount > 0 || saturate) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
         if (saturate) 'saturate': saturate,
-        if (saturate) 'inFlight': inFlight,
+        if (saturate) 'sendLanes': sendLanes,
         if (sendTo != 'all') 'sendTo': sendTo,
       };
 
@@ -188,10 +208,10 @@ class FieldStep {
         dwellSec: json['dwellSec'] as int,
         bulk: json['bulk'] as bool? ?? false,
         sendCount: json['sendCount'] as int? ?? 0,
-        sendBytes: json['sendBytes'] as int? ?? 184,
+        sendBytes: json['sendBytes'] as int? ?? defaultSendBytes,
         autoAdvance: json['autoAdvance'] as bool? ?? false,
         saturate: json['saturate'] as bool? ?? false,
-        inFlight: json['inFlight'] as int? ?? 8,
+        sendLanes: json['sendLanes'] as int? ?? 1,
         sendTo: json['sendTo'] as String? ?? 'all',
       );
 
@@ -205,13 +225,13 @@ class FieldStep {
       other.sendBytes == sendBytes &&
       other.autoAdvance == autoAdvance &&
       other.saturate == saturate &&
-      other.inFlight == inFlight &&
+      other.sendLanes == sendLanes &&
       other.sendTo == sendTo;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, inFlight, sendTo);
+          saturate, sendLanes, sendTo);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and

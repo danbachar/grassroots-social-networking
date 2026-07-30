@@ -364,7 +364,7 @@ void main() {
     });
   });
 
-  test('saturate: window stays full, each ACK fires the next send', () {
+  test('saturate: no ACK gating — one lane is clocked by the send alone', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       final sent = <String>[];
@@ -372,8 +372,95 @@ void main() {
         recorder: recorder,
         myPubkeyHex: hexOf(0),
         knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
+        // A send that takes 10ms of transport time — the loop's only clock.
         send: (r, p, {String? messageId}) async {
           sent.add(messageId!);
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          return messageId;
+        },
+      );
+      runner.start(const FieldPlan(
+        expId: 'tp',
+        settleSec: 1,
+        resetSessions: false,
+        steps: [
+          FieldStep(label: 'saturate', dwellSec: 10, saturate: true),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.elapse(const Duration(seconds: 1));
+
+      // Not one-shot and not window-sized: it keeps going without any ACK.
+      expect(sent.length, greaterThan(20),
+          reason: 'a 10ms send over 1s should fire ~90 messages, ACK or not');
+      expect(runner.ackedCount, 0, reason: 'nothing was ACKed, yet it sent');
+      expect(sent.toSet().length, sent.length, reason: 'never re-sends an id');
+      final atOneSec = sent.length;
+
+      // It keeps pushing for the WHOLE dwell: a 10s dwell at 10ms per send is
+      // ~1000 messages, none of them ACK-gated.
+      async.elapse(const Duration(seconds: 11)); // past dwell (10s) + settle
+      expect(sent.length, greaterThan(atOneSec));
+      expect(sent.length, greaterThan(900));
+      final atEnd = sent.length;
+
+      // …and then stops with the step rather than running on.
+      async.elapse(const Duration(seconds: 5));
+      expect(sent.length, atEnd,
+          reason: 'the push loop must end with the step');
+      runner.dispose();
+    });
+  });
+
+  // REAL timers on purpose: the starvation this guards against is a
+  // microtask chain outrunning the event loop, and fakeAsync cannot model it
+  // (a zero-duration timer there re-fires forever at the same fake instant).
+  test('saturate unlimited: a send with no targets cannot starve the loop',
+      () async {
+    final recorder = _FakeRecorder();
+    var sends = 0;
+    final runner = FieldRunner(
+      recorder: recorder,
+      myPubkeyHex: hexOf(0),
+      knownPeers: () => const [], // nobody to send to: _fireSaturating no-ops
+      send: (r, p, {String? messageId}) async {
+        sends++;
+        return messageId;
+      },
+    );
+    await runner.start(const FieldPlan(
+      expId: 'tp',
+      settleSec: 1,
+      resetSessions: false,
+      steps: [
+        FieldStep(label: 'saturate', dwellSec: 1, saturate: true),
+      ],
+    ));
+    await runner.inPosition();
+    expect(runner.phase, FieldPhase.dwelling);
+    // Without the event-loop yield in _pushUnlimited the dwell timer would
+    // never get a turn and this would still be dwelling (or hung) at 2s.
+    await Future<void>.delayed(const Duration(seconds: 2));
+    expect(sends, 0);
+    expect(runner.phase, isNot(FieldPhase.dwelling),
+        reason: 'the dwell timer fired, so the push loop yielded to it');
+    runner.dispose();
+  });
+
+  test('saturate: N lanes push concurrently and an ACK never fires a send',
+      () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final sent = <String>[];
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
+        // 10ms of transport time per send: each lane advances at 100/s.
+        send: (r, p, {String? messageId}) async {
+          sent.add(messageId!);
+          await Future<void>.delayed(const Duration(milliseconds: 10));
           return messageId;
         },
       );
@@ -383,35 +470,40 @@ void main() {
         resetSessions: false,
         steps: [
           FieldStep(
-              label: 'saturate', dwellSec: 10, saturate: true, inFlight: 3),
+              label: 'saturate', dwellSec: 10, saturate: true, sendLanes: 3),
         ],
       ));
       async.flushMicrotasks();
       runner.inPosition();
       async.flushMicrotasks();
 
-      // Window opens at inFlight, not a paced schedule.
+      // All lanes open at once — that IS the offered load.
       expect(sent, hasLength(3));
       expect(recorder.events, contains('marker:saturate-start'));
 
-      // Each ACK immediately frees a slot and fires the next.
-      runner.onAck(sent[0]);
-      expect(sent, hasLength(4));
-      runner.onAck(sent[1]);
-      runner.onAck(sent[2]);
-      expect(sent, hasLength(6));
-      expect(runner.ackedCount, 3);
+      // Three lanes at 10ms each carry ~3x what one lane would: the whole
+      // point of the knob. (One lane over 1s was ~90 in the test above.)
+      async.elapse(const Duration(seconds: 1));
+      expect(sent.length, greaterThan(200));
+      final before = sent.length;
 
-      // Unknown/duplicate ACKs never inflate the window.
+      // An ACK only counts. It must not clock a send, or the rate would be
+      // capped at lanes/RTT instead of by the link.
+      runner.onAck(sent[0]);
+      runner.onAck(sent[1]);
+      expect(runner.ackedCount, 2);
+      expect(sent.length, before, reason: 'an ACK fired no send');
+
+      // Unknown/duplicate ACKs are ignored.
       runner.onAck('nope');
       runner.onAck(sent[0]);
-      expect(sent, hasLength(6));
+      expect(runner.ackedCount, 2);
 
-      // Dwell end stops the loop and logs the flow summary.
-      async.elapse(const Duration(seconds: 10));
-      runner.onAck(sent[3]);
-      expect(sent, hasLength(6), reason: 'no sends after the window closes');
-      async.elapse(const Duration(seconds: 2));
+      // Dwell end stops every lane.
+      async.elapse(const Duration(seconds: 11));
+      final atEnd = sent.length;
+      async.elapse(const Duration(seconds: 5));
+      expect(sent.length, atEnd, reason: 'all lanes ended with the step');
       runner.dispose();
     });
   });

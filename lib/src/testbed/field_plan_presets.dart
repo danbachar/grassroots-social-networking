@@ -17,7 +17,7 @@ class FieldPlanPresets {
     String expId = 'home-soak-1',
     int dwellMin = 40,
     int sends = 40,
-    int sendBytes = 184,
+    int sendBytes = defaultSendBytes,
     int repeat = 1,
     bool resetSessions = true,
     bool resetLinks = false,
@@ -50,7 +50,7 @@ class FieldPlanPresets {
     int dwellSec = 180,
     int anchorDwellSec = 120,
     int sendsPerStep = 5,
-    int sendBytes = 184,
+    int sendBytes = defaultSendBytes,
     bool retreat = true,
     int repeat = 1,
     bool resetSessions = true,
@@ -143,34 +143,94 @@ class FieldPlanPresets {
     );
   }
 
-  /// Throughput: saturate the link for [dwellSec] — keep [inFlight] messages
-  /// outstanding and fire the next on every ACK, as many as the link carries.
-  /// Sessions/links stay warm (this measures the data plane, not
-  /// establishment); repeat trials at the same spot auto-advance.
+  /// Throughput: saturate the link for [dwellSec] on [sendLanes] concurrent
+  /// send lanes, none of them ACK-gated. Sessions/links stay warm (this
+  /// measures the data plane, not establishment).
+  ///
+  /// [payloadSizes] is the PAYLOAD ARM: one saturating step per size, so the
+  /// per-message cost of fragmentation is a measured result instead of a
+  /// hidden constant. [defaultSendBytes] (132 B) is exactly one sealed packet;
+  /// 264 B is exactly two; 1200 B is ten. Every step runs from the same spot,
+  /// so only the very first waits for the tap — a whole arm is hands-free
+  /// after one press. Labels carry the size (`p=264B`) so the analyzer
+  /// segments the arms apart.
   static FieldPlan throughput({
     String expId = 'throughput-1',
     int dwellSec = 60,
-    int payloadBytes = 184,
-    int inFlight = 8,
+    List<int> payloadSizes = const [defaultSendBytes],
+    List<int> laneCounts = const [1, 4, 16, 64],
+    int sendLanes = 1,
     int repeat = 1,
   }) {
     final trials = repeat < 1 ? 1 : repeat;
+    final sizes = payloadSizes.isEmpty ? const [defaultSendBytes] : payloadSizes;
+    final steps = <FieldStep>[];
+    for (final bytes in sizes) {
+      for (var i = 1; i <= trials; i++) {
+        final size = sizes.length > 1 ? 'p=${bytes}B' : 'saturate';
+        steps.add(FieldStep(
+          label: trials > 1 ? '$size t$i' : size,
+          dwellSec: dwellSec,
+          sendBytes: bytes,
+          saturate: true,
+          sendLanes: sendLanes,
+          // Stationary experiment: nothing to walk to between steps.
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
     return FieldPlan(
       expId: expId,
       settleSec: 30,
       resetSessions: false,
       resetLinks: false,
-      steps: [
-        for (var i = 1; i <= trials; i++)
-          FieldStep(
-            label: trials > 1 ? 't$i saturate' : 'saturate',
-            dwellSec: dwellSec,
-            sendBytes: payloadBytes,
-            saturate: true,
-            inFlight: inFlight,
-            autoAdvance: i > 1,
-          ),
-      ],
+      steps: steps,
+    );
+  }
+
+  /// Throughput CEILING: the same saturating step at rising lane counts, so
+  /// offered load climbs until the link stops carrying it.
+  ///
+  /// The payload arm answered "what does a message cost"; this answers "how
+  /// much fits". One lane delivered 100% at every payload size, which proves
+  /// the sender never outran the link and makes those rates a lower bound, not
+  /// a capacity. Each step here doubles down until `delivery_rate` falls below
+  /// 1.0 and goodput stops rising — that knee is the ceiling. Labels carry the
+  /// lane count (`lanes=16`) so the analyzer segments them apart.
+  ///
+  /// Fixed payload (one sealed packet by default) so lanes are the only
+  /// variable. Stationary and warm, so one tap runs the whole sweep.
+  static FieldPlan throughputCeiling({
+    String expId = 'throughput-ceiling-1',
+    int dwellSec = 60,
+    int payloadBytes = defaultSendBytes,
+    List<int> lanes = const [1, 4, 16, 64],
+    int repeat = 1,
+  }) {
+    final trials = repeat < 1 ? 1 : repeat;
+    final counts = lanes.isEmpty ? const [1] : lanes;
+    final steps = <FieldStep>[];
+    for (final n in counts) {
+      for (var i = 1; i <= trials; i++) {
+        steps.add(FieldStep(
+          label: trials > 1 ? 'lanes=$n t$i' : 'lanes=$n',
+          dwellSec: dwellSec,
+          sendBytes: payloadBytes,
+          saturate: true,
+          sendLanes: n,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      // Longer than usual: an overrun leaves a backlog of custody and ACKs
+      // still draining when the dwell ends, and cutting the recording there
+      // would score those sends as lost when they were merely late.
+      settleSec: 90,
+      resetSessions: false,
+      resetLinks: false,
+      steps: steps,
     );
   }
 
@@ -253,6 +313,10 @@ class FieldPlanPresets {
         'Home soak (stationary, 40 min)': homeSoak(),
         'Link-cycle check (5×1 min)': cycleCheck(),
         'Throughput (saturate 60s)': throughput(),
+        'Throughput: payload arm (132/264/1200 B)': throughput(
+            expId: 'throughput-arm-1',
+            payloadSizes: const [defaultSendBytes, 264, 1200]),
+        'Throughput: ceiling sweep (1/4/16/64 lanes)': throughputCeiling(),
         'Control-plane line sweep': lineSweep(),
         'Mesh: multi-hop relay (set target!)':
             multiHop(targetPrefix: '<peer-prefix>'),
@@ -263,12 +327,21 @@ class FieldPlanPresets {
 }
 
 /// The experiment shapes the wizard can build.
-enum FieldPlanKind { homeSoak, throughput, multiHop, storeCarry, lineSweep, dataPlane }
+enum FieldPlanKind {
+  homeSoak,
+  throughput,
+  throughputCeiling,
+  multiHop,
+  storeCarry,
+  lineSweep,
+  dataPlane
+}
 
 extension FieldPlanKindLabel on FieldPlanKind {
   String get label => switch (this) {
         FieldPlanKind.homeSoak => 'Home soak (stationary)',
         FieldPlanKind.throughput => 'Throughput (saturate)',
+        FieldPlanKind.throughputCeiling => 'Throughput: ceiling sweep',
         FieldPlanKind.multiHop => 'Mesh: multi-hop relay',
         FieldPlanKind.storeCarry => 'Mesh: store-carry-forward',
         FieldPlanKind.lineSweep => 'Control-plane line sweep',
@@ -284,6 +357,7 @@ class FieldPlanWizard {
       switch (kind) {
         FieldPlanKind.homeSoak => (true, false),
         FieldPlanKind.throughput => (false, false),
+        FieldPlanKind.throughputCeiling => (false, false),
         FieldPlanKind.multiHop => (false, false),
         FieldPlanKind.storeCarry => (false, false),
         FieldPlanKind.lineSweep => (true, true),
@@ -303,8 +377,9 @@ class FieldPlanWizard {
     int repeat = 1,
     bool? resetSessions,
     bool? resetLinks,
-    int payloadBytes = 184,
-    int inFlight = 8,
+    List<int> payloadSizes = const [defaultSendBytes],
+    List<int> laneCounts = const [1, 4, 16, 64],
+    int sendLanes = 1,
     String targetPrefix = '',
     int holdMin = 5,
   }) {
@@ -326,8 +401,16 @@ class FieldPlanWizard {
         return FieldPlanPresets.throughput(
           expId: id,
           dwellSec: dwellSec,
-          payloadBytes: payloadBytes,
-          inFlight: inFlight,
+          payloadSizes: payloadSizes,
+          sendLanes: sendLanes,
+          repeat: repeat,
+        );
+      case FieldPlanKind.throughputCeiling:
+        return FieldPlanPresets.throughputCeiling(
+          expId: id,
+          dwellSec: dwellSec,
+          payloadBytes: payloadSizes.isEmpty ? defaultSendBytes : payloadSizes.first,
+          lanes: laneCounts,
           repeat: repeat,
         );
       case FieldPlanKind.multiHop:

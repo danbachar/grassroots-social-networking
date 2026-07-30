@@ -1,4 +1,7 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 
@@ -86,16 +89,83 @@ void main() {
           [false, true, false, true]);
     });
 
+    test('throughput lanes survive the round-trip', () {
+      final p = FieldPlanPresets.throughput(sendLanes: 8);
+      expect(p.steps.single.saturate, isTrue);
+      expect(p.steps.single.sendLanes, 8);
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('ceiling sweep: one step per lane count, count in the label', () {
+      final p = FieldPlanPresets.throughputCeiling(lanes: const [1, 8, 32]);
+      expect(p.steps.map((s) => s.sendLanes), [1, 8, 32]);
+      expect(p.steps.map((s) => s.label), ['lanes=1', 'lanes=8', 'lanes=32']);
+      expect(p.steps.every((s) => s.saturate), isTrue);
+      expect(p.steps.every((s) => s.sendBytes == defaultSendBytes), isTrue,
+          reason: 'fixed payload — lanes must be the only variable');
+      // Stationary: one tap for the whole sweep.
+      expect(p.steps.map((s) => s.autoAdvance), [false, true, true]);
+      expect(p.settleSec, greaterThanOrEqualTo(90),
+          reason: 'an overrun leaves a backlog still draining at dwell end');
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('ceiling sweep: empty lane list falls back to a single lane', () {
+      expect(FieldPlanPresets.throughputCeiling(lanes: const [])
+          .steps.single.sendLanes, 1);
+    });
+
     test('throughput: saturating steps, warm sessions, repeats auto-advance',
         () {
-      final p = FieldPlanPresets.throughput(repeat: 3, inFlight: 4);
+      final p = FieldPlanPresets.throughput(repeat: 3, sendLanes: 4);
       expect(p.steps, hasLength(3));
       expect(p.steps.every((s) => s.saturate), isTrue);
-      expect(p.steps.every((s) => s.inFlight == 4), isTrue);
+      expect(p.steps.every((s) => s.sendLanes == 4), isTrue);
+      expect(p.steps.every((s) => s.sendBytes == defaultSendBytes), isTrue,
+          reason: 'one sealed packet per message unless asked otherwise');
       expect(p.resetSessions, isFalse, reason: 'data plane, not establishment');
       expect(p.resetLinks, isFalse);
       expect(p.steps.map((s) => s.autoAdvance), [false, true, true]);
       expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('throughput payload arm: one step per size, size in the label', () {
+      final p = FieldPlanPresets.throughput(payloadSizes: const [132, 1200]);
+      expect(p.steps.map((s) => s.sendBytes), [132, 1200]);
+      expect(p.steps.map((s) => s.label), ['p=132B', 'p=1200B']);
+      // Stationary: one tap for the whole arm.
+      expect(p.steps.map((s) => s.autoAdvance), [false, true]);
+      expect(FieldPlan.fromJson(p.toJson()), p,
+          reason: 'a saturating step carries no sendCount — its payload size '
+              'must still survive the round-trip, it IS the arm variable');
+    });
+
+    test('throughput payload arm x repeat: sizes outer, trials inner', () {
+      final p = FieldPlanPresets.throughput(
+          payloadSizes: const [132, 264], repeat: 2);
+      expect(p.steps.map((s) => s.label),
+          ['p=132B t1', 'p=132B t2', 'p=264B t1', 'p=264B t2']);
+      expect(p.steps.map((s) => s.sendBytes), [132, 132, 264, 264]);
+      expect(p.steps.map((s) => s.autoAdvance), [false, true, true, true]);
+    });
+
+    test('empty payload list falls back to the one-packet default', () {
+      final p = FieldPlanPresets.throughput(payloadSizes: const []);
+      expect(p.steps.single.sendBytes, defaultSendBytes);
+    });
+
+    test('the default send size is exactly one sealed packet', () {
+      expect(defaultSendBytes, FragmentHandler.fragmentThreshold);
+      expect(FragmentHandler().needsFragmentation(Uint8List(defaultSendBytes)),
+          isFalse);
+      expect(
+          FragmentHandler().needsFragmentation(Uint8List(defaultSendBytes + 1)),
+          isTrue);
+      // Every plan builder inherits it.
+      expect(FieldPlanPresets.homeSoak().steps.single.sendBytes,
+          defaultSendBytes);
+      expect(FieldPlanPresets.lineSweep().steps.first.sendBytes,
+          defaultSendBytes);
     });
 
     test('multiHop: every step addresses the target alone', () {
@@ -171,6 +241,22 @@ void main() {
       final p = FieldPlanWizard.build(
           kind: FieldPlanKind.homeSoak, expId: 'a', dwellMin: 1, repeat: 4);
       expect(p.steps, hasLength(4));
+    });
+
+    test('ceiling route threads the lane sweep through', () {
+      final p = FieldPlanWizard.build(
+          kind: FieldPlanKind.throughputCeiling,
+          expId: 'c',
+          laneCounts: const [2, 8]);
+      expect(p.steps.map((s) => s.sendLanes), [2, 8]);
+    });
+
+    test('throughput route threads the payload arm through', () {
+      final p = FieldPlanWizard.build(
+          kind: FieldPlanKind.throughput,
+          expId: 't',
+          payloadSizes: const [132, 1200]);
+      expect(p.steps.map((s) => s.sendBytes), [132, 1200]);
     });
 
     test('parseInts handles commas/spaces and rejects junk', () {

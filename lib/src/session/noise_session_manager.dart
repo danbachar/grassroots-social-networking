@@ -198,6 +198,18 @@ class NoiseSessionManager {
     removed?.complete(false);
   }
 
+  /// TESTBED ONLY. Drop every session and in-flight handshake. The field
+  /// runner calls this at each experiment step so the full establishment
+  /// ladder (handshake → session → first ACK) is measured per step instead
+  /// of riding a session formed at setup range. The next send to any peer
+  /// re-handshakes lazily.
+  void resetAll() {
+    for (final entry in _entries.values) {
+      entry.complete(false);
+    }
+    _entries.clear();
+  }
+
   void dispose() {
     for (final entry in _entries.values) {
       entry.complete(false);

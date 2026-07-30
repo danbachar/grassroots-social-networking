@@ -5,7 +5,6 @@ import 'package:uuid/uuid.dart';
 
 import '../trace/experiment_recorder.dart';
 import 'testbed_config.dart';
-import 'workload_driver.dart' show workloadUuidNamespace;
 
 /// Live status of one bulk flow, surfaced for the testbed UI.
 @immutable

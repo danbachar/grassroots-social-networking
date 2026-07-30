@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:redux/redux.dart';
@@ -30,13 +31,13 @@ class SettingsScreen extends StatefulWidget {
   /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
   /// is not up. [myPubkeyHex] is this device's hex identity.
   final String? myPubkeyHex;
-  final Future<void> Function()? onStartWorkload;
-  final VoidCallback? onStopWorkload;
-  final WorkloadStatus Function()? workloadStatus;
   final ExperimentRecorder? experimentRecorder;
   final VoidCallback? onStartBulk;
   final VoidCallback? onStopBulk;
-  final BulkStatus Function()? bulkStatus;
+  final Future<String?> Function(Uint8List recipient, Uint8List payload,
+      {String? messageId})? sendMessage;
+  final VoidCallback? onResetSessions;
+  final VoidCallback? onResetLinks;
 
   const SettingsScreen({
     super.key,
@@ -45,13 +46,12 @@ class SettingsScreen extends StatefulWidget {
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
     this.myPubkeyHex,
-    this.onStartWorkload,
-    this.onStopWorkload,
-    this.workloadStatus,
     this.experimentRecorder,
     this.onStartBulk,
     this.onStopBulk,
-    this.bulkStatus,
+    this.sendMessage,
+    this.onResetSessions,
+    this.onResetLinks,
   });
 
   @override
@@ -275,13 +275,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context) => TestbedScreen(
                       store: widget.store,
                       myPubkeyHex: widget.myPubkeyHex,
-                      onStartWorkload: widget.onStartWorkload,
-                      onStopWorkload: widget.onStopWorkload,
-                      workloadStatus: widget.workloadStatus,
                       experimentRecorder: widget.experimentRecorder,
                       onStartBulk: widget.onStartBulk,
                       onStopBulk: widget.onStopBulk,
-                      bulkStatus: widget.bulkStatus,
+                      sendMessage: widget.sendMessage,
+                      onResetSessions: widget.onResetSessions,
+                      onResetLinks: widget.onResetLinks,
                     ),
                   ),
                 );

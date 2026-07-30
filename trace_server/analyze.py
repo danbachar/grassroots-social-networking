@@ -10,8 +10,12 @@ emits, under ``--out``:
 
     <exp>/summary.txt          per-device record counts, stage events,
                                delivery ratio, latency stats, flow goodput
-    <exp>/steps.csv            per distance-step marker segment: RSSI stats
+    <exp>/steps.csv            per position-step marker segment (d= or side=;
+                               one row per repeat trial): RSSI stats
                                (adv/conn), stage events seen, drops
+    <exp>/establishment.csv    repeat trials aggregated per (distance,
+                               direction): fraction of trials that reached
+                               each link stage — establishment probability
     <exp>/pathloss.txt         log-distance fit RSSI = A - 10 n log10(d)
                                (needs >= 3 distinct d= markers)
     <exp>/rssi_timeline.png    RSSI vs time per device, markers as verticals
@@ -50,8 +54,12 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-MARKER_DISTANCE_RE = re.compile(r"\bd\s*=\s*(\d+(?:\.\d+)?)")
+# A position marker: `d=<m>` (line sweep) or `side=<m>` (dilating clique).
+# Trailing trial suffixes ("d=40 approach t2") don't affect the capture.
+MARKER_POS_RE = re.compile(r"\b(?:d|side)\s*=\s*(\d+(?:\.\d+)?)")
 LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
+# Runner control markers that annotate a step boundary but are not positions.
+CONTROL_MARKERS = {"links-reset", "sessions-reset"}
 
 
 # --------------------------------------------------------------------------- #
@@ -123,16 +131,19 @@ def _num(v, default=0):
 # Per-experiment analyses
 # --------------------------------------------------------------------------- #
 def marker_segments(df: pd.DataFrame) -> list[dict]:
-    """Distance segments from d=<x> markers: [{d, direction, t0, t1}, ...].
+    """Position segments from d=<x>/side=<x> markers: [{d, direction, t0, t1}].
 
-    Every device stamps its own copy of each step marker, so identical labels
-    arriving within 90s collapse into one segment (keyed to the earliest).
+    One segment per step. Repeat trials at the same distance carry distinct
+    labels (…t1, …t2), so each stays its own segment. In static+moving mode
+    only the moving device stamps position markers; the static device's
+    records fall into these segments by timestamp. A duplicate identical label
+    within 90s (e.g. both devices stamping) collapses to the earlier one.
     """
     markers = df[(df._type == "marker")].sort_values("_t")
     segs: list[dict] = []
     for _, m in markers.iterrows():
         label = m.get("label") or ""
-        match = MARKER_DISTANCE_RE.search(str(label))
+        match = MARKER_POS_RE.search(str(label))
         if not match:
             continue
         if segs and segs[-1]["label"] == str(label) \
@@ -153,13 +164,33 @@ def marker_segments(df: pd.DataFrame) -> list[dict]:
     return segs
 
 
-def steps_table(df: pd.DataFrame, segs: list[dict]) -> pd.DataFrame:
+def steps_table(df: pd.DataFrame, segs: list[dict],
+                latency: pd.DataFrame) -> pd.DataFrame:
     rssi = df[df._type == "rssi"]
     link = df[df._type == "link"]
     rows = []
     for seg in segs:
         in_seg_rssi = rssi[(rssi._t >= seg["t0"]) & (rssi._t < seg["t1"])]
         in_seg_link = link[(link._t >= seg["t0"]) & (link._t < seg["t1"])]
+        # Messages SENT within this step (by any device) and their round-trip
+        # latency — the send→ACK RTT, i.e. delivered.e2eLatencyMs. Gives the
+        # latency-vs-distance curve and the per-step delivery ratio.
+        seg_msgs = (
+            latency[(latency.sentAt >= seg["t0"]) & (latency.sentAt < seg["t1"])]
+            if not latency.empty else latency
+        )
+        dwell_sec = max((seg["t1"] - seg["t0"]) / 1000.0, 1e-9)
+        adv = in_seg_rssi[in_seg_rssi.get("src") == "adv"]
+        # Receiver-side advert visibility. The TX side cannot be measured
+        # (the BLE controller broadcasts autonomously below the app), so the
+        # denominator is the *known* advertising interval, and these two
+        # receiver metrics carry the signal:
+        #   advPerMin  — sightings/minute (app-side sampling is rate-limited
+        #                to ~1/s per path, so this saturates around 60);
+        #   advCoverage — fraction of dwell-seconds with >=1 sighting, which
+        #                is robust to scan batching and the rate limit. This
+        #                is the censoring-proof discovery-probability proxy.
+        adv_seconds = set((adv._t // 1000).astype(int)) if len(adv) else set()
         row = {
             "d": seg["d"],
             "direction": seg["direction"],
@@ -167,7 +198,21 @@ def steps_table(df: pd.DataFrame, segs: list[dict]) -> pd.DataFrame:
             "t0": seg["t0"],
             "t1": seg["t1"],
             "rssi_n": len(in_seg_rssi),
+            "advPerMin": round(len(adv) / (dwell_sec / 60.0), 1),
+            "advCoverage": round(len(adv_seconds) / dwell_sec, 3),
         }
+        if len(seg_msgs):
+            sent_n = len(seg_msgs)
+            lat = seg_msgs["latencyMs"].dropna()
+            row["msg_sent"] = sent_n
+            row["msg_delivered"] = int(len(lat))
+            row["delivery_rate"] = round(len(lat) / sent_n, 3)
+            row["rtt_median_ms"] = round(lat.median()) if len(lat) else None
+            row["rtt_p90_ms"] = round(lat.quantile(0.9)) if len(lat) else None
+        else:
+            row.update({"msg_sent": 0, "msg_delivered": 0,
+                        "delivery_rate": None, "rtt_median_ms": None,
+                        "rtt_p90_ms": None})
         for src in ("adv", "conn"):
             vals = in_seg_rssi[in_seg_rssi.get("src") == src]["rssi"].dropna()
             row[f"rssi_{src}_mean"] = round(vals.mean(), 1) if len(vals) else None
@@ -179,22 +224,49 @@ def steps_table(df: pd.DataFrame, segs: list[dict]) -> pd.DataFrame:
 
 
 def pathloss_fit(steps: pd.DataFrame) -> str | None:
-    """Log-distance fit over segment means: RSSI = A - 10 n log10(d)."""
+    """Log-distance fit RSSI = A - 10 n log10(d), over the per-distance mean
+    adv RSSI so repeat trials at a distance don't over-weight it."""
     pts = steps.dropna(subset=["rssi_adv_mean"])
     pts = pts[pts.d > 0]
     if pts.d.nunique() < 3:
         return None
-    x = 10 * np.log10(pts.d.astype(float))
-    y = pts.rssi_adv_mean.astype(float)
+    means = pts.groupby("d")["rssi_adv_mean"].mean()
+    x = 10 * np.log10(means.index.to_numpy(dtype=float))
+    y = means.to_numpy(dtype=float)
     n, a = np.polyfit(-x, y, 1)  # y = a - n * x
     resid = y - (a - n * x)
     return (
-        f"log-distance fit over {pts.d.nunique()} distances "
-        f"(adv-RSSI segment means):\n"
+        f"log-distance fit over {len(means)} distances "
+        f"(per-distance mean adv RSSI):\n"
         f"  RSSI(d) = {a:.1f} - 10 * {n:.2f} * log10(d)\n"
         f"  path-loss exponent n = {n:.2f}, RSSI@1m = {a:.1f} dBm, "
         f"residual std = {resid.std():.1f} dB\n"
     )
+
+
+def establishment_table(steps: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate repeat trials per (distance, direction): how often each link
+    stage was reached — the establishment-probability-vs-distance result the
+    `repeat` knob exists to produce. A stage counts as reached in a trial when
+    its per-segment count > 0."""
+    if steps.empty:
+        return pd.DataFrame()
+    rows = []
+    for (d, direction), g in steps.groupby(["d", "direction"]):
+        n = len(g)
+        row = {"d": d, "direction": direction, "trials": n}
+        for stage in LINK_STAGES:
+            row[f"{stage}_rate"] = round((g[stage] > 0).sum() / n, 2)
+        row["advCoverage_mean"] = round(g["advCoverage"].mean(), 3)
+        adv = g["rssi_adv_mean"].dropna()
+        row["rssi_adv_mean"] = round(adv.mean(), 1) if len(adv) else None
+        sent = g["msg_sent"].sum()
+        deliv = g["msg_delivered"].sum()
+        row["delivery_rate"] = round(deliv / sent, 3) if sent else None
+        rtt = g["rtt_median_ms"].dropna()
+        row["rtt_median_ms"] = round(rtt.mean()) if len(rtt) else None
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["direction", "d"])
 
 
 def latency_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -266,6 +338,8 @@ def _marker_verticals(ax, df: pd.DataFrame, t_base: float):
         label = m.get("label") or m.get("event")
         if m.get("event") in ("expStart", "expStop"):
             continue
+        if label in CONTROL_MARKERS:
+            continue  # links-reset / sessions-reset — one per step, too noisy
         x = (m._t - t_base) / 1000
         ax.axvline(x, color="gray", linestyle=":", alpha=0.6)
         ax.annotate(str(label), (x, ax.get_ylim()[1]), fontsize=7,
@@ -391,8 +465,11 @@ def main() -> int:
 
         segs = marker_segments(edf)
         if segs:
-            steps = steps_table(edf, segs)
+            steps = steps_table(edf, segs, latency)
             steps.to_csv(out / "steps.csv", index=False)
+            est = establishment_table(steps)
+            if not est.empty:
+                est.to_csv(out / "establishment.csv", index=False)
             fit = pathloss_fit(steps)
             if fit:
                 (out / "pathloss.txt").write_text(fit)

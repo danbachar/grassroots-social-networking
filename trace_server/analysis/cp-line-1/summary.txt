@@ -1,0 +1,11 @@
+records: 1029   span: 2021s
+
+device 2fe9d005:
+  records by type: {'rssi': 223, 'link': 194, 'wire': 126, 'marker': 11}
+  link stages: {'discovered': 181, 'drop': 7, 'connected': 6}
+  wire bytes: {'rx:announce': 40185, 'tx:announce': 41553}
+
+device 3c1a075c:
+  records by type: {'link': 177, 'rssi': 170, 'wire': 117, 'marker': 11}
+  link stages: {'discovered': 169, 'connected': 4, 'drop': 4}
+  wire bytes: {'rx:announce': 38646, 'tx:announce': 39159}

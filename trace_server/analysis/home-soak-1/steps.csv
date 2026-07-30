@@ -1,0 +1,2 @@
+d,direction,label,t0,t1,rssi_n,advPerMin,advCoverage,rssi_adv_mean,rssi_adv_std,rssi_conn_mean,rssi_conn_std,discovered,connected,session,usable,drop
+3.0,,d=3 home soak,1785243171367,1785245637003,3177,68.3,0.634,-65.3,4.6,-60.6,2.7,823,0,3,1,0

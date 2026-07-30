@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -98,6 +99,27 @@ void main() {
     expect(note['label'], 'd=80m approaching');
     expect(note['exp'], 'm1');
     await recorder.stopExperiment();
+  });
+
+  test('no records are dropped under a burst of concurrent unawaited logs',
+      () async {
+    // Regression: the old per-call writeAsString(append) fired concurrent
+    // opens and silently dropped records under load (a 40-min soak lost ~a
+    // third of its recv records). The persistent sink must keep every one.
+    await recorder.startExperiment('burst');
+    const n = 1000;
+    // Fire without awaiting, exactly as the instrumentation does.
+    for (var i = 0; i < n; i++) {
+      unawaited(recorder.log({'type': 'x', 'i': i}));
+    }
+    await recorder.stopExperiment(); // flushes + closes
+
+    final records = readJsonl((await recorder.experimentFilePaths()).single);
+    final xs = records.where((r) => r['type'] == 'x').map((r) => r['i']).toSet();
+    expect(xs, hasLength(n), reason: 'every concurrent log must be persisted');
+    for (var i = 0; i < n; i++) {
+      expect(xs, contains(i));
+    }
   });
 
   test('clearExperimentFiles deletes everything; size reflects the live file',

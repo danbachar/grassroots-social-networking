@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'package:collection/collection.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
@@ -21,7 +20,6 @@ import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
 import 'models/identity.dart';
 import 'testbed/bulk_flow_driver.dart';
-import 'testbed/workload_driver.dart';
 import 'trace/experiment_recorder.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
@@ -1652,32 +1650,6 @@ class GrassrootsNetwork {
     _messageRouter.removeCustody(ids ?? [messageId]);
   }
 
-  // ===== Testbed workload driver (debug-only; inert until started) =====
-
-  WorkloadDriver? _workloadDriver;
-
-  /// DEBUG/TESTBED ONLY. The offered-load driver, lazily bound to [send]. It
-  /// does nothing until [startWorkload] is called from a debug screen.
-  WorkloadDriver get workloadDriver => _workloadDriver ??= WorkloadDriver(
-        send: send,
-        log: (m) => debugPrint(m),
-      );
-
-  /// DEBUG/TESTBED ONLY. Begin executing the workload config stored in
-  /// settings. No-op if no config is set or the driver is already running.
-  void startWorkload() {
-    final config = store.state.settings.workloadConfig;
-    if (config == null) {
-      debugPrint('[workload] no config set — nothing to start');
-      return;
-    }
-    final myPubkeyHex = _pubkeyToHex(identity.publicKey);
-    workloadDriver.start(config: config, myPubkeyHex: myPubkeyHex);
-  }
-
-  /// DEBUG/TESTBED ONLY. Stop the workload driver.
-  void stopWorkload() => _workloadDriver?.stop();
-
   BulkFlowDriver? _bulkFlowDriver;
 
   /// DEBUG/TESTBED ONLY. The sustained-throughput driver (data-plane
@@ -1702,6 +1674,23 @@ class GrassrootsNetwork {
 
   /// DEBUG/TESTBED ONLY. Stop the bulk-flow driver.
   void stopBulkFlows() => _bulkFlowDriver?.stop();
+
+  /// DEBUG/TESTBED ONLY. Drop every Noise session so the next contact runs
+  /// the full establishment ladder from a cold handshake (the field runner
+  /// invokes this at each experiment step). Messages sent while sessionless
+  /// wait in the pending-seal buffer and trigger the lazy handshake.
+  void resetAllSessions() {
+    debugPrint('[testbed] Dropping all Noise sessions');
+    _noiseSessions.resetAll();
+  }
+
+  /// DEBUG/TESTBED ONLY. Tear down every live BLE link so the next contact
+  /// re-runs discovery + connect (the field runner pairs this with
+  /// [resetAllSessions] for a full per-step establishment ladder).
+  Future<void> resetAllBleLinks() async {
+    debugPrint('[testbed] Tearing down all BLE links');
+    await _bleService?.disconnectAllPaths();
+  }
 
   /// Sealed packets currently held in custody (own un-ACK'd + relayed DTN).
   int get dtnBufferedCount => _messageRouter.dtnBufferedCount;
@@ -2031,21 +2020,6 @@ class GrassrootsNetwork {
     final peer = _peersState.getPeerByPubkeyHex(hex);
     if (peer?.isFriend == true) return true;
     return store.state.friendships.isFriend(hex);
-  }
-
-  /// TESTBED ONLY. Whether the neighbour behind [bleDeviceId] is identified and
-  /// excluded by an active neighbour allowlist. Returns false (allow) when the
-  /// allowlist is off, or when we cannot yet resolve the neighbour's identity
-  /// (Layer 2 gates its ANNOUNCE). Never true in production (allowlist null).
-  bool _neighborBlockedByAllowlist(String bleDeviceId) {
-    final allowlist = store.state.settings.neighborAllowlist;
-    if (allowlist == null || !allowlist.enabled) return false;
-    final neighbor = _peersState.peersList.firstWhereOrNull((p) =>
-        p.bleCentralDeviceId == bleDeviceId ||
-        p.blePeripheralDeviceId == bleDeviceId);
-    final pubkey = neighbor?.publicKey;
-    if (pubkey == null) return false; // not yet identified — let Layer 2 decide
-    return !allowlist.allowsPubkey(pubkey);
   }
 
   /// Whether [pubkey] is currently authorized by an invite we issued — an
@@ -3661,17 +3635,6 @@ class GrassrootsNetwork {
     // Forward BLE packets to the MessageRouter for processing
     _bleService!.onBlePacketReceived =
         (packet, {String? bleDeviceId, int? rssi, BleRole? bleRole}) {
-      // TESTBED Layer 3 (software-defined topology, ingress hard-drop): a
-      // backstop against BLE re-discovery churn slipping a link past Layer 1.
-      // The wire envelope is sender-anonymous, so we can only key on the
-      // IMMEDIATE neighbour we received from — which is exactly the topology
-      // edge. Drop + tear down if that neighbour is identified and not
-      // allowed. Unidentified neighbours pass through; their ANNOUNCE is
-      // gated by Layer 2. Off in production.
-      if (bleDeviceId != null && _neighborBlockedByAllowlist(bleDeviceId)) {
-        unawaited(_bleService?.disconnectDevice(bleDeviceId));
-        return;
-      }
       _messageRouter.processPacket(
         packet,
         transport: PeerTransport.bleDirect,
@@ -3683,13 +3646,6 @@ class GrassrootsNetwork {
 
     _messageRouter.shouldAcceptBleAnnounce =
         (senderPubkey, {String? bleDeviceId, BleRole? bleRole}) {
-      // TESTBED Layer 2 (software-defined topology): the allowlist overrides
-      // the cold-call posture entirely — an ANNOUNCE from a non-allowed
-      // neighbour is refused even in open mode. Off in production.
-      final allowlist = store.state.settings.neighborAllowlist;
-      if (allowlist != null && allowlist.enabled) {
-        return allowlist.allowsPubkey(senderPubkey);
-      }
       if (store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.open) {
         return true;
       }
@@ -4285,7 +4241,6 @@ class GrassrootsNetwork {
     _storeSubscription = null;
     _announceTimer?.cancel();
     _scanTimer?.cancel();
-    _workloadDriver?.stop();
     _bulkFlowDriver?.stop();
 
     // Wait for any in-flight transport update to finish before disposing

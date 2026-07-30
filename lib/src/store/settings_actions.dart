@@ -67,22 +67,6 @@ class SetShowLinkDiagnosticsAction extends SettingsAction {
   SetShowLinkDiagnosticsAction(this.enabled);
 }
 
-/// DEBUG/TESTBED ONLY. Install (or clear, with null) the software-defined BLE
-/// topology allowlist.
-class SetNeighborAllowlistAction extends SettingsAction {
-  final NeighborAllowlist? allowlist;
-
-  SetNeighborAllowlistAction(this.allowlist);
-}
-
-/// DEBUG/TESTBED ONLY. Install (or clear, with null) the deterministic
-/// offered-load workload config. Does NOT start the driver.
-class SetWorkloadConfigAction extends SettingsAction {
-  final WorkloadConfig? config;
-
-  SetWorkloadConfigAction(this.config);
-}
-
 /// DEBUG/TESTBED ONLY. Install (or clear, with null) the sustained-throughput
 /// bulk-flow config. Does NOT start the driver.
 class SetBulkFlowConfigAction extends SettingsAction {

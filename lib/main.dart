@@ -14,7 +14,6 @@ import 'dart:async';
 import 'chat_screen.dart';
 import 'chat_models.dart';
 import 'settings_screen.dart';
-import 'testbed_screen.dart';
 import 'theme/grasslink_theme.dart';
 import 'theme/grasslink_tokens.dart';
 import 'theme/grasslink_widgets.dart';
@@ -2408,32 +2407,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           myPubkeyHex: _grassroots?.identity.publicKey
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(),
-          onStartWorkload: _grassroots == null
-              ? null
-              : () async => _grassroots!.startWorkload(),
-          onStopWorkload:
-              _grassroots == null ? null : () => _grassroots!.stopWorkload(),
-          workloadStatus: _grassroots == null
-              ? null
-              : () {
-                  final d = _grassroots!.workloadDriver;
-                  return WorkloadStatus(
-                    running: d.isRunning,
-                    scheduled: d.scheduledCount,
-                    sent: d.sentCount,
-                  );
-                },
           experimentRecorder: experimentRecorder,
           onStartBulk:
               _grassroots == null ? null : () => _grassroots!.startBulkFlows(),
           onStopBulk:
               _grassroots == null ? null : () => _grassroots!.stopBulkFlows(),
-          bulkStatus: _grassroots == null
+          sendMessage: _grassroots?.send,
+          onResetSessions:
+              _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
+          onResetLinks: _grassroots == null
               ? null
-              : () {
-                  final d = _grassroots!.bulkFlowDriver;
-                  return BulkStatus(running: d.isRunning, flows: d.status);
-                },
+              : () => unawaited(_grassroots!.resetAllBleLinks()),
         ),
       ),
     );

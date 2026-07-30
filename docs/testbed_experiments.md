@@ -127,6 +127,18 @@ at `lanes / RTT` and makes the experiment measure its own window rather than
 the link. Offered load is therefore set by the lane count alone, and `sent` vs
 `delivered` measures offered against carried load.
 
+**Per-step custody reset.** `resetCustody` (default **on**) empties the DTN
+store at every step start, stamping a `custody-reset` marker. Without it an
+overrun step's undelivered backlog survives in custody and drains into the
+next step's window via the sync exchange — steps contaminate each other and
+`delivery_rate` never dips, because custody eventually heals everything.
+Clearing makes each step's delivery its own verdict: an overrun now shows as
+`delivery_rate < 1.0` at that step. The mesh presets (`multiHop`,
+`storeCarry`) set it **off** — custody surviving across steps is the thing
+they measure. Note the static device's store is NOT cleared (it runs no
+plan); its confirmation custody is small and the sync exchange only conveys
+what the runner actually lacks.
+
 **Ceiling sweep.** One lane keeps exactly one message in the send path, and in
 the first payload arm that delivered **100% at every size** — proof the sender
 never outran the link, which makes those rates a *lower bound* on capacity, not

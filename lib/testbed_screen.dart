@@ -38,6 +38,7 @@ class TestbedScreen extends StatefulWidget {
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
   final Future<void> Function()? onResetLinks;
+  final VoidCallback? onResetCustody;
   final bool Function(Uint8List peer)? linkSettled;
 
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
@@ -54,6 +55,7 @@ class TestbedScreen extends StatefulWidget {
     this.sendMessage,
     this.onResetSessions,
     this.onResetLinks,
+    this.onResetCustody,
     this.linkSettled,
     this.registerAckListener,
   });
@@ -234,6 +236,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       send: widget.sendMessage,
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
+      onResetCustody: widget.onResetCustody,
       linkSettled: widget.linkSettled,
       // Rosterless plans (the two-device default) target every peer the
       // store currently knows.

@@ -55,6 +55,10 @@ class FieldRunner extends ChangeNotifier {
   /// marker and sends wait until the transport is back up.
   final Future<void> Function()? onResetLinks;
 
+  /// Empties the DTN custody store (per-step, when the plan asks) so a prior
+  /// step's undelivered backlog cannot drain into this step's window.
+  final VoidCallback? onResetCustody;
+
   /// Currently identified peers (pubkeys), consulted when the plan has NO
   /// roster: every known peer becomes a send target and labels are the 8-hex
   /// pubkey prefixes — the two-device case needs no manual pubkey entry.
@@ -86,6 +90,7 @@ class FieldRunner extends ChangeNotifier {
     this.send,
     this.onResetSessions,
     this.onResetLinks,
+    this.onResetCustody,
     this.knownPeers,
     this.linkSettled,
     this.upload,
@@ -174,6 +179,10 @@ class FieldRunner extends ChangeNotifier {
     if (_plan!.resetSessions && onResetSessions != null) {
       onResetSessions!.call();
       await recorder.logMarker('sessions-reset');
+    }
+    if (_plan!.resetCustody && onResetCustody != null) {
+      onResetCustody!.call();
+      await recorder.logMarker('custody-reset');
     }
     await recorder.logMarker(step.label);
     if (step.bulk) onStartBulk?.call();

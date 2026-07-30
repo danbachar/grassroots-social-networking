@@ -630,7 +630,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       TextEditingController(text: '40');
   late final TextEditingController _sends = TextEditingController(text: '40');
   late final TextEditingController _distances =
-      TextEditingController(text: '1, 5, 10, 20, 40, 80, 120');
+      TextEditingController(text: '10, 20, 30, 40, 50, 60, 70, 80, 90, 100');
   late final TextEditingController _sendsPerStep =
       TextEditingController(text: '5');
   late final TextEditingController _dwellSec =
@@ -753,6 +753,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
                   onChanged: (k) => setState(() {
                     _kind = k!;
                     _suggestId(k);
+                    _suggestTiming(k);
                     // Reset toggles fall back to the new kind's defaults.
                     _resetSessions = null;
                     _resetLinks = null;
@@ -935,6 +936,25 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         onChanged: onChanged,
       );
 
+  /// Load the kind's canonical dwell/repeat when the experiment changes —
+  /// a shared text field keeping the PREVIOUS kind's numbers is how a line
+  /// sweep ends up with a 180s dwell nobody chose.
+  void _suggestTiming(FieldPlanKind kind) {
+    final (dwell, repeat, sends) = switch (kind) {
+      FieldPlanKind.homeSoak => (60, 1, 40),
+      FieldPlanKind.throughput => (60, 1, 0),
+      FieldPlanKind.throughputCeiling => (60, 1, 0),
+      FieldPlanKind.rawLink => (30, 10, 0),
+      FieldPlanKind.multiHop => (120, 1, 30),
+      FieldPlanKind.storeCarry => (60, 1, 20),
+      FieldPlanKind.lineSweep => (30, 10, 100),
+      FieldPlanKind.dataPlane => (150, 1, 0),
+    };
+    _dwellSec.text = '$dwell';
+    _repeat.text = '$repeat';
+    if (sends > 0) _sendsPerStep.text = '$sends';
+  }
+
   bool get _defSessions => FieldPlanWizard.resetDefaults(_kind).$1;
   bool get _defLinks => FieldPlanWizard.resetDefaults(_kind).$2;
 
@@ -943,10 +963,10 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         expId: _expId.text,
         dwellMin: _int(_dwellMin, 40),
         sends: _int(_sends, 40),
-        distances: FieldPlanWizard.parseInts(
-            _distances.text, const [1, 5, 10, 20, 40, 80, 120]),
+        distances: FieldPlanWizard.parseInts(_distances.text,
+            const [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]),
         retreat: _retreat,
-        sendsPerStep: _int(_sendsPerStep, 5),
+        sendsPerStep: _int(_sendsPerStep, 100),
         dwellSec: _int(_dwellSec, 180),
         sideLengths:
             FieldPlanWizard.parseInts(_sides.text, const [10, 20, 40]),

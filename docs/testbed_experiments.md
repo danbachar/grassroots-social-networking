@@ -40,6 +40,7 @@ NTP-synced, or bound skew with a start-of-run marker ritual on each device).
 | `packetDup` | a redundant PACKET arrival dropped by the packetId bloom (dual-leg copy, re-flood, custody conveyance). Outer `packetId` — a different namespace from `messageId`, never join the two |
 | `relay` | this node forwarded someone else's packet | `packetId`, `ttlIn`/`ttlOut`, `hop`, `fromDevice`, `carried`, `degreeAtEvent` |
 | `custody` | store / convey / end | `packetId`, `recipient`, `held` |
+| `power` | fuel-gauge sample every 10 s while recording | `currentNowUa` (Android sign convention: negative = discharge; recorded raw), `chargeCounterUah`, `levelPct`, `voltageMv`, `tempDeciC`, `charging` |
 | `flow` | bulk driver start/stop | `flow` (`A>B`), `payloadBytes`, `inFlight`, final `sent`/`acked`/`ackedBytes` |
 
 ## Auto runner (scripted, hands-free)
@@ -138,6 +139,16 @@ Clearing makes each step's delivery its own verdict: an overrun now shows as
 they measure. Note the static device's store is NOT cleared (it runs no
 plan); its confirmation custody is small and the sync exchange only conveys
 what the runner actually lacks.
+
+**Power.** While recording, the fuel gauge is sampled every 10 s into
+`power` records. `steps.csv` gains per-device columns (`power_mA_<dev>` =
+median absolute discharge current, `energy_mAh_<dev>` = charge-counter drop
+over the step) and the summary reports battery start→end per device.
+Constraints: phones must run **unplugged** (a charging sample reports charge
+current, not consumption — flagged `power_charging_<dev>` and excluded);
+absolute draw is screen-dominated, so the honest numbers are differential —
+per-phase, per-distance, per-message within one device; never compare across
+devices.
 
 **Raw link throughput.** The *Raw link throughput* wizard kind measures the
 naked GATT pipe: MTU-sized blobs (outer type `0x7F`, ATT payload = negotiated

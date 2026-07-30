@@ -58,6 +58,45 @@ void main() {
     expect(records[2]['event'], 'expStop');
   });
 
+  test('power probe: sampled at start, records tagged, stops with the run',
+      () async {
+    var reads = 0;
+    final probed = ExperimentRecorder(powerProbe: () async {
+      reads++;
+      return {'currentNowUa': -350000, 'levelPct': 81, 'charging': false};
+    });
+    await probed.startExperiment('pw');
+    // The start-boundary baseline sample fires immediately.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(reads, 1);
+    await probed.stopExperiment();
+
+    final paths = await probed.experimentFilePaths();
+    final records = readJsonl(paths.single);
+    final power = records.where((r) => r['type'] == 'power').toList();
+    expect(power, hasLength(1));
+    expect(power.single['currentNowUa'], -350000);
+    expect(power.single['charging'], isFalse);
+    expect(power.single['t'], isA<int>());
+
+    // Stopped: the periodic timer must not keep probing.
+    final after = reads;
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(reads, after);
+  });
+
+  test('a failing or null power probe records nothing and does not crash',
+      () async {
+    final probed = ExperimentRecorder(powerProbe: () async => null);
+    await probed.startExperiment('pw2');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await probed.stopExperiment();
+    final paths = await probed.experimentFilePaths();
+    final records = readJsonl(
+        paths.singleWhere((p) => p.endsWith('exp_pw2.jsonl')));
+    expect(records.where((r) => r['type'] == 'power'), isEmpty);
+  });
+
   test('log is a no-op when no experiment is active', () async {
     await recorder.log({'type': 'rssi', 't': 2});
     expect(await recorder.experimentFilePaths(), isEmpty);

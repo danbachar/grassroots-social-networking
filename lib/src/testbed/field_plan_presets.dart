@@ -41,18 +41,21 @@ class FieldPlanPresets {
     );
   }
 
-  /// Control-plane line sweep: near anchors, then approach to the range edge
-  /// and (optionally) retreat back for the hysteresis. Sessions reset per
-  /// step so each distance measures the full establishment ladder.
+  /// Control-plane line sweep: one fully cold formation trial per step
+  /// (links bounced, sessions dropped, custody emptied), [repeat] trials per
+  /// distance. With every trial independent there is nothing for a retreat
+  /// pass to add — direction hysteresis (formation vs survival range) only
+  /// exists in the WARM variant, so [retreat] defaults off and is the knob
+  /// for that separate experiment (resets off + retreat on).
   static FieldPlan lineSweep({
     String expId = 'cp-line-1',
-    List<int> distances = const [1, 5, 10, 20, 40, 80, 120],
-    int dwellSec = 180,
-    int anchorDwellSec = 120,
-    int sendsPerStep = 5,
+    List<int> distances = const [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    int dwellSec = 30,
+    int anchorDwellSec = 30,
+    int sendsPerStep = 100,
     int sendBytes = defaultSendBytes,
-    bool retreat = true,
-    int repeat = 1,
+    bool retreat = false,
+    int repeat = 10,
     bool resetSessions = true,
     bool resetLinks = true,
   }) {
@@ -86,6 +89,12 @@ class FieldPlanPresets {
       settleSec: 30,
       resetSessions: resetSessions,
       resetLinks: resetLinks,
+      // Every trial is a fully cold, uncontaminated formation attempt: BLE
+      // stack bounced, Noise sessions dropped, DTN store emptied. (The
+      // seen/delivered blooms are kept, and cannot contaminate: field-plan
+      // message ids embed the step index, so no id ever repeats across
+      // steps.)
+      resetCustody: true,
     );
   }
 

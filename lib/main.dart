@@ -292,7 +292,20 @@ void main() async {
   // Local-only experiment recorder (testbed evaluation). Inert until an
   // experiment is started from the testbed screen; records never leave the
   // device except via an explicit share.
-  experimentRecorder = ExperimentRecorder();
+  const powerChannel = MethodChannel('grassroots/power');
+  experimentRecorder = ExperimentRecorder(
+    // Raw fuel-gauge probe (Android BatteryManager). Failures return null —
+    // a device without the channel (or a denied read) records no power
+    // records rather than crashing the run.
+    powerProbe: () async {
+      try {
+        final raw = await powerChannel.invokeMethod<Map>('read');
+        return raw?.cast<String, dynamic>();
+      } catch (_) {
+        return null;
+      }
+    },
+  );
 
   // Initialize notifications
   const AndroidInitializationSettings initializationSettingsAndroid =

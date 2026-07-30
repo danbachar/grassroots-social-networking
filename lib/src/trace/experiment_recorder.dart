@@ -20,6 +20,18 @@ import 'package:path_provider/path_provider.dart';
 class ExperimentRecorder {
   static const _subdir = 'trace';
 
+  /// Optional fuel-gauge probe (raw BatteryManager readings, injected by the
+  /// coordinator so this class stays platform-free and testable). While an
+  /// experiment is active it is sampled every [powerSampleInterval] into
+  /// `power` records. Readings taken while charging carry `charging: true`
+  /// and are excluded from power analysis offline — a plugged-in phone
+  /// reports charge current, not consumption.
+  final Future<Map<String, dynamic>?> Function()? powerProbe;
+  static const Duration powerSampleInterval = Duration(seconds: 10);
+  Timer? _powerTimer;
+
+  ExperimentRecorder({this.powerProbe});
+
   String? _experimentId;
   String? get experimentId => _experimentId;
 
@@ -82,12 +94,34 @@ class ExperimentRecorder {
       'exp': clean,
       't': DateTime.now().millisecondsSinceEpoch,
     });
+    final probe = powerProbe;
+    if (probe != null) {
+      Future<void> sample() async {
+        try {
+          final reading = await probe();
+          if (reading == null || !active) return;
+          await log({
+            'type': 'power',
+            't': DateTime.now().millisecondsSinceEpoch,
+            ...reading,
+          });
+        } catch (e) {
+          debugPrint('[exp] power probe failed: $e');
+        }
+      }
+
+      unawaited(sample()); // baseline at the start boundary
+      _powerTimer =
+          Timer.periodic(powerSampleInterval, (_) => unawaited(sample()));
+    }
   }
 
   /// Stop the experiment recording: mark the boundary with `expStop` and
   /// write the whole buffered run to disk in one append.
   Future<void> stopExperiment() async {
     if (_experimentId == null) return;
+    _powerTimer?.cancel();
+    _powerTimer = null;
     await log({
       'type': 'marker',
       'event': 'expStop',

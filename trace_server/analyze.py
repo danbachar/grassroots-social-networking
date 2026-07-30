@@ -269,6 +269,7 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
     link = df[df._type == "link"]
     msgs = df[df._type == "message"]
     wire = df[df._type == "wire"]
+    power = df[df._type == "power"]
     rows = []
     for seg in segs:
         in_seg_rssi = rssi[(rssi._t >= seg["t0"]) & (rssi._t < seg["t1"])]
@@ -343,6 +344,31 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             "advPerMin": round(len(adv) / (dwell_sec / 60.0), 1),
             "advCoverage": round(len(adv_seconds) / dwell_sec, 3),
         }
+        # Fuel-gauge power per step, PER DEVICE (columns suffixed with the
+        # device's short id — absolute draw is dominated by the screen and
+        # differs per phone, so never pool across devices; compare steps
+        # WITHIN a device). Samples taken while charging are excluded: a
+        # plugged-in phone reports charge current, not consumption.
+        in_seg_pw = power[(power._t >= seg["t0"]) & (power._t < seg["t1"])]
+        for dev, g in in_seg_pw.groupby("_device"):
+            tag = str(dev)[:8]
+            # astype(bool) matters: the column loads as object dtype and `~`
+            # on objects is BITWISE (True -> -2), which then indexes columns.
+            chg_mask = _col(g, "charging").fillna(False).astype(bool)
+            ok = g[~chg_mask]
+            cur = pd.to_numeric(_col(ok, "currentNowUa"),
+                                errors="coerce").dropna()
+            if len(cur):
+                row[f"power_mA_{tag}"] = round(cur.abs().median() / 1000, 1)
+            cc = pd.to_numeric(_col(ok, "chargeCounterUah"),
+                               errors="coerce").dropna()
+            if len(cc) >= 2:
+                # Discharge over the step (positive = energy spent).
+                row[f"energy_mAh_{tag}"] = round(
+                    (cc.iloc[0] - cc.iloc[-1]) / 1000, 3)
+            if chg_mask.any():
+                row[f"power_charging_{tag}"] = True
+
         if raw_tx or raw_rx:
             # Raw-link step: offered vs carried BYTES from the wire ledgers
             # (sender tx, receiver rx). No messages exist in this mode. The
@@ -359,7 +385,13 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
         if len(seg_msgs):
             sent_n = len(seg_msgs)
             lat = seg_msgs["latencyMs"].dropna()
+            recv_n = int(seg_msgs["receivedAt"].notna().sum())
             row["msg_sent"] = sent_n
+            # One-way: the receiver logged the message. THE reachability
+            # numerator (received/sent per distance).
+            row["msg_recv"] = recv_n
+            row["recv_rate"] = round(recv_n / sent_n, 3)
+            # Round trip: the ACK made it back to the sender too.
             row["msg_delivered"] = int(len(lat))
             row["delivery_rate"] = round(len(lat) / sent_n, 3)
             row["rtt_median_ms"] = round(lat.median()) if len(lat) else None
@@ -386,7 +418,8 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             row["air_overhead"] = (round(air_b / (len(lat) * payload_b), 2)
                                    if len(lat) and payload_b else None)
         else:
-            row.update({"msg_sent": 0, "msg_delivered": 0,
+            row.update({"msg_sent": 0, "msg_recv": 0, "recv_rate": None,
+                        "msg_delivered": 0,
                         "delivery_rate": None, "rtt_median_ms": None,
                         "rtt_p90_ms": None, "applat_median_ms": None,
                         "active_s": None, "msg_per_s": None,
@@ -452,7 +485,12 @@ def establishment_table(steps: pd.DataFrame) -> pd.DataFrame:
         adv = g["rssi_adv_mean"].dropna()
         row["rssi_adv_mean"] = round(adv.mean(), 1) if len(adv) else None
         sent = g["msg_sent"].sum()
+        recv_n = g["msg_recv"].sum()
         deliv = g["msg_delivered"].sum()
+        # received/sent is the one-way reachability curve vs distance;
+        # acked/sent additionally requires the reverse path.
+        row["msg_sent"] = int(sent)
+        row["recv_rate"] = round(recv_n / sent, 3) if sent else None
         row["delivery_rate"] = round(deliv / sent, 3) if sent else None
         rtt = g["rtt_median_ms"].dropna()
         row["rtt_median_ms"] = round(rtt.mean()) if len(rtt) else None
@@ -630,6 +668,15 @@ def latency_table(df: pd.DataFrame) -> pd.DataFrame:
         ["appLatencyMs"] if "appLatencyMs" in delivered.columns else [])
     d = delivered[d_cols].rename(columns={"_t": "deliveredAt"})
     joined = s.merge(d.drop_duplicates("messageId"), on="messageId", how="left")
+    # ONE-WAY reception, from the RECEIVER's recv records. Distinct from the
+    # ACK join above: at the range edge B may receive a message whose ACK
+    # never survives the trip back, so received/sent > acked/sent there —
+    # conflating them would understate one-way reachability by the reverse
+    # path's loss.
+    recv = msgs[_col(msgs, "dir") == "recv"]
+    r = recv[["messageId", "_t"]].rename(columns={"_t": "receivedAt"})
+    joined = joined.merge(
+        r.drop_duplicates("messageId"), on="messageId", how="left")
     # TWO different latencies, deliberately kept apart:
     #   latencyMs    — WIRE RTT: the sealed packet hitting the transport until
     #                  its ACK came back. Both stamps are trace records on the
@@ -663,9 +710,11 @@ def summarize(df: pd.DataFrame, latency: pd.DataFrame) -> str:
             mine = latency[latency.sender == device]
             if len(mine):
                 ok = mine.latencyMs.notna()
+                recv_ok = mine.receivedAt.notna()
                 lines.append(
-                    f"  messages sent: {len(mine)}, delivered: {int(ok.sum())} "
-                    f"({100 * ok.mean():.0f}%)")
+                    f"  messages sent: {len(mine)}, received: "
+                    f"{int(recv_ok.sum())} ({100 * recv_ok.mean():.0f}%), "
+                    f"ACK-confirmed: {int(ok.sum())} ({100 * ok.mean():.0f}%)")
                 if ok.any():
                     lat = mine.latencyMs.dropna()
                     lines.append(
@@ -699,6 +748,24 @@ def summarize(df: pd.DataFrame, latency: pd.DataFrame) -> str:
                     for k, v in _dict(w.get(field)).items():
                         totals[f"{field[:2]}:{k}"] += v
             lines.append(f"  wire bytes: {dict(sorted(totals.items()))}")
+    power = df[df._type == "power"]
+    for dev, g in power.groupby("_device"):
+        g = g.sort_values("_t")
+        lvl = pd.to_numeric(_col(g, "levelPct"), errors="coerce").dropna()
+        chg_mask = _col(g, "charging").fillna(False).astype(bool)
+        cur = pd.to_numeric(
+            _col(g[~chg_mask], "currentNowUa"), errors="coerce").dropna()
+        if len(lvl):
+            line = (f"battery {label_for(str(dev), roles)}: "
+                    f"{lvl.iloc[0]:.0f}% -> {lvl.iloc[-1]:.0f}%")
+            if len(cur):
+                line += (f", median draw {cur.abs().median() / 1000:.0f} mA "
+                         f"({len(cur)} samples)")
+            if chg_mask.any():
+                line += (f" [WARNING: {int(chg_mask.sum())}/{len(g)} samples "
+                         f"while charging — excluded from draw]")
+            lines.append(line)
+
     return "\n".join(lines) + "\n"
 
 

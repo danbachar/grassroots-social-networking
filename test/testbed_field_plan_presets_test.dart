@@ -18,7 +18,7 @@ void main() {
 
     test('line sweep: approach sorted, retreat excludes near anchors', () {
       final p = FieldPlanPresets.lineSweep(
-          distances: const [1, 5, 10, 40], retreat: true);
+          distances: const [1, 5, 10, 40], retreat: true, repeat: 1);
       final labels = p.steps.map((s) => s.label).toList();
       expect(labels, [
         'd=1 approach',
@@ -39,7 +39,7 @@ void main() {
 
     test('line sweep without retreat is approach-only', () {
       final p = FieldPlanPresets.lineSweep(
-          distances: const [5, 10, 20], retreat: false);
+          distances: const [5, 10, 20], retreat: false, repeat: 1);
       expect(p.steps.map((s) => s.label),
           ['d=5 approach', 'd=10 approach', 'd=20 approach']);
     });
@@ -189,6 +189,32 @@ void main() {
       expect(p.steps.last.dwellSec, 3 * 60);
       expect(p.steps.last.autoAdvance, isTrue);
       expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('lineSweep: every trial is fully cold — links, sessions, custody',
+        () {
+      final p = FieldPlanPresets.lineSweep();
+      expect(p.resetLinks, isTrue, reason: 'BLE stack bounced per step');
+      expect(p.resetSessions, isTrue, reason: 'Noise dropped per step');
+      expect(p.resetCustody, isTrue, reason: 'DTN store emptied per step');
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test(
+        'lineSweep field-day defaults: 10..100m, 30s, 10 cold trials, no retreat',
+        () {
+      final p = FieldPlanPresets.lineSweep();
+      expect(p.steps, hasLength(100)); // 10 distances x 10 trials
+      expect(p.steps.every((s) => s.label.contains('approach')), isTrue,
+          reason: 'fully cold trials are direction-independent — a retreat '
+              'pass would just repeat the same measurement; hysteresis '
+              'needs the warm variant (resets off, retreat on)');
+      expect(p.steps.every((s) => s.dwellSec == 30), isTrue);
+      expect(p.steps.every((s) => s.sendCount == 100), isTrue,
+          reason: '100 paced sends/30s = 3.3 msg/s, <10% of measured '
+              'capacity, ~1 in flight — 1000 delivery samples per distance');
+      // One tap per NEW distance; trials at the same distance auto-advance.
+      expect(p.steps.where((s) => !s.autoAdvance), hasLength(10));
     });
 
     test('all named presets parse back and are non-empty', () {

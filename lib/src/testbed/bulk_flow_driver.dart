@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../trace/experiment_recorder.dart';
+import '../models/block.dart';
 import 'testbed_config.dart';
 
 /// Live status of one bulk flow, surfaced for the testbed UI.
@@ -162,6 +163,9 @@ class BulkFlowDriver {
     for (var i = 0; i < payload.length; i++) {
       payload[i] = (seq + i) & 0xff;
     }
+    // Reserved first byte: testbed traffic must never look like a real
+    // block class in the wire-byte breakdown.
+    if (payload.isNotEmpty) payload[0] = testbedPayloadMarker;
     run.outstanding.add(messageId);
     _byMessageId[messageId] = run;
     run.sent++;

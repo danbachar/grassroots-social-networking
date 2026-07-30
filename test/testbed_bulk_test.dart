@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/store/settings_reducer.dart';
 import 'package:grassroots_networking/src/store/settings_actions.dart';
 import 'package:grassroots_networking/src/store/settings_state.dart';
+import 'package:grassroots_networking/src/models/block.dart';
 import 'package:grassroots_networking/src/testbed/bulk_flow_driver.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 import 'package:grassroots_networking/src/trace/wire_ledger.dart';
@@ -159,8 +160,10 @@ void main() {
         myPubkeyHex: _hex(_pubkey(0)),
       );
       expect(captured.length, 64);
-      expect(captured[0], 0); // seq 0 pattern
-      expect(captured[5], 5);
+      // Byte 0 is the reserved testbed marker so synthetic traffic is never
+      // classified as a real block class in the wire-byte breakdown.
+      expect(captured[0], testbedPayloadMarker);
+      expect(captured[5], 5); // seq-derived pattern elsewhere
       driver.stop();
     });
 
@@ -211,6 +214,32 @@ void main() {
       expect(record['txPackets'], {'announce': 2, 'handshake': 1});
       expect(record['rxBytes'], {'secure': 500, 'other': 10});
       expect(record['rxPackets'], {'secure': 1, 'other': 1});
+    });
+
+    test('tx secure is split by inner content; rx stays aggregate', () {
+      final ledger = WireLedger()
+        ..secureContentFor = (id) => id.startsWith('aaaaaaaa') ? 'data:say'
+            : id.startsWith('bbbbbbbb') ? 'ack' : '';
+      // packetId occupies bytes 38..54 of the envelope.
+      Uint8List sealed(String idHex, int length) {
+        final p = Uint8List(length);
+        p[0] = 0x03; // secure
+        for (var i = 0; i < 16; i++) {
+          p[38 + i] = int.parse(idHex.substring(i * 2, i * 2 + 2), radix: 16);
+        }
+        return p;
+      }
+
+      final dataId = 'aaaaaaaa' + '0' * 24;
+      final ackId = 'bbbbbbbb' + '0' * 24;
+      ledger.onTx(sealed(dataId, 300));
+      ledger.onTx(sealed(ackId, 100));
+      ledger.onRx(sealed(dataId, 300)); // rx is never split
+
+      final record = ledger.drainRecord(transport: 'ble')!;
+      expect(record['txBytes'], {'secure:data:say': 300, 'secure:ack': 100});
+      expect(record['rxBytes'], {'secure': 300},
+          reason: 'a peer on the air cannot tell sealed content apart');
     });
 
     test('drain resets: second drain with no traffic returns null', () {

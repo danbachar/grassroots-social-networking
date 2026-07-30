@@ -188,6 +188,12 @@ class BleTransportService extends TransportService {
   /// Per-type tx/rx byte counters, drained to a `wire` trace record on a
   /// fixed cadence while tracing is active.
   final WireLedger _wireLedger = WireLedger();
+
+  /// Wire-ledger hook: resolve one of our sealed packets' inner content type
+  /// (set by the coordinator, which does the sealing). See
+  /// [WireLedger.secureContentFor].
+  set secureContentResolver(String Function(String packetId) resolver) =>
+      _wireLedger.secureContentFor = resolver;
   Timer? _wireLedgerTimer;
 
   /// Rate-limit for per-peer `rssi` trace records (adv sightings can arrive

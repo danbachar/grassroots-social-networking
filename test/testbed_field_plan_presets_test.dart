@@ -86,6 +86,41 @@ void main() {
           [false, true, false, true]);
     });
 
+    test('throughput: saturating steps, warm sessions, repeats auto-advance',
+        () {
+      final p = FieldPlanPresets.throughput(repeat: 3, inFlight: 4);
+      expect(p.steps, hasLength(3));
+      expect(p.steps.every((s) => s.saturate), isTrue);
+      expect(p.steps.every((s) => s.inFlight == 4), isTrue);
+      expect(p.resetSessions, isFalse, reason: 'data plane, not establishment');
+      expect(p.resetLinks, isFalse);
+      expect(p.steps.map((s) => s.autoAdvance), [false, true, true]);
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('multiHop: every step addresses the target alone', () {
+      final p = FieldPlanPresets.multiHop(targetPrefix: '9c46b4f3', repeat: 2);
+      expect(p.steps, hasLength(2));
+      expect(p.steps.every((s) => s.sendTo == '9c46b4f3'), isTrue,
+          reason: 'a delivery must prove it crossed the relay');
+      expect(p.resetSessions, isFalse);
+      expect(p.settleSec, greaterThanOrEqualTo(60),
+          reason: 'relayed paths deliver later than direct ones');
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('storeCarry: seed step sends to the absent target, then holds', () {
+      final p = FieldPlanPresets.storeCarry(
+          targetPrefix: 'abcd1234', sends: 20, holdMin: 3);
+      expect(p.steps, hasLength(2));
+      expect(p.steps.first.sendCount, 20);
+      expect(p.steps.first.sendTo, 'abcd1234');
+      expect(p.steps.last.sendCount, 0, reason: 'the hold sends nothing');
+      expect(p.steps.last.dwellSec, 3 * 60);
+      expect(p.steps.last.autoAdvance, isTrue);
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
     test('all named presets parse back and are non-empty', () {
       for (final entry in FieldPlanPresets.presets.entries) {
         expect(entry.value.steps, isNotEmpty, reason: entry.key);

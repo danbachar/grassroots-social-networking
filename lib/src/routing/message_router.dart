@@ -141,6 +141,12 @@ class MessageRouter {
   /// wires this to the BLE transport's per-device send.
   void Function(GrassrootsPacket packet, String bleDeviceId)? onSyncSend;
 
+  /// Seals a sync control frame ([ContentType.syncOffer]/[ContentType.
+  /// syncRequest]) to the neighbor behind [bleDeviceId] and sends it. The
+  /// coordinator owns the Noise sessions, so sealing happens there.
+  void Function(ContentType type, Uint8List payload, String bleDeviceId)?
+      onSyncFrame;
+
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
 
@@ -208,20 +214,6 @@ class MessageRouter {
       return;
     }
 
-    // Sync-on-connect (anti-entropy): neighbor-local custody reconciliation.
-    // BLE-only — the UDP transport is direct point-to-point and carries no
-    // DTN custody. Never relayed (TTL 1), never deduped (each sync packet is
-    // acted on exactly where it lands).
-    if (packet.type == PacketType.syncOffer ||
-        packet.type == PacketType.syncRequest) {
-      if (transport != PeerTransport.bleDirect || bleDeviceId == null) return;
-      if (packet.type == PacketType.syncOffer) {
-        _handleSyncOffer(packet, bleDeviceId);
-      } else {
-        _handleSyncRequest(packet, bleDeviceId);
-      }
-      return;
-    }
 
     final forUs = _isForUs(packet);
 
@@ -256,9 +248,38 @@ class MessageRouter {
         // Store-carry-forward: if the recipient isn't a currently-reachable
         // peer, cache the sealed packet and re-flood it when they reappear.
         final recipientHex = _recipientHex(packet);
-        if (recipientHex != null && !_recipientReachable(packet)) {
+        final carried = recipientHex != null && !_recipientReachable(packet);
+        if (carried) {
           _dtnStore.store(recipientHex, packet);
         }
+        if (trace?.active ?? false) {
+          // The relay's own view: this node forwarded someone else's sealed
+          // packet. Joining these across devices by packetId reconstructs the
+          // actual path a message took through the mesh (multi-hop evidence).
+          // The envelope is sender-anonymous, so we can only report the
+          // neighbour we received FROM — which is exactly the topology edge.
+          unawaited(trace!.log({
+            'type': 'relay',
+            't': DateTime.now().millisecondsSinceEpoch,
+            'packetId': packet.packetId,
+            'ttlIn': packet.ttl,
+            'ttlOut': packet.ttl - 1,
+            'hop': GrassrootsPacket.defaultTtl - packet.ttl + 1,
+            'recipient': recipientHex,
+            'fromDevice': bleDeviceId,
+            'carried': carried, // entered store-carry-forward custody
+            'degreeAtEvent': _reachablePeerCount(),
+          }));
+        }
+      } else if ((trace?.active ?? false) && !firstSeen) {
+        // A relayed duplicate: the flood reached us again by another path.
+        unawaited(trace!.log({
+          'type': 'relay',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'dup',
+          'packetId': packet.packetId,
+          'fromDevice': bleDeviceId,
+        }));
       }
       return;
     }
@@ -330,6 +351,16 @@ class MessageRouter {
           observedIp: observedIp,
           observedPort: observedPort,
         );
+      case ContentType.syncOffer:
+        // Neighbor-local custody reconciliation, sealed to this pair's
+        // session. BLE-only: UDP is point-to-point and carries no custody.
+        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
+          _handleSyncOffer(frame.chunk, bleDeviceId);
+        }
+      case ContentType.syncRequest:
+        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
+          _handleSyncRequest(frame.chunk, bleDeviceId);
+        }
     }
   }
 
@@ -645,6 +676,16 @@ class MessageRouter {
   /// or age expiry.
   void storeCustody(Uint8List recipientPubkey, GrassrootsPacket sealedPacket) {
     _dtnStore.store(_pubkeyToHex(recipientPubkey), sealedPacket);
+    if (trace?.active ?? false) {
+      unawaited(trace!.log({
+        'type': 'custody',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'store',
+        'packetId': sealedPacket.packetId,
+        'recipient': _pubkeyToHex(recipientPubkey),
+        'held': _dtnStore.totalCount,
+      }));
+    }
     // Our own sealed packets count as seen: a copy conveyed back to us by a
     // relay must not be re-relayed as a fresh sighting.
     _seenPackets.add(sealedPacket.packetId);
@@ -654,6 +695,15 @@ class MessageRouter {
   void removeCustody(Iterable<String> packetIds) {
     for (final id in packetIds) {
       _dtnStore.removeById(id);
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'custody',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'end',
+          'packetId': id,
+          'held': _dtnStore.totalCount,
+        }));
+      }
     }
   }
 
@@ -676,19 +726,19 @@ class MessageRouter {
   /// Build the sync offer packets advertising every packetId currently in the
   /// DTN store (chunked to fit single BLE writes). Empty when carrying
   /// nothing — the common case, costing zero packets.
-  List<GrassrootsPacket> buildSyncOffers() {
+  List<Uint8List> buildSyncOffers() {
     final ids = _dtnStore.carriedPacketIds();
     if (ids.isEmpty) return const [];
-    return buildSyncPackets(PacketType.syncOffer, ids);
+    return buildSyncPayloads(ids);
   }
 
   /// A neighbor offered the packetIds it carries: request the ones our
   /// seen-set lacks. A bloom false positive skips a packet we actually lack —
   /// healed by the next contact or the recipient-triggered flush.
-  void _handleSyncOffer(GrassrootsPacket packet, String bleDeviceId) {
+  void _handleSyncOffer(Uint8List payload, String bleDeviceId) {
     final List<String> offered;
     try {
-      offered = decodeSyncIds(packet.payload);
+      offered = decodeSyncIds(payload);
     } on FormatException catch (e) {
       debugPrint('[sync] Malformed offer from $bleDeviceId: $e');
       return;
@@ -699,8 +749,8 @@ class MessageRouter {
     debugPrint(
         '[sync] Requesting ${wanted.length}/${offered.length} offered '
         'packet(s) from $bleDeviceId');
-    for (final request in buildSyncPackets(PacketType.syncRequest, wanted)) {
-      onSyncSend?.call(request, bleDeviceId);
+    for (final payload in buildSyncPayloads(wanted)) {
+      onSyncFrame?.call(ContentType.syncRequest, payload, bleDeviceId);
     }
   }
 
@@ -708,10 +758,10 @@ class MessageRouter {
   /// carry, directed over that link. Conveyance counts against the
   /// requester's per-neighbor relay budget — sync must not be a way around
   /// the flooding cap. Ids expired/evicted since the offer are skipped.
-  void _handleSyncRequest(GrassrootsPacket packet, String bleDeviceId) {
+  void _handleSyncRequest(Uint8List payload, String bleDeviceId) {
     final List<String> requested;
     try {
-      requested = decodeSyncIds(packet.payload);
+      requested = decodeSyncIds(payload);
     } on FormatException catch (e) {
       debugPrint('[sync] Malformed request from $bleDeviceId: $e');
       return;
@@ -723,6 +773,15 @@ class MessageRouter {
       if (!_allowRelayFrom(bleDeviceId)) break; // budget exhausted this window
       onSyncSend?.call(stored, bleDeviceId);
       conveyed++;
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'custody',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'convey',
+          'packetId': id,
+          'toDevice': bleDeviceId,
+        }));
+      }
     }
     if (conveyed > 0) {
       debugPrint(

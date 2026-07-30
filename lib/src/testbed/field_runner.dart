@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
 import '../trace/experiment_recorder.dart';
+import '../models/block.dart';
 import 'testbed_config.dart';
 
 /// The runner's user-visible phase.
@@ -101,6 +102,13 @@ class FieldRunner extends ChangeNotifier {
   final List<Timer> _sendTimers = [];
   int _sentCount = 0;
   bool _resetting = false;
+  /// Saturating mode: outstanding messageIds and the next sequence number.
+  final Set<String> _outstanding = {};
+  int _satSeq = 0;
+  int _ackedCount = 0;
+
+  /// ACKed sends in the current saturating step (throughput numerator).
+  int get ackedCount => _ackedCount;
 
   /// Messages fired by the plan so far (all steps).
   int get sentCount => _sentCount;
@@ -181,6 +189,18 @@ class FieldRunner extends ChangeNotifier {
   /// peer, labeled by 8-hex pubkey prefix — the two-device case with no
   /// manual pubkey entry.
   List<(String, Uint8List)> _sendTargets() {
+    final targets = _allSendTargets();
+    final want = currentStep?.sendTo.toLowerCase() ?? 'all';
+    if (want == 'all') return targets;
+    // Address ONE peer by pubkey prefix: the multi-hop case, where the
+    // recipient may not be a direct neighbour at all. An unmatched prefix
+    // sends nothing rather than silently broadcasting.
+    return targets
+        .where((t) => _hex(t.$2).toLowerCase().startsWith(want))
+        .toList();
+  }
+
+  List<(String, Uint8List)> _allSendTargets() {
     final me = myPubkeyHex?.toLowerCase();
     final plan = _plan!;
     if (plan.roster.isNotEmpty) {
@@ -222,7 +242,12 @@ class FieldRunner extends ChangeNotifier {
   /// `field|expId|src|dst|stepIndex|seq`.
   void _scheduleSends(FieldStep step) {
     final doSend = send;
-    if (step.sendCount <= 0 || doSend == null) return;
+    if (doSend == null) return;
+    if (step.saturate) {
+      _scheduleSaturating(step); // saturating mode ignores sendCount
+      return;
+    }
+    if (step.sendCount <= 0) return;
     final settled = linkSettled;
     if (settled == null) {
       final windowSec = step.dwellSec > 2 ? step.dwellSec - 2 : step.dwellSec;
@@ -251,6 +276,72 @@ class FieldRunner extends ChangeNotifier {
     _sendTimers.add(poll);
   }
 
+  /// Saturating throughput mode: wait for the link to settle, then keep
+  /// [FieldStep.inFlight] messages outstanding for the rest of the dwell,
+  /// firing the next as soon as one is ACKed ([onAck]). No pacing, no cap —
+  /// as many as the link carries.
+  void _scheduleSaturating(FieldStep step) {
+    _outstanding.clear();
+    _satSeq = 0;
+    _ackedCount = 0;
+    final settled = linkSettled;
+    void begin() {
+      unawaited(recorder.logMarker('saturate-start'));
+      for (var i = 0; i < step.inFlight; i++) {
+        _fireSaturating(step);
+      }
+      notifyListeners();
+    }
+
+    if (settled == null) {
+      begin();
+      return;
+    }
+    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
+      if (!_running || _phase != FieldPhase.dwelling) {
+        t.cancel();
+        return;
+      }
+      if (!_sendTargets().any((target) => settled(target.$2))) return;
+      t.cancel();
+      unawaited(recorder.logMarker('link-settled'));
+      begin();
+    });
+    _sendTimers.add(poll);
+  }
+
+  void _fireSaturating(FieldStep step) {
+    final doSend = send;
+    final plan = _plan;
+    if (doSend == null || plan == null) return;
+    if (!_running || _phase != FieldPhase.dwelling) return;
+    final seq = _satSeq++;
+    for (final (dstLabel, pubkey) in _sendTargets()) {
+      final messageId = _uuid.v5(workloadUuidNamespace,
+          'field|${plan.expId}|$_srcLabel|$dstLabel|$_stepIndex|$seq');
+      final payload = Uint8List(step.sendBytes);
+      for (var i = 0; i < payload.length; i++) {
+        payload[i] = (seq + i) & 0xff;
+      }
+      // Reserved first byte: testbed traffic must never look like a real
+      // block class in the wire-byte breakdown.
+      if (payload.isNotEmpty) payload[0] = testbedPayloadMarker;
+      _outstanding.add(messageId);
+      _sentCount++;
+      unawaited(doSend(pubkey, payload, messageId: messageId));
+    }
+  }
+
+  /// End-to-end ACK feed from the coordinator. In saturating mode each ACK
+  /// frees a window slot and immediately fires the next message.
+  void onAck(String messageId) {
+    if (!_outstanding.remove(messageId)) return;
+    _ackedCount++;
+    final step = currentStep;
+    if (step != null && step.saturate) _fireSaturating(step);
+    notifyListeners();
+  }
+
   void _queueSend(FieldStep step, int seq, int offsetSec) {
     final plan = _plan!;
     final stepIdx = _stepIndex;
@@ -262,6 +353,9 @@ class FieldRunner extends ChangeNotifier {
         for (var i = 0; i < payload.length; i++) {
           payload[i] = (seq + i) & 0xff;
         }
+        // Reserved first byte: testbed traffic must never look like a real
+        // block class in the wire-byte breakdown.
+        if (payload.isNotEmpty) payload[0] = testbedPayloadMarker;
         _sentCount++;
         unawaited(send!(pubkey, payload, messageId: messageId));
       }
@@ -281,6 +375,20 @@ class FieldRunner extends ChangeNotifier {
 
   Future<void> _endDwell() async {
     _cancelSends();
+    if ((currentStep?.saturate ?? false)) {
+      await recorder.log({
+        'type': 'flow',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'stop',
+        'flow': 'saturate',
+        'payloadBytes': currentStep!.sendBytes,
+        'inFlight': currentStep!.inFlight,
+        'sent': _satSeq,
+        'acked': _ackedCount,
+        'ackedBytes': _ackedCount * currentStep!.sendBytes,
+      });
+      _outstanding.clear();
+    }
     final step = currentStep;
     if (step != null && step.bulk) onStopBulk?.call();
     onWindowElapsed?.call();

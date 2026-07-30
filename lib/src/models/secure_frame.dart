@@ -17,7 +17,18 @@ enum ContentType {
   readReceipt(0x03),
 
   /// Hole-punch / address signaling. Chunk is a `SignalingCodec` payload.
-  signaling(0x04);
+  signaling(0x04),
+
+  /// Sync-on-connect custody summary: the packetIds this node's DTN store
+  /// carries. Neighbor-local (TTL 1, never relayed) but sealed like every
+  /// other content — the Noise session with the neighbor exists before any
+  /// sync runs, so there is no reason to put the custody inventory on the
+  /// air in the clear.
+  syncOffer(0x05),
+
+  /// Reply to [syncOffer]: the subset of offered packetIds the sender wants
+  /// conveyed. Sealed to the neighbor's session, same as the offer.
+  syncRequest(0x06);
 
   final int value;
   const ContentType(this.value);

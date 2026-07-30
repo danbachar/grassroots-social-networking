@@ -3,7 +3,7 @@ import 'dart:typed_data';
 import '../models/packet.dart';
 
 /// Wire codec for the sync-on-connect packetId lists carried by
-/// [PacketType.syncOffer] and [PacketType.syncRequest].
+/// [ContentType.syncOffer] and [ContentType.syncRequest] frames.
 ///
 /// Payload format: `[count:1][packetId:16] × count`.
 ///
@@ -55,21 +55,18 @@ List<String> decodeSyncIds(Uint8List payload) {
 /// Chunk [packetIds] into sync packets of the given [type] (offer or request).
 /// Each packet is neighbor-local: broadcast-addressed with TTL 1 so a relay
 /// never forwards it.
-List<GrassrootsPacket> buildSyncPackets(
-    PacketType type, List<String> packetIds) {
-  assert(type == PacketType.syncOffer || type == PacketType.syncRequest);
-  final packets = <GrassrootsPacket>[];
+/// Chunk [packetIds] into payloads that each fit a single BLE write. Each
+/// chunk becomes one sealed SecureFrame (syncOffer/syncRequest) — the ids
+/// never travel in the clear.
+List<Uint8List> buildSyncPayloads(List<String> packetIds) {
+  final out = <Uint8List>[];
   for (var i = 0; i < packetIds.length; i += maxSyncIdsPerPacket) {
     final chunk = packetIds.sublist(
         i,
         (i + maxSyncIdsPerPacket > packetIds.length)
             ? packetIds.length
             : i + maxSyncIdsPerPacket);
-    packets.add(GrassrootsPacket(
-      type: type,
-      ttl: 1, // neighbor-local: never relayed
-      payload: encodeSyncIds(chunk),
-    ));
+    out.add(encodeSyncIds(chunk));
   }
-  return packets;
+  return out;
 }

@@ -10,6 +10,7 @@ import 'package:grassroots_networking/src/mesh/sync_codec.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
+import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
@@ -19,8 +20,9 @@ import '../helpers/sodium_test_bootstrap.dart';
 
 /// Sync-on-connect (DTN anti-entropy): offer carried packetIds on connect,
 /// request the unseen subset, convey the stored sealed packets. Custody is
-/// replicated, never transferred; reconciliation uses only cleartext
-/// packetIds.
+/// replicated, never transferred. The offer/request frames are SEALED to the
+/// neighbour's Noise session (ContentType.syncOffer/syncRequest) — packetIds
+/// never travel in the clear.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -57,18 +59,15 @@ void main() {
       expect(() => decodeSyncIds(long), throwsFormatException);
     });
 
-    test('buildSyncPackets chunks and marks packets neighbor-local (ttl 1)',
-        () {
+    test('buildSyncPayloads chunks ids to fit a single BLE write', () {
       final ids = List.generate(maxSyncIdsPerPacket * 2 + 3, (_) => uuid.v4());
-      final packets = buildSyncPackets(PacketType.syncOffer, ids);
-      expect(packets, hasLength(3));
-      for (final p in packets) {
-        expect(p.ttl, 1);
-        expect(p.type, PacketType.syncOffer);
-        // Each packet must fit a single 244-byte BLE write.
-        expect(p.serialize().length, lessThanOrEqualTo(244));
+      final payloads = buildSyncPayloads(ids);
+      expect(payloads, hasLength(3));
+      for (final payload in payloads) {
+        // header + sealed frame overhead must still fit a 244-byte write.
+        expect(payload.length, lessThanOrEqualTo(180));
       }
-      expect(packets.expand((p) => decodeSyncIds(p.payload)), ids);
+      expect(payloads.expand(decodeSyncIds), ids);
     });
   });
 
@@ -115,10 +114,11 @@ void main() {
   group('MessageRouter sync handlers', () {
     late MessageRouter router;
     late Store<AppState> store;
+    late GrassrootsIdentity identity;
 
     setUp(() async {
       final keyPair = await Ed25519().newKeyPair();
-      final identity = await GrassrootsIdentity.create(
+      identity = await GrassrootsIdentity.create(
         keyPair: keyPair,
         nickname: 'SyncTester',
       );
@@ -141,6 +141,33 @@ void main() {
               Uint8List.fromList(List.generate(32, (i) => i + 1)),
           payload: Uint8List.fromList([9, 9, 9]),
         );
+
+    /// Deliver a sync control frame the way the wire does now: as a `secure`
+    /// packet whose trial-decrypt yields the sealed SecureFrame. The stub
+    /// stands in for the Noise session with the neighbour.
+    final neighbourPubkey =
+        Uint8List.fromList(List.generate(32, (i) => 200 + i % 50));
+    Future<void> deliverSyncFrame(
+        ContentType type, List<String> ids, String bleDeviceId) async {
+      final frame = SecureFrame(
+        contentType: type,
+        messageId: uuid.v4(),
+        chunk: encodeSyncIds(ids),
+      );
+      final sealed = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 1,
+        recipientPubkey: identity.publicKey, // sync is addressed to us
+        payload: Uint8List.fromList([0xE0, 0xC0]), // opaque on the wire
+      );
+      router.trialDecrypt = (p) async =>
+          (p.copyWith(payload: frame.encode()), neighbourPubkey);
+      await router.processPacket(
+        sealed,
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: bleDeviceId,
+      );
+    }
 
     /// Relay a third-party sealed packet through the router so it lands in
     /// the DTN store (recipient unreachable in the empty peers state).
@@ -172,7 +199,7 @@ void main() {
       // is offered in sync like any relayed custody.
       router.storeCustody(recipient, sealed);
       expect(
-        decodeSyncIds(router.buildSyncOffers().single.payload),
+        decodeSyncIds(router.buildSyncOffers().single),
         contains(sealed.packetId),
       );
       expect(router.custodyFor(recipient).single.packetId, sealed.packetId);
@@ -188,8 +215,7 @@ void main() {
       final p = await storeViaRelay();
       final offers = router.buildSyncOffers();
       expect(offers, hasLength(1));
-      expect(offers.first.type, PacketType.syncOffer);
-      expect(decodeSyncIds(offers.first.payload), contains(p.packetId));
+      expect(decodeSyncIds(offers.first), contains(p.packetId));
     });
 
     test('offer -> requests exactly the unseen subset', () async {
@@ -197,35 +223,28 @@ void main() {
       router.markSeen(seenId);
       final unseen1 = uuid.v4(), unseen2 = uuid.v4();
 
-      final sent = <(GrassrootsPacket, String)>[];
-      router.onSyncSend = (packet, device) => sent.add((packet, device));
+      final frames = <(ContentType, Uint8List, String)>[];
+      router.onSyncFrame = (t, payload, device) =>
+          frames.add((t, payload, device));
 
-      await router.processPacket(
-        buildSyncPackets(
-            PacketType.syncOffer, [seenId, unseen1, unseen2]).single,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: 'neighbor-1',
-      );
+      await deliverSyncFrame(
+          ContentType.syncOffer, [seenId, unseen1, unseen2], 'neighbor-1');
 
-      expect(sent, hasLength(1));
-      final (request, device) = sent.single;
+      expect(frames, hasLength(1));
+      final (type, payload, device) = frames.single;
       expect(device, 'neighbor-1');
-      expect(request.type, PacketType.syncRequest);
-      expect(decodeSyncIds(request.payload),
-          unorderedEquals([unseen1, unseen2]));
+      expect(type, ContentType.syncRequest,
+          reason: 'the reply is sealed, not a cleartext packet type');
+      expect(decodeSyncIds(payload), unorderedEquals([unseen1, unseen2]));
     });
 
     test('offer with only seen ids -> no request', () async {
       final id = uuid.v4();
       router.markSeen(id);
       var called = false;
-      router.onSyncSend = (_, __) => called = true;
+      router.onSyncFrame = (_, __, ___) => called = true;
 
-      await router.processPacket(
-        buildSyncPackets(PacketType.syncOffer, [id]).single,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: 'neighbor-1',
-      );
+      await deliverSyncFrame(ContentType.syncOffer, [id], 'neighbor-1');
       expect(called, isFalse);
     });
 
@@ -236,11 +255,8 @@ void main() {
       final sent = <(GrassrootsPacket, String)>[];
       router.onSyncSend = (packet, device) => sent.add((packet, device));
 
-      await router.processPacket(
-        buildSyncPackets(PacketType.syncRequest, [stored.packetId]).single,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: 'neighbor-2',
-      );
+      await deliverSyncFrame(
+          ContentType.syncRequest, [stored.packetId], 'neighbor-2');
 
       expect(sent, hasLength(1));
       final (conveyed, device) = sent.single;
@@ -254,11 +270,8 @@ void main() {
     test('request for unknown/expired ids conveys nothing', () async {
       var called = false;
       router.onSyncSend = (_, __) => called = true;
-      await router.processPacket(
-        buildSyncPackets(PacketType.syncRequest, [uuid.v4()]).single,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: 'neighbor-2',
-      );
+      await deliverSyncFrame(
+          ContentType.syncRequest, [uuid.v4()], 'neighbor-2');
       expect(called, isFalse);
     });
 
@@ -268,20 +281,28 @@ void main() {
       router.onMessageReceived =
           (_, __, ___, ____) => fail('sync must not deliver');
 
-      await router.processPacket(
-        buildSyncPackets(PacketType.syncOffer, [uuid.v4()]).single,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: 'neighbor-1',
-      );
+      await deliverSyncFrame(ContentType.syncOffer, [uuid.v4()], 'neighbor-1');
       expect(relayed, isFalse);
     });
 
     test('sync over non-BLE transports is ignored (UDP carries no custody)',
         () async {
       var called = false;
-      router.onSyncSend = (_, __) => called = true;
+      router.onSyncFrame = (_, __, ___) => called = true;
+      final frame = SecureFrame(
+        contentType: ContentType.syncOffer,
+        messageId: uuid.v4(),
+        chunk: encodeSyncIds([uuid.v4()]),
+      );
+      router.trialDecrypt = (p) async =>
+          (p.copyWith(payload: frame.encode()), neighbourPubkey);
       await router.processPacket(
-        buildSyncPackets(PacketType.syncOffer, [uuid.v4()]).single,
+        GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 1,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([1, 2]),
+        ),
         transport: PeerTransport.udp,
         udpPeerId: 'udp-peer',
       );
@@ -290,14 +311,21 @@ void main() {
 
     test('malformed sync payload is dropped without side effects', () async {
       var called = false;
-      router.onSyncSend = (_, __) => called = true;
-      final bad = GrassrootsPacket(
-        type: PacketType.syncOffer,
-        ttl: 1,
-        payload: Uint8List.fromList([7]), // count=7, no ids
+      router.onSyncFrame = (_, __, ___) => called = true;
+      final frame = SecureFrame(
+        contentType: ContentType.syncOffer,
+        messageId: uuid.v4(),
+        chunk: Uint8List.fromList([7]), // count=7, no ids
       );
+      router.trialDecrypt = (p) async =>
+          (p.copyWith(payload: frame.encode()), neighbourPubkey);
       await router.processPacket(
-        bad,
+        GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 1,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([1, 2]),
+        ),
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'neighbor-1',
       );

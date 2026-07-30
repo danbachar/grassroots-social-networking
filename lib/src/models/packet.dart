@@ -13,20 +13,10 @@ enum PacketType {
   /// Session-sealed envelope. Everything that is not an ANNOUNCE or a handshake
   /// is one opaque `secure` packet: the content type and any fragmentation live
   /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
-  /// an opaque, recipient-addressed blob — never the message class.
-  secure(0x03),
-
-  /// Sync-on-connect custody summary (neighbor-local, never relayed).
-  /// Cleartext list of packetIds this node's DTN store is carrying; the
-  /// receiving neighbor tests them against its seen-set and requests the ones
-  /// it lacks. Reveals only packetIds — which the envelope already exposes to
-  /// every flood recipient.
-  syncOffer(0x04),
-
-  /// Reply to [syncOffer] (neighbor-local, never relayed): the subset of
-  /// offered packetIds the sender wants conveyed. The offerer answers by
-  /// sending each stored sealed packet over the same link.
-  syncRequest(0x05);
+  /// an opaque, recipient-addressed blob — never the message class. Sync-on-
+  /// connect control frames ride inside it too, so custody inventories are
+  /// never on the air in the clear.
+  secure(0x03);
 
   final int value;
   const PacketType(this.value);

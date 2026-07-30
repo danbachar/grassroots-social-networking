@@ -193,6 +193,87 @@ class WorkloadConfig {
       );
 }
 
+/// One directed bulk transfer: [srcLabel] saturates toward [dstLabel].
+@immutable
+class BulkFlow {
+  final String srcLabel;
+  final String dstLabel;
+
+  const BulkFlow({required this.srcLabel, required this.dstLabel});
+
+  Map<String, dynamic> toJson() => {'src': srcLabel, 'dst': dstLabel};
+
+  factory BulkFlow.fromJson(Map<String, dynamic> json) => BulkFlow(
+        srcLabel: json['src'] as String,
+        dstLabel: json['dst'] as String,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is BulkFlow &&
+      other.srcLabel == srcLabel &&
+      other.dstLabel == dstLabel;
+
+  @override
+  int get hashCode => Object.hash(srcLabel, dstLabel);
+}
+
+/// Sustained-throughput workload for the data-plane evaluation (dilating
+/// clique): each listed flow keeps [inFlight] messages of [payloadBytes]
+/// outstanding — sending the next only when one is ACKed, never re-sending —
+/// for [durationMs] from Start. The same config is deployed to every device;
+/// each executes only the flows where it is the source. One flow = the
+/// distance-only baseline; all ordered pairs = the contended all-to-all run.
+@immutable
+class BulkFlowConfig {
+  final List<WorkloadRosterEntry> roster;
+  final List<BulkFlow> flows;
+  final int payloadBytes;
+  final int durationMs;
+  final int inFlight;
+
+  const BulkFlowConfig({
+    required this.roster,
+    required this.flows,
+    required this.payloadBytes,
+    required this.durationMs,
+    this.inFlight = 2,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'roster': roster.map((r) => r.toJson()).toList(),
+        'flows': flows.map((f) => f.toJson()).toList(),
+        'payloadBytes': payloadBytes,
+        'durationMs': durationMs,
+        'inFlight': inFlight,
+      };
+
+  factory BulkFlowConfig.fromJson(Map<String, dynamic> json) => BulkFlowConfig(
+        roster: (json['roster'] as List<dynamic>)
+            .map((e) => WorkloadRosterEntry.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        flows: (json['flows'] as List<dynamic>)
+            .map((e) => BulkFlow.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        payloadBytes: json['payloadBytes'] as int,
+        durationMs: json['durationMs'] as int,
+        inFlight: json['inFlight'] as int? ?? 2,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is BulkFlowConfig &&
+      listEquals(other.roster, roster) &&
+      listEquals(other.flows, flows) &&
+      other.payloadBytes == payloadBytes &&
+      other.durationMs == durationMs &&
+      other.inFlight == inFlight;
+
+  @override
+  int get hashCode => Object.hash(Object.hashAll(roster),
+      Object.hashAll(flows), payloadBytes, durationMs, inFlight);
+}
+
 Uint8List? _hexToBytes(String hex) {
   final clean = hex.trim().toLowerCase();
   if (clean.isEmpty || clean.length.isOdd) return null;

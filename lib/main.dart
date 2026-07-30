@@ -5,14 +5,10 @@ import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:logger/logger.dart' show Logger, Level;
 import 'src/debug/log_buffer.dart';
-import 'src/trace/trace_logger.dart';
-import 'src/trace/trace_config.dart';
-import 'src/trace/location_sampler.dart';
+import 'src/trace/experiment_recorder.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:redux/redux.dart';
 import 'package:flutter_redux/flutter_redux.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:battery_plus/battery_plus.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'dart:async';
 import 'chat_screen.dart';
@@ -42,7 +38,7 @@ late final Store<AppState> appStore;
 late final PersistenceService persistenceService;
 
 // Global opt-in trace logger (enabled only after the user consents).
-late final TraceLogger traceLogger;
+late final ExperimentRecorder experimentRecorder;
 
 // Global libsodium handle, initialized at app startup. Used by ProtocolHandler
 // for native Ed25519 sign on the main isolate; verifier worker isolates
@@ -294,15 +290,10 @@ void main() async {
   // Subscribe to persist changes (debounced)
   appStore.onChange.listen((state) => persistenceService.onStateChanged(state));
 
-  // Opt-in trace logger — enabled only while the user's consent is on. Keep
-  // its enabled state in sync with the (persisted) consent flag.
-  traceLogger = TraceLogger(
-    platform: defaultTargetPlatform == TargetPlatform.iOS ? 'ios' : 'android',
-  );
-  traceLogger.setEnabled(settings.traceLoggingConsent);
-  appStore.onChange.listen(
-    (state) => traceLogger.setEnabled(state.settings.traceLoggingConsent),
-  );
+  // Local-only experiment recorder (testbed evaluation). Inert until an
+  // experiment is started from the testbed screen; records never leave the
+  // device except via an explicit share.
+  experimentRecorder = ExperimentRecorder();
 
   // Initialize notifications
   const AndroidInitializationSettings initializationSettingsAndroid =
@@ -363,7 +354,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   GrassrootsIdentity? _identity;
   GrassrootsNetwork? _grassroots;
   Timer? _refreshTimer;
-  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   int _currentIndex = 1; // Start on "Around" tab (center)
 
   // Track nickname changes for animation
@@ -407,12 +397,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     appStore.onChange.listen((_) {
       if (mounted) setState(() {});
     });
-    // Subscribe to connectivity changes
-    _connectivitySubscription =
-        Connectivity().onConnectivityChanged.listen(_onConnectivityChanged);
-    unawaited(Connectivity().checkConnectivity().then((r) {
-      if (mounted) _connectivity = r;
-    }));
     _initialize();
     // Refresh UI every second to update "seconds ago" display
     _refreshTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -422,20 +406,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         _checkPendingChat();
       }
     });
-    // First-frame trace prompts: one-time consent, then the once-per-day upload
-    // prompt (main() has no BuildContext, so these run here).
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(_runTracePrompts());
-    });
-    // Periodic trace sampler (density + buffer). Foreground-only; cheap no-op
-    // when trace logging is disabled.
-    _traceSampleTimer = Timer.periodic(
-        const Duration(seconds: 60), (_) => unawaited(_sampleTrace()));
-  }
-
-  void _onConnectivityChanged(List<ConnectivityResult> results) {
-    debugPrint('🌐 Connectivity changed: $results');
-    _connectivity = results;
   }
 
   void _checkPendingChat() {
@@ -456,258 +426,11 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     }
   }
 
-  // ===== Trace logging prompts =====
-
-  bool _tracePromptBusy = false;
-
-  // Contact-session bookkeeping for trace 'contact' records (pubkeyHex -> ms).
-  final Map<String, int> _contactStartedAt = {};
-  final Map<String, int> _lastContactEndedAt = {};
-  // Periodic sampler for 'density' + 'buffer' records (foreground only).
-  Timer? _traceSampleTimer;
-  final LocationSampler _locationSampler = LocationSampler();
-  bool _locationRequested = false;
-
-  // Device-trace state.
-  final Battery _battery = Battery();
-  int? _lastBatteryLevel;
-  int? _lastBatteryAt;
-  List<ConnectivityResult> _connectivity = const [];
-  int? _backgroundedAt; // ms when the app last left the foreground
-
-  Future<void> _ensureLocationPermission() async {
-    if (_locationRequested || !traceLogger.enabled) return;
-    _locationRequested = true;
-    await _locationSampler.ensurePermission();
-  }
-
-  /// Log a `contact` record when a peer's consolidated reachability drops:
-  /// session duration + inter-contact gap since the previous session.
-  void _logContactRecord(PeerState peer) {
-    if (!traceLogger.enabled) return;
-    final hex = peer.pubkeyHex;
-    final startedAt = _contactStartedAt.remove(hex);
-    if (startedAt == null) return;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final prevEnd = _lastContactEndedAt[hex];
-    _lastContactEndedAt[hex] = now;
-    unawaited(traceLogger.log({
-      'type': 'contact',
-      't': now,
-      'peer': hex,
-      'startedAt': startedAt,
-      'endedAt': now,
-      'durationMs': now - startedAt,
-      if (prevEnd != null) 'interContactMs': startedAt - prevEnd,
-      if (peer.rssi != null) 'rssi': peer.rssi,
-    }));
-  }
-
-  /// Periodic coarse sample of node density + buffer occupancy. Foreground-only
-  /// (the timer doesn't run while backgrounded); lat/lon land in the geo stage.
-  Future<void> _sampleTrace() async {
-    if (!traceLogger.enabled) return;
-    await _ensureLocationPermission();
-
-    // Coarse location fix (emits 'visit' records via onVisit when leaving a
-    // cell); null when unavailable / permission denied.
-    final geo = await _locationSampler.sample(
-      onVisit: (v) => unawaited(traceLogger.log(v)),
-    );
-    if (!mounted) return;
-
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final peers = appStore.state.peers.peers.values;
-    final reachable = peers.where((p) => p.isReachable).toList();
-    final rssis = reachable.map((p) => p.rssi).whereType<int>().toList();
-    unawaited(traceLogger.log({
-      'type': 'density',
-      't': now,
-      'peersConnectedNow': reachable.length,
-      'friends': appStore.state.friendships.friends.length,
-      if (rssis.isNotEmpty)
-        'rssi': (rssis.reduce((a, b) => a + b) / rssis.length).round(),
-      ...?geo,
-    }));
-    final g = _grassroots;
-    if (g != null) {
-      unawaited(traceLogger.log({
-        'type': 'buffer',
-        't': now,
-        'event': 'sample',
-        'outboundQueued': g.outboundQueuedCount,
-        'dtnBuffered': g.dtnBufferedCount,
-      }));
-    }
-
-    unawaited(_sampleDevice());
-  }
-
-  /// Battery + network sample -> 'device' record. Drain rate is derived from
-  /// successive level samples (mAh isn't portable across platforms).
-  Future<void> _sampleDevice() async {
-    if (!traceLogger.enabled) return;
-    int? level;
-    try {
-      level = await _battery.batteryLevel;
-    } catch (_) {}
-    final now = DateTime.now().millisecondsSinceEpoch;
-    double? drainPctPerHr;
-    if (level != null && _lastBatteryLevel != null && _lastBatteryAt != null) {
-      final dLevel = _lastBatteryLevel! - level; // positive = drained
-      final dHours = (now - _lastBatteryAt!) / 3600000.0;
-      if (dHours > 0) drainPctPerHr = dLevel / dHours;
-    }
-    if (level != null) {
-      _lastBatteryLevel = level;
-      _lastBatteryAt = now;
-    }
-    unawaited(traceLogger.log({
-      'type': 'device',
-      't': now,
-      if (level != null) 'batteryPct': level,
-      if (drainPctPerHr != null)
-        'batteryDrainPctPerHr': double.parse(drainPctPerHr.toStringAsFixed(2)),
-      'lifecycleState': 'resumed', // the sampler runs only in the foreground
-      'networkType': _networkTypeString(),
-    }));
-  }
-
-  String _networkTypeString() {
-    if (_connectivity.contains(ConnectivityResult.wifi)) return 'wifi';
-    if (_connectivity.contains(ConnectivityResult.mobile)) return 'mobile';
-    if (_connectivity.contains(ConnectivityResult.ethernet)) return 'ethernet';
-    if (_connectivity.isEmpty ||
-        _connectivity.contains(ConnectivityResult.none)) {
-      return 'none';
-    }
-    return _connectivity.first.name;
-  }
-
-  /// One-time consent prompt, then the upload prompt — run once per app start.
-  Future<void> _runTracePrompts() async {
-    await _maybeConsentPrompt();
-    await _maybeTraceUploadPrompt();
-  }
-
-  /// Manual "Upload now" from settings. Uploads immediately (no prompt) and
-  /// returns a short user-facing status message for the caller to surface.
-  Future<String> _uploadTracesNow() async {
-    if (!TraceConfig.isConfigured) return 'Trace uploads are not configured';
-    if (!await traceLogger.hasUnuploaded()) return 'Nothing to upload';
-    final ok = await traceLogger.uploadAll(
-      url: TraceConfig.serverUrl,
-      token: TraceConfig.serverToken,
-    );
-    return ok ? 'Traces uploaded' : 'Trace upload failed';
-  }
-
-  /// Ask once, ever, whether the user opts in to trace logging + upload.
-  Future<void> _maybeConsentPrompt() async {
-    // consentTimestamp is non-null once the user has answered (grant or decline).
-    if (appStore.state.settings.consentTimestamp != null) return;
-    if (!mounted) return;
-
-    final accepted = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Help improve the network?'),
-        content: const Text(
-          'You can opt in to collect anonymous diagnostic traces '
-          '(connectivity, message timing, coarse location) on this device. '
-          'Nothing is sent automatically — once a day the app will ask before '
-          'uploading to your configured research server. You can turn this off '
-          'any time in Settings.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('No thanks'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Opt in'),
-          ),
-        ],
-      ),
-    );
-
-    appStore.dispatch(SetTraceLoggingConsentAction(
-      accepted == true,
-      consentTimestamp: DateTime.now().toUtc().toIso8601String(),
-    ));
-
-    if (accepted == true) {
-      // Enable + request location now (don't wait for the store listener), so
-      // the OS location prompt follows the consent dialog immediately.
-      traceLogger.setEnabled(true);
-      _locationRequested = true;
-      unawaited(_locationSampler.ensurePermission());
-    }
-  }
-
-  /// On every app start, offer to upload any traces not yet uploaded since the
-  /// last successful upload. Fires only when the user has opted in, a
-  /// destination is baked in, and there is actually something pending.
-  Future<void> _maybeTraceUploadPrompt() async {
-    if (_tracePromptBusy) return;
-    final settings = appStore.state.settings;
-    if (!settings.traceLoggingConsent) return;
-
-    // Destination is baked in (not user-configurable). A build shipped without
-    // a token stays inert.
-    if (!TraceConfig.isConfigured) return;
-
-    if (!await traceLogger.hasUnuploaded()) return;
-    if (!mounted) return;
-
-    _tracePromptBusy = true;
-    try {
-      final accepted = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Upload diagnostic traces?'),
-          content: const Text(
-            'Upload the diagnostic traces collected on this device to your '
-            'research server?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Not now'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Upload'),
-            ),
-          ],
-        ),
-      );
-
-      if (accepted == true) {
-        final ok = await traceLogger.uploadAll(
-          url: TraceConfig.serverUrl,
-          token: TraceConfig.serverToken,
-        );
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text(ok ? 'Traces uploaded' : 'Trace upload failed'),
-            duration: const Duration(seconds: 2),
-          ));
-        }
-      }
-    } finally {
-      _tracePromptBusy = false;
-    }
-  }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _connectivitySubscription?.cancel();
     _refreshTimer?.cancel();
-    _traceSampleTimer?.cancel();
     _grassroots?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
@@ -718,27 +441,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     debugPrint('[lifecycle] App state -> $state');
-    final now = DateTime.now().millisecondsSinceEpoch;
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
-      _backgroundedAt ??= now;
       // Persist the log tail before a possible background kill.
       unawaited(LogBuffer.instance.flushNow());
     }
     if (state == AppLifecycleState.resumed) {
-      final bgMs = _backgroundedAt != null ? now - _backgroundedAt! : null;
-      _backgroundedAt = null;
-      if (traceLogger.enabled) {
-        unawaited(traceLogger.log({
-          'type': 'device',
-          't': now,
-          'lifecycleState': 'resumed',
-          if (bgMs != null) 'bgDurationMs': bgMs,
-          // OS-throttle proxy: a long background gap suggests the OS suspended
-          // us (true Doze / App-Standby needs native APIs we don't have).
-          if (bgMs != null) 'osThrottled': bgMs > 60000,
-        }));
-      }
       unawaited(_grassroots?.onAppResumed() ?? Future.value());
     }
   }
@@ -751,7 +459,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         identity: identity,
         store: appStore,
         sodium: appSodium,
-        trace: traceLogger,
+        trace: experimentRecorder,
       );
 
       grassroots.onMessageReceived =
@@ -759,36 +467,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         _handleIncomingMessage(messageId, senderPubkey, payload, transport);
       };
 
-      // Trace: a contact session begins/ends (consolidated reachability edges).
-      grassroots.onPeerConnected = (peer) {
-        if (traceLogger.enabled) {
-          _contactStartedAt[peer.pubkeyHex] =
-              DateTime.now().millisecondsSinceEpoch;
-        }
-      };
-      grassroots.onPeerDisconnected = _logContactRecord;
-
       // Friend presence is handled at the transport layer; no app-layer
       // callback needed for UDP initialization.
-
-      // grassroots.onPeerConnected = (peer) {
-      //   print('Peer connected: ${peer.displayName}');
-      //   // PeerStore already has the peer - just track nickname changes
-      // };
-
-      // grassroots.onPeerUpdated = (peer) {
-      //   print('Peer updated: ${peer.displayName}');
-
-      //   // Check if nickname changed - use peerStore to get the previous state
-      //   // Note: Since peerStore already updated, we track changes via the _nicknameChanges map
-      //   // The peer object passed here is from peerStore, so we can't compare old/new directly
-      //   // This callback is mainly for nickname change animations
-      // };
-
-      // grassroots.onPeerDisconnected = (peer) {
-      //   print('Peer disconnected: ${peer.displayName}');
-      //   // PeerStore already updated - UI will refresh via _onPeersChanged
-      // };
 
       setState(() {
         _identity = identity;
@@ -2725,7 +2405,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
-          onUploadTracesNow: _uploadTracesNow,
           myPubkeyHex: _grassroots?.identity.publicKey
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(),
@@ -2743,6 +2422,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                     scheduled: d.scheduledCount,
                     sent: d.sentCount,
                   );
+                },
+          experimentRecorder: experimentRecorder,
+          onStartBulk:
+              _grassroots == null ? null : () => _grassroots!.startBulkFlows(),
+          onStopBulk:
+              _grassroots == null ? null : () => _grassroots!.stopBulkFlows(),
+          bulkStatus: _grassroots == null
+              ? null
+              : () {
+                  final d = _grassroots!.bulkFlowDriver;
+                  return BulkStatus(running: d.isRunning, flows: d.status);
                 },
         ),
       ),
@@ -2910,7 +2600,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       identity: newIdentity,
       store: appStore,
       sodium: appSodium,
-      trace: traceLogger,
+      trace: experimentRecorder,
     );
     newGrassroots.onMessageReceived =
         (messageId, senderPubkey, payload, transport) {

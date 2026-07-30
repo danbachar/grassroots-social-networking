@@ -10,6 +10,7 @@ import 'src/store/app_state.dart';
 import 'src/store/settings_actions.dart';
 import 'src/store/settings_state.dart';
 import 'src/store/transports_state.dart';
+import 'src/trace/experiment_recorder.dart';
 import 'src/transport/transport_service.dart';
 
 /// Settings screen for configuring transport protocols
@@ -26,16 +27,16 @@ class SettingsScreen extends StatefulWidget {
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
 
-  /// Upload not-yet-uploaded diagnostic traces on demand ("Upload now").
-  /// Returns a short user-facing status message to surface in a snackbar.
-  final Future<String> Function()? onUploadTracesNow;
-
   /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
   /// is not up. [myPubkeyHex] is this device's hex identity.
   final String? myPubkeyHex;
   final Future<void> Function()? onStartWorkload;
   final VoidCallback? onStopWorkload;
   final WorkloadStatus Function()? workloadStatus;
+  final ExperimentRecorder? experimentRecorder;
+  final VoidCallback? onStartBulk;
+  final VoidCallback? onStopBulk;
+  final BulkStatus Function()? bulkStatus;
 
   const SettingsScreen({
     super.key,
@@ -43,11 +44,14 @@ class SettingsScreen extends StatefulWidget {
     this.onSettingsChanged,
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
-    this.onUploadTracesNow,
     this.myPubkeyHex,
     this.onStartWorkload,
     this.onStopWorkload,
     this.workloadStatus,
+    this.experimentRecorder,
+    this.onStartBulk,
+    this.onStopBulk,
+    this.bulkStatus,
   });
 
   @override
@@ -59,9 +63,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _udpEnabled;
   bool _isRetryingPublicAddressDiscovery = false;
   StreamSubscription<AppState>? _storeSubscription;
-
-  /// True while a manual "Upload now" is in flight (disables the button).
-  bool _uploadingTraces = false;
 
   @override
   void initState() {
@@ -158,11 +159,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           // Introduce strangers (invite facilitation)
           _buildFacilitateInvitesSection(),
-
-          const Divider(height: 32),
-
-          // Diagnostic traces (opt-in research telemetry)
-          _buildTraceLoggingSection(),
 
           const Divider(height: 32),
 
@@ -282,6 +278,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onStartWorkload: widget.onStartWorkload,
                       onStopWorkload: widget.onStopWorkload,
                       workloadStatus: widget.workloadStatus,
+                      experimentRecorder: widget.experimentRecorder,
+                      onStartBulk: widget.onStartBulk,
+                      onStopBulk: widget.onStopBulk,
+                      bulkStatus: widget.bulkStatus,
                     ),
                   ),
                 );
@@ -511,79 +511,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ],
     );
-  }
-
-  Widget _buildTraceLoggingSection() {
-    final settings = widget.store.state.settings;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Padding(
-          padding: EdgeInsets.symmetric(
-              horizontal: GlSpace.s4, vertical: GlSpace.s2),
-          child:
-              EyebrowLabel('Diagnostic traces', color: GlColors.accentOnSoft),
-        ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: GlSpace.s4),
-          child: Text(
-            'Opt in to collect anonymous diagnostic traces on this device. '
-            'The app asks on every start before uploading, or upload manually '
-            'below.',
-            style:
-                TextStyle(color: GlColors.textMuted, fontSize: GlType.textSm),
-          ),
-        ),
-        SwitchListTile(
-          value: settings.traceLoggingConsent,
-          title: const Text('Collect diagnostic traces'),
-          subtitle: Text(settings.traceLoggingConsent ? 'On' : 'Off'),
-          onChanged: (value) => widget.store.dispatch(
-            SetTraceLoggingConsentAction(
-              value,
-              consentTimestamp: DateTime.now().toUtc().toIso8601String(),
-            ),
-          ),
-        ),
-        if (settings.traceLoggingConsent && widget.onUploadTracesNow != null)
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: ElevatedButton.icon(
-                onPressed: _uploadingTraces ? null : _handleUploadNow,
-                icon: _uploadingTraces
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.upload),
-                label: Text(_uploadingTraces ? 'Uploading…' : 'Upload now'),
-              ),
-            ),
-          ),
-      ],
-    );
-  }
-
-  /// Run the manual trace upload and surface its status in a snackbar.
-  Future<void> _handleUploadNow() async {
-    final upload = widget.onUploadTracesNow;
-    if (upload == null) return;
-    setState(() => _uploadingTraces = true);
-    String message;
-    try {
-      message = await upload();
-    } catch (_) {
-      message = 'Trace upload failed';
-    }
-    if (!mounted) return;
-    setState(() => _uploadingTraces = false);
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(message),
-      duration: const Duration(seconds: 2),
-    ));
   }
 
   Widget _buildColdCallTrustSelector() {

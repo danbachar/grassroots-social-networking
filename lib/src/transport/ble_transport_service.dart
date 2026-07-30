@@ -9,6 +9,8 @@ import 'package:redux/redux.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../store/store.dart';
+import '../trace/experiment_recorder.dart';
+import '../trace/wire_ledger.dart';
 import 'transport_service.dart';
 
 /// Default display info for BLE transport
@@ -174,8 +176,80 @@ class BleTransportService extends TransportService {
     this.localName,
     this.firstMoverFallback = const Duration(seconds: 5),
     this.scanSilenceRestart = const Duration(seconds: 30),
+    this.trace,
     ble.GrassrootsBluetooth? grassrootsBluetooth,
   }) : _ble = grassrootsBluetooth ?? ble.GrassrootsBluetooth();
+
+  /// Optional trace logger for the evaluation instrumentation: per-sample
+  /// RSSI records, link-stage events, and the periodic wire byte ledger.
+  /// All emissions gate on `trace!.active` — zero cost in production.
+  final ExperimentRecorder? trace;
+
+  /// Per-type tx/rx byte counters, drained to a `wire` trace record on a
+  /// fixed cadence while tracing is active.
+  final WireLedger _wireLedger = WireLedger();
+  Timer? _wireLedgerTimer;
+
+  /// Rate-limit for per-peer `rssi` trace records (adv sightings can arrive
+  /// many times per second).
+  final Map<String, int> _lastRssiTraceMs = {};
+  static const int _rssiTraceMinIntervalMs = 900;
+
+  bool get _tracing => trace?.active ?? false;
+
+  String? _peerHexForPathId(String pathId) {
+    final pubkey = getPubkeyForPeerId(pathId);
+    if (pubkey == null) return null;
+    return pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  /// Emit one `rssi` sample record, rate-limited per path.
+  void _traceRssi(String pathId, int rssi,
+      {required String source, String? role}) {
+    if (!_tracing) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final last = _lastRssiTraceMs[pathId];
+    if (last != null && now - last < _rssiTraceMinIntervalMs) return;
+    // MAC rotation mints fresh pathIds every ~30s; bound the map on long runs.
+    if (_lastRssiTraceMs.length > 512) _lastRssiTraceMs.clear();
+    _lastRssiTraceMs[pathId] = now;
+    unawaited(trace!.log({
+      'type': 'rssi',
+      't': now,
+      'src': source,
+      'path': pathId,
+      'rssi': rssi,
+      if (role != null) 'role': role,
+      ...?_peerField(pathId),
+    }));
+  }
+
+  /// Emit one `link` stage record (connected / drop are transport-local
+  /// stages; discovered / session / usable are logged by the coordinator).
+  void _traceLink(String event, ble.BlePath path, BleRole role) {
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'link',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'event': event,
+      'path': path.pathId,
+      'role': role.name,
+      if (path.rssi != null) 'rssi': path.rssi,
+      if (event == 'drop') 'reason': path.error ?? path.state.name,
+      ...?_peerField(path.pathId),
+    }));
+  }
+
+  Map<String, dynamic>? _peerField(String pathId) {
+    final hex = _peerHexForPathId(pathId);
+    return hex == null ? null : {'peer': hex};
+  }
+
+  void _drainWireLedger() {
+    if (!_tracing) return;
+    final record = _wireLedger.drainRecord(transport: 'ble');
+    if (record != null) unawaited(trace!.log(record));
+  }
 
   // ===== TransportService implementation =====
 
@@ -247,6 +321,8 @@ class BleTransportService extends TransportService {
       _logSub = _ble.logs.listen(
         (msg) => debugPrint('[grassroots_bluetooth_layer] $msg'),
       );
+      _wireLedgerTimer ??= Timer.periodic(
+          const Duration(seconds: 10), (_) => _drainWireLedger());
 
       // `restoreState: true` opts the iOS plugin into CoreBluetooth's
       // state-preservation. With this on, when iOS suspends and later
@@ -602,6 +678,7 @@ class BleTransportService extends TransportService {
     }
     try {
       await _ble.send(peerId, data);
+      if (_tracing) _wireLedger.onTx(data);
       return true;
     } catch (e) {
       debugPrint('send() failed for $peerId: $e');
@@ -624,6 +701,7 @@ class BleTransportService extends TransportService {
       }
       try {
         await _ble.send(path.pathId, data);
+        if (_tracing) _wireLedger.onTx(data);
         sent++;
       } catch (e) {
         debugPrint('broadcast send() failed for ${path.pathId}: $e');
@@ -786,6 +864,8 @@ class BleTransportService extends TransportService {
   @override
   Future<void> dispose() async {
     await stop();
+    _wireLedgerTimer?.cancel();
+    _wireLedgerTimer = null;
     await _adapterSub?.cancel();
     await _advertisementSub?.cancel();
     await _pathSub?.cancel();
@@ -1042,6 +1122,7 @@ class BleTransportService extends TransportService {
       rssi: adv.rssi,
       serviceUuid: serviceUuid,
     ));
+    _traceRssi(pathId, adv.rssi, source: 'adv');
     final pubkey = getPubkeyForPeerId(pathId);
     if (pubkey != null) {
       final existingPeer = _peersState.getPeerByPubkey(pubkey);
@@ -1265,6 +1346,7 @@ class BleTransportService extends TransportService {
       case ble.BlePathState.ready:
         if (previous?.state != ble.BlePathState.ready) {
           store.dispatch(BleDeviceConnectedAction(path.pathId));
+          _traceLink('connected', path, role);
           _addConnectionEvent(TransportConnectionEvent(
             peerId: path.pathId,
             transport: TransportType.ble,
@@ -1281,6 +1363,10 @@ class BleTransportService extends TransportService {
           // may need targeted scanning to find its MAC, and a completed
           // central leg lets us drop a target and fall back to a broad scan.
           unawaited(_applyScanTargets());
+        } else if (path.rssi != null) {
+          // ready → ready re-emit: the plugin's periodic connected-RSSI poll
+          // (or an MTU update). Sample it for the evaluation trace.
+          _traceRssi(path.pathId, path.rssi!, source: 'conn', role: role.name);
         }
         break;
       case ble.BlePathState.failed:
@@ -1297,6 +1383,7 @@ class BleTransportService extends TransportService {
         // pair, and scan re-discoveries that keep firing path-changed with
         // the cached state) would otherwise spam disconnect logs.
         if (previous?.state == ble.BlePathState.ready) {
+          _traceLink('drop', path, role);
           _emitDisconnect(path, role);
         }
         _paths.remove(path.pathId);
@@ -1329,6 +1416,9 @@ class BleTransportService extends TransportService {
 
   void _onPayload(ble.BlePayload payload) {
     if (_stopped) return;
+    // Count on-air bytes before any drop gate below: the radio already spent
+    // them whether or not the path is deemed ready.
+    if (_tracing) _wireLedger.onRx(payload.value);
     // Drop payloads unless the plugin currently marks the path ready. This
     // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
     // not-sendable paths from populating PeerState BLE role fields.

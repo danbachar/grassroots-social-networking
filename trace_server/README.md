@@ -1,9 +1,12 @@
 # Grassroots trace server
 
-A small FastAPI service that accepts **opt-in** trace uploads from the Grassroots
-Networking mobile app. The app collects a set of mobility / messaging / device
-metrics locally and, on the first open of each day, asks the user to upload all
-not-yet-uploaded data here.
+A small FastAPI service that collects **testbed experiment recordings** from
+the Grassroots Networking mobile app. The app records experiment traces
+locally (`exp_<id>.jsonl`, see `docs/testbed_experiments.md`); the
+experimenter uploads them with the manual "Upload files" action on the
+testbed screen — one envelope per experiment file, `deviceId` = the device's
+pubkey hex, `experiment` = the file name. There is no automatic or
+consent-prompted upload path.
 
 * One `POST /v1/traces` = one upload (an envelope + a batch of records).
 * Uploads are **idempotent** (keyed by `uploadId`) — safe to retry.

@@ -91,15 +91,6 @@ class SettingsState {
   /// plugin's OS-level link snapshot, not the app's path bookkeeping.
   final bool showLinkDiagnostics;
 
-  // ===== Trace logging (opt-in research telemetry) =====
-
-  /// Whether the user has opted in to local trace logging + upload.
-  final bool traceLoggingConsent;
-
-  /// ISO-8601 timestamp when consent was granted (computed at the dispatch
-  /// site — reducers are pure and must not synthesize time).
-  final String? consentTimestamp;
-
   // ===== Testbed harnesses (debug-only; null/off in production) =====
 
   /// DEBUG-ONLY software-defined BLE topology. Null or `enabled == false`
@@ -109,6 +100,10 @@ class SettingsState {
   /// DEBUG-ONLY deterministic offered-load config. Presence does NOT start the
   /// driver — it is only executed when explicitly launched from a debug screen.
   final WorkloadConfig? workloadConfig;
+
+  /// DEBUG-ONLY sustained-throughput flow config (data-plane evaluation).
+  /// Presence does NOT start the driver.
+  final BulkFlowConfig? bulkFlowConfig;
 
   const SettingsState({
     this.bluetoothEnabled = true,
@@ -121,10 +116,9 @@ class SettingsState {
     this.coldCallTrustLevel = ColdCallTrustLevel.open,
     this.facilitateInvites = false,
     this.showLinkDiagnostics = false,
-    this.traceLoggingConsent = false,
-    this.consentTimestamp,
     this.neighborAllowlist,
     this.workloadConfig,
+    this.bulkFlowConfig,
   });
 
   static const SettingsState initial = SettingsState();
@@ -160,11 +154,10 @@ class SettingsState {
     ColdCallTrustLevel? coldCallTrustLevel,
     bool? facilitateInvites,
     bool? showLinkDiagnostics,
-    bool? traceLoggingConsent,
     // Use Object? + sentinel so callers can pass null to clear.
-    Object? consentTimestamp = _sentinel,
     Object? neighborAllowlist = _sentinel,
     Object? workloadConfig = _sentinel,
+    Object? bulkFlowConfig = _sentinel,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -174,16 +167,15 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       facilitateInvites: facilitateInvites ?? this.facilitateInvites,
       showLinkDiagnostics: showLinkDiagnostics ?? this.showLinkDiagnostics,
-      traceLoggingConsent: traceLoggingConsent ?? this.traceLoggingConsent,
-      consentTimestamp: identical(consentTimestamp, _sentinel)
-          ? this.consentTimestamp
-          : consentTimestamp as String?,
       neighborAllowlist: identical(neighborAllowlist, _sentinel)
           ? this.neighborAllowlist
           : neighborAllowlist as NeighborAllowlist?,
       workloadConfig: identical(workloadConfig, _sentinel)
           ? this.workloadConfig
           : workloadConfig as WorkloadConfig?,
+      bulkFlowConfig: identical(bulkFlowConfig, _sentinel)
+          ? this.bulkFlowConfig
+          : bulkFlowConfig as BulkFlowConfig?,
     );
   }
 
@@ -195,10 +187,9 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
         'showLinkDiagnostics': showLinkDiagnostics,
-        'traceLoggingConsent': traceLoggingConsent,
-        'consentTimestamp': consentTimestamp,
         'neighborAllowlist': neighborAllowlist?.toJson(),
         'workloadConfig': workloadConfig?.toJson(),
+        'bulkFlowConfig': bulkFlowConfig?.toJson(),
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -227,8 +218,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
-      traceLoggingConsent: json['traceLoggingConsent'] as bool? ?? false,
-      consentTimestamp: json['consentTimestamp'] as String?,
       neighborAllowlist: json['neighborAllowlist'] == null
           ? null
           : NeighborAllowlist.fromJson(
@@ -237,6 +226,10 @@ class SettingsState {
           ? null
           : WorkloadConfig.fromJson(
               json['workloadConfig'] as Map<String, dynamic>),
+      bulkFlowConfig: json['bulkFlowConfig'] == null
+          ? null
+          : BulkFlowConfig.fromJson(
+              json['bulkFlowConfig'] as Map<String, dynamic>),
     );
   }
 
@@ -252,10 +245,9 @@ class SettingsState {
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
           showLinkDiagnostics == other.showLinkDiagnostics &&
-          traceLoggingConsent == other.traceLoggingConsent &&
-          consentTimestamp == other.consentTimestamp &&
           neighborAllowlist == other.neighborAllowlist &&
-          workloadConfig == other.workloadConfig;
+          workloadConfig == other.workloadConfig &&
+          bulkFlowConfig == other.bulkFlowConfig;
 
   @override
   int get hashCode => Object.hash(
@@ -266,10 +258,9 @@ class SettingsState {
         coldCallTrustLevel,
         facilitateInvites,
         showLinkDiagnostics,
-        traceLoggingConsent,
-        consentTimestamp,
         neighborAllowlist,
         workloadConfig,
+        bulkFlowConfig,
       );
 
   @override

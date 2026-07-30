@@ -49,21 +49,16 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(showLinkDiagnostics: action.enabled);
   }
 
-  if (action is SetTraceLoggingConsentAction) {
-    return state.copyWith(
-      traceLoggingConsent: action.consent,
-      // Record the most recent decision time (grant OR decline). A non-null
-      // consentTimestamp means the user has been asked, so we don't re-prompt.
-      consentTimestamp: action.consentTimestamp ?? state.consentTimestamp,
-    );
-  }
-
   if (action is SetNeighborAllowlistAction) {
     return state.copyWith(neighborAllowlist: action.allowlist);
   }
 
   if (action is SetWorkloadConfigAction) {
     return state.copyWith(workloadConfig: action.config);
+  }
+
+  if (action is SetBulkFlowConfigAction) {
+    return state.copyWith(bulkFlowConfig: action.config);
   }
 
   return state;

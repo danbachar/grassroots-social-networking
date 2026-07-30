@@ -67,15 +67,6 @@ class SetShowLinkDiagnosticsAction extends SettingsAction {
   SetShowLinkDiagnosticsAction(this.enabled);
 }
 
-/// Opt in/out of trace logging + upload. [consentTimestamp] is computed at the
-/// dispatch site (reducers are pure) and stored only when opting in.
-class SetTraceLoggingConsentAction extends SettingsAction {
-  final bool consent;
-  final String? consentTimestamp;
-
-  SetTraceLoggingConsentAction(this.consent, {this.consentTimestamp});
-}
-
 /// DEBUG/TESTBED ONLY. Install (or clear, with null) the software-defined BLE
 /// topology allowlist.
 class SetNeighborAllowlistAction extends SettingsAction {
@@ -90,5 +81,13 @@ class SetWorkloadConfigAction extends SettingsAction {
   final WorkloadConfig? config;
 
   SetWorkloadConfigAction(this.config);
+}
+
+/// DEBUG/TESTBED ONLY. Install (or clear, with null) the sustained-throughput
+/// bulk-flow config. Does NOT start the driver.
+class SetBulkFlowConfigAction extends SettingsAction {
+  final BulkFlowConfig? config;
+
+  SetBulkFlowConfigAction(this.config);
 }
 

@@ -20,8 +20,9 @@ import 'transport/hole_punch_service.dart';
 import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
 import 'models/identity.dart';
+import 'testbed/bulk_flow_driver.dart';
 import 'testbed/workload_driver.dart';
-import 'trace/trace_logger.dart';
+import 'trace/experiment_recorder.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
 import 'models/secure_frame.dart';
@@ -273,7 +274,7 @@ class GrassrootsNetwork {
 
   /// Optional opt-in trace logger. When present and enabled, message/transport
   /// events are recorded for later upload. Null in tests / when logging is off.
-  final TraceLogger? trace;
+  final ExperimentRecorder? trace;
 
   /// Subscription for listening to store changes
   StreamSubscription<AppState>? _storeSubscription;
@@ -722,6 +723,7 @@ class GrassrootsNetwork {
         identity: identity,
         store: store,
         localName: config.localName ?? identity.nickname,
+        trace: trace,
       );
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
@@ -1585,7 +1587,7 @@ class GrassrootsNetwork {
             payloadSize: payload.length,
           )
         : MessageQueuedAction(messageId: messageId));
-    if (trace?.enabled ?? false) {
+    if (trace?.active ?? false) {
       final now = DateTime.now().millisecondsSinceEpoch;
       unawaited(trace!.log({
         'type': 'message',
@@ -1676,12 +1678,33 @@ class GrassrootsNetwork {
   /// DEBUG/TESTBED ONLY. Stop the workload driver.
   void stopWorkload() => _workloadDriver?.stop();
 
+  BulkFlowDriver? _bulkFlowDriver;
+
+  /// DEBUG/TESTBED ONLY. The sustained-throughput driver (data-plane
+  /// evaluation), lazily bound to [send]. Inert until [startBulkFlows].
+  BulkFlowDriver get bulkFlowDriver => _bulkFlowDriver ??= BulkFlowDriver(
+        send: send,
+        log: (m) => debugPrint(m),
+        trace: trace,
+      );
+
+  /// DEBUG/TESTBED ONLY. Begin executing the bulk-flow config stored in
+  /// settings. No-op without a config or while already running.
+  void startBulkFlows() {
+    final config = store.state.settings.bulkFlowConfig;
+    if (config == null) {
+      debugPrint('[bulk] no bulk-flow config set');
+      return;
+    }
+    bulkFlowDriver.start(
+        config: config, myPubkeyHex: _pubkeyToHex(identity.publicKey));
+  }
+
+  /// DEBUG/TESTBED ONLY. Stop the bulk-flow driver.
+  void stopBulkFlows() => _bulkFlowDriver?.stop();
+
   /// Sealed packets currently held in custody (own un-ACK'd + relayed DTN).
   int get dtnBufferedCount => _messageRouter.dtnBufferedCount;
-
-  /// Messages held un-sealable (no Noise session with the recipient yet).
-  /// Public accessor for trace sampling.
-  int get outboundQueuedCount => _pendingSeal.length;
 
   @visibleForTesting
   int get pendingSealCount => _pendingSeal.length;
@@ -2045,7 +2068,22 @@ class GrassrootsNetwork {
   /// authenticated"). The session is also the gate for all custody flow with
   /// this peer: pending messages become sealable, their custody is conveyed,
   /// and the sync-on-connect vector exchange runs — never before the session.
+  /// Peers whose next end-to-end ACK marks the link "usable" for the
+  /// evaluation trace (armed on every session establishment).
+  final Set<String> _awaitingFirstAck = {};
+
   void _onNoiseSessionEstablished(PeerTransport transport, Uint8List pubkey) {
+    if (trace?.active ?? false) {
+      final hex = _pubkeyToHex(pubkey);
+      _awaitingFirstAck.add(hex);
+      unawaited(trace!.log({
+        'type': 'link',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'session',
+        'peer': hex,
+        'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+      }));
+    }
     switch (transport) {
       case PeerTransport.udp:
         store.dispatch(
@@ -3159,9 +3197,10 @@ class GrassrootsNetwork {
     // ACK received (UDP delivery confirmation)
     _messageRouter.onAckReceived = (messageId) {
       debugPrint('ACK received for message $messageId');
-      if (trace?.enabled ?? false) {
+      if (trace?.active ?? false) {
         final now = DateTime.now().millisecondsSinceEpoch;
-        final sentAt = store.state.messages.outgoingMessages[messageId]?.sentAt;
+        final outgoing = store.state.messages.outgoingMessages[messageId];
+        final sentAt = outgoing?.sentAt;
         unawaited(trace!.log({
           'type': 'message',
           't': now,
@@ -3172,8 +3211,21 @@ class GrassrootsNetwork {
             'e2eLatencyMs': now - sentAt.millisecondsSinceEpoch,
           'deliverySuccess': true,
         }));
+        // First end-to-end ACK since the session came up: the link is
+        // "usable" (the third stage of the control-plane evaluation).
+        final peerHex = outgoing?.recipientPubkeyHex;
+        if (peerHex != null && _awaitingFirstAck.remove(peerHex)) {
+          unawaited(trace!.log({
+            'type': 'link',
+            't': now,
+            'event': 'usable',
+            'peer': peerHex,
+            'messageId': messageId,
+          }));
+        }
       }
       store.dispatch(MessageDeliveredAction(messageId: messageId));
+      _bulkFlowDriver?.onAck(messageId);
       _endCustodyForMessage(messageId);
     };
 
@@ -3253,6 +3305,21 @@ class GrassrootsNetwork {
         (data, transport, {bool isNew = false, String? udpPeerId}) {
       final pubkeyHex =
           data.publicKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+      if (trace?.active ?? false) {
+        // "Discovered" stage of the control-plane evaluation: a verified
+        // ANNOUNCE from this peer arrived (fires once per announce cycle, so
+        // the record stream doubles as a presence-visibility sample).
+        final rssi = store.state.peers.getPeerByPubkeyHex(pubkeyHex)?.rssi;
+        unawaited(trace!.log({
+          'type': 'link',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'discovered',
+          'peer': pubkeyHex,
+          'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+          'isNew': isNew,
+          if (rssi != null) 'rssi': rssi,
+        }));
+      }
       // When we are well-connected and receive an ANNOUNCE from a friend
       // with a UDP address, register it in our address table. This is used
       // by the direct-punch path ([requestDirectPunch]) when we want a
@@ -4210,6 +4277,8 @@ class GrassrootsNetwork {
     _storeSubscription = null;
     _announceTimer?.cancel();
     _scanTimer?.cancel();
+    _workloadDriver?.stop();
+    _bulkFlowDriver?.stop();
 
     // Wait for any in-flight transport update to finish before disposing
     if (_transportUpdateLock != null) {

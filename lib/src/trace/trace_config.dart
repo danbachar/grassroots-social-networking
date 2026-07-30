@@ -1,8 +1,9 @@
 /// Baked-in trace-upload destination.
 ///
-/// The diagnostic trace uploader posts to this endpoint with a bearer token
-/// whenever the user has opted in to trace logging. The destination is NOT
-/// user-facing and NOT modifiable at runtime — it is fixed per build.
+/// The testbed screen's manual "Upload files" action posts experiment
+/// recordings to this endpoint with a bearer token (see `trace_server/`).
+/// The destination is NOT user-facing and NOT modifiable at runtime — it is
+/// fixed per build.
 ///
 /// The token is a **secret** and is injected at build time via `--dart-define`,
 /// never committed to source. The URL is not secret and carries a sensible

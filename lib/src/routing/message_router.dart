@@ -3,7 +3,7 @@ import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
 import '../mesh/dtn_store.dart';
 import '../mesh/sync_codec.dart';
-import '../trace/trace_logger.dart';
+import '../trace/experiment_recorder.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/peer.dart';
@@ -145,7 +145,7 @@ class MessageRouter {
   PeersState get _peersState => store.state.peers;
 
   /// Optional opt-in trace logger (null in tests / when logging is off).
-  final TraceLogger? trace;
+  final ExperimentRecorder? trace;
 
   MessageRouter({
     required this.identity,
@@ -229,7 +229,7 @@ class MessageRouter {
     // (relay each packet at most once) and gates re-processing.
     final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
 
-    if (forUs && !firstSeen && (trace?.enabled ?? false)) {
+    if (forUs && !firstSeen && (trace?.active ?? false)) {
       // A duplicate copy of a packet addressed to us arrived (flooding /
       // retransmit) — the message-duplication signal.
       unawaited(trace!.log({
@@ -471,7 +471,7 @@ class MessageRouter {
     final firstSeen = !_deliveredMessages.checkAndAdd(messageId);
     if (firstSeen) {
       onMessageReceived?.call(messageId, senderPubkey, payload, transport);
-      if (trace?.enabled ?? false) {
+      if (trace?.active ?? false) {
         final now = DateTime.now().millisecondsSinceEpoch;
         // The receiver sees how far the packet travelled: the sender starts at
         // defaultTtl and each relay decrements, so hops = the drop.

@@ -35,7 +35,7 @@ NTP-synced, or bound skew with a start-of-run marker ritual on each device).
 | `marker` | expStart / expStop / **Mark** button | `event`, `label`, `exp`, `t` |
 | `rssi` | every adv sighting (≤1/s/path) + the 10 s connected-RSSI poll | `src` (`adv`\|`conn`), `path`, `role`, `rssi`, `peer`, `t` |
 | `link` | stage transitions | `event` = `discovered` (verified ANNOUNCE, 1/announce-cycle), `connected` (GATT leg ready), `session` (Noise established), `usable` (first e2e ACK after session), `drop` (leg lost, with `reason`); + `peer`, `path`, `role`, `rssi`, `t` |
-| `wire` | every 10 s while traffic moved | per-outer-type tx/rx `{bytes,packets}` deltas: `announce`, `handshake`, `secure`, `syncOffer`, `syncRequest` — control plane = everything except `secure` |
+| `wire` | every 10 s while traffic moved | per-outer-type tx/rx `{bytes,packets}` deltas: `announce`, `handshake`, `secure`. Our OWN tx `secure` is split by inner content at seal time — `secure:data`, `secure:ack`, `secure:receipt`, `secure:sync` — while rx `secure` stays aggregate, exactly what a peer on the air can distinguish |
 | `message` | send / recv / delivered / dup | `messageId`, `peer`, `payloadSize`, `e2eLatencyMs`, `relayHops`, … |
 | `flow` | bulk driver start/stop | `flow` (`A>B`), `payloadBytes`, `inFlight`, final `sent`/`acked`/`ackedBytes` |
 
@@ -104,6 +104,15 @@ nothing — that's the static receiver on 3+ device campaigns. Ids are the
 reproducible UUIDv5 set `field|expId|src|dst|step|seq`, so the offered
 count is computable offline.
 
+**Throughput (saturate).** A step with `"saturate": true` ignores `sendCount`
+and instead keeps `inFlight` messages outstanding for the whole dwell, firing
+the next the moment one is ACKed — as many messages as the link carries, no
+pacing and no cap. Wizard: *Throughput (saturate)* (60s dwell, 184-byte
+messages, 8 in flight by default; sessions and links stay warm). The step
+stamps `saturate-start` and, at dwell end, a `flow` record with
+sent/acked/ackedBytes — messages/sec and goodput come straight from it, and
+RTT under saturation from the usual `message` records.
+
 For the data-plane sweep, set `"bulk": true` on the steps that should run the
 loaded bulk-flow config during their dwell (load that config in the Bulk
 flows section first). The manual Record / Mark / Stop / Upload controls
@@ -148,6 +157,35 @@ stage breakdown and establishment probability; per-step delivery ratio
 falls out of the deterministic send ids; `drop` events on the retreat give
 the hysteresis threshold; `wire` deltas between `connected` and steady
 state give control-plane bytes to establish vs. to keep alive per unit time.
+
+## Experiment 3 — multi-hop relay (3 devices)
+
+The mesh claim: a message reaches a peer that is **not** a direct neighbour.
+
+Place **A — B — C** in a line with B in range of both and **C out of A's
+range** (verify: on A, C must not appear as a connected peer). B and C press
+**Record** with the shared exp id and do nothing else. A runs the wizard's
+*Mesh: multi-hop relay*, with **C's pubkey prefix** as the target — every
+message addresses C alone, so a delivery can only have crossed B.
+
+Offline (`mesh_paths.csv` + the `=== mesh ===` block in `summary.txt`):
+each message's reconstructed path (`sender -> relay -> receiver`), the
+relay-hop histogram from the receiver's TTL view, per-path latency, and the
+duplication factor. `MULTI-HOP deliveries: n/m` is the headline number.
+
+## Experiment 4 — store-carry-forward (the mule, 3 devices)
+
+The DTN claim: a message survives having **no path at all** and is carried.
+
+A and C start far apart with **nothing in between** — sends have nowhere to
+go and enter custody. A runs *Mesh: store-carry-forward* (target = C's
+prefix): a seed step fires the messages into the void, then a long hold
+while you physically walk device **B** (recording, otherwise idle) from A to
+C. B picks the packets up in custody near A and delivers them near C.
+
+Offline: `custody` store→convey→end events, `carried: true` on the paths, and
+carry→delivery latency (the time the message spent riding B). C's `recv`
+records prove arrival without A and C ever being in range of each other.
 
 ## Experiment 2 — data plane (dilating triangle)
 

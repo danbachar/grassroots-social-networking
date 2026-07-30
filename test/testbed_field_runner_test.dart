@@ -364,6 +364,123 @@ void main() {
     });
   });
 
+  test('saturate: window stays full, each ACK fires the next send', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final sent = <String>[];
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
+        send: (r, p, {String? messageId}) async {
+          sent.add(messageId!);
+          return messageId;
+        },
+      );
+      runner.start(const FieldPlan(
+        expId: 'tp',
+        settleSec: 1,
+        resetSessions: false,
+        steps: [
+          FieldStep(
+              label: 'saturate', dwellSec: 10, saturate: true, inFlight: 3),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+
+      // Window opens at inFlight, not a paced schedule.
+      expect(sent, hasLength(3));
+      expect(recorder.events, contains('marker:saturate-start'));
+
+      // Each ACK immediately frees a slot and fires the next.
+      runner.onAck(sent[0]);
+      expect(sent, hasLength(4));
+      runner.onAck(sent[1]);
+      runner.onAck(sent[2]);
+      expect(sent, hasLength(6));
+      expect(runner.ackedCount, 3);
+
+      // Unknown/duplicate ACKs never inflate the window.
+      runner.onAck('nope');
+      runner.onAck(sent[0]);
+      expect(sent, hasLength(6));
+
+      // Dwell end stops the loop and logs the flow summary.
+      async.elapse(const Duration(seconds: 10));
+      runner.onAck(sent[3]);
+      expect(sent, hasLength(6), reason: 'no sends after the window closes');
+      async.elapse(const Duration(seconds: 2));
+      runner.dispose();
+    });
+  });
+
+  test('sendTo addresses one peer by prefix; a miss sends nothing', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final peerA = Uint8List.fromList(List.generate(32, (i) => 100 + i % 50));
+      final peerB = Uint8List.fromList(List.generate(32, (i) => 200 + i % 50));
+      final sentTo = <String>[];
+      FieldRunner build(String sendTo) => FieldRunner(
+            recorder: recorder,
+            myPubkeyHex: hexOf(0),
+            knownPeers: () => [peerA, peerB],
+            send: (r, p, {String? messageId}) async {
+              sentTo.add(r.map((b) => b.toRadixString(16).padLeft(2, '0'))
+                  .join()
+                  .substring(0, 8));
+              return messageId;
+            },
+          );
+
+      // Address peerB alone.
+      final wantHex =
+          peerB.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+      final runner = build(wantHex.substring(0, 8));
+      runner.start(FieldPlan(
+        expId: 'hop',
+        settleSec: 1,
+        resetSessions: false,
+        steps: [
+          FieldStep(
+              label: 'hop',
+              dwellSec: 10,
+              sendCount: 2,
+              sendTo: wantHex.substring(0, 8)),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 10));
+      expect(sentTo, hasLength(2));
+      expect(sentTo.toSet(), {wantHex.substring(0, 8)},
+          reason: 'only the addressed peer, never a silent broadcast');
+      async.elapse(const Duration(seconds: 3));
+      runner.dispose();
+
+      // An unmatched prefix sends nothing at all.
+      sentTo.clear();
+      final miss = build('deadbeef');
+      miss.start(const FieldPlan(
+        expId: 'hop',
+        settleSec: 1,
+        resetSessions: false,
+        steps: [
+          FieldStep(
+              label: 'hop', dwellSec: 5, sendCount: 3, sendTo: 'deadbeef'),
+        ],
+      ));
+      async.flushMicrotasks();
+      miss.inPosition();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 10));
+      expect(sentTo, isEmpty);
+      miss.dispose();
+    });
+  });
+
   test('rosterless plan targets every known peer with hex-prefix labels', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

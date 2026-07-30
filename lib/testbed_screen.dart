@@ -40,6 +40,10 @@ class TestbedScreen extends StatefulWidget {
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Registers a listener for end-to-end ACKs (saturating throughput mode).
+  final void Function(void Function(String messageId)? listener)?
+      registerAckListener;
+
   const TestbedScreen({
     super.key,
     required this.store,
@@ -51,6 +55,7 @@ class TestbedScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.linkSettled,
+    this.registerAckListener,
   });
 
   @override
@@ -245,12 +250,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
               )
           : null,
     );
+    // Saturating steps refill their window on each end-to-end ACK.
+    widget.registerAckListener?.call(runner.onAck);
     Navigator.of(context)
         .push(MaterialPageRoute(
           fullscreenDialog: true,
           builder: (_) => FieldRunnerScreen(runner: runner, plan: plan),
         ))
-        .then((_) => runner.dispose());
+        .then((_) {
+      widget.registerAckListener?.call(null);
+      runner.dispose();
+    });
   }
 
   Future<void> _shareExperimentFiles() async {
@@ -614,6 +624,11 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   late final TextEditingController _sides =
       TextEditingController(text: '10, 20, 40');
   late final TextEditingController _repeat = TextEditingController(text: '1');
+  late final TextEditingController _payloadBytes =
+      TextEditingController(text: '184');
+  late final TextEditingController _inFlight = TextEditingController(text: '8');
+  late final TextEditingController _targetPrefix = TextEditingController();
+  late final TextEditingController _holdMin = TextEditingController(text: '5');
   bool _retreat = true;
   /// Whether THIS device walks the sweep (mover) or stays put (static,
   /// record-only). Drives the whole form.
@@ -633,6 +648,10 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       _dwellSec,
       _sides,
       _repeat,
+      _payloadBytes,
+      _inFlight,
+      _targetPrefix,
+      _holdMin,
     ]) {
       c.dispose();
     }
@@ -645,6 +664,9 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   void _suggestId(FieldPlanKind kind) {
     _expId.text = switch (kind) {
       FieldPlanKind.homeSoak => 'home-soak-1',
+      FieldPlanKind.throughput => 'throughput-1',
+      FieldPlanKind.multiHop => 'mesh-hop-1',
+      FieldPlanKind.storeCarry => 'mesh-dtn-1',
       FieldPlanKind.lineSweep => 'cp-line-1',
       FieldPlanKind.dataPlane => 'dp-tri-baseline',
     };
@@ -754,6 +776,54 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
           const SizedBox(height: 12),
           _num(_sends, 'Messages over the dwell'),
         ];
+      case FieldPlanKind.throughput:
+        return [
+          _num(_dwellSec, 'Saturate for (s)'),
+          const SizedBox(height: 12),
+          _num(_payloadBytes, 'Message size (bytes)'),
+          const SizedBox(height: 12),
+          _num(_inFlight, 'Messages in flight'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Fires as many messages as the link carries: keeps the window '
+              'full, sending the next on every ACK. No pacing, no cap.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.multiHop:
+        return [
+          _num(_targetPrefix, 'Target peer (pubkey prefix, e.g. 9c46b4f3)'),
+          const SizedBox(height: 12),
+          _num(_dwellSec, 'Dwell per trial (s)'),
+          const SizedBox(height: 12),
+          _num(_sendsPerStep, 'Messages per trial'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Place the relay between this device and the target, with the '
+              'target OUT of direct range. Every message addresses the target '
+              'alone, so a delivery proves it crossed the relay. Relay and '
+              'target just Record.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.storeCarry:
+        return [
+          _num(_targetPrefix, 'Target peer (pubkey prefix)'),
+          const SizedBox(height: 12),
+          _num(_sendsPerStep, 'Messages to seed'),
+          const SizedBox(height: 12),
+          _num(_holdMin, 'Mule travel window (minutes)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'No relay in between: the target must be unreachable when the '
+              'messages are sent, so they enter custody. Then walk the mule '
+              'device from here to the target and back if you like.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
       case FieldPlanKind.lineSweep:
         return [
           _num(_distances, 'Distances (m, comma-separated)'),
@@ -816,5 +886,9 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         repeat: _int(_repeat, 1),
         resetSessions: _resetSessions,
         resetLinks: _resetLinks,
+        payloadBytes: _int(_payloadBytes, 184),
+        inFlight: _int(_inFlight, 8),
+        targetPrefix: _targetPrefix.text.trim(),
+        holdMin: _int(_holdMin, 5),
       );
 }

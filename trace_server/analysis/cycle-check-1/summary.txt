@@ -1,0 +1,13 @@
+records: 4293   span: 473s
+
+device cefd8819:
+  records by type: {'message': 1440, 'rssi': 391, 'link': 145, 'wire': 44, 'marker': 2}
+  link stages: {'discovered': 120, 'drop': 10, 'connected': 10, 'session': 5}
+  wire bytes: {'rx:announce': 16074, 'rx:handshake': 600, 'rx:secure': 376632, 'rx:syncOffer': 123, 'rx:syncRequest': 673, 'tx:announce': 18798, 'tx:handshake': 420, 'tx:secure': 154645, 'tx:syncOffer': 1378, 'tx:syncRequest': 91}
+
+device e68e3f8d:
+  records by type: {'message': 1636, 'rssi': 419, 'link': 155, 'wire': 43, 'marker': 18}
+  link stages: {'discovered': 125, 'drop': 10, 'connected': 10, 'session': 5, 'usable': 5}
+  messages sent: 500, delivered: 490 (98%)
+  e2e latency ms: median 77, p90 121, max 205
+  wire bytes: {'rx:announce': 18798, 'rx:handshake': 420, 'rx:secure': 154645, 'rx:syncOffer': 1378, 'rx:syncRequest': 91, 'tx:announce': 15732, 'tx:handshake': 600, 'tx:secure': 376632, 'tx:syncOffer': 123, 'tx:syncRequest': 673}

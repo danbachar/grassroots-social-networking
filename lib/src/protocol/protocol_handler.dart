@@ -4,6 +4,7 @@ import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:sodium_libs/sodium_libs.dart';
+import 'package:uuid/uuid.dart';
 
 /// Handles Grassroots protocol logic: packet encoding/decoding,
 /// ANNOUNCE parsing, MESSAGE handling, etc.
@@ -233,6 +234,28 @@ class ProtocolHandler {
     );
     return GrassrootsPacket(
       type: PacketType.secure,
+      recipientPubkey: recipientPubkey,
+      payload: frame.encode(),
+    );
+  }
+
+  /// A neighbor-local sync control packet (offer/request). Sealed like all
+  /// content: TTL 1 so it is never relayed, addressed to the neighbor whose
+  /// session seals it.
+  GrassrootsPacket createSyncPacket({
+    required ContentType type,
+    required Uint8List payload,
+    required Uint8List recipientPubkey,
+  }) {
+    assert(type == ContentType.syncOffer || type == ContentType.syncRequest);
+    final frame = SecureFrame(
+      contentType: type,
+      messageId: const Uuid().v4(),
+      chunk: payload,
+    );
+    return GrassrootsPacket(
+      type: PacketType.secure,
+      ttl: 1, // neighbor-local: never relayed
       recipientPubkey: recipientPubkey,
       payload: frame.encode(),
     );

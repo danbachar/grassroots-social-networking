@@ -2420,6 +2420,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
+          registerAckListener: _grassroots == null
+              ? null
+              : (listener) => _grassroots!.onTestbedAck = listener,
         ),
       ),
     );

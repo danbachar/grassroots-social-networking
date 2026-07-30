@@ -18,6 +18,7 @@ import 'transport/connection_service.dart';
 import 'transport/hole_punch_service.dart';
 import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
+import 'models/block.dart';
 import 'models/identity.dart';
 import 'testbed/bulk_flow_driver.dart';
 import 'trace/experiment_recorder.dart';
@@ -723,6 +724,9 @@ class GrassrootsNetwork {
         localName: config.localName ?? identity.nickname,
         trace: trace,
       );
+      // Wire-ledger content split: only we know what our sealed packets carry.
+      _bleService!.secureContentResolver =
+          (packetId) => _sealedContentById[packetId] ?? '';
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
       // broadcast stream that drops events with no listener. BLE connections
@@ -1650,6 +1654,10 @@ class GrassrootsNetwork {
     _messageRouter.removeCustody(ids ?? [messageId]);
   }
 
+  /// DEBUG/TESTBED ONLY. Notified on every end-to-end ACK so the field
+  /// runner's saturating mode can refill its send window.
+  void Function(String messageId)? onTestbedAck;
+
   BulkFlowDriver? _bulkFlowDriver;
 
   /// DEBUG/TESTBED ONLY. The sustained-throughput driver (data-plane
@@ -1732,6 +1740,39 @@ class GrassrootsNetwork {
     if (_started && _bleAvailable) await _bleService!.start();
   }
 
+  /// The application block class carried by a `message` payload, from its
+  /// first byte (`BlockType`). Testbed traffic uses a reserved byte so it
+  /// never masquerades as a real block — see `testbedPayloadMarker`.
+  static String? _dataKindOf(Uint8List payload) {
+    if (payload.isEmpty) return null;
+    if (payload[0] == testbedPayloadMarker) return 'testbed';
+    return BlockType.isValidType(payload[0])
+        ? BlockType.fromValue(payload[0]).name
+        : 'other';
+  }
+
+  /// TESTBED/TRACE ONLY. Inner content type of packets we sealed, keyed by
+  /// packetId, so the wire ledger can split our own `secure` tx bytes by
+  /// what they actually carry (data by block class vs ack/receipt/sync).
+  /// Bounded ring — only recent packets can still be in flight.
+  final Map<String, String> _sealedContentById = {};
+  static const int _sealedContentCap = 2048;
+
+  void _noteSealedContent(String packetId, ContentType type,
+      {String? dataKind}) {
+    if (!(trace?.active ?? false)) return;
+    if (_sealedContentById.length > _sealedContentCap) {
+      _sealedContentById.clear();
+    }
+    _sealedContentById[packetId] = switch (type) {
+      ContentType.message => dataKind == null ? 'data' : 'data:$dataKind',
+      ContentType.ack => 'ack',
+      ContentType.readReceipt => 'receipt',
+      ContentType.signaling => 'signaling',
+      ContentType.syncOffer || ContentType.syncRequest => 'sync',
+    };
+  }
+
   /// Sealed packets currently held in custody (own un-ACK'd + relayed DTN).
   int get dtnBufferedCount => _messageRouter.dtnBufferedCount;
 
@@ -1770,6 +1811,7 @@ class GrassrootsNetwork {
         packet,
         remotePubkey: senderPubkey,
       );
+      _noteSealedContent(sealed.packetId, ContentType.readReceipt);
       // First-custodian rule, same as ACKs: the sealed receipt rides future
       // sync exchanges even if this flood reaches nobody. Age-expiry only.
       _messageRouter.storeCustody(senderPubkey, sealed);
@@ -3243,6 +3285,7 @@ class GrassrootsNetwork {
       }
       store.dispatch(MessageDeliveredAction(messageId: messageId));
       _bulkFlowDriver?.onAck(messageId);
+      onTestbedAck?.call(messageId);
       _endCustodyForMessage(messageId);
     };
 
@@ -3315,6 +3358,17 @@ class GrassrootsNetwork {
       final ble = _bleService;
       if (ble == null) return;
       unawaited(ble.sendToPeer(bleDeviceId, packet.serialize()));
+    };
+
+    // Sync control frames (offer/request) are sealed to the neighbor's Noise
+    // session before they hit the air — the session exists by the time sync
+    // runs, so the custody inventory is never transmitted in the clear.
+    _messageRouter.onSyncFrame = (type, payload, bleDeviceId) {
+      final ble = _bleService;
+      if (ble == null) return;
+      final pubkey = ble.getPubkeyForPeerId(bleDeviceId);
+      if (pubkey == null) return; // path not yet identified
+      unawaited(_sealAndSendSyncFrame(type, payload, pubkey, bleDeviceId));
     };
 
     // Peer ANNOUNCE processed
@@ -3498,6 +3552,7 @@ class GrassrootsNetwork {
         ackPacket,
         remotePubkey: senderPubkey,
       );
+      _noteSealedContent(sealed.packetId, ContentType.ack);
       final bytes = sealed.serialize();
 
       if (transport == PeerTransport.udp) {
@@ -4432,12 +4487,38 @@ class GrassrootsNetwork {
 
     final offers = _messageRouter.buildSyncOffers();
     if (offers.isEmpty) return; // carrying nothing — offer nothing
+    final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
+    if (pubkey == null) return; // path not yet identified; retry next connect
     _lastSyncOfferAt[addr] = now;
     debugPrint(
         '[sync] Offering ${_messageRouter.dtnBufferedCount} carried '
-        'packet(s) to $deviceId in ${offers.length} offer packet(s)');
-    for (final offer in offers) {
-      unawaited(_bleService!.sendToPeer(deviceId, offer.serialize()));
+        'packet(s) to $deviceId in ${offers.length} sealed offer(s)');
+    for (final payload in offers) {
+      unawaited(_sealAndSendSyncFrame(
+          ContentType.syncOffer, payload, pubkey, deviceId));
+    }
+  }
+
+  /// Seal a sync control frame to [recipientPubkey]'s session and send it to
+  /// that neighbor. No session yet (a pairing still handshaking) simply skips
+  /// the exchange — sync-on-connect retries on the next pairing.
+  Future<void> _sealAndSendSyncFrame(ContentType type, Uint8List payload,
+      Uint8List recipientPubkey, String bleDeviceId) async {
+    if (!_noiseSessions.hasSession(recipientPubkey)) return;
+    try {
+      final packet = _protocolHandler.createSyncPacket(
+        type: type,
+        payload: payload,
+        recipientPubkey: recipientPubkey,
+      );
+      final sealed = await _noiseSessions.encryptPacket(
+        packet,
+        remotePubkey: recipientPubkey,
+      );
+      _noteSealedContent(sealed.packetId, type);
+      await _bleService?.sendToPeer(bleDeviceId, sealed.serialize());
+    } catch (e) {
+      debugPrint('[sync] Failed to seal/send ${type.name}: $e');
     }
   }
 
@@ -4708,10 +4789,13 @@ class GrassrootsNetwork {
         recipientPubkey: recipientPubkey,
         payload: frame.encode(),
       );
-      sealed.add(await _noiseSessions.encryptPacket(
+      final out = await _noiseSessions.encryptPacket(
         packet,
         remotePubkey: recipientPubkey,
-      ));
+      );
+      _noteSealedContent(out.packetId, ContentType.message,
+          dataKind: _dataKindOf(payload));
+      sealed.add(out);
     }
     return sealed;
   }

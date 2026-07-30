@@ -137,6 +137,22 @@ class FieldStep {
   final int sendCount;
   final int sendBytes;
 
+  /// Which peers this step addresses. `all` (default) sends to every send
+  /// target — the broadcast-shaped default. A pubkey-prefix (e.g. `9c46b4f3`)
+  /// addresses ONE peer, which is how a multi-hop test aims past the relay at
+  /// a node that is out of direct range: the message can only arrive by being
+  /// relayed or carried. Matching is case-insensitive on the hex prefix.
+  final String sendTo;
+
+  /// Saturating send mode: instead of [sendCount] messages spread through
+  /// the dwell, keep [inFlight] messages outstanding and fire the next the
+  /// moment one is ACKed — as many as the link will carry for the whole
+  /// dwell. Throughput measurement; [sendCount] is ignored.
+  final bool saturate;
+
+  /// Outstanding-message window used while [saturate] is on.
+  final int inFlight;
+
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
   /// repeat trial at the same position — nothing to walk to). A step at a new
@@ -150,6 +166,9 @@ class FieldStep {
     this.sendCount = 0,
     this.sendBytes = 184,
     this.autoAdvance = false,
+    this.saturate = false,
+    this.inFlight = 8,
+    this.sendTo = 'all',
   });
 
   Map<String, dynamic> toJson() => {
@@ -159,6 +178,9 @@ class FieldStep {
         if (sendCount > 0) 'sendCount': sendCount,
         if (sendCount > 0) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
+        if (saturate) 'saturate': saturate,
+        if (saturate) 'inFlight': inFlight,
+        if (sendTo != 'all') 'sendTo': sendTo,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
@@ -168,6 +190,9 @@ class FieldStep {
         sendCount: json['sendCount'] as int? ?? 0,
         sendBytes: json['sendBytes'] as int? ?? 184,
         autoAdvance: json['autoAdvance'] as bool? ?? false,
+        saturate: json['saturate'] as bool? ?? false,
+        inFlight: json['inFlight'] as int? ?? 8,
+        sendTo: json['sendTo'] as String? ?? 'all',
       );
 
   @override
@@ -178,11 +203,15 @@ class FieldStep {
       other.bulk == bulk &&
       other.sendCount == sendCount &&
       other.sendBytes == sendBytes &&
-      other.autoAdvance == autoAdvance;
+      other.autoAdvance == autoAdvance &&
+      other.saturate == saturate &&
+      other.inFlight == inFlight &&
+      other.sendTo == sendTo;
 
   @override
   int get hashCode =>
-      Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance);
+      Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
+          saturate, inFlight, sendTo);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and

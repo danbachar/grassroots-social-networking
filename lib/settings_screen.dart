@@ -40,6 +40,10 @@ class SettingsScreen extends StatefulWidget {
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Registers a listener for end-to-end ACKs (saturating throughput mode).
+  final void Function(void Function(String messageId)? listener)?
+      registerAckListener;
+
   const SettingsScreen({
     super.key,
     required this.store,
@@ -54,6 +58,7 @@ class SettingsScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.linkSettled,
+    this.registerAckListener,
   });
 
   @override
@@ -284,6 +289,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onResetSessions: widget.onResetSessions,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
+                      registerAckListener: widget.registerAckListener,
                     ),
                   ),
                 );

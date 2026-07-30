@@ -117,6 +117,35 @@ def short(device: str) -> str:
     return device[:8]
 
 
+def device_roles(df: pd.DataFrame) -> dict[str, str]:
+    """Human roles instead of pubkey hex.
+
+    The device that runs the plan stamps the step markers and originates the
+    workload — the *sender* (the moving device in static+moving mode). The
+    device that only records, receives and ACKs is the *receiver*. Ties or
+    3+-device runs fall back to numbered senders/receivers so labels stay
+    unique.
+    """
+    roles: dict[str, str] = {}
+    msgs = df[df._type == "message"]
+    senders, receivers = [], []
+    for device in sorted(df._device.unique()):
+        sub = msgs[msgs._device == device]
+        sends = int((sub.get("dir") == "sent").sum()) if len(sub) else 0
+        (senders if sends > 0 else receivers).append(device)
+    for i, d in enumerate(senders):
+        roles[d] = "sender" if len(senders) == 1 else f"sender{i + 1}"
+    for i, d in enumerate(receivers):
+        roles[d] = "receiver" if len(receivers) == 1 else f"receiver{i + 1}"
+    return roles
+
+
+def label_for(device: str, roles: dict[str, str]) -> str:
+    """`sender (3c1a075c)` — role first, hex kept for traceability."""
+    role = roles.get(device)
+    return f"{role} ({short(device)})" if role else short(device)
+
+
 def _dict(v) -> dict:
     """A record field that should be a dict; pandas yields NaN when absent."""
     return v if isinstance(v, dict) else {}
@@ -269,6 +298,103 @@ def establishment_table(steps: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["direction", "d"])
 
 
+def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
+    """Reconstruct each message's actual path through the mesh.
+
+    A message is `sent` by one device, may be forwarded by relays (each logs a
+    `relay` record for the packet it forwarded), and is `recv`d by the
+    recipient. Joining those on the packet/message id across devices gives the
+    real path — the only direct evidence of multi-hop delivery, since the
+    envelope is sender-anonymous and no single device sees the whole route.
+
+    Single-packet messages use packetId == messageId, so the ids join
+    directly; fragmented messages (multi-packet) are reported by their
+    relayed packet ids and counted separately.
+    """
+    msgs = df[df._type == "message"]
+    if msgs.empty:
+        return pd.DataFrame()
+    relays = df[df._type == "relay"]
+    sent = msgs[msgs.get("dir") == "sent"]
+    recv = msgs[msgs.get("dir") == "recv"]
+    if sent.empty:
+        return pd.DataFrame()
+
+    relay_by_id: dict[str, list] = defaultdict(list)
+    for _, r in relays.iterrows():
+        if r.get("event") == "dup":
+            continue
+        relay_by_id[str(r.get("packetId"))].append(r)
+
+    rows = []
+    for _, s_row in sent.iterrows():
+        mid = str(s_row.get("messageId"))
+        hops = sorted(relay_by_id.get(mid, []), key=lambda r: r._t)
+        got = recv[recv.get("messageId") == mid]
+        delivered = len(got) > 0
+        path = [roles.get(s_row._device, short(s_row._device))]
+        path += [roles.get(h._device, short(h._device)) for h in hops]
+        if delivered:
+            path.append(roles.get(got.iloc[0]._device,
+                                  short(got.iloc[0]._device)))
+        rows.append({
+            "messageId": mid,
+            "sentAt": s_row._t,
+            "path": " -> ".join(path),
+            "relayHops": len(hops),
+            "delivered": delivered,
+            "deliveredAt": int(got.iloc[0]._t) if delivered else None,
+            "latencyMs": int(got.iloc[0]._t - s_row._t) if delivered else None,
+            # The receiver's own view of distance travelled (TTL drop).
+            "recvRelayHops": (int(got.iloc[0].get("relayHops"))
+                              if delivered and pd.notna(got.iloc[0].get("relayHops"))
+                              else None),
+            "carried": any(bool(h.get("carried")) for h in hops),
+        })
+    return pd.DataFrame(rows)
+
+
+def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
+    """Hop-count distribution, relay/custody evidence, duplication factor."""
+    if paths.empty:
+        return ""
+    lines = ["", "=== mesh ==="]
+    n = len(paths)
+    d = int(paths.delivered.sum())
+    lines.append(f"messages sent: {n}, delivered: {d} ({100 * d / n:.0f}%)")
+    hop_counts = paths[paths.delivered].recvRelayHops.dropna()
+    if len(hop_counts):
+        dist = hop_counts.astype(int).value_counts().sort_index().to_dict()
+        lines.append(f"delivered by relay hops (receiver TTL view): {dist}")
+        multi = int((hop_counts > 0).sum())
+        lines.append(f"  MULTI-HOP deliveries: {multi}/{len(hop_counts)}")
+    relayed = paths[paths.relayHops > 0]
+    if len(relayed):
+        lines.append(f"messages observed being forwarded by a relay: "
+                     f"{len(relayed)}")
+        for path, grp in relayed.groupby("path"):
+            lat = grp.latencyMs.dropna()
+            lines.append(f"  {path}: {len(grp)} msg"
+                         + (f", median {lat.median():.0f} ms" if len(lat) else ""))
+    carried = paths[paths.carried]
+    if len(carried):
+        lat = carried.latencyMs.dropna()
+        lines.append(f"store-carry-forward: {len(carried)} message(s) entered "
+                     "a relay's custody"
+                     + (f", carry→delivery median {lat.median() / 1000:.1f}s"
+                        if len(lat) else ""))
+    cust = df[df._type == "custody"]
+    if not cust.empty:
+        ev = cust.get("event").value_counts().to_dict()
+        lines.append(f"custody events: {ev}")
+    dups = df[(df._type == "message") & (df.get("dir") == "dup")]
+    fresh = df[(df._type == "message") & (df.get("dir") == "recv")]
+    if len(fresh):
+        lines.append(f"duplication factor: {len(dups)} dup / {len(fresh)} "
+                     f"fresh = {len(dups) / len(fresh):.2f}x redundant copies")
+    return "\n".join(lines) + "\n"
+
+
 def latency_table(df: pd.DataFrame) -> pd.DataFrame:
     msgs = df[df._type == "message"]
     sent = msgs[msgs.get("dir") == "sent"]
@@ -284,11 +410,12 @@ def latency_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize(df: pd.DataFrame, latency: pd.DataFrame) -> str:
+    roles = device_roles(df)
     lines = []
     t0, t1 = df._t.dropna().min(), df._t.dropna().max()
     lines.append(f"records: {len(df)}   span: {(t1 - t0) / 1000:.0f}s")
     for device, sub in df.groupby("_device"):
-        lines.append(f"\ndevice {short(device)}:")
+        lines.append(f"\n{label_for(device, roles)}:")
         counts = sub._type.value_counts().to_dict()
         lines.append(f"  records by type: {counts}")
         link = sub[sub._type == "link"]
@@ -351,11 +478,12 @@ def plot_rssi(df: pd.DataFrame, out: Path):
     if rssi.empty:
         return
     t_base = df._t.dropna().min()
+    roles = device_roles(df)
     fig, ax = plt.subplots(figsize=(11, 5))
     for (device, src), sub in rssi.groupby(["_device", "src"]):
         ax.plot((sub._t - t_base) / 1000, sub.rssi,
                 marker="." if src == "adv" else "x", markersize=3,
-                linestyle="none", label=f"{short(device)} {src}", alpha=0.7)
+                linestyle="none", label=f"{label_for(device, roles)} {src}", alpha=0.7)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("RSSI (dBm)")
     ax.legend(fontsize=8)
@@ -371,6 +499,7 @@ def plot_link_stages(df: pd.DataFrame, out: Path):
     if link.empty:
         return
     t_base = df._t.dropna().min()
+    roles = device_roles(df)
     devices = sorted(df._device.unique())
     fig, ax = plt.subplots(figsize=(11, 1.2 + 1.4 * len(devices)))
     yticks, ylabels = [], []
@@ -383,7 +512,7 @@ def plot_link_stages(df: pd.DataFrame, out: Path):
                 ax.plot((pts._t - t_base) / 1000, [y] * len(pts),
                         "rv" if stage == "drop" else "o", markersize=5)
             yticks.append(y)
-            ylabels.append(f"{short(device)}:{stage}")
+            ylabels.append(f"{roles.get(device, short(device))}:{stage}")
     ax.set_yticks(yticks)
     ax.set_yticklabels(ylabels, fontsize=7)
     ax.set_xlabel("time (s)")
@@ -395,31 +524,57 @@ def plot_link_stages(df: pd.DataFrame, out: Path):
 
 
 def plot_wire(df: pd.DataFrame, out: Path):
+    """tx bytes per 10s window, split by what the bytes carry.
+
+    The ledger classifies by outer type; for OUR OWN sealed packets it also
+    resolves the inner content at seal time, so tx `secure` arrives already
+    split as `secure:data` / `secure:ack` / `secure:receipt` / `secure:sync`
+    (exact, not inferred). Older traces predating that split show a single
+    `secure` band. Rx is deliberately never split — a peer on the air cannot
+    tell sealed content apart either.
+    """
     wire = df[df._type == "wire"]
     if wire.empty:
         return
     t_base = df._t.dropna().min()
+    roles = device_roles(df)
     devices = sorted(wire._device.unique())
     fig, axes = plt.subplots(len(devices), 1,
-                             figsize=(11, 3.2 * len(devices)), squeeze=False)
+                             figsize=(11, 3.4 * len(devices)), squeeze=False)
+    nice = {
+        "announce": "announce",
+        "handshake": "handshake",
+        "secure": "secure (unsplit)",
+        "secure:data": "secure: data",
+        "secure:data:say": "secure: chat message",
+        "secure:data:friendshipOffer": "secure: friend request",
+        "secure:data:friendshipAccept": "secure: friend accept",
+        "secure:data:friendshipRevoke": "secure: unfriend",
+        "secure:data:testbed": "secure: testbed payload",
+        "secure:data:other": "secure: data (other)",
+        "secure:ack": "secure: ack",
+        "secure:receipt": "secure: read receipt",
+        "secure:sync": "secure: sync (custody)",
+        "secure:signaling": "secure: signaling",
+    }
     for ax, device in zip(axes[:, 0], devices):
         sub = wire[wire._device == device].sort_values("_t")
-        series: dict[str, list] = defaultdict(list)
-        times = []
-        keys = set()
+        keys: set[str] = set()
+        for _, w in sub.iterrows():
+            keys.update(_dict(w.get("txBytes")).keys())
+        order = [k for k in nice if k in keys] + sorted(keys - set(nice))
+        times, series = [], defaultdict(list)
         for _, w in sub.iterrows():
             tx = _dict(w.get("txBytes"))
-            keys.update(tx.keys())
-        for _, w in sub.iterrows():
             times.append((w._t - t_base) / 1000)
-            tx = _dict(w.get("txBytes"))
-            for k in keys:
+            for k in order:
                 series[k].append(tx.get(k, 0))
-        if times:
-            ax.stackplot(times, *[series[k] for k in sorted(keys)],
-                         labels=sorted(keys), alpha=0.8)
+        if times and order:
+            ax.stackplot(times, *[series[k] for k in order],
+                         labels=[nice.get(k, k) for k in order], alpha=0.85)
             ax.legend(fontsize=7, loc="upper right")
-        ax.set_title(f"{short(device)} tx bytes / 10s window", fontsize=9)
+        ax.set_title(f"{label_for(device, roles)} — tx bytes / 10s window",
+                     fontsize=10)
         ax.set_xlabel("time (s)")
         ax.set_ylabel("bytes")
         ax.grid(alpha=0.3)
@@ -459,7 +614,13 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
 
         latency = latency_table(edf)
-        (out / "summary.txt").write_text(summarize(edf, latency))
+        roles = device_roles(edf)
+        paths = mesh_paths(edf, roles)
+        summary = summarize(edf, latency)
+        if not paths.empty:
+            paths.to_csv(out / "mesh_paths.csv", index=False)
+            summary += mesh_summary(paths, edf)
+        (out / "summary.txt").write_text(summary)
         if not latency.empty:
             latency.to_csv(out / "latency.csv", index=False)
 

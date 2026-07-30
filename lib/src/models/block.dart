@@ -2,6 +2,11 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 /// Block types for the Grassroots protocol
+/// First payload byte reserved for synthetic testbed traffic: not a
+/// [BlockType], so experiment payloads are never mistaken for real blocks in
+/// the wire-byte breakdown.
+const int testbedPayloadMarker = 0xFF;
+
 enum BlockType {
   /// Regular text message
   say(0x01),

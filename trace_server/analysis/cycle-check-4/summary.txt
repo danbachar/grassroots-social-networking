@@ -1,0 +1,13 @@
+records: 4228   span: 571s
+
+sender (87582740):
+  records by type: {'message': 1703, 'rssi': 347, 'link': 109, 'wire': 36, 'marker': 23}
+  link stages: {'discovered': 81, 'connected': 10, 'drop': 8, 'session': 5, 'usable': 5}
+  messages sent: 500, delivered: 500 (100%)
+  e2e latency ms: median 90, p90 150, max 316
+  wire bytes: {'rx:announce': 13303, 'rx:handshake': 700, 'rx:secure': 172335, 'rx:syncOffer': 2847, 'rx:syncRequest': 91, 'tx:announce': 13851, 'tx:handshake': 1000, 'tx:secure': 394380, 'tx:syncOffer': 535, 'tx:syncRequest': 545}
+
+receiver (9dc579cb):
+  records by type: {'message': 1514, 'rssi': 333, 'link': 117, 'wire': 44, 'marker': 2}
+  link stages: {'discovered': 92, 'drop': 10, 'connected': 10, 'session': 5}
+  wire bytes: {'rx:announce': 15561, 'rx:handshake': 1000, 'rx:secure': 394380, 'rx:syncOffer': 535, 'rx:syncRequest': 545, 'tx:announce': 15355, 'tx:handshake': 700, 'tx:secure': 172335, 'tx:syncOffer': 2847, 'tx:syncRequest': 91}

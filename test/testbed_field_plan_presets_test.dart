@@ -272,6 +272,32 @@ void main() {
           reason: 'must survive the JSON round-trip');
     });
 
+    test('rawLink: one step per leg, leg in the label, raw mode set', () {
+      final p = FieldPlanPresets.rawLink(legs: const ['notify', 'stripe']);
+      expect(p.steps.map((s) => s.rawLeg), ['notify', 'stripe']);
+      expect(p.steps.map((s) => s.label), ['leg=notify', 'leg=stripe']);
+      expect(p.steps.map((s) => s.autoAdvance), [false, true]);
+      expect(p.resetSessions, isFalse);
+      expect(p.resetLinks, isTrue,
+          reason: 'the plugin GATT op queue is unbounded and survives every '
+              'app-level reset; only a link teardown discards a blast '
+              'step\'s backlog, so raw steps bounce the link by default');
+      expect(p.resetCustody, isFalse,
+          reason: 'raw blobs never touch custody — nothing to clear');
+      expect(FieldPlanWizard.resetDefaults(FieldPlanKind.rawLink),
+          (false, true));
+      expect(FieldPlan.fromJson(p.toJson()), p,
+          reason: 'rawLeg must survive the JSON round-trip');
+    });
+
+    test('rawLink route threads legs through the wizard', () {
+      final p = FieldPlanWizard.build(
+          kind: FieldPlanKind.rawLink,
+          expId: 'r',
+          rawLegs: const ['write']);
+      expect(p.steps.single.rawLeg, 'write');
+    });
+
     test('ceiling route threads the lane sweep through', () {
       final p = FieldPlanWizard.build(
           kind: FieldPlanKind.throughputCeiling,

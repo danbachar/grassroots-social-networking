@@ -718,6 +718,75 @@ class BleTransportService extends TransportService {
     return sent;
   }
 
+  /// DEBUG/TESTBED ONLY. Which GATT leg a raw-throughput blob rides.
+  ///
+  /// `notify` = our peripheral leg, `write` = our central leg, `stripe` =
+  /// alternate by [seq] parity — the arm that asks whether a converged
+  /// pair's two legs are two usable pipes for bulk transfer.
+  static ble.BlePath? pickRawPath({
+    required Iterable<ble.BlePath> ready,
+    required Uint8List? Function(String pathId) pubkeyFor,
+    required String peerHex,
+    required String leg,
+    required int seq,
+  }) {
+    ble.BlePath? peripheral;
+    ble.BlePath? central;
+    for (final path in ready) {
+      final pubkey = pubkeyFor(path.pathId);
+      if (pubkey == null || _pubkeyHex(pubkey) != peerHex) continue;
+      if (path.role == ble.BleRole.peripheral) {
+        peripheral ??= path;
+      } else {
+        central ??= path;
+      }
+    }
+    return switch (leg) {
+      'notify' => peripheral,
+      'write' => central,
+      // Stripe wants BOTH pipes; with one leg missing it degrades to the
+      // one that exists rather than stalling every other blob.
+      'stripe' => seq.isEven
+          ? (peripheral ?? central)
+          : (central ?? peripheral),
+      _ => null,
+    };
+  }
+
+  /// DEBUG/TESTBED ONLY. Send one raw blob to [peerHex] over [leg], sized to
+  /// the chosen path's negotiated MTU (ATT payload = MTU - 3). Returns the
+  /// blob size, or null when the leg does not exist / is not ready.
+  Future<int?> sendRawBlob({
+    required String peerHex,
+    required String leg,
+    required int seq,
+  }) async {
+    final path = pickRawPath(
+      ready: _readyPaths,
+      pubkeyFor: getPubkeyForPeerId,
+      peerHex: peerHex,
+      leg: leg,
+      seq: seq,
+    );
+    if (path == null) return null;
+    final size = (path.mtu - 3).clamp(1, 512);
+    final blob = Uint8List(size);
+    blob[0] = rawPacketType;
+    // Fill so the radio cannot run-length anything (paranoia; BLE does not
+    // compress, but a constant fill would make that assumption silent).
+    for (var i = 1; i < size; i++) {
+      blob[i] = (seq + i) & 0xff;
+    }
+    try {
+      await _ble.send(path.pathId, blob);
+      if (_tracing) _wireLedger.onTx(blob);
+      return size;
+    } catch (e) {
+      debugPrint('raw blob send failed on ${path.pathId}: $e');
+      return null;
+    }
+  }
+
   /// Act on the pair's reverse leg the moment a verified ANNOUNCE identifies
   /// the peer behind a BLE path. Wired from
   /// `MessageRouter.onBlePeerIdentified`, after the announce has been applied
@@ -1475,6 +1544,9 @@ class BleTransportService extends TransportService {
     // Count on-air bytes before any drop gate below: the radio already spent
     // them whether or not the path is deemed ready.
     if (_tracing) _wireLedger.onRx(payload.value);
+    // Raw-throughput blobs (DEBUG/TESTBED): counted above, dropped here —
+    // they are deliberately not packets and must never reach the parser.
+    if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) return;
     // Drop payloads unless the plugin currently marks the path ready. This
     // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
     // not-sendable paths from populating PeerState BLE role fields.

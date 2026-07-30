@@ -38,6 +38,8 @@ class SettingsScreen extends StatefulWidget {
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
   final VoidCallback? onResetCustody;
+  final Future<int?> Function(Uint8List peer,
+      {required String leg, required int seq})? sendRaw;
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
@@ -58,6 +60,7 @@ class SettingsScreen extends StatefulWidget {
     this.sendMessage,
     this.onResetSessions,
     this.onResetCustody,
+    this.sendRaw,
     this.onResetLinks,
     this.linkSettled,
     this.registerAckListener,
@@ -290,6 +293,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetCustody: widget.onResetCustody,
+                      sendRaw: widget.sendRaw,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
                       registerAckListener: widget.registerAckListener,

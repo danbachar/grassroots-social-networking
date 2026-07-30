@@ -1688,6 +1688,14 @@ class GrassrootsNetwork {
   /// the full establishment ladder from a cold handshake (the field runner
   /// invokes this at each experiment step). Messages sent while sessionless
   /// wait in the pending-seal buffer and trigger the lazy handshake.
+  /// DEBUG/TESTBED ONLY. Send one raw-throughput blob (unsealed, un-ACKed,
+  /// dropped before the peer's parser) to [peer] over [leg]. Returns the blob
+  /// size or null when the leg is not available.
+  Future<int?> sendRawBlob(Uint8List peer,
+          {required String leg, required int seq}) async =>
+      _bleService?.sendRawBlob(
+          peerHex: _pubkeyToHex(peer), leg: leg, seq: seq);
+
   /// DEBUG/TESTBED ONLY. Empty the DTN custody store and the packetId index
   /// that maps messages to their custody packets.
   void clearCustody() {

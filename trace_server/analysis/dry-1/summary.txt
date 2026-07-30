@@ -1,0 +1,15 @@
+records: 234   span: 143s
+
+device 208480ca:
+  records by type: {'rssi': 57, 'link': 25, 'message': 13, 'wire': 12, 'marker': 4}
+  link stages: {'discovered': 23, 'drop': 1, 'connected': 1}
+  messages sent: 3, delivered: 1 (33%)
+  e2e latency ms: median 77, p90 77, max 77
+  wire bytes: {'rx:announce': 4104, 'rx:secure': 2602, 'tx:announce': 3762, 'tx:secure': 2882}
+
+device 381a8308:
+  records by type: {'rssi': 70, 'link': 21, 'message': 16, 'wire': 12, 'marker': 4}
+  link stages: {'discovered': 18, 'drop': 2, 'connected': 1}
+  messages sent: 3, delivered: 3 (100%)
+  e2e latency ms: median 156, p90 216, max 231
+  wire bytes: {'rx:announce': 3762, 'rx:secure': 2882, 'tx:announce': 4104, 'tx:secure': 2602}

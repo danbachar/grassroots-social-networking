@@ -93,14 +93,6 @@ class SettingsState {
 
   // ===== Testbed harnesses (debug-only; null/off in production) =====
 
-  /// DEBUG-ONLY software-defined BLE topology. Null or `enabled == false`
-  /// means no filtering — normal behaviour. Never set in production builds.
-  final NeighborAllowlist? neighborAllowlist;
-
-  /// DEBUG-ONLY deterministic offered-load config. Presence does NOT start the
-  /// driver — it is only executed when explicitly launched from a debug screen.
-  final WorkloadConfig? workloadConfig;
-
   /// DEBUG-ONLY sustained-throughput flow config (data-plane evaluation).
   /// Presence does NOT start the driver.
   final BulkFlowConfig? bulkFlowConfig;
@@ -116,8 +108,6 @@ class SettingsState {
     this.coldCallTrustLevel = ColdCallTrustLevel.open,
     this.facilitateInvites = false,
     this.showLinkDiagnostics = false,
-    this.neighborAllowlist,
-    this.workloadConfig,
     this.bulkFlowConfig,
   });
 
@@ -155,8 +145,6 @@ class SettingsState {
     bool? facilitateInvites,
     bool? showLinkDiagnostics,
     // Use Object? + sentinel so callers can pass null to clear.
-    Object? neighborAllowlist = _sentinel,
-    Object? workloadConfig = _sentinel,
     Object? bulkFlowConfig = _sentinel,
   }) {
     return SettingsState(
@@ -167,12 +155,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       facilitateInvites: facilitateInvites ?? this.facilitateInvites,
       showLinkDiagnostics: showLinkDiagnostics ?? this.showLinkDiagnostics,
-      neighborAllowlist: identical(neighborAllowlist, _sentinel)
-          ? this.neighborAllowlist
-          : neighborAllowlist as NeighborAllowlist?,
-      workloadConfig: identical(workloadConfig, _sentinel)
-          ? this.workloadConfig
-          : workloadConfig as WorkloadConfig?,
       bulkFlowConfig: identical(bulkFlowConfig, _sentinel)
           ? this.bulkFlowConfig
           : bulkFlowConfig as BulkFlowConfig?,
@@ -187,8 +169,6 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
         'showLinkDiagnostics': showLinkDiagnostics,
-        'neighborAllowlist': neighborAllowlist?.toJson(),
-        'workloadConfig': workloadConfig?.toJson(),
         'bulkFlowConfig': bulkFlowConfig?.toJson(),
       };
 
@@ -218,14 +198,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
-      neighborAllowlist: json['neighborAllowlist'] == null
-          ? null
-          : NeighborAllowlist.fromJson(
-              json['neighborAllowlist'] as Map<String, dynamic>),
-      workloadConfig: json['workloadConfig'] == null
-          ? null
-          : WorkloadConfig.fromJson(
-              json['workloadConfig'] as Map<String, dynamic>),
       bulkFlowConfig: json['bulkFlowConfig'] == null
           ? null
           : BulkFlowConfig.fromJson(
@@ -245,9 +217,7 @@ class SettingsState {
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
           showLinkDiagnostics == other.showLinkDiagnostics &&
-          neighborAllowlist == other.neighborAllowlist &&
-          workloadConfig == other.workloadConfig &&
-          bulkFlowConfig == other.bulkFlowConfig;
+                    bulkFlowConfig == other.bulkFlowConfig;
 
   @override
   int get hashCode => Object.hash(
@@ -258,8 +228,6 @@ class SettingsState {
         coldCallTrustLevel,
         facilitateInvites,
         showLinkDiagnostics,
-        neighborAllowlist,
-        workloadConfig,
         bulkFlowConfig,
       );
 

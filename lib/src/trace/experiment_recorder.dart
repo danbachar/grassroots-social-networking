@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,8 +8,10 @@ import 'package:path_provider/path_provider.dart';
 
 /// TESTBED ONLY. Local experiment recording for the evaluation chapter.
 ///
-/// While an experiment is active every [log] record is appended to a
-/// per-experiment JSONL file (`exp_<id>.jsonl`) under the app documents dir.
+/// While an experiment is active every [log] record is buffered in memory
+/// and written to the per-experiment JSONL file (`exp_<id>.jsonl`, app
+/// documents dir) in one append when the run stops — zero disk I/O inside
+/// the measurement window, and an app kill mid-run loses the buffer.
 /// Files leave the device only on the experimenter's explicit action from the
 /// testbed screen — the share sheet, or a manual upload to the trace server
 /// ([uploadExperimentFiles]). There is no automatic upload, no prompt, and no
@@ -19,6 +22,17 @@ class ExperimentRecorder {
 
   String? _experimentId;
   String? get experimentId => _experimentId;
+
+  /// All records of the active experiment, held IN MEMORY and written to the
+  /// file only when the run ends (or when the files are shared/uploaded
+  /// mid-run). Rationale: no disk I/O inside the measurement window — the
+  /// old per-call `writeAsString(mode: append)` fired hundreds of concurrent
+  /// opens under load and silently dropped records (a 40-min soak lost ~a
+  /// third of its `recv` records). Buffering is synchronous, ordered, and
+  /// cannot drop; a 40-min run is well under 1 MB. The deliberate trade: an
+  /// app kill mid-run loses the whole buffer.
+  final List<String> _buffer = [];
+  int _bufferedBytes = 0;
 
   /// Whether an experiment is recording — the gate instrumentation checks
   /// before composing records. Zero cost in normal operation.
@@ -41,23 +55,25 @@ class ExperimentRecorder {
     return cleaned.isEmpty ? 'exp' : cleaned;
   }
 
-  /// Append one record to the active experiment file. No-op when inactive;
-  /// never throws.
+  /// Append one record to the active experiment's in-memory buffer. No-op
+  /// when inactive; never throws. Purely synchronous — ordered, no I/O, no
+  /// possibility of a dropped record.
   Future<void> log(Map<String, dynamic> record) async {
-    final expId = _experimentId;
-    if (expId == null) return;
+    if (_experimentId == null) return;
     try {
-      final exp = await _file(_expFileName(expId));
-      await exp.writeAsString('${jsonEncode(record)}\n',
-          mode: FileMode.append, flush: false);
+      final line = '${jsonEncode(record)}\n';
+      _buffer.add(line);
+      _bufferedBytes += line.length;
     } catch (e) {
       debugPrint('[exp] log failed: $e');
     }
   }
 
-  /// Begin (or resume — appends to an existing file of the same id) an
-  /// experiment recording. Marks the boundary with an `expStart` marker.
+  /// Begin (or resume — the eventual write appends to an existing file of
+  /// the same id) an experiment recording. Marks the boundary with an
+  /// `expStart` marker.
   Future<void> startExperiment(String id) async {
+    if (_experimentId != null) await _writeBufferToDisk();
     final clean = sanitizeExperimentId(id);
     _experimentId = clean;
     await log({
@@ -68,7 +84,8 @@ class ExperimentRecorder {
     });
   }
 
-  /// Stop the experiment recording, marking the boundary with `expStop`.
+  /// Stop the experiment recording: mark the boundary with `expStop` and
+  /// write the whole buffered run to disk in one append.
   Future<void> stopExperiment() async {
     if (_experimentId == null) return;
     await log({
@@ -77,7 +94,25 @@ class ExperimentRecorder {
       'exp': _experimentId,
       't': DateTime.now().millisecondsSinceEpoch,
     });
+    await _writeBufferToDisk();
     _experimentId = null;
+  }
+
+  /// Append everything buffered so far to the experiment file and clear the
+  /// buffer. Called at stop, and before any read of the files (share/upload
+  /// mid-run) so on-disk content is current.
+  Future<void> _writeBufferToDisk() async {
+    final expId = _experimentId;
+    if (expId == null || _buffer.isEmpty) return;
+    final lines = _buffer.join();
+    _buffer.clear();
+    _bufferedBytes = 0;
+    try {
+      final exp = await _file(_expFileName(expId));
+      await exp.writeAsString(lines, mode: FileMode.append, flush: true);
+    } catch (e) {
+      debugPrint('[exp] buffer write failed: $e');
+    }
   }
 
   /// Free-form ground-truth annotation (distance step, direction, note),
@@ -92,6 +127,7 @@ class ExperimentRecorder {
 
   /// Paths of all experiment files currently on disk (any id, sorted).
   Future<List<String>> experimentFilePaths() async {
+    await _writeBufferToDisk(); // make the active file current before reading
     final dir = await _dir();
     final out = <String>[];
     await for (final f in dir.list()) {
@@ -103,12 +139,15 @@ class ExperimentRecorder {
     return out;
   }
 
-  /// Size in bytes of the active experiment's file (0 when absent/inactive).
+  /// Size in bytes of the active experiment's data: what is already on disk
+  /// plus the in-memory buffer (0 when inactive). Drives the UI counter
+  /// without forcing a disk write.
   Future<int> experimentFileSize() async {
     final id = _experimentId;
     if (id == null) return 0;
     final f = await _file(_expFileName(id));
-    return await f.exists() ? await f.length() : 0;
+    final onDisk = await f.exists() ? await f.length() : 0;
+    return onDisk + _bufferedBytes;
   }
 
   /// Upload every experiment file to the trace server (`POST /v1/traces`,

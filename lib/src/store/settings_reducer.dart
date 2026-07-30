@@ -49,14 +49,6 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(showLinkDiagnostics: action.enabled);
   }
 
-  if (action is SetNeighborAllowlistAction) {
-    return state.copyWith(neighborAllowlist: action.allowlist);
-  }
-
-  if (action is SetWorkloadConfigAction) {
-    return state.copyWith(workloadConfig: action.config);
-  }
-
   if (action is SetBulkFlowConfigAction) {
     return state.copyWith(bulkFlowConfig: action.config);
   }

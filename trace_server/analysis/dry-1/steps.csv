@@ -1,0 +1,2 @@
+d,direction,label,t0,t1,rssi_n,rssi_adv_mean,rssi_adv_std,rssi_conn_mean,rssi_conn_std,discovered,connected,session,usable,drop
+1.0,,d=1,1784751660959,1784751796574,117,-47.3,2.8,-47.5,2.4,39,2,0,0,3

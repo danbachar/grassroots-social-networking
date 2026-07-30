@@ -1,78 +1,16 @@
 import 'package:flutter/foundation.dart';
 
-import '../models/identity.dart';
 
-/// DEBUG/TESTBED ONLY. Config models for the two evaluation harnesses:
-/// [NeighborAllowlist] (software-defined BLE topology) and [WorkloadConfig]
-/// (deterministic offered load). Both are stored as nullable fields on
-/// `SettingsState`, are inert/off by default, and must never affect
-/// production behaviour. See `docs/testbed_case_studies.md`.
+/// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:
+/// [BulkFlowConfig] (sustained throughput) and [FieldPlan] (scripted field
+/// experiment). Stored as nullable fields on `SettingsState` where noted,
+/// inert/off by default, and never affecting production behaviour. See
+/// `docs/testbed_experiments.md`.
 
-/// Force an arbitrary BLE topology by restricting which *immediate* BLE
-/// neighbours this device may link with. The relayed wire envelope is
-/// sender-anonymous, so we can only filter on the neighbour we received from —
-/// which is exactly the adjacency edge in the topology graph.
-@immutable
-class NeighborAllowlist {
-  /// When false, normal (production) behaviour — no filtering at all.
-  final bool enabled;
-
-  /// Lowercase hex-encoded *full* Ed25519 public keys (64 chars) of the only
-  /// neighbours this device may form a BLE link with. Empty + enabled means
-  /// "link with no one" (a fully partitioned node). Full keys are required
-  /// (not prefixes) so the primary enforcement layer can derive each peer's
-  /// rotating service UUID without an ANNOUNCE.
-  final List<String> allow;
-
-  const NeighborAllowlist({this.enabled = false, this.allow = const []});
-
-  static const NeighborAllowlist disabled = NeighborAllowlist();
-
-  /// Allowed pubkeys parsed to bytes (skips malformed entries).
-  List<Uint8List> get _allowedPubkeys {
-    final out = <Uint8List>[];
-    for (final hex in allow) {
-      final bytes = _hexToBytes(hex);
-      if (bytes != null && bytes.length >= 32) out.add(bytes);
-    }
-    return out;
-  }
-
-  /// Whether a peer identified by [pubkey] is an allowed neighbour.
-  bool allowsPubkey(Uint8List pubkey) => allowsPubkeyHex(
-      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join());
-
-  bool allowsPubkeyHex(String pubkeyHex) {
-    final target = pubkeyHex.toLowerCase();
-    return allow.any((a) => target == a.toLowerCase());
-  }
-
-  /// Whether a discovered BLE [serviceUuid] derives to an allowed neighbour —
-  /// the pre-ANNOUNCE check used to refuse a dial (Layer 1). Matches the
-  /// current and adjacent rotation slots, like normal recognition.
-  bool allowsServiceUuid(String serviceUuid) => _allowedPubkeys.any(
-      (pk) => GrassrootsIdentity.serviceUuidMatchesPubkey(serviceUuid, pk));
-
-  Map<String, dynamic> toJson() => {'enabled': enabled, 'allow': allow};
-
-  factory NeighborAllowlist.fromJson(Map<String, dynamic> json) =>
-      NeighborAllowlist(
-        enabled: json['enabled'] as bool? ?? false,
-        allow: (json['allow'] as List<dynamic>?)
-                ?.map((e) => (e as String).toLowerCase())
-                .toList() ??
-            const [],
-      );
-
-  @override
-  bool operator ==(Object other) =>
-      other is NeighborAllowlist &&
-      other.enabled == enabled &&
-      listEquals(other.allow, allow);
-
-  @override
-  int get hashCode => Object.hash(enabled, Object.hashAll(allow));
-}
+/// Fixed namespace for deterministic UUIDv5 message ids (bulk flows and
+/// field-plan sends). Any offline tool using this namespace + the same name
+/// string reproduces the exact id set — the delivery-ratio denominator.
+const String workloadUuidNamespace = 'b8f4a1e2-1c3d-4b5a-9e7f-677261737372';
 
 /// One label→identity binding in the workload roster. The same roster file is
 /// deployed to every device; a device finds its own row by matching
@@ -100,97 +38,6 @@ class WorkloadRosterEntry {
 
   @override
   int get hashCode => Object.hash(label, pubkeyHex);
-}
-
-/// A payload-size bucket for the workload's size mix.
-@immutable
-class WorkloadPayload {
-  final int bytes;
-  final double weight;
-
-  const WorkloadPayload({required this.bytes, required this.weight});
-
-  Map<String, dynamic> toJson() => {'bytes': bytes, 'weight': weight};
-
-  factory WorkloadPayload.fromJson(Map<String, dynamic> json) =>
-      WorkloadPayload(
-        bytes: json['bytes'] as int,
-        weight: (json['weight'] as num).toDouble(),
-      );
-
-  @override
-  bool operator ==(Object other) =>
-      other is WorkloadPayload && other.bytes == bytes && other.weight == weight;
-
-  @override
-  int get hashCode => Object.hash(bytes, weight);
-}
-
-/// Deterministic offered-load schedule. Every device computes the SAME full
-/// schedule from [seed] + [roster] and executes only the rows where it is the
-/// source, so the total scheduled count (across devices) is the reproducible
-/// delivery-ratio denominator, computable offline from this config alone.
-@immutable
-class WorkloadConfig {
-  final int seed;
-  final int startAtEpochMs;
-  final int endAtEpochMs;
-  final List<WorkloadRosterEntry> roster;
-
-  /// Seeded-Poisson mean rate per ORDERED pair (src→dst), messages per hour.
-  final double ratePerPairPerHour;
-  final List<WorkloadPayload> payloadMix;
-
-  const WorkloadConfig({
-    required this.seed,
-    required this.startAtEpochMs,
-    required this.endAtEpochMs,
-    required this.roster,
-    required this.ratePerPairPerHour,
-    required this.payloadMix,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'seed': seed,
-        'startAtEpochMs': startAtEpochMs,
-        'endAtEpochMs': endAtEpochMs,
-        'roster': roster.map((r) => r.toJson()).toList(),
-        'ratePerPairPerHour': ratePerPairPerHour,
-        'payloadMix': payloadMix.map((p) => p.toJson()).toList(),
-      };
-
-  factory WorkloadConfig.fromJson(Map<String, dynamic> json) => WorkloadConfig(
-        seed: json['seed'] as int,
-        startAtEpochMs: json['startAtEpochMs'] as int,
-        endAtEpochMs: json['endAtEpochMs'] as int,
-        roster: (json['roster'] as List<dynamic>)
-            .map((e) => WorkloadRosterEntry.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        ratePerPairPerHour: (json['ratePerPairPerHour'] as num).toDouble(),
-        payloadMix: (json['payloadMix'] as List<dynamic>)
-            .map((e) => WorkloadPayload.fromJson(e as Map<String, dynamic>))
-            .toList(),
-      );
-
-  @override
-  bool operator ==(Object other) =>
-      other is WorkloadConfig &&
-      other.seed == seed &&
-      other.startAtEpochMs == startAtEpochMs &&
-      other.endAtEpochMs == endAtEpochMs &&
-      listEquals(other.roster, roster) &&
-      other.ratePerPairPerHour == ratePerPairPerHour &&
-      listEquals(other.payloadMix, payloadMix);
-
-  @override
-  int get hashCode => Object.hash(
-        seed,
-        startAtEpochMs,
-        endAtEpochMs,
-        Object.hashAll(roster),
-        ratePerPairPerHour,
-        Object.hashAll(payloadMix),
-      );
 }
 
 /// One directed bulk transfer: [srcLabel] saturates toward [dstLabel].
@@ -274,14 +121,154 @@ class BulkFlowConfig {
       Object.hashAll(flows), payloadBytes, durationMs, inFlight);
 }
 
-Uint8List? _hexToBytes(String hex) {
-  final clean = hex.trim().toLowerCase();
-  if (clean.isEmpty || clean.length.isOdd) return null;
-  final out = Uint8List(clean.length ~/ 2);
-  for (var i = 0; i < out.length; i++) {
-    final byte = int.tryParse(clean.substring(i * 2, i * 2 + 2), radix: 16);
-    if (byte == null) return null;
-    out[i] = byte;
-  }
-  return out;
+/// One step of a field-experiment plan: the experimenter walks into
+/// position, taps IN POSITION (which stamps [label] as a ground-truth
+/// marker), and the runner holds the dwell for [dwellSec] before advancing.
+/// When [bulk] is true the bulk-flow driver runs during the dwell. When
+/// [sendCount] > 0 the runner sends that many [sendBytes]-sized messages to
+/// every other roster device, spaced evenly through the dwell — the first
+/// send doubles as the handshake trigger after a session reset, so the
+/// discovered→connected→session→usable ladder runs inside the step.
+@immutable
+class FieldStep {
+  final String label;
+  final int dwellSec;
+  final bool bulk;
+  final int sendCount;
+  final int sendBytes;
+
+  /// Begin this step automatically without the IN POSITION tap. Set by the
+  /// plan builders when the step's distance equals the previous step's (a
+  /// repeat trial at the same position — nothing to walk to). A step at a new
+  /// distance leaves this false so the runner waits for the tap.
+  final bool autoAdvance;
+
+  const FieldStep({
+    required this.label,
+    required this.dwellSec,
+    this.bulk = false,
+    this.sendCount = 0,
+    this.sendBytes = 184,
+    this.autoAdvance = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'label': label,
+        'dwellSec': dwellSec,
+        if (bulk) 'bulk': bulk,
+        if (sendCount > 0) 'sendCount': sendCount,
+        if (sendCount > 0) 'sendBytes': sendBytes,
+        if (autoAdvance) 'autoAdvance': autoAdvance,
+      };
+
+  factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
+        label: json['label'] as String,
+        dwellSec: json['dwellSec'] as int,
+        bulk: json['bulk'] as bool? ?? false,
+        sendCount: json['sendCount'] as int? ?? 0,
+        sendBytes: json['sendBytes'] as int? ?? 184,
+        autoAdvance: json['autoAdvance'] as bool? ?? false,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is FieldStep &&
+      other.label == label &&
+      other.dwellSec == dwellSec &&
+      other.bulk == bulk &&
+      other.sendCount == sendCount &&
+      other.sendBytes == sendBytes &&
+      other.autoAdvance == autoAdvance;
+
+  @override
+  int get hashCode =>
+      Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance);
+}
+
+/// A scripted field experiment: the same plan is loaded on every device and
+/// the runner walks the experimenter through it — markers, dwell timing,
+/// bulk-flow triggering, and the end-of-run stop/upload are all automated;
+/// only the walking and one IN POSITION tap per step stay manual.
+@immutable
+class FieldPlan {
+  final String expId;
+  final List<FieldStep> steps;
+
+  /// Post-plan settle window before the recording stops — lets late ACKs and
+  /// custody deliveries land inside the trace.
+  final int settleSec;
+
+  /// Label→identity bindings for per-step sends. A device finds its own row
+  /// by pubkey and sends to every OTHER row; a device not in the roster is
+  /// receive-only. EMPTY roster (the two-device default): sends target every
+  /// currently identified peer instead, labeled by 8-hex pubkey prefix — no
+  /// manual pubkey entry needed.
+  final List<WorkloadRosterEntry> roster;
+
+  /// Drop all Noise sessions at the start of every step (default on): each
+  /// step then measures the full establishment ladder from a cold handshake
+  /// instead of reusing a session formed at setup range.
+  final bool resetSessions;
+
+  /// Also tear down every BLE link at the start of every step (default off):
+  /// the step then re-runs discovery + connect too, making each distance a
+  /// fully independent discovered→connected→session→usable trial. Costs a
+  /// few seconds of re-dial per step.
+  final bool resetLinks;
+
+  /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
+  /// begins, in seconds. A manual tap still skips the remaining gap.
+  final int autoAdvanceGapSec;
+
+  const FieldPlan({
+    required this.expId,
+    required this.steps,
+    this.settleSec = 30,
+    this.roster = const [],
+    this.resetSessions = true,
+    this.resetLinks = false,
+    this.autoAdvanceGapSec = 5,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'expId': expId,
+        'steps': steps.map((s) => s.toJson()).toList(),
+        'settleSec': settleSec,
+        if (roster.isNotEmpty)
+          'roster': roster.map((r) => r.toJson()).toList(),
+        'resetSessions': resetSessions,
+        if (resetLinks) 'resetLinks': resetLinks,
+        'autoAdvanceGapSec': autoAdvanceGapSec,
+      };
+
+  factory FieldPlan.fromJson(Map<String, dynamic> json) => FieldPlan(
+        expId: json['expId'] as String,
+        steps: (json['steps'] as List<dynamic>)
+            .map((e) => FieldStep.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        settleSec: json['settleSec'] as int? ?? 30,
+        roster: (json['roster'] as List<dynamic>?)
+                ?.map((e) =>
+                    WorkloadRosterEntry.fromJson(e as Map<String, dynamic>))
+                .toList() ??
+            const [],
+        resetSessions: json['resetSessions'] as bool? ?? true,
+        resetLinks: json['resetLinks'] as bool? ?? false,
+        autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is FieldPlan &&
+      other.expId == expId &&
+      listEquals(other.steps, steps) &&
+      other.settleSec == settleSec &&
+      listEquals(other.roster, roster) &&
+      other.resetSessions == resetSessions &&
+      other.resetLinks == resetLinks &&
+      other.autoAdvanceGapSec == autoAdvanceGapSec;
+
+  @override
+  int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
+      Object.hashAll(roster), resetSessions, resetLinks, autoAdvanceGapSec);
 }

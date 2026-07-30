@@ -1741,6 +1741,9 @@ class GrassrootsNetwork {
         packet,
         remotePubkey: senderPubkey,
       );
+      // First-custodian rule, same as ACKs: the sealed receipt rides future
+      // sync exchanges even if this flood reaches nobody. Age-expiry only.
+      _messageRouter.storeCustody(senderPubkey, sealed);
       if (await _floodViaBle(sealed.serialize()) > 0) {
         return true;
       }
@@ -3481,6 +3484,11 @@ class GrassrootsNetwork {
       if (transport == PeerTransport.udp) {
         await _udpService?.sendToPeer(_pubkeyToHex(senderPubkey), bytes);
       } else {
+        // The ACK is epidemic traffic like everything else, and we are its
+        // first custodian: if no neighbor hears this flood, the sealed ACK
+        // still rides every future sync exchange. Nothing ACKs an ACK, so
+        // the entry leaves custody only by age expiry.
+        _messageRouter.storeCustody(senderPubkey, sealed);
         await _floodViaBle(bytes);
       }
     };

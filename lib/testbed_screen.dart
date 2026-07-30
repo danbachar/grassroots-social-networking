@@ -242,13 +242,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
           .where((pk) => pk.length == 32)
           .toList(),
       onWindowElapsed: () => HapticFeedback.heavyImpact(),
+      // A token-less build must SAY so at the end of a run. Wiring this to
+      // null instead let a finished plan report nothing at all, which is how
+      // a multi-hour recording silently fails to reach the server — the data
+      // is still on the device, but nothing on screen says to go get it.
       upload: TraceConfig.isConfigured
           ? () => recorder.uploadExperimentFiles(
                 url: TraceConfig.serverUrl,
                 token: TraceConfig.serverToken,
                 deviceId: widget.myPubkeyHex ?? 'unknown',
               )
-          : null,
+          : () async => 'NOT UPLOADED — this build has no TRACE_TOKEN. The '
+              'recording is safe on this device: rebuild with '
+              '--dart-define=TRACE_TOKEN=..., install with -r (app data is '
+              'kept), then press Upload files.',
     );
     // Saturating steps refill their window on each end-to-end ACK.
     widget.registerAckListener?.call(runner.onAck);
@@ -624,9 +631,15 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   late final TextEditingController _sides =
       TextEditingController(text: '10, 20, 40');
   late final TextEditingController _repeat = TextEditingController(text: '1');
+  // Payload ARM: one saturating step per size. 132 B is exactly one sealed
+  // packet at the BLE floor MTU, 264 B exactly two, 1200 B ten — so the
+  // per-message cost of fragmentation comes out as a measured curve.
   late final TextEditingController _payloadBytes =
-      TextEditingController(text: '184');
-  late final TextEditingController _inFlight = TextEditingController(text: '8');
+      TextEditingController(text: '$defaultSendBytes, 264, 1200');
+  late final TextEditingController _sendLanes =
+      TextEditingController(text: '1');
+  late final TextEditingController _laneCounts =
+      TextEditingController(text: '1, 4, 16, 64');
   late final TextEditingController _targetPrefix = TextEditingController();
   late final TextEditingController _holdMin = TextEditingController(text: '5');
   bool _retreat = true;
@@ -649,7 +662,8 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       _sides,
       _repeat,
       _payloadBytes,
-      _inFlight,
+      _sendLanes,
+      _laneCounts,
       _targetPrefix,
       _holdMin,
     ]) {
@@ -661,10 +675,18 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   int _int(TextEditingController c, int fallback) =>
       int.tryParse(c.text.trim()) ?? fallback;
 
+  /// True once the experimenter has typed in the id field. Changing the
+  /// experiment kind then leaves their id ALONE — silently overwriting it is
+  /// how a run ends up filed under the wrong name, which only surfaces hours
+  /// later when the analysis cannot find it.
+  bool _idEdited = false;
+
   void _suggestId(FieldPlanKind kind) {
+    if (_idEdited) return;
     _expId.text = switch (kind) {
       FieldPlanKind.homeSoak => 'home-soak-1',
       FieldPlanKind.throughput => 'throughput-1',
+      FieldPlanKind.throughputCeiling => 'throughput-ceiling-1',
       FieldPlanKind.multiHop => 'mesh-hop-1',
       FieldPlanKind.storeCarry => 'mesh-dtn-1',
       FieldPlanKind.lineSweep => 'cp-line-1',
@@ -691,6 +713,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
               const SizedBox(height: 4),
               TextField(
                 controller: _expId,
+                onChanged: (_) => _idEdited = true,
                 decoration: const InputDecoration(
                     labelText: 'Experiment id (same on both devices)',
                     isDense: true),
@@ -780,14 +803,33 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         return [
           _num(_dwellSec, 'Saturate for (s)'),
           const SizedBox(height: 12),
-          _num(_payloadBytes, 'Message size (bytes)'),
+          _num(_payloadBytes, 'Message sizes (bytes, comma-separated)'),
           const SizedBox(height: 12),
-          _num(_inFlight, 'Messages in flight'),
+          _num(_sendLanes, 'Concurrent send lanes'),
           const Padding(
             padding: EdgeInsets.only(top: 8),
             child: Text(
-              'Fires as many messages as the link carries: keeps the window '
-              'full, sending the next on every ACK. No pacing, no cap.',
+              'Fires as many messages as the link carries: pushes '
+              'as fast as the send path drains, never waiting for an '
+              'ACK. Each size is its own step — $defaultSendBytes B is one '
+              'sealed packet, larger sizes fragment. A NON-zero window is '
+              'ACK-clocked and caps the rate at window/RTT.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.throughputCeiling:
+        return [
+          _num(_dwellSec, 'Saturate for (s)'),
+          const SizedBox(height: 12),
+          _num(_payloadBytes, 'Message size (bytes) — first value is used'),
+          const SizedBox(height: 12),
+          _num(_laneCounts, 'Lane counts to sweep (comma-separated)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Each lane pushes independently, none ACK-gated, so offered '
+              'load rises with the lane count. The ceiling is where delivery '
+              'drops below 100% and goodput stops climbing.',
               style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
         ];
@@ -886,8 +928,11 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         repeat: _int(_repeat, 1),
         resetSessions: _resetSessions,
         resetLinks: _resetLinks,
-        payloadBytes: _int(_payloadBytes, 184),
-        inFlight: _int(_inFlight, 8),
+        payloadSizes: FieldPlanWizard.parseInts(
+            _payloadBytes.text, const [defaultSendBytes]),
+        sendLanes: _int(_sendLanes, 1),
+        laneCounts:
+            FieldPlanWizard.parseInts(_laneCounts.text, const [1, 4, 16, 64]),
         targetPrefix: _targetPrefix.text.trim(),
         holdMin: _int(_holdMin, 5),
       );

@@ -440,11 +440,24 @@ class GrassrootsNetwork {
   /// Messages awaiting their first Noise session with the recipient — the
   /// plaintext cannot be sealed into custody until the eager handshake on an
   /// accepted pairing completes. Keyed by messageId.
+  ///
+  /// BOUNDED: this holds full payloads, so a peer that never pairs would
+  /// otherwise let it grow without limit — the sealed DTN store is capped
+  /// (32 packets per recipient) and this pre-seal buffer must be too, or the
+  /// unsealed side becomes the leak the sealed side was designed to avoid.
+  /// Insertion-ordered, so eviction drops the oldest hold first.
   final Map<String, _PendingSealMessage> _pendingSeal = {};
+  static const int _maxPendingSeal = 256;
 
   /// messageId → the sealed custody packetIds belonging to it (one for a
   /// single-packet message, N for fragments) so the ACK can end custody.
+  ///
+  /// BOUNDED: entries leave on the recipient's ACK, so anything never ACKed
+  /// would accumulate forever. Evicting the oldest only costs the ability to
+  /// end custody early for that message — the DTN store still ages it out.
+  /// Sized to match `MessagesState.maxMessages`, the delivery-tracking depth.
   final Map<String, List<String>> _custodyPacketIds = {};
+  static const int _maxCustodyTracked = 1000;
 
 
   // ===== Public callbacks =====
@@ -1373,6 +1386,14 @@ class GrassrootsNetwork {
       recipientPubkey: recipientPubkey,
       payload: payload,
     );
+    while (_pendingSeal.length > _maxPendingSeal) {
+      final oldest = _pendingSeal.keys.first;
+      _pendingSeal.remove(oldest);
+      // Surfaced as failed: the user retries, we never silently re-attempt.
+      store.dispatch(MessageFailedAction(messageId: oldest));
+      debugPrint('[custody] pre-seal buffer full ($_maxPendingSeal) — '
+          'dropped the oldest hold');
+    }
     store.dispatch(MessageQueuedAction(messageId: messageId));
     debugPrint(
       '[custody] No session for ${_pubkeyToHex(recipientPubkey).substring(0, 8)} '
@@ -1441,6 +1462,9 @@ class GrassrootsNetwork {
         _custodyPacketIds[messageId] = [
           for (final p in sealedPackets) p.packetId,
         ];
+        while (_custodyPacketIds.length > _maxCustodyTracked) {
+          _custodyPacketIds.remove(_custodyPacketIds.keys.first);
+        }
         for (final p in sealedPackets) {
           _messageRouter.storeCustody(recipientPubkey, p);
         }
@@ -1754,15 +1778,19 @@ class GrassrootsNetwork {
   /// TESTBED/TRACE ONLY. Inner content type of packets we sealed, keyed by
   /// packetId, so the wire ledger can split our own `secure` tx bytes by
   /// what they actually carry (data by block class vs ack/receipt/sync).
-  /// Bounded ring — only recent packets can still be in flight.
+  /// Bounded FIFO — only recent packets can still be in flight. Evicts the
+  /// OLDEST entry at a time rather than clearing wholesale: a clear drops the
+  /// classification for every packet still on the air, and under load
+  /// (throughput runs seal thousands of packets a minute) that lost ~1.3 MB
+  /// of a 3.8 MB run to the unclassified `secure` bucket.
   final Map<String, String> _sealedContentById = {};
-  static const int _sealedContentCap = 2048;
+  static const int _sealedContentCap = 8192;
 
   void _noteSealedContent(String packetId, ContentType type,
       {String? dataKind}) {
     if (!(trace?.active ?? false)) return;
-    if (_sealedContentById.length > _sealedContentCap) {
-      _sealedContentById.clear();
+    while (_sealedContentById.length >= _sealedContentCap) {
+      _sealedContentById.remove(_sealedContentById.keys.first);
     }
     _sealedContentById[packetId] = switch (type) {
       ContentType.message => dataKind == null ? 'data' : 'data:$dataKind',
@@ -3266,8 +3294,14 @@ class GrassrootsNetwork {
           'dir': 'delivered',
           'messageId': messageId,
           'deliveredAt': now,
+          // NOT the wire RTT. `outgoing.sentAt` is when the message was
+          // CREATED, so this spans enqueue -> seal -> wait for the session and
+          // the settled link -> flood -> ACK. The wire RTT is deliveredAt
+          // minus the `sent` record's own `sentAt` (stamped when the sealed
+          // packet is handed to the transport); the analyzer reports both, and
+          // the gap between them is the send path's own cost.
           if (sentAt != null)
-            'e2eLatencyMs': now - sentAt.millisecondsSinceEpoch,
+            'appLatencyMs': now - sentAt.millisecondsSinceEpoch,
           'deliverySuccess': true,
         }));
         // First end-to-end ACK since the session came up: the link is

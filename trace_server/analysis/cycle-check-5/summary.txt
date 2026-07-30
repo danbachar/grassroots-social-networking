@@ -11,3 +11,10 @@ receiver (f86de4d9):
   records by type: {'message': 1500, 'rssi': 394, 'link': 136, 'wire': 54, 'marker': 2}
   link stages: {'discovered': 111, 'drop': 10, 'connected': 10, 'session': 5}
   wire bytes: {'rx:announce': 18810, 'rx:handshake': 1092, 'rx:secure': 392000, 'tx:announce': 18297, 'tx:handshake': 700, 'tx:secure:ack': 168980, 'tx:secure:sync': 3308}
+
+=== mesh ===
+messages sent: 500, delivered: 500 (100%)
+delivered by relay hops (receiver TTL view): {0: 500}
+  MULTI-HOP deliveries: 0/500
+packet redundancy: 0 redundant packet arrival(s) for 500 delivered message(s) = 1.00 copies on the air per message (dual-leg pairs deliver every flood twice)
+message re-delivery: 1674 (must be 0 — a duplicate of an already-delivered message triggers nothing)

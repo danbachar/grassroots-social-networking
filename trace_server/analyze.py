@@ -10,9 +10,11 @@ emits, under ``--out``:
 
     <exp>/summary.txt          per-device record counts, stage events,
                                delivery ratio, latency stats, flow goodput
-    <exp>/steps.csv            per position-step marker segment (d= or side=;
-                               one row per repeat trial): RSSI stats
-                               (adv/conn), stage events seen, drops
+    <exp>/steps.csv            one row per step marker segment (per repeat
+                               trial): RSSI stats (adv/conn), stage events
+                               seen, drops, delivery, and the per-step cost
+                               metrics — payloadB, lanes, msg_per_s,
+                               goodput_Bps, airB_per_msg and air_overhead
     <exp>/establishment.csv    repeat trials aggregated per (distance,
                                direction): fraction of trials that reached
                                each link stage — establishment probability
@@ -24,10 +26,26 @@ emits, under ``--out``:
     <exp>/latency.csv          per-message e2e latency (sent joined to
                                delivered on messageId)
 
-Markers drive the ground truth: a marker whose label contains ``d=<number>``
-opens a distance segment that runs until the next ``d=`` marker (or expStop).
-Direction words in the label (``approach``/``retreat``) are carried through to
-``steps.csv`` for the hysteresis analysis.
+Markers drive the ground truth: every step marker opens a segment that runs
+until the next one (or the ``end`` marker), and the step's variables are read
+off its label — ``d=<m>``/``side=<m>`` for position, ``p=<n>B`` for the
+throughput payload arm, ``lanes=<n>`` for the ceiling sweep,
+``approach``/``retreat`` for sweep direction. A step
+without a position (a stationary throughput step) still gets a row; it simply
+has no distance. Runner control markers (resets, ``link-settled``,
+``saturate-start``, ``end``) never open a segment.
+
+Rates are computed over the ACTIVE window (first send -> last ACK), not the
+marker span: the link teardown/handshake sits at a step's head and the
+auto-advance gap at its tail, and nothing is sent in either — dividing by the
+span understates throughput by ~40% in a typical cycle-check. ``active_s``
+next to ``t0``/``t1`` makes the difference visible.
+
+``airB_per_msg`` is every sealed byte both devices put on the air during the
+step (data + acks + custody sync) divided by the messages delivered, and
+``air_overhead`` is that over the payload size. This is what the payload arm
+measures: a payload above one sealed packet (132 B) fragments, and each
+fragment re-pays the full 104-byte header.
 
 Usage:
     python3 analyze.py data/traces.db --out analysis
@@ -57,9 +75,22 @@ import pandas as pd  # noqa: E402
 # A position marker: `d=<m>` (line sweep) or `side=<m>` (dilating clique).
 # Trailing trial suffixes ("d=40 approach t2") don't affect the capture.
 MARKER_POS_RE = re.compile(r"\b(?:d|side)\s*=\s*(\d+(?:\.\d+)?)")
+# A payload-arm marker: `p=<n>B` (throughput arm). The size is also measured
+# from the traffic itself; this is the declared value.
+MARKER_PAYLOAD_RE = re.compile(r"\bp\s*=\s*(\d+)\s*B\b", re.I)
+# A ceiling-sweep marker: `lanes=<n>` — how many sends were pushed
+# concurrently, i.e. the offered-load knob.
+MARKER_LANES_RE = re.compile(r"\blanes\s*=\s*(\d+)", re.I)
 LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
-# Runner control markers that annotate a step boundary but are not positions.
-CONTROL_MARKERS = {"links-reset", "sessions-reset"}
+# Runner markers that annotate a boundary or an event but are not steps. Every
+# OTHER marker opens a step segment — a throughput step ("saturate", "p=264B")
+# has no position at all, and dropping it would make the whole experiment
+# invisible in steps.csv.
+CONTROL_MARKERS = {"links-reset", "sessions-reset", "link-settled",
+                   "saturate-start", "end", "aborted"}
+# Marker span != active time. A step's markers are all stamped at its start,
+# and the auto-advance gap between steps trails the dwell, so rates are taken
+# over the ACTIVE window (first send -> last ACK) instead. See steps_table.
 
 
 # --------------------------------------------------------------------------- #
@@ -131,7 +162,7 @@ def device_roles(df: pd.DataFrame) -> dict[str, str]:
     senders, receivers = [], []
     for device in sorted(df._device.unique()):
         sub = msgs[msgs._device == device]
-        sends = int((sub.get("dir") == "sent").sum()) if len(sub) else 0
+        sends = int((_col(sub, "dir") == "sent").sum()) if len(sub) else 0
         (senders if sends > 0 else receivers).append(device)
     for i, d in enumerate(senders):
         roles[d] = "sender" if len(senders) == 1 else f"sender{i + 1}"
@@ -151,6 +182,18 @@ def _dict(v) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    """A record field that may be absent from THIS trace, as an index-aligned
+    Series. `df.get(name)` returns None when the column is missing, and
+    `None == "x"` is the scalar False — which pandas then rejects as an
+    indexer, so a trace that happens to contain no such record crashes the
+    run. This keeps the comparison a proper all-False mask.
+    """
+    if name in df.columns:
+        return df[name]
+    return pd.Series([None] * len(df), index=df.index, dtype=object)
+
+
 def _num(v, default=0):
     """A numeric record field; NaN (missing) becomes the default."""
     return default if v is None or (isinstance(v, float) and math.isnan(v)) else v
@@ -160,34 +203,51 @@ def _num(v, default=0):
 # Per-experiment analyses
 # --------------------------------------------------------------------------- #
 def marker_segments(df: pd.DataFrame) -> list[dict]:
-    """Position segments from d=<x>/side=<x> markers: [{d, direction, t0, t1}].
+    """One segment per step marker: [{d, payloadB, direction, label, t0, t1}].
 
-    One segment per step. Repeat trials at the same distance carry distinct
-    labels (…t1, …t2), so each stays its own segment. In static+moving mode
-    only the moving device stamps position markers; the static device's
-    records fall into these segments by timestamp. A duplicate identical label
-    within 90s (e.g. both devices stamping) collapses to the earlier one.
+    Every marker that is not a runner control marker opens a segment, and its
+    step variables are read off the label where present: `d=`/`side=` gives the
+    position (NaN for a stationary step), `p=<n>B` the declared payload size.
+    Repeat trials carry distinct labels (…t1, …t2), so each stays its own
+    segment. In static+moving mode only the moving device stamps step markers;
+    the static device's records fall into these segments by timestamp. A
+    duplicate identical label within 90s (both devices stamping) collapses to
+    the earlier one.
     """
     markers = df[(df._type == "marker")].sort_values("_t")
     segs: list[dict] = []
+    end_t = None
     for _, m in markers.iterrows():
-        label = m.get("label") or ""
-        match = MARKER_POS_RE.search(str(label))
-        if not match:
+        # expStart/expStop carry `event`, not `label` — lifecycle, not a step.
+        # (A missing field is NaN, which is truthy: test for str, not falsiness.)
+        raw = m.get("label")
+        label = raw if isinstance(raw, str) else ""
+        # The runner stamps `end` when the last dwell finishes, BEFORE the
+        # settle window. Closing the final segment there keeps per-second
+        # rates honest — settle time carries late ACKs, not sends.
+        if label in ("end", "aborted") and end_t is None:
+            end_t = m._t
+        if not label or label in CONTROL_MARKERS:
             continue
-        if segs and segs[-1]["label"] == str(label) \
+        if segs and segs[-1]["label"] == label \
                 and m._t - segs[-1]["t0"] < 90_000:
             continue  # the same step marked on another device
         if segs:
             segs[-1]["t1"] = m._t
+        pos = MARKER_POS_RE.search(label)
+        payload = MARKER_PAYLOAD_RE.search(label)
+        lanes = MARKER_LANES_RE.search(label)
         direction = (
             "approach"
-            if "approach" in str(label).lower()
-            else "retreat" if "retreat" in str(label).lower() else ""
+            if "approach" in label.lower()
+            else "retreat" if "retreat" in label.lower() else ""
         )
-        segs.append({"d": float(match.group(1)), "direction": direction,
-                     "label": str(label), "t0": m._t, "t1": None})
-    end = df._t.dropna().max()
+        segs.append({"d": float(pos.group(1)) if pos else float("nan"),
+                     "payloadB": int(payload.group(1)) if payload else None,
+                     "lanes": int(lanes.group(1)) if lanes else None,
+                     "direction": direction,
+                     "label": label, "t0": m._t, "t1": None})
+    end = end_t if end_t is not None else df._t.dropna().max()
     if segs and segs[-1]["t1"] is None:
         segs[-1]["t1"] = end
     return segs
@@ -197,19 +257,22 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
                 latency: pd.DataFrame) -> pd.DataFrame:
     rssi = df[df._type == "rssi"]
     link = df[df._type == "link"]
+    msgs = df[df._type == "message"]
+    wire = df[df._type == "wire"]
     rows = []
     for seg in segs:
         in_seg_rssi = rssi[(rssi._t >= seg["t0"]) & (rssi._t < seg["t1"])]
         in_seg_link = link[(link._t >= seg["t0"]) & (link._t < seg["t1"])]
         # Messages SENT within this step (by any device) and their round-trip
-        # latency — the send→ACK RTT, i.e. delivered.e2eLatencyMs. Gives the
-        # latency-vs-distance curve and the per-step delivery ratio.
+        # latency — the WIRE RTT (deliveredAt - the sent record's own stamp),
+        # not the app's create->ACK figure. Gives the latency-vs-distance
+        # curve and the per-step delivery ratio.
         seg_msgs = (
             latency[(latency.sentAt >= seg["t0"]) & (latency.sentAt < seg["t1"])]
             if not latency.empty else latency
         )
         dwell_sec = max((seg["t1"] - seg["t0"]) / 1000.0, 1e-9)
-        adv = in_seg_rssi[in_seg_rssi.get("src") == "adv"]
+        adv = in_seg_rssi[_col(in_seg_rssi, "src") == "adv"]
         # Receiver-side advert visibility. The TX side cannot be measured
         # (the BLE controller broadcasts autonomously below the app), so the
         # denominator is the *known* advertising interval, and these two
@@ -220,8 +283,38 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
         #                is robust to scan batching and the rate limit. This
         #                is the censoring-proof discovery-probability proxy.
         adv_seconds = set((adv._t // 1000).astype(int)) if len(adv) else set()
+        # Payload size MEASURED from the step's own sends (the label's `p=`
+        # value is only the declaration); this also fills it in for steps whose
+        # label says nothing about payload.
+        seg_rows = msgs[(msgs._t >= seg["t0"]) & (msgs._t < seg["t1"])]
+        # `sent` and `recv` records both carry it; `delivered`/`dup` do not.
+        sizes = (seg_rows["payloadSize"].dropna()
+                 if "payloadSize" in seg_rows.columns else pd.Series(dtype=float))
+        payload_b = int(sizes.median()) if len(sizes) else seg["payloadB"]
+        # ACTIVE window: first send -> last ACK. The marker span is longer than
+        # the step actually worked — the link teardown/handshake sits at its
+        # head and the auto-advance gap at its tail, and nothing is sent in
+        # either. Dividing by the marker span understates every rate (in a
+        # 5x60s cycle-check by ~40%), so rates use this window and the table
+        # reports it as active_s next to the span.
+        sent_t = (seg_rows[seg_rows["dir"] == "sent"]["_t"]
+                  if "dir" in seg_rows.columns else pd.Series(dtype=float))
+        # Total SEALED bytes this step put on the air, both devices, all
+        # content (data + acks + custody sync). Divided by the delivered
+        # messages this is the real per-message cost — the number the payload
+        # arm exists to produce, since a payload above one packet pays a full
+        # 104-byte header again per fragment. Wire records are drained on a
+        # timer, so counts at a segment boundary can spill by one window.
+        in_seg_wire = wire[(wire._t >= seg["t0"]) & (wire._t < seg["t1"])]
+        air_b = 0
+        for _, w in in_seg_wire.iterrows():
+            for key, val in _dict(w.get("txBytes")).items():
+                if str(key).startswith("secure"):
+                    air_b += int(val)
         row = {
             "d": seg["d"],
+            "payloadB": payload_b,
+            "lanes": seg["lanes"],
             "direction": seg["direction"],
             "label": seg["label"],
             "t0": seg["t0"],
@@ -238,16 +331,41 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             row["delivery_rate"] = round(len(lat) / sent_n, 3)
             row["rtt_median_ms"] = round(lat.median()) if len(lat) else None
             row["rtt_p90_ms"] = round(lat.quantile(0.9)) if len(lat) else None
+            applat = pd.to_numeric(seg_msgs.get("appLatencyMs"),
+                                   errors="coerce").dropna()
+            row["applat_median_ms"] = (round(applat.median())
+                                       if len(applat) else None)
+            # Throughput: delivered (ACKed) messages only — a send that never
+            # landed moved no data.
+            acked_t = (seg_msgs.sentAt + seg_msgs.latencyMs).dropna()
+            active_t0 = sent_t.min() if len(sent_t) else seg["t0"]
+            active_t1 = max(
+                sent_t.max() if len(sent_t) else seg["t0"],
+                acked_t.max() if len(acked_t) else seg["t0"],
+            )
+            active_sec = max((active_t1 - active_t0) / 1000.0, 1e-9)
+            row["active_s"] = round(active_sec, 1)
+            row["msg_per_s"] = round(len(lat) / active_sec, 2)
+            row["goodput_Bps"] = (round(len(lat) * payload_b / active_sec, 1)
+                                  if payload_b else None)
+            row["airB_per_msg"] = (round(air_b / len(lat), 1)
+                                   if len(lat) else None)
+            row["air_overhead"] = (round(air_b / (len(lat) * payload_b), 2)
+                                   if len(lat) and payload_b else None)
         else:
             row.update({"msg_sent": 0, "msg_delivered": 0,
                         "delivery_rate": None, "rtt_median_ms": None,
-                        "rtt_p90_ms": None})
+                        "rtt_p90_ms": None, "applat_median_ms": None,
+                        "active_s": None, "msg_per_s": None,
+                        "goodput_Bps": None, "airB_per_msg": None,
+                        "air_overhead": None})
         for src in ("adv", "conn"):
-            vals = in_seg_rssi[in_seg_rssi.get("src") == src]["rssi"].dropna()
+            vals = _col(in_seg_rssi[_col(in_seg_rssi, "src") == src],
+                        "rssi").dropna()
             row[f"rssi_{src}_mean"] = round(vals.mean(), 1) if len(vals) else None
             row[f"rssi_{src}_std"] = round(vals.std(), 1) if len(vals) > 1 else None
         for stage in LINK_STAGES:
-            row[stage] = int((in_seg_link.get("event") == stage).sum())
+            row[stage] = int((_col(in_seg_link, "event") == stage).sum())
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -295,6 +413,10 @@ def establishment_table(steps: pd.DataFrame) -> pd.DataFrame:
         rtt = g["rtt_median_ms"].dropna()
         row["rtt_median_ms"] = round(rtt.mean()) if len(rtt) else None
         rows.append(row)
+    # No rows when no step declared a position (a stationary experiment such
+    # as the throughput arm): there is no distance to aggregate over.
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(["direction", "d"])
 
 
@@ -315,8 +437,8 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
     if msgs.empty:
         return pd.DataFrame()
     relays = df[df._type == "relay"]
-    sent = msgs[msgs.get("dir") == "sent"]
-    recv = msgs[msgs.get("dir") == "recv"]
+    sent = msgs[_col(msgs, "dir") == "sent"]
+    recv = msgs[_col(msgs, "dir") == "recv"]
     if sent.empty:
         return pd.DataFrame()
 
@@ -330,7 +452,7 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
     for _, s_row in sent.iterrows():
         mid = str(s_row.get("messageId"))
         hops = sorted(relay_by_id.get(mid, []), key=lambda r: r._t)
-        got = recv[recv.get("messageId") == mid]
+        got = recv[_col(recv, "messageId") == mid]
         delivered = len(got) > 0
         path = [roles.get(s_row._device, short(s_row._device))]
         path += [roles.get(h._device, short(h._device)) for h in hops]
@@ -385,7 +507,7 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
                         if len(lat) else ""))
     cust = df[df._type == "custody"]
     if not cust.empty:
-        ev = cust.get("event").value_counts().to_dict()
+        ev = _col(cust, "event").value_counts().to_dict()
         lines.append(f"custody events: {ev}")
     # Two distinct duplication questions — keep them apart:
     #   packetDup: redundant PACKETS on the air (dual-leg delivery, re-floods,
@@ -393,15 +515,15 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
     #   message dup: the same logical MESSAGE arriving again after it was
     #              already delivered — should be ~0, and is the correctness
     #              claim ("dedup means delivered exactly once").
-    fresh = df[(df._type == "message") & (df.get("dir") == "recv")]
+    fresh = df[(df._type == "message") & (_col(df, "dir") == "recv")]
     pkt_dups = df[df._type == "packetDup"]
-    msg_dups = df[(df._type == "message") & (df.get("dir") == "dup")]
+    msg_dups = df[(df._type == "message") & (_col(df, "dir") == "dup")]
     if len(fresh):
         lines.append(
             f"packet redundancy: {len(pkt_dups)} redundant packet arrival(s) "
             f"for {len(fresh)} delivered message(s) "
             f"= {1 + len(pkt_dups) / len(fresh):.2f} copies on the air per "
-            "message (dual-leg pairs deliver every flood twice)")
+            "message (1.00 = every packet arrived exactly once)")
         lines.append(
             f"message re-delivery: {len(msg_dups)} (must be 0 — a duplicate "
             "of an already-delivered message triggers nothing)")
@@ -410,15 +532,29 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
 
 def latency_table(df: pd.DataFrame) -> pd.DataFrame:
     msgs = df[df._type == "message"]
-    sent = msgs[msgs.get("dir") == "sent"]
-    delivered = msgs[msgs.get("dir") == "delivered"]
+    sent = msgs[_col(msgs, "dir") == "sent"]
+    delivered = msgs[_col(msgs, "dir") == "delivered"]
     if sent.empty:
         return pd.DataFrame()
     s = sent[["messageId", "_device", "_t", "payloadSize"]].rename(
         columns={"_t": "sentAt", "_device": "sender"})
-    d = delivered[["messageId", "_t"]].rename(columns={"_t": "deliveredAt"})
+    d_cols = ["messageId", "_t"] + (
+        ["appLatencyMs"] if "appLatencyMs" in delivered.columns else [])
+    d = delivered[d_cols].rename(columns={"_t": "deliveredAt"})
     joined = s.merge(d.drop_duplicates("messageId"), on="messageId", how="left")
+    # TWO different latencies, deliberately kept apart:
+    #   latencyMs    — WIRE RTT: the sealed packet hitting the transport until
+    #                  its ACK came back. Both stamps are trace records on the
+    #                  sender, one clock, no queueing in between.
+    #   appLatencyMs — the app's own view, from when the message was CREATED:
+    #                  enqueue + seal + waiting for the session and the settled
+    #                  link are all inside it.
+    # The gap between them is the send path's own cost and is worth reporting:
+    # it fell from ~92ms to ~15ms per message when the payload stopped
+    # fragmenting and the flood stopped writing both GATT legs.
     joined["latencyMs"] = joined.deliveredAt - joined.sentAt
+    if "appLatencyMs" not in joined.columns:
+        joined["appLatencyMs"] = pd.NA
     return joined
 
 
@@ -433,7 +569,7 @@ def summarize(df: pd.DataFrame, latency: pd.DataFrame) -> str:
         lines.append(f"  records by type: {counts}")
         link = sub[sub._type == "link"]
         if not link.empty:
-            stages = link.get("event").value_counts().to_dict()
+            stages = _col(link, "event").value_counts().to_dict()
             lines.append(f"  link stages: {stages}")
         if not latency.empty:
             mine = latency[latency.sender == device]
@@ -445,12 +581,20 @@ def summarize(df: pd.DataFrame, latency: pd.DataFrame) -> str:
                 if ok.any():
                     lat = mine.latencyMs.dropna()
                     lines.append(
-                        f"  e2e latency ms: median {lat.median():.0f}, "
+                        f"  wire RTT ms (send->ACK): median {lat.median():.0f}, "
                         f"p90 {lat.quantile(0.9):.0f}, max {lat.max():.0f}")
-        flows = sub[(sub._type == "flow") & (sub.get("event") == "stop")]
+                    app = pd.to_numeric(mine.appLatencyMs,
+                                        errors="coerce").dropna()
+                    if len(app):
+                        lines.append(
+                            f"  app latency ms (create->ACK): median "
+                            f"{app.median():.0f}, p90 {app.quantile(0.9):.0f} "
+                            f"— the extra over wire RTT is enqueue + seal + "
+                            f"waiting for a settled link")
+        flows = sub[(sub._type == "flow") & (_col(sub, "event") == "stop")]
         for _, f in flows.iterrows():
-            start = sub[(sub._type == "flow") & (sub.get("event") == "start")
-                        & (sub.get("flow") == f.get("flow"))]
+            start = sub[(sub._type == "flow") & (_col(sub, "event") == "start")
+                        & (_col(sub, "flow") == f.get("flow"))]
             window_ms = (f._t - start._t.iloc[0]) if len(start) else None
             acked_bytes = _num(f.get("ackedBytes"))
             goodput = (
@@ -520,7 +664,7 @@ def plot_link_stages(df: pd.DataFrame, out: Path):
         sub = link[link._device == device]
         for si, stage in enumerate(LINK_STAGES):
             y = di * (len(LINK_STAGES) + 1) + si
-            pts = sub[sub.get("event") == stage]
+            pts = sub[_col(sub, "event") == stage]
             if len(pts):
                 ax.plot((pts._t - t_base) / 1000, [y] * len(pts),
                         "rv" if stage == "drop" else "o", markersize=5)
@@ -653,7 +797,7 @@ def main() -> int:
         plot_wire(edf, out / "wire_bytes.png")
         print(f"[{exp}] -> {out}/  "
               f"({len(edf)} records, {edf._device.nunique()} device(s), "
-              f"{len(segs)} distance step(s))")
+              f"{len(segs)} step(s))")
     return 0
 
 

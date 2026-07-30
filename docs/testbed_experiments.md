@@ -93,7 +93,7 @@ rather than a chaotic same-identity redial; the step waits for the transport
 to come back), drops all Noise sessions (`resetSessions`, so the
 establishment ladder re-runs from a cold handshake every step), stamps the
 marker, and — when `sendCount` > 0 — sends that many `sendBytes`-sized
-messages (default 184). Sends are **gated on the link being settled**
+messages (**default 132** — see Payload size below). Sends are **gated on the link being settled**
 (authenticated session + converged dual-leg pair; a `link-settled` marker
 stamps the moment) and then spread across the remaining dwell — data never
 races a re-forming link, and a step where no peer settles sends nothing
@@ -107,14 +107,53 @@ nothing — that's the static receiver on 3+ device campaigns. Ids are the
 reproducible UUIDv5 set `field|expId|src|dst|step|seq`, so the offered
 count is computable offline.
 
+**Payload size.** The default is **132 bytes**: the largest payload that
+still fits ONE sealed packet at the BLE floor MTU
+(`FragmentHandler.fragmentThreshold`, exported as `defaultSendBytes`). At
+that size one message *is* one packet, so message counts, delivery ratio and
+wire bytes all read per-packet with nothing hidden. Above it the payload
+fragments, and **each fragment re-pays the full 104-byte header** (58 packet
++ 25 Noise + 21 frame): a 184-byte message — the arbitrary default used
+before 29 Jul 2026 — is silently *two* packets, 132 + 52, costing 392 wire
+bytes to move 184. Measurements taken with it are valid but describe the
+fragmented case; the cycle-check traces show ~1140 bytes on air per delivered
+184-byte message (6.2x) under the old both-legs flood.
+
 **Throughput (saturate).** A step with `"saturate": true` ignores `sendCount`
-and instead keeps `inFlight` messages outstanding for the whole dwell, firing
-the next the moment one is ACKed — as many messages as the link carries, no
-pacing and no cap. Wizard: *Throughput (saturate)* (60s dwell, 184-byte
-messages, 8 in flight by default; sessions and links stay warm). The step
-stamps `saturate-start` and, at dwell end, a `flow` record with
-sent/acked/ackedBytes — messages/sec and goodput come straight from it, and
-RTT under saturation from the usual `message` records.
+and pushes continuously for the whole dwell on `sendLanes` concurrent lanes,
+each looping "fire one, await it, fire the next". **Nothing is ACK-gated** — an
+ACK only counts, it never clocks a send, because clocking on ACKs caps the rate
+at `lanes / RTT` and makes the experiment measure its own window rather than
+the link. Offered load is therefore set by the lane count alone, and `sent` vs
+`delivered` measures offered against carried load.
+
+**Ceiling sweep.** One lane keeps exactly one message in the send path, and in
+the first payload arm that delivered **100% at every size** — proof the sender
+never outran the link, which makes those rates a *lower bound* on capacity, not
+a ceiling. `throughputCeiling` sweeps the lane count (1/4/16/64 by default) at a
+fixed payload so lanes are the only variable; the ceiling is the knee where
+`delivery_rate` falls below 1.0 and `goodput_Bps` stops rising. Labels carry the
+count (`lanes=16`) so the analyzer segments them apart, and `settleSec` is 90 so
+a backlog still draining at dwell end is not scored as loss.
+
+The unlimited loop yields to the event loop once per message (a zero-duration
+timer, not a bare `await`): a microtask chain would outrun the dwell countdown
+and hang the app on a step where sends return without touching I/O. That costs
+one event-loop turn (~1000 msg/s), far above anything BLE carries.
+
+Wizard: *Throughput (saturate)* (60s dwell, unlimited, sessions and links stay
+warm). The step stamps `saturate-start` and, at dwell end, a `flow` record with
+sent/acked/ackedBytes — messages/sec and goodput come straight from it, and RTT
+under saturation from the usual `message` records.
+
+**Payload arm.** `payloadSizes` turns the throughput plan into one saturating
+step per size — 132 B (one sealed packet), 264 B (exactly two), 1200 B (ten)
+by default in the wizard and in the *Throughput: payload arm* preset. Each
+step's label carries the size (`p=264B`) so the analyzer segments the arms
+apart, and every step runs from the same spot, so ONE tap runs the whole arm.
+This turns per-message overhead into a measured curve — `airB_per_msg` and
+`air_overhead` in `steps.csv` — instead of a constant baked into every
+experiment.
 
 For the data-plane sweep, set `"bulk": true` on the steps that should run the
 loaded bulk-flow config during their dwell (load that config in the Bulk

@@ -276,10 +276,15 @@ class FieldRunner extends ChangeNotifier {
     _sendTimers.add(poll);
   }
 
-  /// Saturating throughput mode: wait for the link to settle, then keep
-  /// [FieldStep.inFlight] messages outstanding for the rest of the dwell,
-  /// firing the next as soon as one is ACKed ([onAck]). No pacing, no cap —
-  /// as many as the link carries.
+  /// Saturating throughput mode: wait for the link to settle, then push for
+  /// the rest of the dwell on [FieldStep.sendLanes] concurrent lanes, each
+  /// looping "fire one, await it, fire the next".
+  ///
+  /// Nothing is ACK-gated — an ACK never clocks a send — so offered load is
+  /// set purely by the lane count and how fast the send path drains. `sent`
+  /// vs `delivered` therefore measures offered load against carried load, and
+  /// the gap is the overrun, which is the honest way to find capacity: raise
+  /// the lanes until delivery breaks.
   void _scheduleSaturating(FieldStep step) {
     _outstanding.clear();
     _satSeq = 0;
@@ -287,8 +292,9 @@ class FieldRunner extends ChangeNotifier {
     final settled = linkSettled;
     void begin() {
       unawaited(recorder.logMarker('saturate-start'));
-      for (var i = 0; i < step.inFlight; i++) {
-        _fireSaturating(step);
+      final lanes = step.sendLanes < 1 ? 1 : step.sendLanes;
+      for (var i = 0; i < lanes; i++) {
+        unawaited(_pushLane(step));
       }
       notifyListeners();
     }
@@ -310,7 +316,25 @@ class FieldRunner extends ChangeNotifier {
     _sendTimers.add(poll);
   }
 
-  void _fireSaturating(FieldStep step) {
+  /// One push lane: keep sending until the dwell ends, awaiting each send so
+  /// the lane runs at exactly the rate the send path drains it. N lanes run
+  /// concurrently, so N messages are in the send path at once.
+  Future<void> _pushLane(FieldStep step) async {
+    while (_running && _phase == FieldPhase.dwelling && currentStep == step) {
+      await _fireSaturating(step);
+      // Yield to the EVENT LOOP, not just the microtask queue. Awaiting a
+      // send that never touches real I/O (no targets yet, an early return)
+      // resolves as a microtask, and microtasks run ahead of timers — an
+      // unbroken chain of them would starve the dwell countdown and the UI,
+      // i.e. hang the app for the rest of the step. A zero-duration delay is
+      // a timer, so the loop can always be interrupted. It costs one
+      // event-loop turn (sub-millisecond) per message, which is ~1000/s —
+      // far above anything BLE carries, so it does not cap the measurement.
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  Future<void> _fireSaturating(FieldStep step) async {
     final doSend = send;
     final plan = _plan;
     if (doSend == null || plan == null) return;
@@ -328,7 +352,9 @@ class FieldRunner extends ChangeNotifier {
       if (payload.isNotEmpty) payload[0] = testbedPayloadMarker;
       _outstanding.add(messageId);
       _sentCount++;
-      unawaited(doSend(pubkey, payload, messageId: messageId));
+      // Awaited: in unlimited mode this IS the clock. In window mode the
+      // caller does not await, so it behaves exactly as before.
+      await doSend(pubkey, payload, messageId: messageId);
     }
   }
 
@@ -337,8 +363,9 @@ class FieldRunner extends ChangeNotifier {
   void onAck(String messageId) {
     if (!_outstanding.remove(messageId)) return;
     _ackedCount++;
-    final step = currentStep;
-    if (step != null && step.saturate) _fireSaturating(step);
+    // An ACK only COUNTS here. It never triggers a send: clocking sends on
+    // ACKs would cap the rate at lanes/RTT and make the experiment measure
+    // its own window instead of the link.
     notifyListeners();
   }
 
@@ -382,7 +409,7 @@ class FieldRunner extends ChangeNotifier {
         'event': 'stop',
         'flow': 'saturate',
         'payloadBytes': currentStep!.sendBytes,
-        'inFlight': currentStep!.inFlight,
+        'sendLanes': currentStep!.sendLanes,
         'sent': _satSeq,
         'acked': _ackedCount,
         'ackedBytes': _ackedCount * currentStep!.sendBytes,

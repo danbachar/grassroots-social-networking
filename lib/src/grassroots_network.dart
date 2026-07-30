@@ -1684,12 +1684,52 @@ class GrassrootsNetwork {
     _noiseSessions.resetAll();
   }
 
-  /// DEBUG/TESTBED ONLY. Tear down every live BLE link so the next contact
-  /// re-runs discovery + connect (the field runner pairs this with
-  /// [resetAllSessions] for a full per-step establishment ladder).
+  /// DEBUG/TESTBED ONLY. Whether the pair with [pubkey] is fully settled for
+  /// data: an authenticated Noise session AND the converged dual-leg link
+  /// (both BLE legs attached). The field runner gates each step's sends on
+  /// this so messages only travel over a link that is really ready — the
+  /// establishment ladder itself is measured by the link events, not by
+  /// racing data into a half-formed pair.
+  bool isPeerLinkSettled(Uint8List pubkey) {
+    if (!_noiseSessions.hasSession(pubkey)) return false;
+    final peer = _peersState.getPeerByPubkey(pubkey);
+    return peer != null &&
+        peer.bleCentralDeviceId != null &&
+        peer.blePeripheralDeviceId != null;
+  }
+
+  /// DEBUG/TESTBED ONLY. Bounce the BLE transport — the exact teardown the
+  /// settings BLE toggle performs (dispose the service + clear Redux BLE
+  /// state), a brief dark gap, then a full cold re-initialize. Unlike a bare
+  /// path disconnect this stops advertising + scanning, so the pair genuinely
+  /// goes dark and re-establishes through the normal cold-start election
+  /// (no chaotic same-identity redial race). The field runner pairs this with
+  /// [resetAllSessions] for a clean per-step establishment ladder. Awaited by
+  /// the runner so the step's sends only begin once the transport is back.
   Future<void> resetAllBleLinks() async {
-    debugPrint('[testbed] Tearing down all BLE links');
-    await _bleService?.disconnectAllPaths();
+    if (_bleService == null) return;
+    debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
+    await _bleService!.dispose();
+    _bleService = null;
+    store.dispatch(
+        BleTransportStateChangedAction(TransportState.uninitialized));
+    store.dispatch(ClearDiscoveredBlePeersAction());
+    for (final peer in _peersState.peersList) {
+      if (peer.hasBleConnection) {
+        store.dispatch(PeerBleDisconnectedAction(peer.publicKey));
+      }
+    }
+    // Dark gap = 2 announce cycles + 10s. Long enough for the peer's own
+    // stale sweep (staleThreshold = announceInterval * 2) to fire and drop
+    // the connection before we reappear, so the pair re-establishes fully
+    // cold rather than over any half-stale state.
+    final darkGap = config.announceInterval * 2 + const Duration(seconds: 10);
+    debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
+    await Future<void>.delayed(darkGap);
+    if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
+    debugPrint('[testbed] BLE bounce: re-initializing transport');
+    await _initializeBle();
+    if (_started && _bleAvailable) await _bleService!.start();
   }
 
   /// Sealed packets currently held in custody (own un-ACK'd + relayed DTN).
@@ -3422,11 +3462,16 @@ class GrassrootsNetwork {
       }
 
       // Eager pairing: every accepted announce leads straight to a Noise
-      // session (custody flow is session-gated). Deterministic initiator —
-      // the lower pubkey dials the handshake; the higher side responds. The
-      // 10s periodic announce is the natural retry if a handshake is lost.
-      if (!_noiseSessions.hasSession(data.publicKey) &&
-          _pubkeyToHex(identity.publicKey).compareTo(pubkeyHex) < 0) {
+      // session (custody flow is session-gated). ANY sessionless side
+      // initiates — not just the lower pubkey. The lower-initiates rule was
+      // a workaround for handshake glare corrupting state; glare is now
+      // resolved cleanly (msg1 lower-pubkey tie-break + validate-then-commit
+      // message reads), and one-sided initiation left an asymmetry: after a
+      // one-sided session loss (peer restart, testbed reset) the survivor
+      // holds a session and never re-initiates, so a higher-pubkey loser
+      // could only recover via a data send racing the fresh link. The 10s
+      // periodic announce is the natural retry if a handshake is lost.
+      if (!_noiseSessions.hasSession(data.publicKey)) {
         final peer = _peersState.getPeerByPubkey(data.publicKey);
         unawaited(_ensureNoiseSession(
           transport: transport,

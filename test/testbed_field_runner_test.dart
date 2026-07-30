@@ -307,6 +307,63 @@ void main() {
     });
   });
 
+  test('linkSettled gates sends: nothing until settled, then spread', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final sent = <String>[];
+      var settled = false;
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        linkSettled: (_) => settled,
+        send: (r, p, {String? messageId}) async {
+          sent.add(messageId!);
+          return messageId;
+        },
+      );
+      runner.start(sendPlan()); // dwell 10s, 3 sends
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+
+      // Link not settled: no sends, no matter how long into the dwell.
+      async.elapse(const Duration(seconds: 4));
+      expect(sent, isEmpty, reason: 'must not race a re-forming link');
+
+      settled = true; // pair converges mid-dwell
+      async.elapse(const Duration(seconds: 6)); // rest of the dwell
+      expect(sent, hasLength(3),
+          reason: 'all sends spread across the remaining dwell');
+      expect(recorder.events, contains('marker:link-settled'));
+      async.elapse(const Duration(seconds: 5));
+      runner.dispose();
+    });
+  });
+
+  test('linkSettled never true: the step sends nothing (out of range)', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      var sends = 0;
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        linkSettled: (_) => false,
+        send: (r, p, {String? messageId}) async {
+          sends++;
+          return messageId;
+        },
+      );
+      runner.start(sendPlan());
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 20)); // dwell + settle
+      expect(sends, 0);
+      expect(recorder.events.where((e) => e == 'marker:link-settled'), isEmpty);
+      runner.dispose();
+    });
+  });
+
   test('rosterless plan targets every known peer with hex-prefix labels', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
@@ -382,7 +439,7 @@ void main() {
       final runner = FieldRunner(
         recorder: recorder,
         myPubkeyHex: hexOf(0),
-        onResetLinks: () => order.add('links'),
+        onResetLinks: () async => order.add('links'),
         onResetSessions: () => order.add('sessions'),
       );
       runner.start(const FieldPlan(
@@ -426,7 +483,7 @@ void main() {
       var links = 0;
       final runner = FieldRunner(
         recorder: recorder,
-        onResetLinks: () => links++,
+        onResetLinks: () async => links++,
       );
       runner.start(plan());
       async.flushMicrotasks();

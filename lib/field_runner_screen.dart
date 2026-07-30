@@ -90,6 +90,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: switch (runner.phase) {
+              _ when runner.resetting => _resetting(step),
               FieldPhase.positioning => _positioning(step!, runner),
               FieldPhase.dwelling => _countdown(
                   'HOLD — ${step!.label}',
@@ -105,6 +106,24 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       ),
     );
   }
+
+  Widget _resetting(FieldStep? step) => Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.bluetooth_disabled,
+              color: Colors.white54, size: 72),
+          const SizedBox(height: 24),
+          const Text('RESETTING BLE',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  color: Colors.white, fontSize: 40, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 12),
+          Text('going dark so the peer drops us, then reconnecting…'
+              '${step != null ? '\nnext: ${step.label}' : ''}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 16)),
+        ],
+      );
 
   Widget _positioning(FieldStep step, FieldRunner runner) {
     final auto = step.autoAdvance;

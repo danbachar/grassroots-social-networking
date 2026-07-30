@@ -37,7 +37,8 @@ class SettingsScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final VoidCallback? onResetLinks;
+  final Future<void> Function()? onResetLinks;
+  final bool Function(Uint8List peer)? linkSettled;
 
   const SettingsScreen({
     super.key,
@@ -52,6 +53,7 @@ class SettingsScreen extends StatefulWidget {
     this.sendMessage,
     this.onResetSessions,
     this.onResetLinks,
+    this.linkSettled,
   });
 
   @override
@@ -281,6 +283,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetLinks: widget.onResetLinks,
+                      linkSettled: widget.linkSettled,
                     ),
                   ),
                 );

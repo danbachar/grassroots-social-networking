@@ -964,16 +964,6 @@ class BleTransportService extends TransportService {
     }
   }
 
-  /// TESTBED ONLY. Tear down every live BLE leg (scan + advertising keep
-  /// running). The field runner calls this at step start so each distance
-  /// step measures the full discovered→connected ladder from scratch —
-  /// re-dialing follows the normal advertisement/election path.
-  Future<void> disconnectAllPaths() async {
-    for (final pathId in _paths.keys.toList(growable: false)) {
-      await disconnectDevice(pathId);
-    }
-  }
-
   Future<void> disconnectDevice(String pathId, {bool forget = true}) async {
     _recordLocalTeardown(pathId);
     try {

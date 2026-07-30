@@ -265,6 +265,15 @@ class FieldPlan {
   /// few seconds of re-dial per step.
   final bool resetLinks;
 
+  /// Empty the DTN custody store at the start of every step (default on):
+  /// without it, an overrun step's undelivered backlog survives in custody
+  /// and drains into the NEXT step's window via the sync exchange — the
+  /// steps contaminate each other and `delivery_rate` never dips, because
+  /// custody eventually heals everything. Clearing makes each step's
+  /// delivery its own verdict. Turn OFF for the mesh tests whose subject IS
+  /// custody surviving across steps (store-carry-forward, multi-hop).
+  final bool resetCustody;
+
   /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
@@ -276,6 +285,7 @@ class FieldPlan {
     this.roster = const [],
     this.resetSessions = true,
     this.resetLinks = false,
+    this.resetCustody = true,
     this.autoAdvanceGapSec = 5,
   });
 
@@ -287,6 +297,7 @@ class FieldPlan {
           'roster': roster.map((r) => r.toJson()).toList(),
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
+        'resetCustody': resetCustody,
         'autoAdvanceGapSec': autoAdvanceGapSec,
       };
 
@@ -303,6 +314,7 @@ class FieldPlan {
             const [],
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
+        resetCustody: json['resetCustody'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
       );
 
@@ -315,9 +327,11 @@ class FieldPlan {
       listEquals(other.roster, roster) &&
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
+      other.resetCustody == resetCustody &&
       other.autoAdvanceGapSec == autoAdvanceGapSec;
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
-      Object.hashAll(roster), resetSessions, resetLinks, autoAdvanceGapSec);
+      Object.hashAll(roster), resetSessions, resetLinks, resetCustody,
+      autoAdvanceGapSec);
 }

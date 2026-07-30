@@ -18,6 +18,10 @@ emits, under ``--out``:
     <exp>/establishment.csv    repeat trials aggregated per (distance,
                                direction): fraction of trials that reached
                                each link stage — establishment probability
+    <exp>/ladder.csv           establishment LATENCY per stage over all
+                               trials: reach rate plus median/p90/max seconds
+                               from the step marker to discovered / connected
+                               / session / usable (usable = first ACK back)
     <exp>/pathloss.txt         log-distance fit RSSI = A - 10 n log10(d)
                                (needs >= 3 distinct d= markers)
     <exp>/rssi_timeline.png    RSSI vs time per device, markers as verticals
@@ -86,8 +90,8 @@ LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
 # OTHER marker opens a step segment — a throughput step ("saturate", "p=264B")
 # has no position at all, and dropping it would make the whole experiment
 # invisible in steps.csv.
-CONTROL_MARKERS = {"links-reset", "sessions-reset", "link-settled",
-                   "saturate-start", "end", "aborted"}
+CONTROL_MARKERS = {"links-reset", "sessions-reset", "custody-reset",
+                   "link-settled", "saturate-start", "end", "aborted"}
 # Marker span != active time. A step's markers are all stamped at its start,
 # and the auto-advance gap between steps trails the dwell, so rates are taken
 # over the ACTIVE window (first send -> last ACK) instead. See steps_table.
@@ -364,6 +368,17 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
                         "rssi").dropna()
             row[f"rssi_{src}_mean"] = round(vals.mean(), 1) if len(vals) else None
             row[f"rssi_{src}_std"] = round(vals.std(), 1) if len(vals) > 1 else None
+        # Establishment LATENCY, not just whether the stage happened: seconds
+        # from the step marker to the first time each stage is reached. With
+        # resetLinks on, every step starts from a torn-down link, so this is a
+        # cold discovered->connected->session->usable ladder per trial and the
+        # percentiles over many trials are the establishment result itself.
+        for stage in LINK_STAGES:
+            if stage == "drop":
+                continue
+            hit = in_seg_link[_col(in_seg_link, "event") == stage]
+            row[f"t_{stage}_s"] = (round((hit._t.min() - seg["t0"]) / 1000.0, 2)
+                                   if len(hit) else None)
         for stage in LINK_STAGES:
             row[stage] = int((_col(in_seg_link, "event") == stage).sum())
         rows.append(row)
@@ -528,6 +543,35 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
             f"message re-delivery: {len(msg_dups)} (must be 0 — a duplicate "
             "of an already-delivered message triggers nothing)")
     return "\n".join(lines) + "\n"
+
+
+def ladder_table(steps: pd.DataFrame) -> pd.DataFrame:
+    """Establishment-latency percentiles per stage over all trials.
+
+    One row per link stage: how many trials reached it, and how long it took
+    from the step marker. `usable` is the end-to-end one — first ACK back —
+    so its reach-rate is the establishment probability the control-plane
+    evaluation reports, and its percentiles are the time-to-first-message.
+    """
+    rows = []
+    trials = len(steps)
+    for stage in LINK_STAGES:
+        col = f"t_{stage}_s"
+        if stage == "drop" or col not in steps.columns:
+            continue
+        v = steps[col].dropna()
+        if v.empty:
+            continue
+        rows.append({
+            "stage": stage,
+            "trials": trials,
+            "reached": len(v),
+            "reach_rate": round(len(v) / trials, 3) if trials else None,
+            "median_s": round(v.median(), 2),
+            "p90_s": round(v.quantile(0.9), 2),
+            "max_s": round(v.max(), 2),
+        })
+    return pd.DataFrame(rows)
 
 
 def latency_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -788,6 +832,9 @@ def main() -> int:
             est = establishment_table(steps)
             if not est.empty:
                 est.to_csv(out / "establishment.csv", index=False)
+            ladder = ladder_table(steps)
+            if not ladder.empty:
+                ladder.to_csv(out / "ladder.csv", index=False)
             fit = pathloss_fit(steps)
             if fit:
                 (out / "pathloss.txt").write_text(fit)

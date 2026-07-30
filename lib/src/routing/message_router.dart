@@ -28,6 +28,31 @@ import 'package:flutter/foundation.dart';
 /// - Callback dispatch to application layer
 ///
 /// All transports feed into [processPacket] — one entry point, one format.
+/// The authenticated reply context of a sync exchange: the peer a sealed
+/// sync frame decrypted under, plus the transport link it arrived on. Replies
+/// (requests, conveyed custody) are routed back over the same link — by
+/// device path on BLE, by peer identity on UDP.
+class SyncLink {
+  final PeerTransport transport;
+  final Uint8List peerPubkey;
+
+  /// The BLE path the frame arrived on; null on UDP.
+  final String? bleDeviceId;
+
+  const SyncLink(this.transport, this.peerPubkey, {this.bleDeviceId});
+
+  String get peerHex =>
+      peerPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  /// Relay-budget key: BLE budgets are per device path (as for flooding);
+  /// UDP has no path id, so the peer identity is the budget.
+  String get budgetKey => bleDeviceId ?? 'udp:$peerHex';
+
+  /// Log label.
+  String get label =>
+      bleDeviceId ?? 'udp:${peerHex.substring(0, 8)}';
+}
+
 class MessageRouter {
   final GrassrootsIdentity identity;
   final Store<AppState> store;
@@ -136,15 +161,15 @@ class MessageRouter {
   /// wires this to the BLE transport's broadcast.
   void Function(GrassrootsPacket packet, {String? excludeBlePeerId})? onRelay;
 
-  /// Sends a sync-on-connect packet (offer/request/conveyed custody copy) to
-  /// one specific BLE neighbor — directed, never flooded. The coordinator
-  /// wires this to the BLE transport's per-device send.
-  void Function(GrassrootsPacket packet, String bleDeviceId)? onSyncSend;
+  /// Sends a sync-on-connect packet (a conveyed custody copy) back over
+  /// [SyncLink] — directed at that one authenticated peer, never flooded. The
+  /// coordinator routes by the link's transport.
+  void Function(GrassrootsPacket packet, SyncLink link)? onSyncSend;
 
   /// Seals a sync control frame ([ContentType.syncOffer]/[ContentType.
-  /// syncRequest]) to the neighbor behind [bleDeviceId] and sends it. The
+  /// syncRequest]) to the link's peer and sends it back over the link. The
   /// coordinator owns the Noise sessions, so sealing happens there.
-  void Function(ContentType type, Uint8List payload, String bleDeviceId)?
+  void Function(ContentType type, Uint8List payload, SyncLink link)?
       onSyncFrame;
 
   /// Convenience accessor for peers state
@@ -354,15 +379,16 @@ class MessageRouter {
           observedPort: observedPort,
         );
       case ContentType.syncOffer:
-        // Neighbor-local custody reconciliation, sealed to this pair's
-        // session. BLE-only: UDP is point-to-point and carries no custody.
-        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
-          _handleSyncOffer(frame.chunk, bleDeviceId);
-        }
+        // Custody reconciliation, sealed to this pair's session. Runs on
+        // BOTH transports — the sync exchange is the only custody
+        // conveyance path, so a UDP-only pairing must reconcile too. The
+        // reply link carries the authenticated peer (trial decrypt proved
+        // it), so replies never depend on a transport-level id lookup.
+        _handleSyncOffer(frame.chunk,
+            SyncLink(transport, senderPubkey, bleDeviceId: bleDeviceId));
       case ContentType.syncRequest:
-        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
-          _handleSyncRequest(frame.chunk, bleDeviceId);
-        }
+        _handleSyncRequest(frame.chunk,
+            SyncLink(transport, senderPubkey, bleDeviceId: bleDeviceId));
     }
   }
 
@@ -719,10 +745,18 @@ class MessageRouter {
     }
   }
 
-  /// All custody packets held for [recipientPubkey] (own + relayed), for
-  /// direct conveyance over a freshly established session with them.
+  /// All custody packets held for [recipientPubkey] (own + relayed). Test
+  /// inspection only — production custody flow goes exclusively through the
+  /// sync offer/request exchange, never a bulk read.
+  @visibleForTesting
   List<GrassrootsPacket> custodyFor(Uint8List recipientPubkey) =>
       _dtnStore.packetsFor(_pubkeyToHex(recipientPubkey));
+
+  /// DEBUG/TESTBED ONLY. Empty the DTN custody store (per-step, when a field
+  /// plan asks) so one step's undelivered backlog cannot drain into the next
+  /// step's measurement window. The seen/delivered blooms are deliberately
+  /// KEPT — clearing them would re-deliver packets still in flight.
+  void clearCustody() => _dtnStore.clear();
 
   // ===== Sync-on-connect (DTN anti-entropy) =====
   //
@@ -735,11 +769,18 @@ class MessageRouter {
   // Reconciliation operates purely on cleartext packetIds — content stays
   // sealed end-to-end and no custody is ever *transferred*, only replicated.
 
-  /// Build the sync offer packets advertising every packetId currently in the
-  /// DTN store (chunked to fit single BLE writes). Empty when carrying
-  /// nothing — the common case, costing zero packets.
-  List<Uint8List> buildSyncOffers() {
-    final ids = _dtnStore.carriedPacketIds();
+  /// Build the sync offer packets advertising packetIds currently in the DTN
+  /// store (chunked to fit single BLE writes). Empty when carrying nothing —
+  /// the common case, costing zero packets.
+  ///
+  /// [onlyRecipientHex] restricts the offer to packets addressed to that one
+  /// peer: the UDP form. UDP is direct point-to-point and carries no relay
+  /// custody, so offering a UDP peer packets destined for third parties
+  /// would invite conveyance the transport never forwards.
+  List<Uint8List> buildSyncOffers({String? onlyRecipientHex}) {
+    final ids = onlyRecipientHex == null
+        ? _dtnStore.carriedPacketIds()
+        : [for (final p in _dtnStore.packetsFor(onlyRecipientHex)) p.packetId];
     if (ids.isEmpty) return const [];
     return buildSyncPayloads(ids);
   }
@@ -747,12 +788,12 @@ class MessageRouter {
   /// A neighbor offered the packetIds it carries: request the ones our
   /// seen-set lacks. A bloom false positive skips a packet we actually lack —
   /// healed by the next contact or the recipient-triggered flush.
-  void _handleSyncOffer(Uint8List payload, String bleDeviceId) {
+  void _handleSyncOffer(Uint8List payload, SyncLink link) {
     final List<String> offered;
     try {
       offered = decodeSyncIds(payload);
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed offer from $bleDeviceId: $e');
+      debugPrint('[sync] Malformed offer from ${link.label}: $e');
       return;
     }
     final wanted =
@@ -760,9 +801,9 @@ class MessageRouter {
     if (wanted.isEmpty) return;
     debugPrint(
         '[sync] Requesting ${wanted.length}/${offered.length} offered '
-        'packet(s) from $bleDeviceId');
+        'packet(s) from ${link.label}');
     for (final payload in buildSyncPayloads(wanted)) {
-      onSyncFrame?.call(ContentType.syncRequest, payload, bleDeviceId);
+      onSyncFrame?.call(ContentType.syncRequest, payload, link);
     }
   }
 
@@ -770,20 +811,20 @@ class MessageRouter {
   /// carry, directed over that link. Conveyance counts against the
   /// requester's per-neighbor relay budget — sync must not be a way around
   /// the flooding cap. Ids expired/evicted since the offer are skipped.
-  void _handleSyncRequest(Uint8List payload, String bleDeviceId) {
+  void _handleSyncRequest(Uint8List payload, SyncLink link) {
     final List<String> requested;
     try {
       requested = decodeSyncIds(payload);
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed request from $bleDeviceId: $e');
+      debugPrint('[sync] Malformed request from ${link.label}: $e');
       return;
     }
     var conveyed = 0;
     for (final id in requested) {
       final stored = _dtnStore.packetById(id);
       if (stored == null) continue; // expired/evicted since the offer
-      if (!_allowRelayFrom(bleDeviceId)) break; // budget exhausted this window
-      onSyncSend?.call(stored, bleDeviceId);
+      if (!_allowRelayFrom(link.budgetKey)) break; // budget exhausted
+      onSyncSend?.call(stored, link);
       conveyed++;
       if (trace?.active ?? false) {
         unawaited(trace!.log({
@@ -791,14 +832,14 @@ class MessageRouter {
           't': DateTime.now().millisecondsSinceEpoch,
           'event': 'convey',
           'packetId': id,
-          'toDevice': bleDeviceId,
+          'toDevice': link.label,
         }));
       }
     }
     if (conveyed > 0) {
       debugPrint(
           '[sync] Conveyed $conveyed/${requested.length} requested '
-          'packet(s) to $bleDeviceId');
+          'packet(s) to ${link.label}');
     }
   }
 

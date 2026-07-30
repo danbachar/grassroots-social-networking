@@ -641,6 +641,56 @@ void main() {
     });
   });
 
+  test('resetCustody empties the store at each step start', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      var clears = 0;
+      final runner = FieldRunner(
+        recorder: recorder,
+        onResetCustody: () => clears++,
+      );
+      runner.start(const FieldPlan(
+        expId: 'cc',
+        settleSec: 1,
+        resetSessions: false,
+        steps: [
+          FieldStep(label: 's1', dwellSec: 1),
+          FieldStep(label: 's2', dwellSec: 1, autoAdvance: true),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.elapse(const Duration(seconds: 30));
+      expect(clears, 2, reason: 'once per step');
+      expect(recorder.events.where((e) => e == 'marker:custody-reset'),
+          hasLength(2));
+      runner.dispose();
+    });
+  });
+
+  test('resetCustody false never fires the hook', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      var clears = 0;
+      final runner = FieldRunner(
+        recorder: recorder,
+        onResetCustody: () => clears++,
+      );
+      runner.start(const FieldPlan(
+        expId: 'cc',
+        settleSec: 1,
+        resetSessions: false,
+        resetCustody: false,
+        steps: [FieldStep(label: 's1', dwellSec: 1)],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.elapse(const Duration(seconds: 20));
+      expect(clears, 0);
+      runner.dispose();
+    });
+  });
+
   test('resetLinks tears down links before sessions at each step', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

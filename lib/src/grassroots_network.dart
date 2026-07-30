@@ -1647,29 +1647,6 @@ class GrassrootsNetwork {
     }
   }
 
-  /// Send every custody packet destined for [pubkey] directly over the
-  /// just-established link. The recipient dedups; custody is kept until the
-  /// ACK ends it.
-  void _conveyCustodyTo(PeerTransport transport, Uint8List pubkey) {
-    final packets = _messageRouter.custodyFor(pubkey);
-    if (packets.isEmpty) return;
-    debugPrint(
-      '[custody] Conveying ${packets.length} held packet(s) to '
-      '${_pubkeyToHex(pubkey).substring(0, 8)} over ${transport.name}',
-    );
-    unawaited(() async {
-      for (final packet in packets) {
-        final bytes = packet.serialize();
-        if (transport == PeerTransport.udp) {
-          await _udpService?.sendToPeer(_pubkeyToHex(pubkey), bytes);
-        } else {
-          await _floodViaBle(bytes);
-        }
-        await Future.delayed(FragmentHandler.fragmentDelay);
-      }
-    }());
-  }
-
   /// The recipient confirmed delivery (ACK or read receipt): end our custody
   /// of every sealed packet belonging to [messageId].
   void _endCustodyForMessage(String messageId) {
@@ -1711,6 +1688,14 @@ class GrassrootsNetwork {
   /// the full establishment ladder from a cold handshake (the field runner
   /// invokes this at each experiment step). Messages sent while sessionless
   /// wait in the pending-seal buffer and trigger the lazy handshake.
+  /// DEBUG/TESTBED ONLY. Empty the DTN custody store and the packetId index
+  /// that maps messages to their custody packets.
+  void clearCustody() {
+    debugPrint('[testbed] Clearing DTN custody store');
+    _messageRouter.clearCustody();
+    _custodyPacketIds.clear();
+  }
+
   void resetAllSessions() {
     debugPrint('[testbed] Dropping all Noise sessions');
     _noiseSessions.resetAll();
@@ -2189,14 +2174,18 @@ class GrassrootsNetwork {
     // custody and flooded.
     _sealPendingFor(pubkey);
 
-    // Convey every custody packet destined FOR this peer directly over the
-    // fresh authenticated link (they dedup); over BLE additionally run the
-    // custody vector exchange so relayed custody spreads.
-    _conveyCustodyTo(transport, pubkey);
+    // Custody flows ONLY through the sync exchange: offer packetIds, let the
+    // peer request what its seen-set lacks, convey exactly that. Never a
+    // blind push of held packets — measured on soak-night-1, the old push
+    // re-sent ~32 already-delivered packets on every reconnection (31% of
+    // all ACK bytes on the air) because the receiver has no way to know
+    // what the peer already holds. The offer costs ids, not packets.
     if (transport == PeerTransport.bleDirect) {
       final bleDeviceId =
           _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
       if (bleDeviceId != null) _sendSyncOffers(bleDeviceId);
+    } else {
+      _sendUdpSyncOffers(pubkey);
     }
 
     // Cold-bootstrap invitee: if this session is with an inviter whose invite
@@ -3388,21 +3377,26 @@ class GrassrootsNetwork {
 
     // Sync-on-connect: directed (never flooded) send of an offer/request/
     // conveyed custody packet to one specific neighbor.
-    _messageRouter.onSyncSend = (packet, bleDeviceId) {
+    _messageRouter.onSyncSend = (packet, link) {
+      final bytes = packet.serialize();
+      if (link.transport == PeerTransport.udp) {
+        final udp = _udpService;
+        if (udp != null) unawaited(udp.sendToPeer(link.peerHex, bytes));
+        return;
+      }
       final ble = _bleService;
-      if (ble == null) return;
-      unawaited(ble.sendToPeer(bleDeviceId, packet.serialize()));
+      final deviceId = link.bleDeviceId;
+      if (ble == null || deviceId == null) return;
+      unawaited(ble.sendToPeer(deviceId, bytes));
     };
 
     // Sync control frames (offer/request) are sealed to the neighbor's Noise
     // session before they hit the air — the session exists by the time sync
     // runs, so the custody inventory is never transmitted in the clear.
-    _messageRouter.onSyncFrame = (type, payload, bleDeviceId) {
-      final ble = _bleService;
-      if (ble == null) return;
-      final pubkey = ble.getPubkeyForPeerId(bleDeviceId);
-      if (pubkey == null) return; // path not yet identified
-      unawaited(_sealAndSendSyncFrame(type, payload, pubkey, bleDeviceId));
+    _messageRouter.onSyncFrame = (type, payload, link) {
+      // The link's peer is authenticated (the inbound frame decrypted under
+      // that session), so no transport-level identity lookup is needed.
+      unawaited(_sealAndSendSyncFrame(type, payload, link));
     };
 
     // Peer ANNOUNCE processed
@@ -4527,32 +4521,61 @@ class GrassrootsNetwork {
     debugPrint(
         '[sync] Offering ${_messageRouter.dtnBufferedCount} carried '
         'packet(s) to $deviceId in ${offers.length} sealed offer(s)');
+    final link = SyncLink(PeerTransport.bleDirect, pubkey,
+        bleDeviceId: deviceId);
     for (final payload in offers) {
-      unawaited(_sealAndSendSyncFrame(
-          ContentType.syncOffer, payload, pubkey, deviceId));
+      unawaited(_sealAndSendSyncFrame(ContentType.syncOffer, payload, link));
     }
   }
 
-  /// Seal a sync control frame to [recipientPubkey]'s session and send it to
-  /// that neighbor. No session yet (a pairing still handshaking) simply skips
-  /// the exchange — sync-on-connect retries on the next pairing.
-  Future<void> _sealAndSendSyncFrame(ContentType type, Uint8List payload,
-      Uint8List recipientPubkey, String bleDeviceId) async {
-    if (!_noiseSessions.hasSession(recipientPubkey)) return;
+  /// Seal a sync control frame to the link's peer and send it back over the
+  /// link. No session yet (a pairing still handshaking) simply skips the
+  /// exchange — sync-on-connect retries on the next pairing.
+  Future<void> _sealAndSendSyncFrame(
+      ContentType type, Uint8List payload, SyncLink link) async {
+    if (!_noiseSessions.hasSession(link.peerPubkey)) return;
     try {
       final packet = _protocolHandler.createSyncPacket(
         type: type,
         payload: payload,
-        recipientPubkey: recipientPubkey,
+        recipientPubkey: link.peerPubkey,
       );
       final sealed = await _noiseSessions.encryptPacket(
         packet,
-        remotePubkey: recipientPubkey,
+        remotePubkey: link.peerPubkey,
       );
       _noteSealedContent(sealed.packetId, type);
-      await _bleService?.sendToPeer(bleDeviceId, sealed.serialize());
+      if (link.transport == PeerTransport.udp) {
+        await _udpService?.sendToPeer(link.peerHex, sealed.serialize());
+      } else {
+        final deviceId = link.bleDeviceId;
+        if (deviceId == null) return;
+        await _bleService?.sendToPeer(deviceId, sealed.serialize());
+      }
     } catch (e) {
       debugPrint('[sync] Failed to seal/send ${type.name}: $e');
+    }
+  }
+
+  /// Sync-on-connect over UDP: offer this peer the packetIds we hold FOR
+  /// them. UDP is direct point-to-point — no relay custody rides it — so the
+  /// offer is restricted to their own packets, unlike the BLE offer which
+  /// advertises the whole store for mesh replication.
+  void _sendUdpSyncOffers(Uint8List pubkey) {
+    final hex = _pubkeyToHex(pubkey);
+    final now = DateTime.now();
+    final key = 'udp:$hex';
+    final last = _lastSyncOfferAt[key];
+    if (last != null && now.difference(last) < _syncOfferDebounce) return;
+    final offers =
+        _messageRouter.buildSyncOffers(onlyRecipientHex: hex);
+    if (offers.isEmpty) return; // holding nothing for them — offer nothing
+    _lastSyncOfferAt[key] = now;
+    debugPrint('[sync] Offering ${offers.length} sealed offer(s) to '
+        '${hex.substring(0, 8)} over UDP');
+    final link = SyncLink(PeerTransport.udp, pubkey);
+    for (final payload in offers) {
+      unawaited(_sealAndSendSyncFrame(ContentType.syncOffer, payload, link));
     }
   }
 

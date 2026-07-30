@@ -243,6 +243,35 @@ void main() {
       expect(p.steps, hasLength(4));
     });
 
+    test('reset toggles reach the throughput kinds (they were dropped)', () {
+      final p = FieldPlanWizard.build(
+          kind: FieldPlanKind.throughputCeiling,
+          expId: 'c',
+          resetSessions: true,
+          resetLinks: true);
+      expect((p.resetSessions, p.resetLinks), (true, true),
+          reason: 'a wizard switch the JSON ignores is a lying UI');
+      final t = FieldPlanWizard.build(
+          kind: FieldPlanKind.throughput, expId: 't', resetLinks: true);
+      expect(t.resetLinks, isTrue);
+    });
+
+    test('custody resets per step by default; mesh kinds keep custody', () {
+      // Measurement plans: an overrun step's backlog must not drain into the
+      // next step's window.
+      expect(FieldPlanPresets.throughputCeiling().resetCustody, isTrue);
+      expect(FieldPlanPresets.throughput().resetCustody, isTrue);
+      expect(FieldPlanPresets.homeSoak().resetCustody, isTrue);
+      // Custody persistence IS the subject of these two.
+      expect(
+          FieldPlanPresets.storeCarry(targetPrefix: 'ab').resetCustody, isFalse);
+      expect(
+          FieldPlanPresets.multiHop(targetPrefix: 'ab').resetCustody, isFalse);
+      final p = FieldPlanPresets.storeCarry(targetPrefix: 'ab');
+      expect(FieldPlan.fromJson(p.toJson()).resetCustody, isFalse,
+          reason: 'must survive the JSON round-trip');
+    });
+
     test('ceiling route threads the lane sweep through', () {
       final p = FieldPlanWizard.build(
           kind: FieldPlanKind.throughputCeiling,

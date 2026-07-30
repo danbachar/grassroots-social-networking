@@ -158,9 +158,10 @@ class FieldPlanPresets {
     String expId = 'throughput-1',
     int dwellSec = 60,
     List<int> payloadSizes = const [defaultSendBytes],
-    List<int> laneCounts = const [1, 4, 16, 64],
     int sendLanes = 1,
     int repeat = 1,
+    bool resetSessions = false,
+    bool resetLinks = false,
   }) {
     final trials = repeat < 1 ? 1 : repeat;
     final sizes = payloadSizes.isEmpty ? const [defaultSendBytes] : payloadSizes;
@@ -182,8 +183,8 @@ class FieldPlanPresets {
     return FieldPlan(
       expId: expId,
       settleSec: 30,
-      resetSessions: false,
-      resetLinks: false,
+      resetSessions: resetSessions,
+      resetLinks: resetLinks,
       steps: steps,
     );
   }
@@ -206,6 +207,8 @@ class FieldPlanPresets {
     int payloadBytes = defaultSendBytes,
     List<int> lanes = const [1, 4, 16, 64],
     int repeat = 1,
+    bool resetSessions = false,
+    bool resetLinks = false,
   }) {
     final trials = repeat < 1 ? 1 : repeat;
     final counts = lanes.isEmpty ? const [1] : lanes;
@@ -228,8 +231,8 @@ class FieldPlanPresets {
       // still draining when the dwell ends, and cutting the recording there
       // would score those sends as lost when they were merely late.
       settleSec: 90,
-      resetSessions: false,
-      resetLinks: false,
+      resetSessions: resetSessions,
+      resetLinks: resetLinks,
       steps: steps,
     );
   }
@@ -245,13 +248,17 @@ class FieldPlanPresets {
     int dwellSec = 120,
     int sends = 30,
     int repeat = 1,
+    bool resetSessions = false,
+    bool resetLinks = false,
   }) {
     final trials = repeat < 1 ? 1 : repeat;
     return FieldPlan(
       expId: expId,
       settleSec: 60, // relayed paths deliver later than direct ones
-      resetSessions: false,
-      resetLinks: false,
+      resetSessions: resetSessions,
+      resetLinks: resetLinks,
+      // Custody surviving across steps IS the subject of this test.
+      resetCustody: false,
       steps: [
         for (var i = 1; i <= trials; i++)
           FieldStep(
@@ -276,12 +283,16 @@ class FieldPlanPresets {
     required String targetPrefix,
     int sends = 20,
     int holdMin = 5,
+    bool resetSessions = false,
+    bool resetLinks = false,
   }) =>
       FieldPlan(
         expId: expId,
         settleSec: 60,
-        resetSessions: false,
-        resetLinks: false,
+        resetSessions: resetSessions,
+        resetLinks: resetLinks,
+        // The seeded custody must survive into the hold step for the mule.
+        resetCustody: false,
         steps: [
           FieldStep(
             label: 'seed custody (C unreachable)',
@@ -404,6 +415,8 @@ class FieldPlanWizard {
           payloadSizes: payloadSizes,
           sendLanes: sendLanes,
           repeat: repeat,
+          resetSessions: sessions,
+          resetLinks: links,
         );
       case FieldPlanKind.throughputCeiling:
         return FieldPlanPresets.throughputCeiling(
@@ -412,6 +425,8 @@ class FieldPlanWizard {
           payloadBytes: payloadSizes.isEmpty ? defaultSendBytes : payloadSizes.first,
           lanes: laneCounts,
           repeat: repeat,
+          resetSessions: sessions,
+          resetLinks: links,
         );
       case FieldPlanKind.multiHop:
         return FieldPlanPresets.multiHop(
@@ -420,6 +435,8 @@ class FieldPlanWizard {
           dwellSec: dwellSec,
           sends: sendsPerStep,
           repeat: repeat,
+          resetSessions: sessions,
+          resetLinks: links,
         );
       case FieldPlanKind.storeCarry:
         return FieldPlanPresets.storeCarry(
@@ -427,6 +444,8 @@ class FieldPlanWizard {
           targetPrefix: targetPrefix,
           sends: sendsPerStep,
           holdMin: holdMin,
+          resetSessions: sessions,
+          resetLinks: links,
         );
       case FieldPlanKind.lineSweep:
         return FieldPlanPresets.lineSweep(

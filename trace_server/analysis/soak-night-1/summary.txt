@@ -1,0 +1,22 @@
+records: 79066   span: 23504s
+
+receiver (adbed3e0):
+  records by type: {'message': 9000, 'custody': 9000, 'rssi': 6956, 'link': 4736, 'wire': 2163, 'marker': 2, 'packetDup': 2, 'relay': 1}
+  link stages: {'discovered': 4286, 'drop': 180, 'connected': 180, 'session': 90}
+  wire bytes: {'rx:announce': 733419, 'rx:handshake': 18460, 'rx:secure': 2124749, 'tx:announce': 739746, 'tx:handshake': 12600, 'tx:secure': 5880, 'tx:secure:ack': 1686440, 'tx:secure:sync': 73603}
+
+sender (ba2af95f):
+  records by type: {'custody': 18000, 'message': 18000, 'rssi': 5734, 'packetDup': 2782, 'link': 1780, 'wire': 547, 'marker': 363}
+  link stages: {'discovered': 1324, 'connected': 180, 'drop': 96, 'session': 90, 'usable': 90}
+  messages sent: 9000, delivered: 9000 (100%)
+  wire RTT ms (send->ACK): median 112, p90 165, max 313
+  app latency ms (create->ACK): median 140, p90 195 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  wire bytes: {'rx:announce': 211014, 'rx:handshake': 12600, 'rx:secure': 1757468, 'tx:announce': 209475, 'tx:handshake': 18460, 'tx:secure': 2124472, 'tx:secure:sync': 137}
+
+=== mesh ===
+messages sent: 9000, delivered: 9000 (100%)
+delivered by relay hops (receiver TTL view): {0: 9000}
+  MULTI-HOP deliveries: 0/9000
+custody events: {'store': 18000, 'end': 9000}
+packet redundancy: 2784 redundant packet arrival(s) for 9000 delivered message(s) = 1.31 copies on the air per message (1.00 = every packet arrived exactly once)
+message re-delivery: 0 (must be 0 — a duplicate of an already-delivered message triggers nothing)

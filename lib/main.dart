@@ -2417,6 +2417,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
           onResetLinks:
               _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
+          onResetCustody:
+              _grassroots == null ? null : () => _grassroots!.clearCustody(),
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),

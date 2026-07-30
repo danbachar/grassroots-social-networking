@@ -8,22 +8,27 @@ import '../models/packet.dart';
 /// reappears (on their ANNOUNCE / peer-connected event). The relay only ever
 /// holds opaque, recipient-addressed, end-to-end-sealed bytes it cannot read.
 ///
-/// Everything is bounded — number of recipients, depth per recipient, and age —
-/// so an intermediary can never be made to hold unbounded traffic. Eviction is
-/// oldest-first.
+/// Everything is bounded — number of recipients, total packets across the
+/// store, and age — so an intermediary can never be made to hold unbounded
+/// traffic. Eviction is oldest-first. The bound is deliberately store-wide
+/// rather than per-recipient: a per-recipient depth silently dropped a busy
+/// peer's oldest undelivered packets while the rest of the store sat empty,
+/// and pinned confirmation custody (which only age-expires) at exactly the
+/// cap on every reconnection.
 class DtnStore {
   /// Max distinct recipients held at once.
   final int maxRecipients;
 
-  /// Max cached packets per recipient.
-  final int maxPerRecipient;
+  /// Max cached packets across ALL recipients (globally-oldest evicted
+  /// first). 8192 packets ≈ 2 MB at typical sealed sizes.
+  final int maxTotal;
 
   /// Packets older than this are dropped.
   final Duration maxAge;
 
   DtnStore({
     this.maxRecipients = 256,
-    this.maxPerRecipient = 32,
+    this.maxTotal = 8192,
     this.maxAge = const Duration(hours: 6),
   });
 
@@ -46,9 +51,24 @@ class DtnStore {
     }
     list.add(_Entry(packet, at));
 
-    // Bound per-recipient depth (drop oldest).
-    while (list.length > maxPerRecipient) {
-      list.removeAt(0);
+    // Bound the store as a whole: evict the globally-oldest packet. Each
+    // per-recipient list is append-ordered, so the oldest entry overall is
+    // the oldest list head.
+    while (totalCount > maxTotal) {
+      String? evictKey;
+      DateTime? oldestHead;
+      for (final entry in _byRecipient.entries) {
+        if (entry.value.isEmpty) continue;
+        final head = entry.value.first.storedAt;
+        if (oldestHead == null || head.isBefore(oldestHead)) {
+          oldestHead = head;
+          evictKey = entry.key;
+        }
+      }
+      if (evictKey == null) break;
+      final evictList = _byRecipient[evictKey]!;
+      evictList.removeAt(0);
+      if (evictList.isEmpty) _byRecipient.remove(evictKey);
     }
 
     // Bound number of recipients (evict the one whose oldest packet is oldest).

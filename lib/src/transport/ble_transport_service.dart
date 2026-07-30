@@ -700,11 +700,13 @@ class BleTransportService extends TransportService {
     // fallback so they still receive the broadcast.
     final ready = _readyPaths.toList()
       ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+    final targets = selectBroadcastTargets(
+      ready: ready,
+      pubkeyFor: getPubkeyForPeerId,
+      excludePeerIds: excludePeerIds,
+    );
     var sent = 0;
-    for (final path in ready) {
-      if (excludePeerIds != null && excludePeerIds.contains(path.pathId)) {
-        continue;
-      }
+    for (final path in targets) {
       try {
         await _ble.send(path.pathId, data);
         if (_tracing) _wireLedger.onTx(data);
@@ -835,6 +837,65 @@ class BleTransportService extends TransportService {
     }
     return null;
   }
+
+  /// Pick the paths a flood is actually written to: ONE leg per peer
+  /// identity. A converged pair holds two GATT legs, so writing every ready
+  /// path put the same packet on the air twice for the same peer — pure
+  /// waste, since the receiver's packetId bloom drops the second copy.
+  ///
+  /// The kept leg is our PERIPHERAL one where a pair has both (we notify the
+  /// peer's central): a notification is unacknowledged at ATT level and
+  /// several can pack into one connection interval, whereas the central leg
+  /// writes to the peer's characteristic. The other leg stays connected — it
+  /// is the pair's other direction and its fallback — it just does not carry
+  /// a duplicate of the same packet.
+  ///
+  /// Legs whose identity is not yet known cannot be deduplicated and are all
+  /// kept: dropping them would silence a pair that has connected but not yet
+  /// exchanged ANNOUNCE.
+  ///
+  /// [excludePeerIds] is resolved to IDENTITIES for the same reason. The
+  /// relay excludes the path a packet arrived on so it is not echoed back at
+  /// its sender, but a pathId names only ONE leg — without this the reverse
+  /// leg of that same pair echoed it straight back.
+  ///
+  /// Input order is preserved (callers sort by RSSI), and identified targets
+  /// precede unidentified ones.
+  @visibleForTesting
+  static List<ble.BlePath> selectBroadcastTargets({
+    required Iterable<ble.BlePath> ready,
+    required Uint8List? Function(String pathId) pubkeyFor,
+    Set<String>? excludePeerIds,
+  }) {
+    final excludedKeys = <String>{};
+    for (final peerId in excludePeerIds ?? const <String>{}) {
+      final pubkey = pubkeyFor(peerId);
+      if (pubkey != null) excludedKeys.add(_pubkeyHex(pubkey));
+    }
+    final chosen = <String, ble.BlePath>{};
+    final unidentified = <ble.BlePath>[];
+    for (final path in ready) {
+      final pubkey = pubkeyFor(path.pathId);
+      if (pubkey == null) {
+        if (excludePeerIds == null || !excludePeerIds.contains(path.pathId)) {
+          unidentified.add(path);
+        }
+        continue;
+      }
+      final key = _pubkeyHex(pubkey);
+      if (excludedKeys.contains(key)) continue;
+      final existing = chosen[key];
+      if (existing == null ||
+          (existing.role != ble.BleRole.peripheral &&
+              path.role == ble.BleRole.peripheral)) {
+        chosen[key] = path;
+      }
+    }
+    return [...chosen.values, ...unidentified];
+  }
+
+  static String _pubkeyHex(Uint8List pubkey) =>
+      pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   @override
   Uint8List? getPubkeyForPeerId(String peerId) {

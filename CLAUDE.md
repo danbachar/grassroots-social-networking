@@ -31,6 +31,8 @@ The sender is simply the message's **first custodian** (satisfying the madGLP "f
 
 The first-custodian rule applies to **confirmations too**: ACKs and read receipts are sealed, custody-stored by their originator, and flooded like any other recipient-addressed packet — they ride future sync exchanges if the flood reached nobody, and (since nothing ACKs a confirmation) leave custody only by age expiry. **A duplicate of an already-delivered message triggers nothing**: no re-delivery, no re-ACK — dedup means drop, full stop.
 
+**One leg per peer per flood.** A converged pair holds two GATT legs, but a flood writes the packet on exactly ONE of them — preferring our peripheral leg (notify: unacknowledged at ATT level, several per connection interval) over the central leg (write). Sending on both put the same bytes on the air twice for the same peer and the receiver's packetId bloom simply dropped the second copy: double airtime and battery for zero delivery benefit. The second leg is still maintained (it is the pair's other direction and its redundancy on failure), just not written to twice for the same packet.
+
 Bound everything: the DTN store, the per-recipient cache depth, and per-neighbor relay rate are all capped — an unbounded flood/cache is an abuse and battery sink. ANNOUNCE is **not** flooded; it stays neighbor-local (presence, not reach).
 
 ## Mesh Envelope & Trust

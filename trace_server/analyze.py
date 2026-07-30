@@ -387,11 +387,24 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
     if not cust.empty:
         ev = cust.get("event").value_counts().to_dict()
         lines.append(f"custody events: {ev}")
-    dups = df[(df._type == "message") & (df.get("dir") == "dup")]
+    # Two distinct duplication questions — keep them apart:
+    #   packetDup: redundant PACKETS on the air (dual-leg delivery, re-floods,
+    #              custody conveyance), dropped by the packetId bloom;
+    #   message dup: the same logical MESSAGE arriving again after it was
+    #              already delivered — should be ~0, and is the correctness
+    #              claim ("dedup means delivered exactly once").
     fresh = df[(df._type == "message") & (df.get("dir") == "recv")]
+    pkt_dups = df[df._type == "packetDup"]
+    msg_dups = df[(df._type == "message") & (df.get("dir") == "dup")]
     if len(fresh):
-        lines.append(f"duplication factor: {len(dups)} dup / {len(fresh)} "
-                     f"fresh = {len(dups) / len(fresh):.2f}x redundant copies")
+        lines.append(
+            f"packet redundancy: {len(pkt_dups)} redundant packet arrival(s) "
+            f"for {len(fresh)} delivered message(s) "
+            f"= {1 + len(pkt_dups) / len(fresh):.2f} copies on the air per "
+            "message (dual-leg pairs deliver every flood twice)")
+        lines.append(
+            f"message re-delivery: {len(msg_dups)} (must be 0 — a duplicate "
+            "of an already-delivered message triggers nothing)")
     return "\n".join(lines) + "\n"
 
 

@@ -36,7 +36,10 @@ NTP-synced, or bound skew with a start-of-run marker ritual on each device).
 | `rssi` | every adv sighting (≤1/s/path) + the 10 s connected-RSSI poll | `src` (`adv`\|`conn`), `path`, `role`, `rssi`, `peer`, `t` |
 | `link` | stage transitions | `event` = `discovered` (verified ANNOUNCE, 1/announce-cycle), `connected` (GATT leg ready), `session` (Noise established), `usable` (first e2e ACK after session), `drop` (leg lost, with `reason`); + `peer`, `path`, `role`, `rssi`, `t` |
 | `wire` | every 10 s while traffic moved | per-outer-type tx/rx `{bytes,packets}` deltas: `announce`, `handshake`, `secure`. Our OWN tx `secure` is split by inner content at seal time — `secure:data`, `secure:ack`, `secure:receipt`, `secure:sync` — while rx `secure` stays aggregate, exactly what a peer on the air can distinguish |
-| `message` | send / recv / delivered / dup | `messageId`, `peer`, `payloadSize`, `e2eLatencyMs`, `relayHops`, … |
+| `message` | send / recv / delivered / dup (dup = the same logical message re-delivered; should be 0) | `messageId`, `peer`, `payloadSize`, `e2eLatencyMs`, `relayHops`, … |
+| `packetDup` | a redundant PACKET arrival dropped by the packetId bloom (dual-leg copy, re-flood, custody conveyance). Outer `packetId` — a different namespace from `messageId`, never join the two |
+| `relay` | this node forwarded someone else's packet | `packetId`, `ttlIn`/`ttlOut`, `hop`, `fromDevice`, `carried`, `degreeAtEvent` |
+| `custody` | store / convey / end | `packetId`, `recipient`, `held` |
 | `flow` | bulk driver start/stop | `flow` (`A>B`), `payloadBytes`, `inFlight`, final `sent`/`acked`/`ackedBytes` |
 
 ## Auto runner (scripted, hands-free)

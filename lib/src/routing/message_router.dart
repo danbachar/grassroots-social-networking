@@ -222,13 +222,15 @@ class MessageRouter {
     final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
 
     if (forUs && !firstSeen && (trace?.active ?? false)) {
-      // A duplicate copy of a packet addressed to us arrived (flooding /
-      // retransmit) — the message-duplication signal.
+      // A redundant copy of a packet addressed to us arrived (dual-leg
+      // delivery, a re-flood, or a custody conveyance) and was dropped by
+      // the packetId bloom. This is a PACKET-level event: the id is the
+      // outer packetId, which is NOT the inner frame messageId — the two
+      // live in different namespaces, so never join `dup` against `recv`.
       unawaited(trace!.log({
-        'type': 'message',
-        'dir': 'dup',
+        'type': 'packetDup',
         't': DateTime.now().millisecondsSinceEpoch,
-        'messageId': packet.packetId,
+        'packetId': packet.packetId,
         'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
       }));
     }
@@ -529,6 +531,16 @@ class MessageRouter {
       onAckRequested?.call(senderPubkey, messageId, transport);
     } else {
       debugPrint('Duplicate message $messageId dropped.');
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'message',
+          'dir': 'dup',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'messageId': messageId, // inner id: joins with `sent`/`recv`
+          'peer': _pubkeyToHex(senderPubkey),
+          'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+        }));
+      }
     }
   }
 

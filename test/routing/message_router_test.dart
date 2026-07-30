@@ -854,9 +854,9 @@ void main() {
       });
 
       test(
-          'duplicate MESSAGE re-ACKs without re-firing onMessageReceived. '
-          'This is what stops the sender\'s watchdog from looping forever '
-          'when its original ACK was lost.', () async {
+          'a duplicate MESSAGE triggers nothing: no re-delivery and no '
+          're-ACK — dedup means drop. Only the first delivery ACKs.',
+          () async {
         await establishSession();
 
         int deliveries = 0;
@@ -897,10 +897,9 @@ void main() {
 
         expect(deliveries, equals(1),
             reason: 'Recipient must not double-deliver to the app.');
-        expect(ackRequests, hasLength(3),
-            reason:
-                'Recipient must re-ACK every duplicate so the sender can stop '
-                'retrying.');
+        expect(ackRequests, hasLength(1),
+            reason: 'Only the first delivery ACKs; duplicates are dropped '
+                'without side effects.');
         expect(ackRequests, everyElement(messageId));
       });
     });

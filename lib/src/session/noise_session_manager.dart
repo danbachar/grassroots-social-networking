@@ -84,21 +84,28 @@ class NoiseSessionManager {
   Future<Uint8List?> startHandshake(Uint8List remotePubkey) async {
     final hex = _hex(remotePubkey);
     final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
-    if (entry.session != null || entry.handshake != null) {
+    if (entry.session != null || entry.handshake != null || entry.starting) {
       return null;
     }
-    entry.remotePubkey = Uint8List.fromList(remotePubkey);
+    // Reserve BEFORE the first await: concurrent callers (one per BLE leg
+    // delivering the same ANNOUNCE) must not both reach the async work.
+    entry.starting = true;
+    try {
+      entry.remotePubkey = Uint8List.fromList(remotePubkey);
 
-    final handshake = await _NoiseHandshakeState.create(
-      role: NoiseHandshakeRole.initiator,
-      localStaticKeyPair: await _staticKeyPair(),
-    );
-    final body = await handshake.writeMessage1();
-    entry
-      ..session = null
-      ..handshake = handshake
-      ..completer = Completer<bool>();
-    return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
+      final handshake = await _NoiseHandshakeState.create(
+        role: NoiseHandshakeRole.initiator,
+        localStaticKeyPair: await _staticKeyPair(),
+      );
+      final body = await handshake.writeMessage1();
+      entry
+        ..session = null
+        ..handshake = handshake
+        ..completer = Completer<bool>();
+      return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
+    } finally {
+      entry.starting = false;
+    }
   }
 
   Future<bool> waitForSession(Uint8List remotePubkey) async {
@@ -353,6 +360,14 @@ class _SessionEntry {
   _NoiseHandshakeState? handshake;
   Completer<bool>? completer;
 
+  /// Synchronous in-flight reservation for [NoiseSessionManager.startHandshake].
+  /// The dual-leg BLE pair delivers a peer's ANNOUNCE twice within
+  /// milliseconds, and the eager handshake fires per arrival — without a
+  /// pre-await reservation both calls pass the `handshake == null` check and
+  /// spawn two initiator states (two msg1s on the air), which then poison
+  /// each other's msg2 processing.
+  bool starting = false;
+
   /// The peer's Ed25519 public key (set once known). Used as the AAD sender
   /// when trial-decrypting an inbound sealed packet against this session.
   Uint8List? remotePubkey;
@@ -437,23 +452,37 @@ class _NoiseHandshakeState {
     if (body.length != 32 + 48) {
       throw const FormatException('Noise message 2 must be 80 bytes');
     }
-    final localEphemeral = _requireLocalEphemeral();
-    final remoteEphemeralBytes = body.sublist(0, 32);
-    _remoteEphemeralPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteEphemeralBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixHash(remoteEphemeralBytes);
-    await symmetric.mixKey(
-      await _dh(localEphemeral, _remoteEphemeralPublicKey!),
-    );
+    // Validate-then-commit: a msg2 that fails its AEAD check (e.g. the stale
+    // reply to a discarded duplicate msg1) must not mutate this handshake.
+    final snap = symmetric.snapshot();
+    final prevEphemeral = _remoteEphemeralPublicKey;
+    final prevStatic = _remoteStaticPublicKey;
+    try {
+      final localEphemeral = _requireLocalEphemeral();
+      final remoteEphemeralBytes = body.sublist(0, 32);
+      _remoteEphemeralPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteEphemeralBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixHash(remoteEphemeralBytes);
+      await symmetric.mixKey(
+        await _dh(localEphemeral, _remoteEphemeralPublicKey!),
+      );
 
-    final remoteStaticBytes = await symmetric.decryptAndHash(body.sublist(32));
-    _remoteStaticPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteStaticBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixKey(await _dh(localEphemeral, _remoteStaticPublicKey!));
+      final remoteStaticBytes =
+          await symmetric.decryptAndHash(body.sublist(32));
+      _remoteStaticPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteStaticBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixKey(
+          await _dh(localEphemeral, _remoteStaticPublicKey!));
+    } catch (_) {
+      symmetric.restore(snap);
+      _remoteEphemeralPublicKey = prevEphemeral;
+      _remoteStaticPublicKey = prevStatic;
+      rethrow;
+    }
   }
 
   Future<Uint8List> writeMessage3() async {
@@ -468,13 +497,23 @@ class _NoiseHandshakeState {
     if (body.length != 48) {
       throw const FormatException('Noise message 3 must be 48 bytes');
     }
-    final localEphemeral = _requireLocalEphemeral();
-    final remoteStaticBytes = await symmetric.decryptAndHash(body);
-    _remoteStaticPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteStaticBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixKey(await _dh(localEphemeral, _remoteStaticPublicKey!));
+    // Validate-then-commit, same as readMessage2.
+    final snap = symmetric.snapshot();
+    final prevStatic = _remoteStaticPublicKey;
+    try {
+      final localEphemeral = _requireLocalEphemeral();
+      final remoteStaticBytes = await symmetric.decryptAndHash(body);
+      _remoteStaticPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteStaticBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixKey(
+          await _dh(localEphemeral, _remoteStaticPublicKey!));
+    } catch (_) {
+      symmetric.restore(snap);
+      _remoteStaticPublicKey = prevStatic;
+      rethrow;
+    }
   }
 
   Future<_NoiseTransportSession> splitForInitiator() async {
@@ -537,6 +576,25 @@ class _NoiseSymmetricState {
       chainingKey: Uint8List.fromList(initialHash),
       handshakeHash: Uint8List.fromList(initialHash),
     );
+  }
+
+  /// Copy of the mutable state, for validate-then-commit message reads: a
+  /// handshake message that fails its AEAD check must leave the state exactly
+  /// as it was, or the mismatched message poisons the handshake and even the
+  /// matching one subsequently fails (observed live: a raced duplicate msg1
+  /// produced a stale msg2 whose failed read corrupted the survivor).
+  (Uint8List, Uint8List, Uint8List?, int) snapshot() => (
+        Uint8List.fromList(chainingKey),
+        Uint8List.fromList(handshakeHash),
+        cipherKey == null ? null : Uint8List.fromList(cipherKey!),
+        nonce,
+      );
+
+  void restore((Uint8List, Uint8List, Uint8List?, int) snap) {
+    chainingKey = snap.$1;
+    handshakeHash = snap.$2;
+    cipherKey = snap.$3;
+    nonce = snap.$4;
   }
 
   Future<void> mixHash(List<int> data) async {

@@ -490,14 +490,15 @@ class MessageRouter {
           'degreeAtEvent': _reachablePeerCount(),
         }));
       }
+      // ACK back to the original sender (a recipient-addressed packet flooded
+      // through the mesh). Only the first delivery ACKs: a duplicate of an
+      // already-delivered message triggers nothing — dedup means drop. A
+      // sender whose ACK was lost keeps the message in custody until a read
+      // receipt confirms it or the custody age cap expires.
+      onAckRequested?.call(senderPubkey, messageId, transport);
     } else {
-      debugPrint('Duplicate message $messageId; re-ACKing without re-delivering.');
+      debugPrint('Duplicate message $messageId dropped.');
     }
-
-    // ACK back to the original sender (a recipient-addressed packet flooded
-    // through the mesh). Re-ACKing a duplicate lets a sender whose first ACK
-    // was lost stop retrying.
-    onAckRequested?.call(senderPubkey, messageId, transport);
   }
 
   void _handleAck(Uint8List chunk) {

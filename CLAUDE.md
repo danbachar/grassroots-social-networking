@@ -29,6 +29,8 @@ The Bluetooth transport is an **opportunistic mesh**. Delivery is multi-hop and 
 
 The sender is simply the message's **first custodian** (satisfying the madGLP "fair message delivery" assumption, `docs/GLP_Networking_API/sections/api.tex` §Networking Assumptions): a sent message's sealed packets enter the same custody store relays use, are offered in every sync-on-connect vector exchange, and leave custody only on the recipient's end-to-end ACK (or age expiry). There is **no separate sender-side retry queue, ACK-timeout re-queue, or periodic drain** — redelivery happens exclusively through the custody exchange each time a pairing forms. Pairings are **eager**: every accepted ANNOUNCE leads directly to a Noise handshake (lower pubkey initiates), and all custody flow with a peer — sealing held messages, direct conveyance, the sync vector exchange — is gated on that session existing, never on the raw link.
 
+The first-custodian rule applies to **confirmations too**: ACKs and read receipts are sealed, custody-stored by their originator, and flooded like any other recipient-addressed packet — they ride future sync exchanges if the flood reached nobody, and (since nothing ACKs a confirmation) leave custody only by age expiry. **A duplicate of an already-delivered message triggers nothing**: no re-delivery, no re-ACK — dedup means drop, full stop.
+
 Bound everything: the DTN store, the per-recipient cache depth, and per-neighbor relay rate are all capped — an unbounded flood/cache is an abuse and battery sink. ANNOUNCE is **not** flooded; it stays neighbor-local (presence, not reach).
 
 ## Mesh Envelope & Trust

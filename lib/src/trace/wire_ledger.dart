@@ -21,6 +21,7 @@ class WireLedger {
     0x01: 'announce',
     0x02: 'handshake',
     0x03: 'secure',
+    0x7F: 'raw',
   };
 
   static String typeNameFor(int typeByte) =>

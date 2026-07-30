@@ -85,13 +85,17 @@ MARKER_PAYLOAD_RE = re.compile(r"\bp\s*=\s*(\d+)\s*B\b", re.I)
 # A ceiling-sweep marker: `lanes=<n>` — how many sends were pushed
 # concurrently, i.e. the offered-load knob.
 MARKER_LANES_RE = re.compile(r"\blanes\s*=\s*(\d+)", re.I)
+# A raw-link marker: `leg=<notify|write|stripe>` — which GATT leg the raw
+# blobs rode.
+MARKER_LEG_RE = re.compile(r"\bleg\s*=\s*(\w+)", re.I)
 LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
 # Runner markers that annotate a boundary or an event but are not steps. Every
 # OTHER marker opens a step segment — a throughput step ("saturate", "p=264B")
 # has no position at all, and dropping it would make the whole experiment
 # invisible in steps.csv.
 CONTROL_MARKERS = {"links-reset", "sessions-reset", "custody-reset",
-                   "link-settled", "saturate-start", "end", "aborted"}
+                   "link-settled", "saturate-start", "raw-start", "end",
+                   "aborted"}
 # Marker span != active time. A step's markers are all stamped at its start,
 # and the auto-advance gap between steps trails the dwell, so rates are taken
 # over the ACTIVE window (first send -> last ACK) instead. See steps_table.
@@ -241,6 +245,7 @@ def marker_segments(df: pd.DataFrame) -> list[dict]:
         pos = MARKER_POS_RE.search(label)
         payload = MARKER_PAYLOAD_RE.search(label)
         lanes = MARKER_LANES_RE.search(label)
+        leg = MARKER_LEG_RE.search(label)
         direction = (
             "approach"
             if "approach" in label.lower()
@@ -249,6 +254,7 @@ def marker_segments(df: pd.DataFrame) -> list[dict]:
         segs.append({"d": float(pos.group(1)) if pos else float("nan"),
                      "payloadB": int(payload.group(1)) if payload else None,
                      "lanes": int(lanes.group(1)) if lanes else None,
+                     "leg": leg.group(1) if leg else None,
                      "direction": direction,
                      "label": label, "t0": m._t, "t1": None})
     end = end_t if end_t is not None else df._t.dropna().max()
@@ -311,14 +317,24 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
         # timer, so counts at a segment boundary can spill by one window.
         in_seg_wire = wire[(wire._t >= seg["t0"]) & (wire._t < seg["t1"])]
         air_b = 0
+        raw_tx = raw_rx = 0
+        raw_tx_windows = raw_rx_windows = 0
         for _, w in in_seg_wire.iterrows():
             for key, val in _dict(w.get("txBytes")).items():
                 if str(key).startswith("secure"):
                     air_b += int(val)
+                if key == "raw":
+                    raw_tx += int(val)
+                    raw_tx_windows += 1
+            rxr = int(_dict(w.get("rxBytes")).get("raw", 0))
+            if rxr:
+                raw_rx += rxr
+                raw_rx_windows += 1
         row = {
             "d": seg["d"],
             "payloadB": payload_b,
             "lanes": seg["lanes"],
+            "leg": seg["leg"],
             "direction": seg["direction"],
             "label": seg["label"],
             "t0": seg["t0"],
@@ -327,6 +343,19 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             "advPerMin": round(len(adv) / (dwell_sec / 60.0), 1),
             "advCoverage": round(len(adv_seconds) / dwell_sec, 3),
         }
+        if raw_tx or raw_rx:
+            # Raw-link step: offered vs carried BYTES from the wire ledgers
+            # (sender tx, receiver rx). No messages exist in this mode. The
+            # denominator is windows-with-raw x the ledger's fixed 10s drain
+            # period, not the marker span — the span includes the settle
+            # before raw-start and the auto-advance gap, which understated
+            # every rate ~14% on the synthetic check.
+            row["raw_tx_Bps"] = (round(raw_tx / (raw_tx_windows * 10), 1)
+                                 if raw_tx_windows else 0.0)
+            row["raw_rx_Bps"] = (round(raw_rx / (raw_rx_windows * 10), 1)
+                                 if raw_rx_windows else 0.0)
+            row["raw_loss"] = (round(1 - raw_rx / raw_tx, 3)
+                               if raw_tx else None)
         if len(seg_msgs):
             sent_n = len(seg_msgs)
             lat = seg_msgs["latencyMs"].dropna()
@@ -530,6 +559,21 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
     #   message dup: the same logical MESSAGE arriving again after it was
     #              already delivered — should be ~0, and is the correctness
     #              claim ("dedup means delivered exactly once").
+    # Raw-link runs: totals over the WHOLE recording (boundary drain windows
+    # cancel run-wide; per-step loss columns are polluted by the 10s drain
+    # phase crossing step boundaries and by the OS write queue draining into
+    # the next step, so this is the only trustworthy loss figure).
+    raw_tx = raw_rx = 0
+    for _, w in df[df._type == "wire"].iterrows():
+        raw_tx += int(_dict(w.get("txBytes")).get("raw", 0))
+        raw_rx += int(_dict(w.get("rxBytes")).get("raw", 0))
+    if raw_tx:
+        lines.append(
+            f"raw blobs: {raw_tx} B accepted by the sender's stack, "
+            f"{raw_rx} B delivered = {100 * raw_rx / raw_tx:.1f}% "
+            f"(the gap is bytes still queued at step end or dropped by the "
+            f"stack under overrun — the OS accepts writes far faster than "
+            f"the air drains them)")
     fresh = df[(df._type == "message") & (_col(df, "dir") == "recv")]
     pkt_dups = df[df._type == "packetDup"]
     msg_dups = df[(df._type == "message") & (_col(df, "dir") == "dup")]

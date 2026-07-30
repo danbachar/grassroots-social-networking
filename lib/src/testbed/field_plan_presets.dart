@@ -237,6 +237,53 @@ class FieldPlanPresets {
     );
   }
 
+  /// RAW link throughput: MTU-sized unsealed blobs pushed as fast as the
+  /// send path drains, one step per GATT leg — notify (our peripheral leg),
+  /// write (our central leg), stripe (alternate blobs across both). No seal,
+  /// no ACK, no custody: this measures the naked GATT pipe, and the gap to
+  /// the protocol numbers is the measured cost of the stack. The receiver
+  /// counts bytes in its wire ledger and drops the blobs before the parser.
+  static FieldPlan rawLink({
+    String expId = 'raw-link-1',
+    int dwellSec = 30,
+    List<String> legs = const ['notify', 'write', 'stripe'],
+    int repeat = 1,
+    bool resetSessions = false,
+    // Default ON, unlike every other warm-link plan: the plugin's per-path
+    // GATT op queue is unbounded and the Dart send future completes at
+    // ENQUEUE, so a blast step leaves megabytes still draining on air after
+    // its dwell ends — raw-link-1 measured a step receiving 39 KB/s while
+    // sending nothing new. No app-level reset can touch that queue; only a
+    // link teardown discards it. The bounce costs ~35 s/step and buys step
+    // independence.
+    bool resetLinks = true,
+  }) {
+    final trials = repeat < 1 ? 1 : repeat;
+    final arms = legs.isEmpty ? const ['notify'] : legs;
+    final steps = <FieldStep>[];
+    for (final leg in arms) {
+      for (var i = 1; i <= trials; i++) {
+        steps.add(FieldStep(
+          label: trials > 1 ? 'leg=$leg t$i' : 'leg=$leg',
+          dwellSec: dwellSec,
+          rawLeg: leg,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      // Nothing is in flight after the dwell at the APP layer (no ACKs, no
+      // custody), but the OS queue may still be draining: the settle window
+      // plus the next step's link bounce absorb it.
+      settleSec: 15,
+      resetSessions: resetSessions,
+      resetLinks: resetLinks,
+      resetCustody: false,
+      steps: steps,
+    );
+  }
+
   /// TIER 1 — multi-hop relay. Run on the SOURCE (A). B sits between A and
   /// C, in range of both; C is out of A's range. Every step addresses C
   /// alone ([FieldStep.sendTo] = C's pubkey prefix), so a delivery proves
@@ -328,6 +375,7 @@ class FieldPlanPresets {
             expId: 'throughput-arm-1',
             payloadSizes: const [defaultSendBytes, 264, 1200]),
         'Throughput: ceiling sweep (1/4/16/64 lanes)': throughputCeiling(),
+        'Raw link throughput (notify/write/stripe)': rawLink(),
         'Control-plane line sweep': lineSweep(),
         'Mesh: multi-hop relay (set target!)':
             multiHop(targetPrefix: '<peer-prefix>'),
@@ -342,6 +390,7 @@ enum FieldPlanKind {
   homeSoak,
   throughput,
   throughputCeiling,
+  rawLink,
   multiHop,
   storeCarry,
   lineSweep,
@@ -353,6 +402,7 @@ extension FieldPlanKindLabel on FieldPlanKind {
         FieldPlanKind.homeSoak => 'Home soak (stationary)',
         FieldPlanKind.throughput => 'Throughput (saturate)',
         FieldPlanKind.throughputCeiling => 'Throughput: ceiling sweep',
+        FieldPlanKind.rawLink => 'Raw link throughput (GATT pipe)',
         FieldPlanKind.multiHop => 'Mesh: multi-hop relay',
         FieldPlanKind.storeCarry => 'Mesh: store-carry-forward',
         FieldPlanKind.lineSweep => 'Control-plane line sweep',
@@ -369,6 +419,7 @@ class FieldPlanWizard {
         FieldPlanKind.homeSoak => (true, false),
         FieldPlanKind.throughput => (false, false),
         FieldPlanKind.throughputCeiling => (false, false),
+        FieldPlanKind.rawLink => (false, true),
         FieldPlanKind.multiHop => (false, false),
         FieldPlanKind.storeCarry => (false, false),
         FieldPlanKind.lineSweep => (true, true),
@@ -390,6 +441,7 @@ class FieldPlanWizard {
     bool? resetLinks,
     List<int> payloadSizes = const [defaultSendBytes],
     List<int> laneCounts = const [1, 4, 16, 64],
+    List<String> rawLegs = const ['notify', 'write', 'stripe'],
     int sendLanes = 1,
     String targetPrefix = '',
     int holdMin = 5,
@@ -424,6 +476,15 @@ class FieldPlanWizard {
           dwellSec: dwellSec,
           payloadBytes: payloadSizes.isEmpty ? defaultSendBytes : payloadSizes.first,
           lanes: laneCounts,
+          repeat: repeat,
+          resetSessions: sessions,
+          resetLinks: links,
+        );
+      case FieldPlanKind.rawLink:
+        return FieldPlanPresets.rawLink(
+          expId: id,
+          dwellSec: dwellSec,
+          legs: rawLegs,
           repeat: repeat,
           resetSessions: sessions,
           resetLinks: links,

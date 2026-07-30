@@ -52,6 +52,12 @@ enum PacketType {
 /// framer: stream transports (UDP/UDX) accumulate bytes until
 /// `headerSize + payloadLength` are available before treating a buffer as
 /// one packet.
+/// DEBUG/TESTBED ONLY outer type byte for raw-throughput blobs: not a
+/// [PacketType], never deserialized. A raw blob is [rawPacketType, ...fill]
+/// — the receiver counts its bytes in the wire ledger and drops it before
+/// the parser. Measures the GATT pipe with zero protocol on top.
+const int rawPacketType = 0x7F;
+
 class GrassrootsPacket {
   static const int headerSize = 58;
   static const int payloadLengthOffset = 54; // byte index of length field

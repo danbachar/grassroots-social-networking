@@ -2419,6 +2419,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
           onResetCustody:
               _grassroots == null ? null : () => _grassroots!.clearCustody(),
+          sendRaw: _grassroots == null
+              ? null
+              : (peer, {required leg, required seq}) =>
+                  _grassroots!.sendRawBlob(peer, leg: leg, seq: seq),
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),

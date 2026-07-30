@@ -59,6 +59,12 @@ class FieldRunner extends ChangeNotifier {
   /// step's undelivered backlog cannot drain into this step's window.
   final VoidCallback? onResetCustody;
 
+  /// DEBUG raw-throughput send: one MTU-sized raw blob to [peer] over the
+  /// step's [FieldStep.rawLeg]. Returns the blob size, or null when that leg
+  /// is not currently available.
+  final Future<int?> Function(Uint8List peer,
+      {required String leg, required int seq})? sendRaw;
+
   /// Currently identified peers (pubkeys), consulted when the plan has NO
   /// roster: every known peer becomes a send target and labels are the 8-hex
   /// pubkey prefixes — the two-device case needs no manual pubkey entry.
@@ -91,6 +97,7 @@ class FieldRunner extends ChangeNotifier {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetCustody,
+    this.sendRaw,
     this.knownPeers,
     this.linkSettled,
     this.upload,
@@ -111,6 +118,8 @@ class FieldRunner extends ChangeNotifier {
   final Set<String> _outstanding = {};
   int _satSeq = 0;
   int _ackedCount = 0;
+  int _rawBlobs = 0;
+  int _rawBytes = 0;
 
   /// ACKed sends in the current saturating step (throughput numerator).
   int get ackedCount => _ackedCount;
@@ -250,6 +259,12 @@ class FieldRunner extends ChangeNotifier {
   /// fire time; ids are the offline-reproducible UUIDv5 set
   /// `field|expId|src|dst|stepIndex|seq`.
   void _scheduleSends(FieldStep step) {
+    // Raw mode first: it uses [sendRaw], not [send] — gating it behind the
+    // message-send hook silently disabled it (caught by test).
+    if (step.rawLeg != null) {
+      _scheduleRaw(step); // raw mode ignores sendCount/saturate
+      return;
+    }
     final doSend = send;
     if (doSend == null) return;
     if (step.saturate) {
@@ -323,6 +338,62 @@ class FieldRunner extends ChangeNotifier {
       begin();
     });
     _sendTimers.add(poll);
+  }
+
+  /// Raw-throughput mode: wait for the link to settle, then push MTU-sized
+  /// raw blobs on the step's leg for the rest of the dwell — one await-loop
+  /// (the send path serializes at the platform channel anyway). No seal, no
+  /// ACK, no custody: offered bytes come from this counter, carried bytes
+  /// from the RECEIVER's wire ledger.
+  void _scheduleRaw(FieldStep step) {
+    _rawBlobs = 0;
+    _rawBytes = 0;
+    final settled = linkSettled;
+    void begin() {
+      unawaited(recorder.logMarker('raw-start'));
+      unawaited(_pushRaw(step));
+      notifyListeners();
+    }
+
+    if (settled == null) {
+      begin();
+      return;
+    }
+    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
+      if (!_running || _phase != FieldPhase.dwelling) {
+        t.cancel();
+        return;
+      }
+      if (!_sendTargets().any((target) => settled(target.$2))) return;
+      t.cancel();
+      unawaited(recorder.logMarker('link-settled'));
+      begin();
+    });
+    _sendTimers.add(poll);
+  }
+
+  Future<void> _pushRaw(FieldStep step) async {
+    final doSendRaw = sendRaw;
+    if (doSendRaw == null) return;
+    var seq = 0;
+    while (_running && _phase == FieldPhase.dwelling && currentStep == step) {
+      final targets = _sendTargets();
+      var sentAny = false;
+      for (final (_, pubkey) in targets) {
+        final size =
+            await doSendRaw(pubkey, leg: step.rawLeg!, seq: seq);
+        if (size != null) {
+          _rawBlobs++;
+          _rawBytes += size;
+          sentAny = true;
+        }
+      }
+      seq++;
+      // Same event-loop yield as the saturating lanes: a target-less or
+      // failing send must not starve the dwell countdown (see _pushLane).
+      await Future<void>.delayed(
+          sentAny ? Duration.zero : const Duration(milliseconds: 200));
+    }
   }
 
   /// One push lane: keep sending until the dwell ends, awaiting each send so
@@ -411,6 +482,17 @@ class FieldRunner extends ChangeNotifier {
 
   Future<void> _endDwell() async {
     _cancelSends();
+    if (currentStep?.rawLeg != null) {
+      await recorder.log({
+        'type': 'flow',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'stop',
+        'flow': 'raw',
+        'leg': currentStep!.rawLeg,
+        'sent': _rawBlobs,
+        'sentBytes': _rawBytes,
+      });
+    }
     if ((currentStep?.saturate ?? false)) {
       await recorder.log({
         'type': 'flow',

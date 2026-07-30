@@ -139,6 +139,28 @@ they measure. Note the static device's store is NOT cleared (it runs no
 plan); its confirmation custody is small and the sync exchange only conveys
 what the runner actually lacks.
 
+**Raw link throughput.** The *Raw link throughput* wizard kind measures the
+naked GATT pipe: MTU-sized blobs (outer type `0x7F`, ATT payload = negotiated
+MTU − 3) pushed as fast as the send path drains — no seal, no custody, no
+ACK; the receiver counts the bytes in its wire ledger and drops the blob
+before the parser. One step per leg: `leg=notify` (this device's peripheral
+leg), `leg=write` (its central leg), `leg=stripe` (alternate blobs across
+both — the arm that asks whether a converged pair's two legs are two usable
+pipes). `steps.csv` reports `raw_tx_Bps` (offered, sender ledger),
+`raw_rx_Bps` (carried, receiver ledger) and `raw_loss`.
+
+Raw steps **bounce the BLE link between steps by default** (`resetLinks`),
+unlike every other warm-link plan: the plugin's per-path GATT op queue is
+unbounded and the Dart send future completes at *enqueue*, so a blast step
+leaves megabytes still draining on air after its dwell — raw-link-1 measured
+a step receiving 39 KB/s while sending nothing new. No app-level reset can
+reach that queue; only the teardown discards it. Two caveats survive:
+`raw_tx_Bps` is acceptance rate (into the queue), not on-air rate, so
+`raw_rx_Bps` is the measurement; and per-step `raw_loss` includes bytes the
+teardown discarded — the run-wide figure in `summary.txt` is the honest one. The gap between raw
+and the protocol numbers is the measured cost of the stack: framing + crypto
+(104 B/packet), the ACK round, and custody.
+
 **Ceiling sweep.** One lane keeps exactly one message in the send path, and in
 the first payload arm that delivered **100% at every size** — proof the sender
 never outran the link, which makes those rates a *lower bound* on capacity, not

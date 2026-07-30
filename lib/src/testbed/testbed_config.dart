@@ -171,6 +171,13 @@ class FieldStep {
   /// offered load until delivery breaks, and that break is the ceiling.
   final int sendLanes;
 
+  /// DEBUG raw-throughput mode: non-null selects the GATT leg ('notify',
+  /// 'write' or 'stripe') and the step pushes MTU-sized raw blobs — no seal,
+  /// no custody, no ACK; the receiver counts bytes and drops them before the
+  /// parser. Measures the naked GATT pipe; [sendCount]/[saturate] are
+  /// ignored. Delivery accounting comes from the wire ledger alone.
+  final String? rawLeg;
+
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
   /// repeat trial at the same position — nothing to walk to). A step at a new
@@ -187,6 +194,7 @@ class FieldStep {
     this.saturate = false,
     this.sendLanes = 1,
     this.sendTo = 'all',
+    this.rawLeg,
   });
 
   Map<String, dynamic> toJson() => {
@@ -201,6 +209,7 @@ class FieldStep {
         if (saturate) 'saturate': saturate,
         if (saturate) 'sendLanes': sendLanes,
         if (sendTo != 'all') 'sendTo': sendTo,
+        if (rawLeg != null) 'rawLeg': rawLeg,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
@@ -213,6 +222,7 @@ class FieldStep {
         saturate: json['saturate'] as bool? ?? false,
         sendLanes: json['sendLanes'] as int? ?? 1,
         sendTo: json['sendTo'] as String? ?? 'all',
+        rawLeg: json['rawLeg'] as String?,
       );
 
   @override
@@ -226,12 +236,13 @@ class FieldStep {
       other.autoAdvance == autoAdvance &&
       other.saturate == saturate &&
       other.sendLanes == sendLanes &&
-      other.sendTo == sendTo;
+      other.sendTo == sendTo &&
+      other.rawLeg == rawLeg;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, sendLanes, sendTo);
+          saturate, sendLanes, sendTo, rawLeg);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and

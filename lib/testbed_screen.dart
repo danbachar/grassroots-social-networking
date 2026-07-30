@@ -39,6 +39,8 @@ class TestbedScreen extends StatefulWidget {
   final VoidCallback? onResetSessions;
   final Future<void> Function()? onResetLinks;
   final VoidCallback? onResetCustody;
+  final Future<int?> Function(Uint8List peer,
+      {required String leg, required int seq})? sendRaw;
   final bool Function(Uint8List peer)? linkSettled;
 
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
@@ -56,6 +58,7 @@ class TestbedScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetCustody,
+    this.sendRaw,
     this.linkSettled,
     this.registerAckListener,
   });
@@ -237,6 +240,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
       onResetCustody: widget.onResetCustody,
+      sendRaw: widget.sendRaw,
       linkSettled: widget.linkSettled,
       // Rosterless plans (the two-device default) target every peer the
       // store currently knows.
@@ -643,6 +647,8 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       TextEditingController(text: '1');
   late final TextEditingController _laneCounts =
       TextEditingController(text: '1, 4, 16, 64');
+  late final TextEditingController _rawLegs =
+      TextEditingController(text: 'notify, write, stripe');
   late final TextEditingController _targetPrefix = TextEditingController();
   late final TextEditingController _holdMin = TextEditingController(text: '5');
   bool _retreat = true;
@@ -667,6 +673,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       _payloadBytes,
       _sendLanes,
       _laneCounts,
+      _rawLegs,
       _targetPrefix,
       _holdMin,
     ]) {
@@ -690,6 +697,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       FieldPlanKind.homeSoak => 'home-soak-1',
       FieldPlanKind.throughput => 'throughput-1',
       FieldPlanKind.throughputCeiling => 'throughput-ceiling-1',
+      FieldPlanKind.rawLink => 'raw-link-1',
       FieldPlanKind.multiHop => 'mesh-hop-1',
       FieldPlanKind.storeCarry => 'mesh-dtn-1',
       FieldPlanKind.lineSweep => 'cp-line-1',
@@ -836,6 +844,20 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
               style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
         ];
+      case FieldPlanKind.rawLink:
+        return [
+          _num(_dwellSec, 'Blast for (s)'),
+          const SizedBox(height: 12),
+          _num(_rawLegs, 'Legs to test (notify, write, stripe)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'MTU-sized raw blobs, no seal/ACK/custody — the naked GATT '
+              'pipe. notify = this device\'s peripheral leg, write = its '
+              'central leg, stripe = alternate blobs across both.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
       case FieldPlanKind.multiHop:
         return [
           _num(_targetPrefix, 'Target peer (pubkey prefix, e.g. 9c46b4f3)'),
@@ -936,6 +958,11 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         sendLanes: _int(_sendLanes, 1),
         laneCounts:
             FieldPlanWizard.parseInts(_laneCounts.text, const [1, 4, 16, 64]),
+        rawLegs: [
+          for (final leg in _rawLegs.text.split(','))
+            if (const {'notify', 'write', 'stripe'}.contains(leg.trim()))
+              leg.trim(),
+        ],
         targetPrefix: _targetPrefix.text.trim(),
         holdMin: _int(_holdMin, 5),
       );

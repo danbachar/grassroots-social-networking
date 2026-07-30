@@ -205,7 +205,7 @@ void main() {
       ledger.onTx(packet(0x01, 200));
       ledger.onTx(packet(0x02, 96)); // handshake
       ledger.onRx(packet(0x03, 500)); // secure
-      ledger.onRx(packet(0x7f, 10)); // unknown
+      ledger.onRx(packet(0x6e, 10)); // unknown
 
       final record = ledger.drainRecord(transport: 'ble')!;
       expect(record['type'], 'wire');
@@ -240,6 +240,15 @@ void main() {
       expect(record['txBytes'], {'secure:data:say': 300, 'secure:ack': 100});
       expect(record['rxBytes'], {'secure': 300},
           reason: 'a peer on the air cannot tell sealed content apart');
+    });
+
+    test('raw blobs are classified by the 0x7F type byte', () {
+      final ledger = WireLedger();
+      ledger.onTx(packet(0x7F, 182));
+      ledger.onRx(packet(0x7F, 182));
+      final record = ledger.drainRecord(transport: 'ble')!;
+      expect(record['txBytes'], {'raw': 182});
+      expect(record['rxBytes'], {'raw': 182});
     });
 
     test('drain resets: second drain with no traffic returns null', () {

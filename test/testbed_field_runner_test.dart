@@ -641,6 +641,54 @@ void main() {
     });
   });
 
+  test('raw mode pushes blobs for the dwell; a dead leg cannot spin', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final sent = <(String, int)>[];
+      var legUp = true;
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
+        sendRaw: (peer, {required leg, required seq}) async {
+          if (!legUp) return null;
+          sent.add((leg, seq));
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+          return 182;
+        },
+      );
+      runner.start(const FieldPlan(
+        expId: 'raw',
+        settleSec: 1,
+        resetSessions: false,
+        resetCustody: false,
+        steps: [
+          FieldStep(label: 'leg=notify', dwellSec: 5, rawLeg: 'notify'),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.elapse(const Duration(seconds: 2));
+      expect(sent.length, greaterThan(100),
+          reason: '5ms per blob -> ~200 blobs in the first second alone');
+      expect(sent.every((e) => e.$1 == 'notify'), isTrue);
+      expect(recorder.events, contains('marker:raw-start'));
+
+      // Leg drops mid-dwell: the loop must idle (200ms backoff), not spin.
+      legUp = false;
+      final atDrop = sent.length;
+      async.elapse(const Duration(seconds: 2));
+      expect(sent.length, atDrop);
+      expect(runner.phase, FieldPhase.dwelling,
+          reason: 'the dwell countdown kept running through the dead leg');
+
+      // Dwell ends and stops the loop; the flow record carries the counts.
+      async.elapse(const Duration(seconds: 10));
+      expect(runner.phase, isNot(FieldPhase.dwelling));
+      runner.dispose();
+    });
+  });
+
   test('resetCustody empties the store at each step start', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

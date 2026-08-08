@@ -37,7 +37,7 @@ class InviteIntroducer {
 ///    posture — because it verifies its own signature over the invite and
 ///    that the nonce is unused, then burns the nonce.
 ///
-/// See `docs/rv-removal-and-invite-links.md` §Cold bootstrap via invite links.
+/// See docs/architecture-overview.tex §Facilitators, cold bootstrap.
 class Invite {
   /// Wire format version.
   static const int version = 1;

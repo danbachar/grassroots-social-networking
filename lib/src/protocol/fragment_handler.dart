@@ -41,6 +41,21 @@ class FragmentHandler {
   final Map<String, _ReassemblyState> _reassemblyBuffer = {};
   Timer? _cleanupTimer;
 
+  /// Fired when a partial reassembly is abandoned: the 4-minute timeout swept
+  /// it ('timeout') or reassembly failed despite a complete count — an
+  /// out-of-range fragIndex was counted ('broken'). Both are whole-message
+  /// losses that were previously invisible; the coordinator wires this to a
+  /// `drop` trace record.
+  void Function(String reason, String messageId, int have, int total)?
+      onAbandon;
+
+  /// In-progress reassembly count — `buf` trace record occupancy.
+  int get reassemblyCount => _reassemblyBuffer.length;
+
+  /// Bytes currently held across all partial reassemblies.
+  int get reassemblyBytes => _reassemblyBuffer.values
+      .fold(0, (sum, s) => sum + s.bufferedBytes);
+
   FragmentHandler() {
     _startCleanupTimer();
   }
@@ -100,15 +115,26 @@ class FragmentHandler {
     if (!state.isComplete) return null;
 
     _reassemblyBuffer.remove(frame.messageId);
-    return state.reassemble();
+    final whole = state.reassemble();
+    if (whole == null) {
+      // Count-complete but unassemblable: an out-of-range fragIndex was
+      // counted toward isComplete. The state is already removed, so the
+      // message is gone for good — say so.
+      onAbandon?.call(
+          'broken', frame.messageId, state.chunkCount, state.totalFragments);
+    }
+    return whole;
   }
 
   void _startCleanupTimer() {
     _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       final now = DateTime.now();
-      _reassemblyBuffer.removeWhere(
-        (_, state) => now.difference(state.startedAt) > reassemblyTimeout,
-      );
+      _reassemblyBuffer.removeWhere((messageId, state) {
+        if (now.difference(state.startedAt) <= reassemblyTimeout) return false;
+        onAbandon?.call(
+            'timeout', messageId, state.chunkCount, state.totalFragments);
+        return true;
+      });
     });
   }
 
@@ -126,6 +152,11 @@ class _ReassemblyState {
   _ReassemblyState({required this.totalFragments});
 
   void addChunk(int index, Uint8List data) => _chunks[index] = data;
+
+  int get chunkCount => _chunks.length;
+
+  int get bufferedBytes =>
+      _chunks.values.fold(0, (sum, c) => sum + c.length);
 
   bool get isComplete => _chunks.length == totalFragments;
 

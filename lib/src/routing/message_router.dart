@@ -29,28 +29,15 @@ import 'package:flutter/foundation.dart';
 ///
 /// All transports feed into [processPacket] — one entry point, one format.
 /// The authenticated reply context of a sync exchange: the peer a sealed
-/// sync frame decrypted under, plus the transport link it arrived on. Replies
-/// (requests, conveyed custody) are routed back over the same link — by
-/// device path on BLE, by peer identity on UDP.
+/// sync frame decrypted under, plus the BLE path it arrived on. Replies
+/// (requests, conveyed packets) go back over that same path. BLE only —
+/// the buffer is a mesh mechanism and the Internet transport stays direct
+/// point-to-point, so a sync frame off UDP is never acted on.
 class SyncLink {
-  final PeerTransport transport;
   final Uint8List peerPubkey;
+  final String bleDeviceId;
 
-  /// The BLE path the frame arrived on; null on UDP.
-  final String? bleDeviceId;
-
-  const SyncLink(this.transport, this.peerPubkey, {this.bleDeviceId});
-
-  String get peerHex =>
-      peerPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-
-  /// Relay-budget key: BLE budgets are per device path (as for flooding);
-  /// UDP has no path id, so the peer identity is the budget.
-  String get budgetKey => bleDeviceId ?? 'udp:$peerHex';
-
-  /// Log label.
-  String get label =>
-      bleDeviceId ?? 'udp:${peerHex.substring(0, 8)}';
+  const SyncLink(this.peerPubkey, this.bleDeviceId);
 }
 
 class MessageRouter {
@@ -72,8 +59,10 @@ class MessageRouter {
   /// its very first receipt (ACKed but never shown).
   final BloomFilter _deliveredMessages = BloomFilter();
 
-  /// Store-carry-forward cache: packets relayed for recipients not currently in
-  /// range, re-flooded when they reappear (see [flushDtnFor]).
+  /// Store-carry-forward cache: packets held for recipients not currently in
+  /// range. Conveyed ONLY through the sync exchange — a peer offers the ids it
+  /// carries and the other side requests what its seen-set lacks. Nothing is
+  /// ever pushed blindly on connect (see [buildSyncOffers]).
   final DtnStore _dtnStore = DtnStore();
 
   /// Per-neighbor relay budget (managed-flooding abuse cap). A single inbound
@@ -95,11 +84,25 @@ class MessageRouter {
   /// Called when a read receipt is received
   void Function(String messageId)? onReadReceiptReceived;
 
+  /// DEBUG/TESTBED. A peer broadcast a run start for [expId]. Fired for an
+  /// authenticated sender only; acting on it is the coordinator's call.
+  void Function(String expId, Uint8List senderPubkey)? onTestbedStart;
+
+  /// DEBUG/TESTBED. A peer's gossiped neighbour list (armed-time only).
+  void Function(Uint8List senderPubkey, int seq, List<Uint8List> neighbours)?
+      onTestbedNeighbours;
+
   /// Called when a peer ANNOUNCE is processed (new or updated peer).
   /// [udpPeerId] is the transport-level peer identifier (tempKey for incoming
   /// UDP connections) so the coordinator can map it to the peer's pubkey.
+  ///
+  /// [bleDeviceId] is the BLE path it arrived on. ANNOUNCE is the moment a
+  /// path becomes attributable to a pubkey — it carries the key and arrives
+  /// on one link — so passing it through is what lets the trace record that
+  /// binding. Without it a topology reconstruction can only learn path->peer
+  /// from `drop`, and so loses every link that never dropped.
   void Function(AnnounceData data, PeerTransport transport,
-      {bool isNew, String? udpPeerId})? onPeerAnnounced;
+      {bool isNew, String? udpPeerId, String? bleDeviceId})? onPeerAnnounced;
 
   /// Called when a message needs an ACK sent back to its sender. In the mesh the
   /// ACK is a normal recipient-addressed packet flooded back to [senderPubkey]
@@ -161,7 +164,7 @@ class MessageRouter {
   /// wires this to the BLE transport's broadcast.
   void Function(GrassrootsPacket packet, {String? excludeBlePeerId})? onRelay;
 
-  /// Sends a sync-on-connect packet (a conveyed custody copy) back over
+  /// Sends a sync-on-connect packet (a conveyed buffered copy) back over
   /// [SyncLink] — directed at that one authenticated peer, never flooded. The
   /// coordinator routes by the link's transport.
   void Function(GrassrootsPacket packet, SyncLink link)? onSyncSend;
@@ -175,6 +178,23 @@ class MessageRouter {
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
 
+  /// The identity behind a BLE path id, or null when the path has not been
+  /// authenticated yet (no verified ANNOUNCE) or has since rotated its MAC.
+  /// Trace-only: it turns a relay record's inbound path into a real topology
+  /// EDGE (who handed us this packet), instead of leaving the offline
+  /// reconstruction to infer parent-child from timestamps — which is wrong
+  /// the moment two relays receive the same flood in parallel.
+  String? _peerHexForBleDevice(String? bleDeviceId) {
+    if (bleDeviceId == null) return null;
+    for (final peer in _peersState.peersList) {
+      if (peer.bleCentralDeviceId == bleDeviceId ||
+          peer.blePeripheralDeviceId == bleDeviceId) {
+        return _pubkeyToHex(peer.publicKey);
+      }
+    }
+    return null;
+  }
+
   /// Optional opt-in trace logger (null in tests / when logging is off).
   final ExperimentRecorder? trace;
 
@@ -184,7 +204,38 @@ class MessageRouter {
     required this.protocolHandler,
     required this.fragmentHandler,
     this.trace,
-  });
+  }) {
+    // Non-ACK exits from the DTN buffer (age expiry, cap evictions) were
+    // silent: a custody `store` with no `end` was ambiguous between "still
+    // held" and "gone". Now every exit is a custody `end` with a reason.
+    _dtnStore.onDrop = (reason, recipientHex, packet) {
+      if (!(trace?.active ?? false)) return;
+      unawaited(trace!.log({
+        'type': 'custody',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'end',
+        'reason': reason,
+        'packetId': packet.packetId,
+        'held': _dtnStore.totalCount,
+      }));
+    };
+  }
+
+  /// One record shape for every loss point. `where` names the subsystem
+  /// (relay/decrypt/frame/announce/ack/receipt/sync/…), `reason` the cause;
+  /// ids land in [extra] when in scope. Uniform so the analyzer can count
+  /// loss by site without per-type parsing.
+  void _traceDrop(String where, String reason,
+      [Map<String, dynamic> extra = const {}]) {
+    if (!(trace?.active ?? false)) return;
+    unawaited(trace!.log({
+      'type': 'drop',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': where,
+      'reason': reason,
+      ...extra,
+    }));
+  }
 
   /// Currently-reachable peer count — the temporal node degree at receipt time.
   int _reachablePeerCount() =>
@@ -193,6 +244,16 @@ class MessageRouter {
   /// Number of sealed packets currently held in the DTN store-carry-forward
   /// cache (buffer-occupancy trace field).
   int get dtnBufferedCount => _dtnStore.totalCount;
+
+  /// Distinct recipients / payload bytes in the DTN buffer (occupancy trace).
+  int get dtnBufferedRecipients => _dtnStore.recipientCount;
+  int get dtnBufferedBytes => _dtnStore.totalBytes;
+
+  /// Store-wide packet ceiling. Anything indexed against the buffer (notably
+  /// the sender's messageId → packetIds map) must be sized from this: an index
+  /// entry is dead the moment its last packet leaves the store, and no more
+  /// than this many packets can be live at once.
+  int get dtnCapacity => _dtnStore.maxTotal;
 
   // ===== Unified Packet Processing =====
 
@@ -212,6 +273,10 @@ class MessageRouter {
     String? observedIp,
     int? observedPort,
   }) async {
+    // Receipt instant, for the relay record's rx->tx dwell. Taken before any
+    // work so the dwell covers everything this node does to the packet: dedup,
+    // trial-decrypt, seal, DTN store, and handing the flood to the transport.
+    final rxAt = DateTime.now().millisecondsSinceEpoch;
     // ANNOUNCE: neighbor-local presence, self-authenticating (its payload
     // signature is verified in decodeAnnounce). Never deduped or relayed.
     if (packet.type == PacketType.announce) {
@@ -248,7 +313,8 @@ class MessageRouter {
 
     if (forUs && !firstSeen && (trace?.active ?? false)) {
       // A redundant copy of a packet addressed to us arrived (dual-leg
-      // delivery, a re-flood, or a custody conveyance) and was dropped by
+      // delivery, a re-flood, or a sync-exchange conveyance) and was dropped
+      // by
       // the packetId bloom. This is a PACKET-level event: the id is the
       // outer packetId, which is NOT the inner frame messageId — the two
       // live in different namespaces, so never join `dup` against `recv`.
@@ -265,7 +331,22 @@ class MessageRouter {
       // toward its recipient, unverified and without decrypting. Only the first
       // sighting is relayed; TTL bounds the hop count; a per-neighbor budget
       // caps flooding abuse.
-      if (firstSeen && packet.ttl > 1 && _allowRelayFrom(bleDeviceId)) {
+      if (firstSeen && packet.ttl <= 1) {
+        // The flood dies here: hop budget exhausted on a first sighting.
+        // Previously fully silent — the one place a multi-hop delivery
+        // failure leaves evidence on the node that killed it.
+        _traceDrop('relay', 'ttlExpired', {
+          'packetId': packet.packetId,
+          'fromPeer': _peerHexForBleDevice(bleDeviceId),
+        });
+      } else if (firstSeen && !_allowRelayFrom(bleDeviceId)) {
+        // Refused by the per-neighbour budget: not relayed AND not carried
+        // (carry lives inside the relay branch, deliberately).
+        _traceDrop('relay', 'rateLimited', {
+          'packetId': packet.packetId,
+          'fromPeer': _peerHexForBleDevice(bleDeviceId),
+        });
+      } else if (firstSeen && packet.ttl > 1 && _allowRelayFrom(bleDeviceId)) {
         onRelay?.call(
           packet.decrementTtl(),
           excludeBlePeerId:
@@ -292,9 +373,23 @@ class MessageRouter {
             'ttlIn': packet.ttl,
             'ttlOut': packet.ttl - 1,
             'hop': GrassrootsPacket.defaultTtl - packet.ttl + 1,
-            'recipient': recipientHex,
+            // No recipient: a relay must not need one. Paths reconstruct by
+            // packetId alone (the dedup id, cleartext by necessity); the
+            // ENDPOINTS log recipient/messageId, so an offline join still
+            // yields who it was for without the mesh carrying that.
             'fromDevice': bleDeviceId,
-            'carried': carried, // entered store-carry-forward custody
+            // The topology edge: WHO handed us this packet. Null when the
+            // path is not yet authenticated — the reconstruction then falls
+            // back to time ordering for that hop and says so.
+            'fromPeer': _peerHexForBleDevice(bleDeviceId),
+            'carried': carried, // entered the DTN memory buffer
+            // Time this node held the packet, receipt to forward, on ONE
+            // clock. End-to-end latency is the sum of these plus the carry
+            // times (custody store->convey) plus the radio time between
+            // hops — a decomposition that needs no clock sync between
+            // devices, unlike subtracting a send timestamp on one phone from
+            // a delivery timestamp on another.
+            'dwellMs': DateTime.now().millisecondsSinceEpoch - rxAt,
             'degreeAtEvent': _reachablePeerCount(),
           }));
         }
@@ -306,6 +401,7 @@ class MessageRouter {
           'event': 'dup',
           'packetId': packet.packetId,
           'fromDevice': bleDeviceId,
+          'fromPeer': _peerHexForBleDevice(bleDeviceId),
         }));
       }
       return;
@@ -316,13 +412,22 @@ class MessageRouter {
     if (packet.type != PacketType.secure) {
       debugPrint(
           'Dropping unauthenticated cleartext ${packet.type} addressed to us');
+      _traceDrop('cleartext', packet.type.name, {'packetId': packet.packetId});
       return;
     }
 
     final decrypted = await trialDecrypt?.call(packet);
     if (decrypted == null) {
       // No active session can open it (or it is a replay of a packet we already
-      // processed — the session's AEAD/nonce check rejects it).
+      // processed — the session's AEAD/nonce check rejects it). The packetId
+      // is already in the seen-set (checkAndAdd ran before decrypt), so the
+      // sync-offer filter will refuse to re-request this packet: for the
+      // pre-session race this is a REAL loss window until a bloom rotation,
+      // and this record is its only evidence.
+      _traceDrop('decrypt', 'noSession', {
+        'packetId': packet.packetId,
+        'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+      });
       return;
     }
     final (clear, senderPubkey) = decrypted;
@@ -356,6 +461,10 @@ class MessageRouter {
       frame = SecureFrame.decode(clear.payload);
     } on FormatException catch (e) {
       debugPrint('Dropping secure packet with malformed frame: $e');
+      _traceDrop('frame', 'malformed', {
+        'packetId': packet.packetId,
+        'peer': _pubkeyToHex(senderPubkey),
+      });
       return;
     }
 
@@ -366,11 +475,13 @@ class MessageRouter {
           packet: clear,
           senderPubkey: senderPubkey,
           transport: transport,
+          bleDeviceId: bleDeviceId,
+          rxAt: rxAt,
         );
       case ContentType.ack:
-        _handleAck(frame.chunk);
+        _handleAck(frame.chunk, clear, senderPubkey, transport);
       case ContentType.readReceipt:
-        _handleReadReceipt(frame.chunk);
+        _handleReadReceipt(frame.chunk, clear, senderPubkey, transport);
       case ContentType.signaling:
         _handleSignaling(
           frame.chunk,
@@ -379,16 +490,47 @@ class MessageRouter {
           observedPort: observedPort,
         );
       case ContentType.syncOffer:
-        // Custody reconciliation, sealed to this pair's session. Runs on
-        // BOTH transports — the sync exchange is the only custody
-        // conveyance path, so a UDP-only pairing must reconcile too. The
+        // Buffer reconciliation is a MESH mechanism: BLE only. UDP is
+        // direct point-to-point and moves nothing out of the buffer — it
+        // neither
+        // relays for third parties nor delivers held packets, so a sync
+        // frame arriving over it is not something we participate in. The
         // reply link carries the authenticated peer (trial decrypt proved
         // it), so replies never depend on a transport-level id lookup.
-        _handleSyncOffer(frame.chunk,
-            SyncLink(transport, senderPubkey, bleDeviceId: bleDeviceId));
+        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
+          _handleSyncOffer(frame.chunk, SyncLink(senderPubkey, bleDeviceId));
+        }
       case ContentType.syncRequest:
-        _handleSyncRequest(frame.chunk,
-            SyncLink(transport, senderPubkey, bleDeviceId: bleDeviceId));
+        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
+          _handleSyncRequest(
+              frame.chunk, SyncLink(senderPubkey, bleDeviceId));
+        }
+      case ContentType.testbedStart:
+        // DEBUG/TESTBED. The sender is authenticated (this decrypted under
+        // their session); whether to act is the coordinator's decision — it
+        // ignores the signal unless the runner was explicitly armed.
+        final expId = String.fromCharCodes(frame.chunk);
+        if (trace?.active ?? false) {
+          unawaited(trace!.log({
+            'type': 'runner',
+            't': DateTime.now().millisecondsSinceEpoch,
+            'event': 'startRx',
+            'exp': expId,
+            'peer': _pubkeyToHex(senderPubkey),
+          }));
+        }
+        onTestbedStart?.call(expId, senderPubkey);
+      case ContentType.testbedNeighbours:
+        // DEBUG/TESTBED. Armed-time only; the coordinator drops it outright
+        // once a run is under way, so it can never share the air with a
+        // measurement.
+        try {
+          final (seq, peers) =
+              ProtocolHandler.decodeTestbedNeighbours(frame.chunk);
+          onTestbedNeighbours?.call(senderPubkey, seq, peers);
+        } on FormatException catch (e) {
+          _traceDrop('neighbourGossip', 'malformed', {'error': e.message});
+        }
     }
   }
 
@@ -409,6 +551,9 @@ class MessageRouter {
       data = protocolHandler.decodeAnnounce(packet.payload);
     } catch (e) {
       debugPrint('Dropping ANNOUNCE with invalid signature/format: $e');
+      _traceDrop('announce', 'invalid', {
+        'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+      });
       return;
     }
     final pubkey = data.publicKey;
@@ -425,6 +570,9 @@ class MessageRouter {
       if (!accepted) {
         debugPrint('[trust] Dropping BLE ANNOUNCE from '
             '${_pubkeyToHex(pubkey).substring(0, 8)}');
+        _traceDrop('announce', 'trustRejected', {
+          'peer': _pubkeyToHex(pubkey),
+        });
         onBleAnnounceRejected?.call(pubkey, bleDeviceId);
         return;
       }
@@ -508,7 +656,8 @@ class MessageRouter {
 
     // debugPrint('Peer announced!');
 
-    onPeerAnnounced?.call(data, transport, isNew: isNew, udpPeerId: udpPeerId);
+    onPeerAnnounced?.call(data, transport,
+        isNew: isNew, udpPeerId: udpPeerId, bleDeviceId: bleDeviceId);
   }
 
   void _handleMessageFrame(
@@ -516,6 +665,8 @@ class MessageRouter {
     required GrassrootsPacket packet,
     required Uint8List senderPubkey,
     required PeerTransport transport,
+    String? bleDeviceId,
+    int? rxAt,
   }) {
     // Reassemble if fragmented; a single-fragment frame yields its payload
     // immediately. Nothing is delivered until the whole message is present.
@@ -546,14 +697,26 @@ class MessageRouter {
           'receivedAt': now,
           'relayHops': relayHops,
           'deliveryMethod': relayHops <= 0 ? 'direct' : 'relayed',
+          // The FINAL topology edge: the neighbour that handed us the packet,
+          // which is the original sender only on a direct delivery. `peer`
+          // above is the end-to-end sender recovered by trial decrypt — the
+          // two differ exactly when the message was relayed.
+          'fromPeer': _peerHexForBleDevice(bleDeviceId),
           'degreeAtEvent': _reachablePeerCount(),
+          // Receipt instant of the LAST packet (taken at processPacket entry,
+          // before dedup/decrypt/reassembly). t - rxAt = this node's own
+          // processing dwell for the delivery, on one clock — the recipient
+          // term of the no-sync latency decomposition. For a fragmented
+          // message it covers only the final fragment's arrival.
+          if (rxAt != null) 'rxAt': rxAt,
+          if (rxAt != null) 'procMs': now - rxAt,
         }));
       }
       // ACK back to the original sender (a recipient-addressed packet flooded
       // through the mesh). Only the first delivery ACKs: a duplicate of an
       // already-delivered message triggers nothing — dedup means drop. A
-      // sender whose ACK was lost keeps the message in custody until a read
-      // receipt confirms it or the custody age cap expires.
+      // sender whose ACK was lost keeps the message in its buffer until a read
+      // receipt confirms it or the buffer's age cap expires.
       onAckRequested?.call(senderPubkey, messageId, transport);
     } else {
       debugPrint('Duplicate message $messageId dropped.');
@@ -570,7 +733,8 @@ class MessageRouter {
     }
   }
 
-  void _handleAck(Uint8List chunk) {
+  void _handleAck(Uint8List chunk, GrassrootsPacket packet,
+      Uint8List senderPubkey, PeerTransport transport) {
     if (chunk.isEmpty) return;
     try {
       final messageId = String.fromCharCodes(chunk);
@@ -578,11 +742,28 @@ class MessageRouter {
       if (messageId.length > 36) {
         debugPrint(
             'Ignoring ACK with invalid message ID length: ${messageId.length}');
+        _traceDrop('ack', 'badId', {'packetId': packet.packetId});
         return;
+      }
+      // The ackPacketId <-> messageId join: relay/packetDup/custody records
+      // for the ACK's own mesh journey carry only its packetId — this record
+      // ties them to the message being acknowledged, making the ACK's return
+      // leg reconstructable exactly like the forward leg.
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'message',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'dir': 'ackRx',
+          'messageId': messageId,
+          'packetId': packet.packetId,
+          'peer': _pubkeyToHex(senderPubkey),
+          'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+        }));
       }
       onAckReceived?.call(messageId);
     } catch (e) {
       debugPrint('Failed to decode ACK payload: $e');
+      _traceDrop('ack', 'malformed', {'packetId': packet.packetId});
     }
   }
 
@@ -600,18 +781,32 @@ class MessageRouter {
     );
   }
 
-  void _handleReadReceipt(Uint8List chunk) {
+  void _handleReadReceipt(Uint8List chunk, GrassrootsPacket packet,
+      Uint8List senderPubkey, PeerTransport transport) {
     if (chunk.isEmpty) return;
     try {
       final messageId = String.fromCharCodes(chunk);
       if (messageId.length > 36) {
         debugPrint(
             'Ignoring read receipt with invalid message ID length: ${messageId.length}');
+        _traceDrop('receipt', 'badId', {'packetId': packet.packetId});
         return;
+      }
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'message',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'dir': 'receiptRx',
+          'messageId': messageId,
+          'packetId': packet.packetId,
+          'peer': _pubkeyToHex(senderPubkey),
+          'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
+        }));
       }
       onReadReceiptReceived?.call(messageId);
     } catch (e) {
       debugPrint('Failed to decode read receipt payload: $e');
+      _traceDrop('receipt', 'malformed', {'packetId': packet.packetId});
     }
   }
 
@@ -708,11 +903,13 @@ class MessageRouter {
     return _seenPackets.mightContain(packetId);
   }
 
-  /// Enter a self-originated sealed packet into custody: the sender is the
-  /// message's first custodian. Custody is offered in sync-on-connect,
-  /// conveyed to whoever lacks it, and ends only on ACK ([removeCustody])
+  /// Buffer a self-originated sealed packet — the sender holds its own
+  /// outgoing packets exactly as a relay holds a stranger's. Offered in
+  /// sync-on-connect,
+  /// conveyed to whoever lacks it, and ends only on ACK ([dropFromDtnBuffer])
   /// or age expiry.
-  void storeCustody(Uint8List recipientPubkey, GrassrootsPacket sealedPacket) {
+  void storeInDtnBuffer(
+      Uint8List recipientPubkey, GrassrootsPacket sealedPacket) {
     _dtnStore.store(_pubkeyToHex(recipientPubkey), sealedPacket);
     if (trace?.active ?? false) {
       unawaited(trace!.log({
@@ -729,8 +926,9 @@ class MessageRouter {
     _seenPackets.add(sealedPacket.packetId);
   }
 
-  /// End custody of [packetIds] — the recipient ACKed the message.
-  void removeCustody(Iterable<String> packetIds) {
+  /// Drop [packetIds] from the DTN memory buffer — the recipient ACKed the
+  /// message.
+  void dropFromDtnBuffer(Iterable<String> packetIds) {
     for (final id in packetIds) {
       _dtnStore.removeById(id);
       if (trace?.active ?? false) {
@@ -745,42 +943,39 @@ class MessageRouter {
     }
   }
 
-  /// All custody packets held for [recipientPubkey] (own + relayed). Test
-  /// inspection only — production custody flow goes exclusively through the
+  /// All buffered packets held for [recipientPubkey] (own + relayed). Test
+  /// inspection only — in production, buffered packets move exclusively
+  /// through the
   /// sync offer/request exchange, never a bulk read.
   @visibleForTesting
-  List<GrassrootsPacket> custodyFor(Uint8List recipientPubkey) =>
+  List<GrassrootsPacket> dtnBufferFor(Uint8List recipientPubkey) =>
       _dtnStore.packetsFor(_pubkeyToHex(recipientPubkey));
 
-  /// DEBUG/TESTBED ONLY. Empty the DTN custody store (per-step, when a field
+  /// DEBUG/TESTBED ONLY. Empty the DTN memory buffer (per-step, when a field
   /// plan asks) so one step's undelivered backlog cannot drain into the next
   /// step's measurement window. The seen/delivered blooms are deliberately
   /// KEPT — clearing them would re-deliver packets still in flight.
-  void clearCustody() => _dtnStore.clear();
+  void clearDtnBuffer() => _dtnStore.clear();
 
   // ===== Sync-on-connect (DTN anti-entropy) =====
   //
-  // Epidemic custody replication: on meeting a new neighbor, each side offers
+  // Epidemic replication of the DTN memory buffer: on meeting a new
+  // neighbor, each side offers
   // the packetIds its DTN store carries; the other requests the ones it has
   // not seen; the offerer conveys the stored sealed packets over that link.
   // The conveyed packets enter the neighbor's normal processPacket path
   // (dedup → deliver / relay / DTN-store), so carried messages spread through
   // mobile relays instead of waiting for the recipient itself to appear.
   // Reconciliation operates purely on cleartext packetIds — content stays
-  // sealed end-to-end and no custody is ever *transferred*, only replicated.
+  // sealed end-to-end and no buffer entry is ever *transferred*, only
+  // replicated.
 
   /// Build the sync offer packets advertising packetIds currently in the DTN
   /// store (chunked to fit single BLE writes). Empty when carrying nothing —
   /// the common case, costing zero packets.
   ///
-  /// [onlyRecipientHex] restricts the offer to packets addressed to that one
-  /// peer: the UDP form. UDP is direct point-to-point and carries no relay
-  /// custody, so offering a UDP peer packets destined for third parties
-  /// would invite conveyance the transport never forwards.
-  List<Uint8List> buildSyncOffers({String? onlyRecipientHex}) {
-    final ids = onlyRecipientHex == null
-        ? _dtnStore.carriedPacketIds()
-        : [for (final p in _dtnStore.packetsFor(onlyRecipientHex)) p.packetId];
+  List<Uint8List> buildSyncOffers() {
+    final ids = _dtnStore.carriedPacketIds();
     if (ids.isEmpty) return const [];
     return buildSyncPayloads(ids);
   }
@@ -793,7 +988,8 @@ class MessageRouter {
     try {
       offered = decodeSyncIds(payload);
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed offer from ${link.label}: $e');
+      debugPrint('[sync] Malformed offer from ${link.bleDeviceId}: $e');
+      _traceDrop('sync', 'malformedOffer', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
     }
     final wanted =
@@ -801,7 +997,7 @@ class MessageRouter {
     if (wanted.isEmpty) return;
     debugPrint(
         '[sync] Requesting ${wanted.length}/${offered.length} offered '
-        'packet(s) from ${link.label}');
+        'packet(s) from ${link.bleDeviceId}');
     for (final payload in buildSyncPayloads(wanted)) {
       onSyncFrame?.call(ContentType.syncRequest, payload, link);
     }
@@ -816,14 +1012,29 @@ class MessageRouter {
     try {
       requested = decodeSyncIds(payload);
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed request from ${link.label}: $e');
+      debugPrint('[sync] Malformed request from ${link.bleDeviceId}: $e');
+      _traceDrop('sync', 'malformedRequest', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
     }
     var conveyed = 0;
-    for (final id in requested) {
+    for (var i = 0; i < requested.length; i++) {
+      final id = requested[i];
       final stored = _dtnStore.packetById(id);
-      if (stored == null) continue; // expired/evicted since the offer
-      if (!_allowRelayFrom(link.budgetKey)) break; // budget exhausted
+      if (stored == null) {
+        // Expired/evicted since the offer: the requester never learns, and
+        // is healed only by a future contact.
+        _traceDrop('sync', 'staleOffer', {'packetId': id});
+        continue;
+      }
+      if (!_allowRelayFrom(link.bleDeviceId)) {
+        // Budget exhausted mid-conveyance: everything after this point in
+        // the request silently waits for the next sync round.
+        _traceDrop('sync', 'budgetExhausted', {
+          'remaining': requested.length - i,
+          'peer': _pubkeyToHex(link.peerPubkey),
+        });
+        break;
+      }
       onSyncSend?.call(stored, link);
       conveyed++;
       if (trace?.active ?? false) {
@@ -832,14 +1043,14 @@ class MessageRouter {
           't': DateTime.now().millisecondsSinceEpoch,
           'event': 'convey',
           'packetId': id,
-          'toDevice': link.label,
+          'toDevice': link.bleDeviceId,
         }));
       }
     }
     if (conveyed > 0) {
       debugPrint(
           '[sync] Conveyed $conveyed/${requested.length} requested '
-          'packet(s) to ${link.label}');
+          'packet(s) to ${link.bleDeviceId}');
     }
   }
 

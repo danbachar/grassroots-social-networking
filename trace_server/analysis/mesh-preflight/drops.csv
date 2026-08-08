@@ -1,0 +1,16 @@
+_device,where,reason,count
+d8254397,ackIndex,evicted,4734
+5abc4da1,ackIndex,evicted,3936
+907a2f08,relay,rateLimited,3914
+2537c7bf,relay,rateLimited,2789
+2537c7bf,decrypt,noSession,1742
+d8254397,decrypt,noSession,1393
+907a2f08,decrypt,noSession,1355
+5abc4da1,decrypt,noSession,913
+d8254397,relay,rateLimited,825
+2537c7bf,bleBroadcast,writeFailed,13
+907a2f08,bleBroadcast,writeFailed,3
+2537c7bf,bleSend,writeFailed,2
+d8254397,bleBroadcast,writeFailed,2
+d8254397,bleSend,noPath,2
+2537c7bf,bleRx,notReady,1

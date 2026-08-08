@@ -14,7 +14,7 @@ enum PacketType {
   /// is one opaque `secure` packet: the content type and any fragmentation live
   /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
   /// an opaque, recipient-addressed blob — never the message class. Sync-on-
-  /// connect control frames ride inside it too, so custody inventories are
+  /// connect control frames ride inside it too, so buffer contents are
   /// never on the air in the clear.
   secure(0x03);
 

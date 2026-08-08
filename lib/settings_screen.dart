@@ -37,9 +37,23 @@ class SettingsScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final VoidCallback? onResetCustody;
+  final VoidCallback? onResetDtnBuffer;
+  final Future<Map<String, dynamic>> Function()? onCryptoBench;
+  final int Function()? bleWireBytes;
+  final bool Function()? bleUsable;
+  final Stream<bool>? bleUsableChanges;
+  final Future<int> Function(String expId)? onBroadcastStart;
+
+  /// DEBUG/TESTBED. Armed-time mesh gossip, and the view it builds.
+  final Future<int> Function()? onGossipNeighbours;
+  final int Function()? sessionPeerCount;
+  final int Function()? meshComponentSize;
+  final VoidCallback? onClearMeshView;
+  final void Function(void Function(String expId)? listener)?
+      registerStartListener;
   final Future<int?> Function(Uint8List peer,
       {required String leg, required int seq})? sendRaw;
+  final Future<void> Function(bool on)? onSetBle;
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
@@ -59,8 +73,19 @@ class SettingsScreen extends StatefulWidget {
     this.onStopBulk,
     this.sendMessage,
     this.onResetSessions,
-    this.onResetCustody,
+    this.onResetDtnBuffer,
+    this.onCryptoBench,
+    this.bleWireBytes,
+    this.bleUsable,
+    this.bleUsableChanges,
+    this.onBroadcastStart,
+    this.registerStartListener,
+    this.onGossipNeighbours,
+    this.sessionPeerCount,
+    this.meshComponentSize,
+    this.onClearMeshView,
     this.sendRaw,
+    this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
     this.registerAckListener,
@@ -292,8 +317,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onStopBulk: widget.onStopBulk,
                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
-                      onResetCustody: widget.onResetCustody,
+                      onResetDtnBuffer: widget.onResetDtnBuffer,
+                      onCryptoBench: widget.onCryptoBench,
+                      bleWireBytes: widget.bleWireBytes,
+                      bleUsable: widget.bleUsable,
+                      bleUsableChanges: widget.bleUsableChanges,
+                      onBroadcastStart: widget.onBroadcastStart,
+                      registerStartListener: widget.registerStartListener,
+                      onGossipNeighbours: widget.onGossipNeighbours,
+                      sessionPeerCount: widget.sessionPeerCount,
+                      meshComponentSize: widget.meshComponentSize,
+                      onClearMeshView: widget.onClearMeshView,
                       sendRaw: widget.sendRaw,
+                      onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
                       registerAckListener: widget.registerAckListener,

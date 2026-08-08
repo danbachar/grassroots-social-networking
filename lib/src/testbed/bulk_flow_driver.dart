@@ -44,9 +44,10 @@ class _FlowRun {
 /// evaluation: per flow where this device is the source, keeps
 /// `config.inFlight` messages of `config.payloadBytes` outstanding, sending
 /// the next only when one is ACKed end-to-end — a message-level ARQ window
-/// that saturates the link through the normal custody path. Messages are
+/// that saturates the link through the normal buffered path. Messages are
 /// NEVER re-sent by the driver: a lost message simply leaves the window
-/// (custody/sync may still deliver it; the trace shows it as a late or
+/// (the buffer and sync exchange may still deliver it; the trace shows it as
+/// a late or
 /// missing ACK). Goodput is computed offline from the `message` trace
 /// records; the driver only marks the flow boundaries.
 class BulkFlowDriver {

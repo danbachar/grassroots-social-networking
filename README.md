@@ -33,8 +33,9 @@ lib/
     routing/                         Packet routing between transports and the app
     protocol/, proto/                Wire formats
     store/                           Redux state, actions, reducers
-    trace/                           Opt-in diagnostic traces (contacts, density, battery,
-                                     coarse location) for field experiments
+    trace/                           Experiment recorder + wire-byte ledger for the
+                                     testbed evaluation (records only while a run is
+                                     explicitly started; nothing automatic)
 docs/                                Protocol spec (GLP Networking API), design documents
 test/                                Unit and integration tests
 trace_server/                        Self-hosted trace-upload server (Python + Caddy)
@@ -86,9 +87,18 @@ Without the define, trace uploads stay inert (see [trace_config.dart](lib/src/tr
 
 Host the APK on any HTTPS server and install it by opening the URL on the phone (Android will ask to allow installs from the browser). Updates install over the top as long as the signing key and `applicationId` stay the same — keep the keystore safe and backed up. Bump `version:` in `pubspec.yaml` for each release; Android refuses downgrades.
 
-## Diagnostic traces
+## Experiment traces
 
-For field experiments the app can record opt-in traces — contact events, peer density, buffer/battery state, coarse background location — and upload them to a self-hosted collector. See [trace_server/README.md](trace_server/README.md) for deployment and [trace_server/schema.md](trace_server/schema.md) for the record schema.
+For the testbed evaluation the app can record a run — link stages, RSSI, messages,
+relay/custody events, wire bytes, and fuel-gauge power — to a local JSONL file, and
+upload it to a self-hosted collector on an explicit action. There is no automatic
+collection: nothing is recorded until an experiment is started from the testbed
+screen, and nothing leaves the device without pressing upload or share.
+
+See [docs/testbed_experiments.md](docs/testbed_experiments.md) for the record types
+and the experiment harnesses, [trace_server/README.md](trace_server/README.md) for
+deploying the collector, and [trace_server/schema.md](trace_server/schema.md) for
+the upload envelope contract.
 
 ## License
 

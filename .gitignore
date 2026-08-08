@@ -55,3 +55,8 @@ docs/*.out
 docs/*.synctex.gz
 docs/*.toc
 claude/
+
+# Trace archives and the collector database never belong in git —
+# a 735 MB tarball once rode a bulk git add into history and killed a push.
+*.tar.gz
+trace_server/data/

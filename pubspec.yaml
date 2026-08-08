@@ -26,6 +26,12 @@ dependencies:
   
   # Permissions handling
   permission_handler: ^11.0.0
+
+  # One GPS fix per phone when it is placed, so the topology can be drawn to
+  # true scale. Sampled once at placement -- never streamed, because the
+  # phones are static and a continuously powered GPS radio would show up in
+  # the power measurements.
+  geolocator: ^13.0.1
   
   # UUID generation
   uuid: ^4.2.0

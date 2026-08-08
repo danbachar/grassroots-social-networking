@@ -189,6 +189,10 @@ class BleTransportService extends TransportService {
   /// fixed cadence while tracing is active.
   final WireLedger _wireLedger = WireLedger();
 
+  /// Monotonic tx+rx bytes on this transport instance — the field runner's
+  /// proof that a scripted `bleOn: true` segment actually reached the air.
+  int get wireBytes => _wireLedger.totalBytes;
+
   /// Wire-ledger hook: resolve one of our sealed packets' inner content type
   /// (set by the coordinator, which does the sealing). See
   /// [WireLedger.secureContentFor].
@@ -246,9 +250,56 @@ class BleTransportService extends TransportService {
     }));
   }
 
+  /// Every currently-live leg, as the link records that WOULD have been
+  /// written had the trace been running when they connected. Logged once at
+  /// experiment start: links formed before the recording — phones sitting
+  /// together with radios on — are otherwise invisible to any topology
+  /// reconstruction, which replays events and cannot see an edge whose
+  /// connect predates the file. The home preflight drew its founding trio at
+  /// degree 0 for exactly this reason while delivering 99.9% of its sends.
+  List<Map<String, dynamic>> liveLinkSnapshot() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    return [
+      for (final path in _readyPaths)
+        {
+          'type': 'link',
+          't': now,
+          'event': 'connected',
+          'path': path.pathId,
+          'role': path.pathId.startsWith('peripheral:')
+              ? 'peripheral'
+              : 'central',
+          // Not a fresh transition: this leg was already up when the
+          // recording began.
+          'snapshot': true,
+          ...?_peerField(path.pathId),
+        },
+    ];
+  }
+
   Map<String, dynamic>? _peerField(String pathId) {
     final hex = _peerHexForPathId(pathId);
     return hex == null ? null : {'peer': hex};
+  }
+
+  /// Public drain for the experiment-stop tail: the periodic timer fires
+  /// every 10s, so up to one interval of traffic sat undrained at stop.
+  void drainWireLedgerNow() => _drainWireLedger();
+
+  /// Uniform loss record, transport edition — the wire ledger only counts
+  /// SUCCESSFUL writes, so without these a failed write is absent from both
+  /// the wire totals and any error stream.
+  void _traceDrop(String where, String reason,
+      [Map<String, dynamic> extra = const {}]) {
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'drop',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': where,
+      'reason': reason,
+      'transport': 'ble',
+      ...extra,
+    }));
   }
 
   void _drainWireLedger() {
@@ -387,6 +438,17 @@ class BleTransportService extends TransportService {
           _startSlotTimer();
         } catch (e) {
           debugPrint('Failed to start advertising: $e');
+          // Undiscoverable: no inbound legs, no peripheral role, for as long
+          // as this persists — while the transport can still report active
+          // via the scan side. Previously invisible in the trace.
+          if (_tracing) {
+            unawaited(trace!.log({
+              'type': 'link',
+              't': DateTime.now().millisecondsSinceEpoch,
+              'event': 'advertiseFailed',
+              'transport': 'ble',
+            }));
+          }
         }
       } else {
         // Make sure we aren't lingering as an advertiser from a previous
@@ -539,7 +601,20 @@ class BleTransportService extends TransportService {
               '(the unfiltered scan is being silently muted under load).',
     );
     _lastAdvertisementAt = t;
-    await _startContinuousScan();
+    final restarted = await _startContinuousScan();
+    // The silence window that triggered this was a discovery-dead interval —
+    // indistinguishable in the trace from an empty room until now.
+    if (_tracing) {
+      unawaited(trace!.log({
+        'type': 'link',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'scanRestart',
+        'transport': 'ble',
+        'silenceSec': scanSilenceRestart.inSeconds,
+        'filtered': _scanTargetUuids.isNotEmpty,
+        'ok': restarted,
+      }));
+    }
   }
 
   /// Candidate service UUIDs of every peer we hold a live inbound peripheral
@@ -680,6 +755,11 @@ class BleTransportService extends TransportService {
   Future<bool> sendToPeer(String peerId, Uint8List data) async {
     final path = _paths[peerId];
     if (path == null || !_isReady(path)) {
+      // Previously returned false with no log at all — the silent-est send
+      // failure in the codebase. Sync conveyances and directed sends vanish
+      // here when a path dies mid-operation.
+      _traceDrop('bleSend', path == null ? 'noPath' : 'notReady',
+          {'path': peerId});
       return false;
     }
     try {
@@ -688,6 +768,7 @@ class BleTransportService extends TransportService {
       return true;
     } catch (e) {
       debugPrint('send() failed for $peerId: $e');
+      _traceDrop('bleSend', 'writeFailed', {'path': peerId});
       return false;
     }
   }
@@ -713,6 +794,10 @@ class BleTransportService extends TransportService {
         sent++;
       } catch (e) {
         debugPrint('broadcast send() failed for ${path.pathId}: $e');
+        // A flood leg that failed: the packet reached fewer neighbours than
+        // selectBroadcastTargets chose. aired counts successes; this names
+        // the leg that missed.
+        _traceDrop('bleBroadcast', 'writeFailed', {'path': path.pathId});
       }
     }
     return sent;
@@ -1166,6 +1251,7 @@ class BleTransportService extends TransportService {
       );
     } catch (e) {
       debugPrint('Failed to deserialize packet: $e');
+      _traceDrop('bleRx', 'deserialize', {'path': fromDeviceId});
     }
   }
 
@@ -1549,9 +1635,16 @@ class BleTransportService extends TransportService {
     if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) return;
     // Drop payloads unless the plugin currently marks the path ready. This
     // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
-    // not-sendable paths from populating PeerState BLE role fields.
+    // not-sendable paths from populating PeerState BLE role fields. NOTE the
+    // wire ledger counted these bytes above — rx totals include them — so
+    // the drop record is what reconciles "bytes on the air" with "packets
+    // processed".
     final path = _paths[payload.pathId];
-    if (path == null || !_isReady(path)) return;
+    if (path == null || !_isReady(path)) {
+      _traceDrop('bleRx', path == null ? 'unknownPath' : 'notReady',
+          {'path': payload.pathId, 'bytes': payload.value.length});
+      return;
+    }
 
     final role = payload.role == ble.BleRole.central
         ? BleRole.central

@@ -41,117 +41,6 @@ class FieldPlanPresets {
     );
   }
 
-  /// Control-plane line sweep: one fully cold formation trial per step
-  /// (links bounced, sessions dropped, custody emptied), [repeat] trials per
-  /// distance. With every trial independent there is nothing for a retreat
-  /// pass to add — direction hysteresis (formation vs survival range) only
-  /// exists in the WARM variant, so [retreat] defaults off and is the knob
-  /// for that separate experiment (resets off + retreat on).
-  static FieldPlan lineSweep({
-    String expId = 'cp-line-1',
-    List<int> distances = const [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
-    int dwellSec = 30,
-    int anchorDwellSec = 30,
-    int sendsPerStep = 100,
-    int sendBytes = defaultSendBytes,
-    bool retreat = false,
-    int repeat = 10,
-    bool resetSessions = true,
-    bool resetLinks = true,
-  }) {
-    final trials = repeat < 1 ? 1 : repeat;
-    // Build the ordered (distance, label) sequence first, then derive each
-    // step's autoAdvance from whether its distance repeats the previous one.
-    final seq = <(int, String)>[];
-    void add(int d, String dir) {
-      for (var i = 1; i <= trials; i++) {
-        seq.add((d, trials > 1 ? 'd=$d $dir t$i' : 'd=$d $dir'));
-      }
-    }
-
-    final approach = [...distances]..sort();
-    for (final d in approach) {
-      add(d, 'approach');
-    }
-    if (retreat) {
-      // Exclude the two nearest anchors from the retreat — the hysteresis is
-      // at the range edge, and skipping them keeps the run shorter.
-      final back = approach.where((d) => d > 5).toList()
-        ..sort((a, b) => b.compareTo(a));
-      for (final d in back) {
-        add(d, 'retreat');
-      }
-    }
-    return FieldPlan(
-      expId: expId,
-      steps: _stepsFrom(seq, sendsPerStep, sendBytes,
-          (d) => d <= 5 ? anchorDwellSec : dwellSec),
-      settleSec: 30,
-      resetSessions: resetSessions,
-      resetLinks: resetLinks,
-      // Every trial is a fully cold, uncontaminated formation attempt: BLE
-      // stack bounced, Noise sessions dropped, DTN store emptied. (The
-      // seen/delivered blooms are kept, and cannot contaminate: field-plan
-      // message ids embed the step index, so no id ever repeats across
-      // steps.)
-      resetCustody: true,
-    );
-  }
-
-  /// Turn an ordered (distance, label) sequence into steps, marking a step
-  /// [FieldStep.autoAdvance] when its distance repeats the previous step's
-  /// (a same-position trial → no walk → no IN POSITION tap).
-  static List<FieldStep> _stepsFrom(List<(int, String)> seq, int sendCount,
-      int sendBytes, int Function(int d) dwellFor) {
-    int? prev;
-    final steps = <FieldStep>[];
-    for (final (d, label) in seq) {
-      steps.add(FieldStep(
-        label: label,
-        dwellSec: dwellFor(d),
-        sendCount: sendCount,
-        sendBytes: sendBytes,
-        autoAdvance: prev == d,
-      ));
-      prev = d;
-    }
-    return steps;
-  }
-
-  /// Data-plane throughput: each side length is a bulk-flow dwell. Sessions
-  /// stay warm (throughput, not establishment); load the bulk-flow config
-  /// separately. Dwell runs a little longer than the flow window.
-  static FieldPlan dataPlane({
-    String expId = 'dp-tri-baseline',
-    List<int> sideLengths = const [10, 20, 40],
-    int dwellSec = 150,
-    int repeat = 1,
-    bool resetSessions = false,
-    bool resetLinks = false,
-  }) {
-    final trials = repeat < 1 ? 1 : repeat;
-    int? prev;
-    final steps = <FieldStep>[];
-    for (final s in sideLengths) {
-      for (var i = 1; i <= trials; i++) {
-        steps.add(FieldStep(
-          label: trials > 1 ? 'side=$s t$i' : 'side=$s',
-          dwellSec: dwellSec,
-          bulk: true,
-          autoAdvance: prev == s, // same side length as the previous trial
-        ));
-        prev = s;
-      }
-    }
-    return FieldPlan(
-      expId: expId,
-      settleSec: 30,
-      resetSessions: resetSessions,
-      resetLinks: resetLinks,
-      steps: steps,
-    );
-  }
-
   /// Throughput: saturate the link for [dwellSec] on [sendLanes] concurrent
   /// send lanes, none of them ACK-gated. Sessions/links stay warm (this
   /// measures the data plane, not establishment).
@@ -236,7 +125,8 @@ class FieldPlanPresets {
     }
     return FieldPlan(
       expId: expId,
-      // Longer than usual: an overrun leaves a backlog of custody and ACKs
+      // Longer than usual: an overrun leaves a backlog of buffered messages
+      // and ACKs
       // still draining when the dwell ends, and cutting the recording there
       // would score those sends as lost when they were merely late.
       settleSec: 90,
@@ -249,7 +139,7 @@ class FieldPlanPresets {
   /// RAW link throughput: MTU-sized unsealed blobs pushed as fast as the
   /// send path drains, one step per GATT leg — notify (our peripheral leg),
   /// write (our central leg), stripe (alternate blobs across both). No seal,
-  /// no ACK, no custody: this measures the naked GATT pipe, and the gap to
+  /// no ACK, no buffering: this measures the naked GATT pipe, and the gap to
   /// the protocol numbers is the measured cost of the stack. The receiver
   /// counts bytes in its wire ledger and drops the blobs before the parser.
   static FieldPlan rawLink({
@@ -283,86 +173,326 @@ class FieldPlanPresets {
     return FieldPlan(
       expId: expId,
       // Nothing is in flight after the dwell at the APP layer (no ACKs, no
-      // custody), but the OS queue may still be draining: the settle window
+      // buffered), but the OS queue may still be draining: the settle window
       // plus the next step's link bounce absorb it.
       settleSec: 15,
       resetSessions: resetSessions,
       resetLinks: resetLinks,
-      resetCustody: false,
+      resetDtnBuffer: false,
       steps: steps,
     );
   }
 
-  /// TIER 1 — multi-hop relay. Run on the SOURCE (A). B sits between A and
-  /// C, in range of both; C is out of A's range. Every step addresses C
-  /// alone ([FieldStep.sendTo] = C's pubkey prefix), so a delivery proves
-  /// the message crossed B. B and C record only. Offline, joining `relay`
-  /// records on packetId reconstructs A→B→C and the hop count.
-  static FieldPlan multiHop({
-    String expId = 'mesh-hop-1',
-    required String targetPrefix,
-    int dwellSec = 120,
-    int sends = 30,
-    int repeat = 1,
-    bool resetSessions = false,
-    bool resetLinks = false,
+  /// POWER BASELINE: screen-constant desk ladder isolating the BLE stack's
+  /// standing and active cost. Both phones run the SAME labels on
+  /// complementary roles, so each 10-min segment is a condition on both:
+  ///
+  ///   base   — BLE down on both          (screen + app + sampling floor)
+  ///   solo   — role-1 up alone           (advertise+scan, no peer)
+  ///   solo2  — role-2 up alone
+  ///   linked — both up, session, silent  (connection + ANNOUNCE upkeep)
+  ///   light  — role-1 sends paced        (~1 msg/s marginal cost)
+  ///   light2 — role-2 sends paced
+  ///   heavy  — role-1 saturates, 1 sender (active ceiling: radio + seal CPU)
+  ///   heavy2 — role-2 saturates
+  ///
+  /// One tap starts it; every later step auto-advances and the runner toggles
+  /// BLE itself ([FieldStep.bleOn]). Repeats interleave the ladder so battery
+  /// and thermal drift average out instead of biasing one condition. Run
+  /// UNPLUGGED at fixed minimum brightness; deltas between conditions are the
+  /// result, absolute draw is screen-dominated.
+  /// DIAGNOSTIC. Bounces BLE off and back on at increasing down-times to
+  /// find where the bring-up stops working.
+  ///
+  /// Exists because a 2h power ladder was recorded against a radio that never
+  /// returned after its first `bleOn: false`, while the 60s pre-check bounced
+  /// the same code path fine. The only obvious difference was how long BLE
+  /// stayed down, and nothing tested that. Each `down` step holds the radio
+  /// off for a different span; each `up` step turns it back on and dwells
+  /// 60s — long enough for the runner's dead-radio watchdog to fire, so a
+  /// failure aborts the run and names the step instead of being inferred from
+  /// silence hours later.
+  ///
+  /// Run on BOTH phones simultaneously (they need each other to move bytes).
+  /// ~22 minutes. A clean pass clears BLE bouncing; an abort gives the
+  /// threshold directly.
+  static FieldPlan bounceStress({
+    String expId = 'bounce-1',
+    List<int> downSec = const [60, 120, 300, 600],
+    int upSec = 60,
   }) {
-    final trials = repeat < 1 ? 1 : repeat;
+    final steps = <FieldStep>[];
+    for (final down in downSec) {
+      steps.add(FieldStep(
+        label: 'down=${down}s',
+        dwellSec: down,
+        bleOn: false,
+        autoAdvance: steps.isNotEmpty,
+      ));
+      steps.add(FieldStep(
+        label: 'up after ${down}s',
+        dwellSec: upSec,
+        bleOn: true,
+        autoAdvance: true,
+      ));
+    }
     return FieldPlan(
       expId: expId,
-      settleSec: 60, // relayed paths deliver later than direct ones
-      resetSessions: resetSessions,
-      resetLinks: resetLinks,
-      // Custody surviving across steps IS the subject of this test.
-      resetCustody: false,
-      steps: [
-        for (var i = 1; i <= trials; i++)
-          FieldStep(
-            label: trials > 1 ? 'hop t$i' : 'hop',
-            dwellSec: dwellSec,
-            sendCount: sends,
-            sendTo: targetPrefix,
-            autoAdvance: i > 1,
-          ),
-      ],
+      settleSec: 15,
+      resetSessions: false,
+      resetLinks: false,
+      steps: steps,
     );
   }
 
-  /// TIER 1 — store-carry-forward (the mule). Run on the SOURCE (A), with C
-  /// far away and NO relay in between: sends enter custody with nowhere to
-  /// go. A mule device (B) then walks A→C, picking the packets up and
-  /// delivering them. Steps: send into the void, then a long hold while the
-  /// mule travels. Offline: `custody` store→convey→end plus C's `recv`
-  /// timestamps give the carry latency.
-  static FieldPlan storeCarry({
-    String expId = 'mesh-dtn-1',
-    required String targetPrefix,
-    int sends = 20,
-    int holdMin = 5,
-    bool resetSessions = false,
-    bool resetLinks = false,
-  }) =>
-      FieldPlan(
-        expId: expId,
-        settleSec: 60,
-        resetSessions: resetSessions,
-        resetLinks: resetLinks,
-        // The seeded custody must survive into the hold step for the mule.
-        resetCustody: false,
-        steps: [
-          FieldStep(
-            label: 'seed custody (C unreachable)',
-            dwellSec: 60,
-            sendCount: sends,
-            sendTo: targetPrefix,
-          ),
-          FieldStep(
-            label: 'mule carries',
-            dwellSec: holdMin * 60,
-            autoAdvance: true, // nothing to walk to on the source
-          ),
-        ],
-      );
+  /// A REAL discharge curve: hold one condition until the battery reaches the
+  /// floor where Android's battery saver engages (default 15%).
+  ///
+  /// The ladder measures a rate and the battery-life figures extrapolate it
+  /// as a straight line. That extrapolation is sound in the middle of a
+  /// Li-ion curve — the ladder's own 96->66% trajectory is linear to within
+  /// 2 percentage points — but it runs straight through the bottom knee,
+  /// where voltage sags and draw is no longer constant. This measures that
+  /// region instead of assuming it.
+  ///
+  /// Stops at [floorPct] rather than at empty on purpose: below the saver
+  /// threshold the OS throttles CPU and radio, so the system under
+  /// measurement is no longer the one being characterised.
+  ///
+  /// The saturating variant is the efficient one — [condition] `heavy` has
+  /// P1 sending while P2 receives, so ONE run yields two different real
+  /// curves at once. Run on both phones with matching roles.
+  ///
+  /// [dwellSec] is deliberately longer than any battery can last; the run
+  /// ends on state of charge (ExperimentRecorder.onBatteryFloor), never on
+  /// the clock.
+  static FieldPlan dischargeRun({
+    String expId = 'discharge-1',
+    required int role, // 1 or 2 — which phone this plan runs on
+    String condition = 'heavy', // base | linked | light | heavy
+    int dwellSec = 20 * 3600,
+    int sendCount = 20000,
+  }) {
+    final one = role == 1;
+    final step = switch (condition) {
+      'base' => FieldStep(label: 'discharge base', dwellSec: dwellSec, bleOn: false),
+      'linked' => FieldStep(label: 'discharge linked', dwellSec: dwellSec, bleOn: true),
+      'light' => FieldStep(
+          label: 'discharge light',
+          dwellSec: dwellSec,
+          bleOn: true,
+          sendCount: one ? sendCount : 0),
+      _ => FieldStep(
+          label: 'discharge heavy',
+          dwellSec: dwellSec,
+          bleOn: true,
+          saturate: one),
+    };
+    return FieldPlan(
+      expId: expId,
+      settleSec: 30,
+      resetSessions: false,
+      resetLinks: false,
+      steps: [step],
+    );
+  }
+
+  static FieldPlan powerBaseline({
+    String expId = 'pw-base-1',
+    required int role, // 1 or 2 — which phone this plan runs on
+    int dwellSec = 600,
+    int reps = 2,
+    int lightSends = 600,
+    int settleSec = 30,
+    /// Which conditions to run, in canonical order regardless of the order
+    /// given. Null runs the full ladder; a subset is how the screen-off
+    /// pre-check stays short while exercising the SAME code path as the real
+    /// run (BLE toggling, step advance, sends) rather than a separate toy
+    /// plan that could pass while the real one fails.
+    List<String>? conditions,
+  }) {
+    final r = reps < 1 ? 1 : reps;
+    final one = role == 1;
+    final want = conditions?.toSet();
+    // Canonical order. Each entry configures the one FieldStep it owns; the
+    // role decides who is radio-up during solo and who sends under load, so
+    // both phones stamp identical labels for the same wall-clock condition.
+    final ladder = <String, FieldStep Function(String label)>{
+      'base': (l) => FieldStep(label: l, dwellSec: dwellSec, bleOn: false),
+      'solo': (l) => FieldStep(label: l, dwellSec: dwellSec, bleOn: one),
+      'solo2': (l) => FieldStep(label: l, dwellSec: dwellSec, bleOn: !one),
+      'linked': (l) => FieldStep(label: l, dwellSec: dwellSec, bleOn: true),
+      'light': (l) => FieldStep(
+          label: l, dwellSec: dwellSec, sendCount: one ? lightSends : 0),
+      'light2': (l) => FieldStep(
+          label: l, dwellSec: dwellSec, sendCount: one ? 0 : lightSends),
+      'heavy': (l) => FieldStep(label: l, dwellSec: dwellSec, saturate: one),
+      'heavy2': (l) => FieldStep(label: l, dwellSec: dwellSec, saturate: !one),
+    };
+
+    final steps = <FieldStep>[];
+    for (var i = 1; i <= r; i++) {
+      final suffix = r > 1 ? ' r$i' : '';
+      for (final entry in ladder.entries) {
+        if (want != null && !want.contains(entry.key)) continue;
+        final step = entry.value('${entry.key}$suffix');
+        // Only the very first step of the whole plan waits for the tap.
+        steps.add(FieldStep(
+          label: step.label,
+          dwellSec: step.dwellSec,
+          sendCount: step.sendCount,
+          saturate: step.saturate,
+          bleOn: step.bleOn,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: settleSec,
+      resetSessions: false,
+      resetLinks: false,
+      steps: steps,
+    );
+  }
+
+  /// TIER 2 — the dilating clique: mesh PERFORMANCE as membership grows.
+  /// The mesh gains one phone per block (the operator turns its Bluetooth on
+  /// at the prompt); every phone that is up saturates throughout, and each
+  /// size holds for [repeat] stable reps before the next phone joins.
+  ///
+  /// Deliberately NO toggling inside a block: a flapping neighbour makes the
+  /// standing phones spend their airtime on discovery, connection and
+  /// handshakes instead of carrying load, so churn and throughput would
+  /// contaminate each other. Join/establishment behaviour is the SEPARATE
+  /// [joinTime] run — split by design.
+  static FieldPlan meshScale({
+    String expId = 'mesh-scale-1',
+    required int role,
+    int maxDevices = 8,
+    int dwellSec = 120,
+    int sends = 60,
+    int repeat = 10,
+    bool saturate = true,
+    // ONE lane, from the ceiling sweep: 1 lane delivered 29.5 and 26.6 msg/s
+    // at 100%/97% while 4 lanes delivered 20.0 and 15.1 — extra lanes only
+    // deepened the queue on a single link, and in an 8-phone shared medium
+    // they multiply RF contention for negative return. One lane is also
+    // closed-loop: each phone self-paces to what the mesh around it actually
+    // drains, which is the sustainable-load curve, not an overload artifact.
+    int sendLanes = 1,
+    int placementSec = 300,
+    int alignSec = 600,
+  }) {
+    final top = maxDevices < 3 ? 3 : maxDevices;
+    final trials = repeat < 1 ? 1 : repeat;
+    final steps = <FieldStep>[];
+    for (var n = 3; n <= top; n++) {
+      final joined = role <= n;
+      for (var t = 1; t <= trials; t++) {
+        steps.add(FieldStep(
+          label: trials > 1 ? 'n=$n t$t' : 'n=$n',
+          dwellSec: dwellSec,
+          saturate: joined && saturate,
+          sendLanes: sendLanes,
+          sendCount: (joined && !saturate) ? sends : 0,
+          bleOn: joined,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: 60, // relayed paths deliver later than direct ones
+      autoAdvanceGapSec: 30,
+      resetSessions: false,
+      resetLinks: false,
+      // Buffer persistence across steps is part of what is measured: a
+      // packet held while the mesh was too sparse may deliver once density
+      // rises, and clearing between steps would erase exactly that effect.
+      resetDtnBuffer: false,
+      deviceOrder: role,
+      manualJoin: true,
+      placementSec: placementSec,
+      alignSec: alignSec,
+      sampleGps: false,
+      steps: steps,
+    );
+  }
+
+  /// TIER 2 — session ESTABLISHMENT as membership grows: the frontier run.
+  /// The mesh grows one phone per block, and within each block the newest
+  /// phone — the frontier — cycles system Bluetooth off/on [repeat] times:
+  /// that many COLD joins per (N, spacing), each re-running discovery,
+  /// connection and the XX handshakes (sessions are dropped while its radio
+  /// is down). When its block ends it anneals into the topology and the next
+  /// phone becomes the frontier.
+  ///
+  /// The standing mesh stays QUIET — no saturating workload — because this
+  /// run measures link formation, and formation under load belongs to a
+  /// different experiment than formation itself. The performance question is
+  /// the separate [meshScale] run; the split is deliberate. The joiner sends
+  /// a handful of messages per rep so the `usable` stage is exercised.
+  ///
+  /// Establishment is measured by the joining phone alone (bt-on ->
+  /// per-peer session), so no cross-device clock is involved.
+  static FieldPlan joinTime({
+    String expId = 'join-time-1',
+    required int role,
+    int maxDevices = 8,
+    int joinDwellSec = 60,
+    int offDwellSec = 15,
+    int repeat = 5,
+    int gapSec = 20,
+    int placementSec = 60,
+    int alignSec = 120,
+  }) {
+    final top = maxDevices < 4 ? 4 : maxDevices;
+    final trials = repeat < 1 ? 1 : repeat;
+    final steps = <FieldStep>[];
+    for (var k = 4; k <= top; k++) {
+      for (var t = 1; t <= trials; t++) {
+        if (role == k) {
+          steps.add(FieldStep(
+            label: 'off n=$k t$t',
+            dwellSec: offDwellSec,
+            bleOn: false,
+            // Reset while DARK, so the next join is cold — never at the
+            // join step, which would kill handshakes that legitimately
+            // began in the toggle window.
+            resetSessions: true,
+          ));
+          steps.add(FieldStep(
+            label: 'n=$k t$t',
+            dwellSec: joinDwellSec,
+            bleOn: true,
+            sendCount: 5,
+          ));
+        } else {
+          steps.add(FieldStep(
+            label: 'n=$k t$t',
+            dwellSec: offDwellSec + gapSec + joinDwellSec,
+            bleOn: role < k || role <= 3,
+          ));
+        }
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: 30,
+      autoAdvanceGapSec: gapSec,
+      resetSessions: false,
+      // Leftover sends would otherwise drain into the next rep's window via
+      // the sync exchange and blur its usable stage.
+      resetDtnBuffer: true,
+      deviceOrder: role,
+      manualJoin: true,
+      placementSec: placementSec,
+      alignSec: alignSec,
+      sampleGps: false,
+      steps: steps,
+    );
+  }
 
   /// Pre-field validation: five back-to-back link-teardown→re-establish
   /// cycles at desk distance (~6 min). Success = five complete
@@ -375,47 +505,144 @@ class FieldPlanPresets {
         resetLinks: true,
       );
 
+  /// Rebuild [p] under the manual running logic: operator-toggled system
+  /// Bluetooth, wall-clock-anchored start, no GPS. This is the ONE flow every
+  /// experiment runs under; walk-driven plans no longer exist. The lone
+  /// exception is the bounce-stress diagnostic, whose subject IS the
+  /// app-level toggle.
+  ///
+  /// Only valid for stationary plans, where every step can open on the
+  /// clock.
+  static FieldPlan manualized(FieldPlan p,
+      {int alignSec = 120, int placementSec = 60}) {
+    return FieldPlan(
+      expId: p.expId,
+      steps: p.steps,
+      settleSec: p.settleSec,
+      roster: p.roster,
+      resetSessions: p.resetSessions,
+      resetLinks: p.resetLinks,
+      resetDtnBuffer: p.resetDtnBuffer,
+      autoAdvanceGapSec: p.autoAdvanceGapSec,
+      deviceOrder: p.deviceOrder,
+      manualJoin: true,
+      placementSec: placementSec,
+      alignSec: alignSec,
+      sampleGps: false,
+    );
+  }
+
   /// Named presets for the dropdown (label → ready-to-run plan).
   static Map<String, FieldPlan> get presets => {
-        'Home soak (stationary, 40 min)': homeSoak(),
-        'Link-cycle check (5×1 min)': cycleCheck(),
-        'Throughput (saturate 60s)': throughput(),
-        'Throughput: payload arm (132/264/1200 B)': throughput(
+        'Home soak (stationary, 40 min)': manualized(homeSoak()),
+        'Link-cycle check (5×1 min)': manualized(cycleCheck()),
+        'Throughput (saturate 60s)': manualized(throughput()),
+        'Throughput: payload arm (132/264/1200 B)': manualized(throughput(
             expId: 'throughput-arm-1',
-            payloadSizes: const [defaultSendBytes, 264, 1200]),
-        'Throughput: ceiling sweep (1/4/16/64 lanes)': throughputCeiling(),
-        'Raw link throughput (notify/write/stripe)': rawLink(),
-        'Control-plane line sweep': lineSweep(),
-        'Mesh: multi-hop relay (set target!)':
-            multiHop(targetPrefix: '<peer-prefix>'),
-        'Mesh: store-carry-forward (set target!)':
-            storeCarry(targetPrefix: '<peer-prefix>'),
-        'Data-plane dilating clique': dataPlane(),
+            payloadSizes: const [defaultSendBytes, 264, 1200])),
+        'Throughput: ceiling sweep (1/4/16/64 lanes)': manualized(throughputCeiling()),
+        'Raw link throughput (notify/write/stripe)': manualized(rawLink()),
+        // Full ladder, ~2h41. Every quantity measured on BOTH devices.
+        'Power baseline P1 (full, ~2h41)': manualized(powerBaseline(role: 1)),
+        'Power baseline P2 (full, ~2h41)': manualized(powerBaseline(role: 2)),
+        // ~1h36. Same 8 conditions, shorter steps, 3 reps instead of 2 —
+        // between-rep spread is the dominant uncertainty (it ran to 20mA on
+        // the same condition), and two reps give a difference rather than a
+        // variance you can trust. Halves the readings per rep to buy that.
+        'Power baseline P1 (short, ~1h36)':
+            manualized(powerBaseline(
+                role: 1, dwellSec: 240, reps: 3, lightSends: 240)),
+        'Power baseline P2 (short, ~1h36)':
+            manualized(powerBaseline(
+                role: 2, dwellSec: 240, reps: 3, lightSends: 240)),
+        // ~1h00. Drops the mirrored conditions: each quantity is then
+        // measured on ONE device only (send cost on P1, receive cost on P2,
+        // discovery cost on P1 alone), so within-device role comparisons are
+        // gone. Take it only if wall-clock is the binding constraint.
+        'Power baseline P1 (minimal, ~1h00)': manualized(powerBaseline(
+            role: 1,
+            dwellSec: 240,
+            reps: 3,
+            lightSends: 240,
+            conditions: const ['base', 'solo', 'linked', 'light', 'heavy'])),
+        'Power baseline P2 (minimal, ~1h00)': manualized(powerBaseline(
+            role: 2,
+            dwellSec: 240,
+            reps: 3,
+            lightSends: 240,
+            conditions: const ['base', 'solo', 'linked', 'light', 'heavy'])),
+        // Screen-off smoke test: the same ladder code, three conditions, one
+        // rep, 60s each — the ladder's own segment granularity, so a segment
+        // that behaves here behaves the same way in the long run. Proves
+        // timers still tick, BLE still toggles and sends still fire with the
+        // display off, before committing to the long run.
+        'Power PRE-CHECK P1 (~3.5 min, screen off)': manualized(powerBaseline(
+            expId: 'pw-pre',
+            role: 1,
+            dwellSec: 60,
+            reps: 1,
+            settleSec: 10,
+            lightSends: 60,
+            conditions: const ['base', 'linked', 'light'])),
+        'Power PRE-CHECK P2 (~3.5 min, screen off)': manualized(powerBaseline(
+            expId: 'pw-pre',
+            role: 2,
+            dwellSec: 60,
+            reps: 1,
+            settleSec: 10,
+            lightSends: 60,
+            conditions: const ['base', 'linked', 'light'])),
+        // Real discharge curves, ending at the 15% battery-saver floor.
+        // The saturating pair yields the sending AND receiving curve at once.
+        'Discharge P1 (saturating sender, ~4-5h)':
+            manualized(dischargeRun(role: 1, condition: 'heavy')),
+        'Discharge P2 (saturating receiver, ~5-6h)':
+            manualized(dischargeRun(role: 2, condition: 'heavy')),
+        'Discharge P1 (link idle, ~11h)': manualized(
+            dischargeRun(expId: 'discharge-linked', role: 1, condition: 'linked')),
+        'Discharge P2 (link idle, ~11h)': manualized(
+            dischargeRun(expId: 'discharge-linked', role: 2, condition: 'linked')),
+        'BLE bounce stress (~22 min, DIAGNOSTIC)': bounceStress(),
+        // Pre-flight for a field day, on 4 phones at a table (~7 min
+        // including the wall-clock wait): the exact manual-join flow of the
+        // real run — typed-id wizard aside — with its own experiment id so a
+        // rehearsal never lands in a real run's file. Aligns to 2 minutes
+        // instead of 10, because waiting most of ten minutes for a
+        // five-minute test means the preflight never gets run.
+        for (var r = 1; r <= 4; r++)
+          'PREFLIGHT 4 devices, manual join (~7 min) — this phone is #$r':
+              meshScale(
+            expId: 'mesh-preflight',
+            role: r,
+            maxDevices: 4,
+            dwellSec: 45,
+            repeat: 2,
+            placementSec: 60,
+            alignSec: 120,
+          ),
       };
 }
 
 /// The experiment shapes the wizard can build.
 enum FieldPlanKind {
+  meshScale,
+  joinTime,
   homeSoak,
   throughput,
   throughputCeiling,
   rawLink,
-  multiHop,
-  storeCarry,
-  lineSweep,
-  dataPlane
+  powerBaseline,
 }
 
 extension FieldPlanKindLabel on FieldPlanKind {
   String get label => switch (this) {
+        FieldPlanKind.meshScale => 'Mesh: scale N devices (all send)',
+        FieldPlanKind.joinTime => 'Establishment: frontier join (quiet mesh)',
         FieldPlanKind.homeSoak => 'Home soak (stationary)',
         FieldPlanKind.throughput => 'Throughput (saturate)',
         FieldPlanKind.throughputCeiling => 'Throughput: ceiling sweep',
         FieldPlanKind.rawLink => 'Raw link throughput (GATT pipe)',
-        FieldPlanKind.multiHop => 'Mesh: multi-hop relay',
-        FieldPlanKind.storeCarry => 'Mesh: store-carry-forward',
-        FieldPlanKind.lineSweep => 'Control-plane line sweep',
-        FieldPlanKind.dataPlane => 'Data-plane dilating clique',
+        FieldPlanKind.powerBaseline => 'Power baseline (desk, unplugged)',
       };
 }
 
@@ -425,14 +652,15 @@ class FieldPlanWizard {
   /// Kind-appropriate defaults for the wizard's reset toggles.
   static (bool sessions, bool links) resetDefaults(FieldPlanKind kind) =>
       switch (kind) {
+        // Sessions and links stay warm: the mesh is grown by devices
+        // joining, not by tearing down what is already established.
+        FieldPlanKind.meshScale => (false, false),
+        FieldPlanKind.joinTime => (false, false),
         FieldPlanKind.homeSoak => (true, false),
         FieldPlanKind.throughput => (false, false),
         FieldPlanKind.throughputCeiling => (false, false),
         FieldPlanKind.rawLink => (false, true),
-        FieldPlanKind.multiHop => (false, false),
-        FieldPlanKind.storeCarry => (false, false),
-        FieldPlanKind.lineSweep => (true, true),
-        FieldPlanKind.dataPlane => (false, false),
+        FieldPlanKind.powerBaseline => (false, false),
       };
 
   static FieldPlan build({
@@ -440,20 +668,21 @@ class FieldPlanWizard {
     required String expId,
     int dwellMin = 40,
     int sends = 40,
-    List<int> distances = const [1, 5, 10, 20, 40, 80, 120],
-    bool retreat = true,
-    int sendsPerStep = 5,
     int dwellSec = 180,
-    List<int> sideLengths = const [10, 20, 40],
     int repeat = 1,
     bool? resetSessions,
     bool? resetLinks,
     List<int> payloadSizes = const [defaultSendBytes],
     List<int> laneCounts = const [1, 4, 16, 64],
     List<String> rawLegs = const ['notify', 'write', 'stripe'],
+    int powerRole = 1,
     int sendLanes = 1,
-    String targetPrefix = '',
-    int holdMin = 5,
+    /// Mesh scaling: how many devices take part in total, and which join
+    /// order THIS phone has (1..maxDevices).
+    int maxDevices = 8,
+    int meshRole = 1,
+    bool saturate = true,
+    bool manualJoin = false,
   }) {
     final id = expId.trim().isEmpty ? 'exp' : expId.trim();
     final (defSessions, defLinks) = resetDefaults(kind);
@@ -498,44 +727,35 @@ class FieldPlanWizard {
           resetSessions: sessions,
           resetLinks: links,
         );
-      case FieldPlanKind.multiHop:
-        return FieldPlanPresets.multiHop(
+      case FieldPlanKind.powerBaseline:
+        return FieldPlanPresets.powerBaseline(
           expId: id,
-          targetPrefix: targetPrefix,
+          role: powerRole,
           dwellSec: dwellSec,
-          sends: sendsPerStep,
-          repeat: repeat,
-          resetSessions: sessions,
-          resetLinks: links,
+          reps: repeat,
+          lightSends: sends,
         );
-      case FieldPlanKind.storeCarry:
-        return FieldPlanPresets.storeCarry(
+      case FieldPlanKind.meshScale:
+        return FieldPlanPresets.meshScale(
           expId: id,
-          targetPrefix: targetPrefix,
-          sends: sendsPerStep,
-          holdMin: holdMin,
-          resetSessions: sessions,
-          resetLinks: links,
-        );
-      case FieldPlanKind.lineSweep:
-        return FieldPlanPresets.lineSweep(
-          expId: id,
-          distances: distances,
+          role: meshRole,
+          maxDevices: maxDevices,
           dwellSec: dwellSec,
-          sendsPerStep: sendsPerStep,
-          retreat: retreat,
+          sends: sends,
           repeat: repeat,
-          resetSessions: sessions,
-          resetLinks: links,
+          saturate: saturate,
+          sendLanes: sendLanes,
         );
-      case FieldPlanKind.dataPlane:
-        return FieldPlanPresets.dataPlane(
+      case FieldPlanKind.joinTime:
+        // The id carries the spacing (join-time-30m): the sweep is repeated
+        // per distance, and one file per distance is what makes the
+        // distance x N comparison possible.
+        return FieldPlanPresets.joinTime(
           expId: id,
-          sideLengths: sideLengths,
-          dwellSec: dwellSec,
+          role: meshRole,
+          maxDevices: maxDevices,
+          joinDwellSec: dwellSec,
           repeat: repeat,
-          resetSessions: sessions,
-          resetLinks: links,
         );
     }
   }

@@ -19,7 +19,7 @@ import 'package:grassroots_networking/src/store/store.dart';
 import '../helpers/sodium_test_bootstrap.dart';
 
 /// Sync-on-connect (DTN anti-entropy): offer carried packetIds on connect,
-/// request the unseen subset, convey the stored sealed packets. Custody is
+/// request the unseen subset, convey the stored sealed packets. The buffer is
 /// replicated, never transferred. The offer/request frames are SEALED to the
 /// neighbour's Noise session (ContentType.syncOffer/syncRequest) — packetIds
 /// never travel in the clear.
@@ -71,7 +71,7 @@ void main() {
     });
   });
 
-  group('DtnStore custody enumeration', () {
+  group('DtnStore buffer enumeration', () {
     GrassrootsPacket sealed(String recipientSeed) => GrassrootsPacket(
           type: PacketType.secure,
           ttl: 5,
@@ -86,7 +86,7 @@ void main() {
       store.store('ra', a);
       store.store('rb', b);
       expect(store.carriedPacketIds(), unorderedEquals([a.packetId, b.packetId]));
-      // Enumeration must not consume custody.
+      // Enumeration must not consume buffer entries.
       expect(store.totalCount, 2);
       expect(store.carriedPacketIds(), hasLength(2));
     });
@@ -120,7 +120,7 @@ void main() {
       expect(store.packetsFor('ra', now: at), isEmpty);
     });
 
-    test('expired custody disappears from enumeration and lookup', () {
+    test('expired entries disappear from enumeration and lookup', () {
       final store = DtnStore(maxAge: const Duration(hours: 6));
       final a = sealed('a');
       final t0 = DateTime(2026, 1, 1);
@@ -153,6 +153,14 @@ void main() {
     });
 
     tearDown(() => router.dispose());
+
+    test('dtnCapacity exposes the store-wide packet ceiling', () {
+      // GrassrootsNetwork sizes its messageId -> packetIds ACK index from
+      // this. The two bounds must not drift: an index entry is dead the
+      // moment its last packet leaves the buffer, so a smaller index silently
+      // disables ACK-driven release and leaves packets to age out instead.
+      expect(router.dtnCapacity, DtnStore().maxTotal);
+    });
 
     GrassrootsPacket thirdPartySealed({int ttl = 5}) => GrassrootsPacket(
           type: PacketType.secure,
@@ -207,7 +215,7 @@ void main() {
       expect(router.buildSyncOffers(), isEmpty);
     });
 
-    test('originated custody enters the sync vector and ends on ACK', () {
+    test('self-originated packets enter the sync vector and leave on ACK', () {
       final recipient = Uint8List.fromList(List.generate(32, (i) => i + 50));
       final sealed = GrassrootsPacket(
         type: PacketType.secure,
@@ -215,23 +223,23 @@ void main() {
         payload: Uint8List.fromList([1, 2, 3]),
       );
 
-      // The sender is the message's first custodian: its own sealed packet
-      // is offered in sync like any relayed custody.
-      router.storeCustody(recipient, sealed);
+      // The sender buffers its own message: its own sealed packet
+      // is offered in sync like any relayed packet.
+      router.storeInDtnBuffer(recipient, sealed);
       expect(
         decodeSyncIds(router.buildSyncOffers().single),
         contains(sealed.packetId),
       );
-      expect(router.custodyFor(recipient).single.packetId, sealed.packetId);
+      expect(router.dtnBufferFor(recipient).single.packetId, sealed.packetId);
       // Own packets are marked seen — a copy conveyed back is never re-relayed.
       expect(router.isDuplicate(sealed.packetId), isTrue);
 
-      // ACK ends custody; nothing left to offer.
-      router.removeCustody([sealed.packetId]);
+      // ACK empties the buffer; nothing left to offer.
+      router.dropFromDtnBuffer([sealed.packetId]);
       expect(router.buildSyncOffers(), isEmpty);
     });
 
-    test('buildSyncOffers advertises stored custody', () async {
+    test('buildSyncOffers advertises buffered packets', () async {
       final p = await storeViaRelay();
       final offers = router.buildSyncOffers();
       expect(offers, hasLength(1));
@@ -253,7 +261,6 @@ void main() {
       expect(frames, hasLength(1));
       final (type, payload, link) = frames.single;
       expect(link.bleDeviceId, 'neighbor-1');
-      expect(link.transport, PeerTransport.bleDirect);
       expect(type, ContentType.syncRequest,
           reason: 'the reply is sealed, not a cleartext packet type');
       expect(decodeSyncIds(payload), unorderedEquals([unseen1, unseen2]));
@@ -284,7 +291,7 @@ void main() {
       expect(link.bleDeviceId, 'neighbor-2');
       expect(conveyed.type, PacketType.secure);
       expect(conveyed.packetId, stored.packetId);
-      // Custody replicated, not transferred.
+      // Buffer entry replicated, not transferred.
       expect(router.dtnBufferedCount, greaterThan(0));
     });
 
@@ -306,12 +313,14 @@ void main() {
       expect(relayed, isFalse);
     });
 
-    test('sync runs over UDP too: an offer draws a request on a UDP link',
+    test('sync over UDP is ignored — the buffer is BLE-only',
         () async {
-      // The sync exchange is the ONLY custody conveyance path, so a UDP-only
-      // pairing must reconcile the same way a BLE pairing does.
-      final frames = <(ContentType, SyncLink)>[];
-      router.onSyncFrame = (t, _, link) => frames.add((t, link));
+      // The Internet transport stays direct point-to-point: it neither
+      // relays for third parties nor reconciles buffers, so a sync frame
+      // arriving over it is never acted on.
+      var called = false;
+      router.onSyncFrame = (_, __, ___) => called = true;
+      router.onSyncSend = (_, __) => called = true;
       final frame = SecureFrame(
         contentType: ContentType.syncOffer,
         messageId: uuid.v4(),
@@ -329,70 +338,7 @@ void main() {
         transport: PeerTransport.udp,
         udpPeerId: 'udp-peer',
       );
-      expect(frames, hasLength(1));
-      final (type, link) = frames.single;
-      expect(type, ContentType.syncRequest);
-      expect(link.transport, PeerTransport.udp);
-      expect(link.bleDeviceId, isNull);
-      expect(link.peerHex, isNot(isEmpty));
-    });
-
-    test('a UDP request conveys custody back over the UDP link', () async {
-      final recipient = Uint8List.fromList(List.generate(32, (i) => i + 50));
-      final held = GrassrootsPacket(
-        type: PacketType.secure,
-        recipientPubkey: recipient,
-        payload: Uint8List.fromList([1, 2, 3]),
-      );
-      router.storeCustody(recipient, held);
-
-      final sent = <(GrassrootsPacket, SyncLink)>[];
-      router.onSyncSend = (packet, link) => sent.add((packet, link));
-      final frame = SecureFrame(
-        contentType: ContentType.syncRequest,
-        messageId: uuid.v4(),
-        chunk: encodeSyncIds([held.packetId]),
-      );
-      router.trialDecrypt = (p) async =>
-          (p.copyWith(payload: frame.encode()), neighbourPubkey);
-      await router.processPacket(
-        GrassrootsPacket(
-          type: PacketType.secure,
-          ttl: 1,
-          recipientPubkey: identity.publicKey,
-          payload: Uint8List.fromList([1, 2]),
-        ),
-        transport: PeerTransport.udp,
-        udpPeerId: 'udp-peer',
-      );
-      expect(sent, hasLength(1));
-      expect(sent.single.$1.packetId, held.packetId);
-      expect(sent.single.$2.transport, PeerTransport.udp);
-    });
-
-    test('buildSyncOffers(onlyRecipientHex:) restricts to that peer', () {
-      final ra = Uint8List.fromList(List.filled(32, 0x61));
-      final rb = Uint8List.fromList(List.filled(32, 0x62));
-      String hex(Uint8List b) =>
-          b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
-      final pa = GrassrootsPacket(
-          type: PacketType.secure,
-          recipientPubkey: ra,
-          payload: Uint8List.fromList([1]));
-      final pb = GrassrootsPacket(
-          type: PacketType.secure,
-          recipientPubkey: rb,
-          payload: Uint8List.fromList([2]));
-      router.storeCustody(ra, pa);
-      router.storeCustody(rb, pb);
-      // UDP is direct point-to-point: never offer a UDP peer custody
-      // addressed to third parties.
-      expect(
-        decodeSyncIds(router.buildSyncOffers(onlyRecipientHex: hex(ra)).single),
-        [pa.packetId],
-      );
-      final all = router.buildSyncOffers().expand(decodeSyncIds);
-      expect(all, unorderedEquals([pa.packetId, pb.packetId]));
+      expect(called, isFalse);
     });
 
     test('malformed sync payload is dropped without side effects', () async {

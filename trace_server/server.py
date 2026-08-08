@@ -54,7 +54,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------- #
@@ -63,9 +63,23 @@ from pydantic import BaseModel, Field
 DATA_DIR = Path(os.environ.get("TRACE_DATA_DIR", "./data")).resolve()
 AUTH_TOKEN = os.environ.get("TRACE_UPLOAD_TOKEN", "")
 ALLOW_NO_AUTH = os.environ.get("ALLOW_NO_AUTH") == "1"
-# Hard limits to bound abuse / accidental megabatches.
-MAX_BODY_BYTES = int(os.environ.get("TRACE_MAX_BODY_BYTES", str(16 * 1024 * 1024)))  # 16 MiB
-MAX_RECORDS_PER_UPLOAD = int(os.environ.get("TRACE_MAX_RECORDS", "200000"))
+# NO upload limits. An experiment must never be shaped around the collector,
+# and a run that took hours to produce must never be refused for being large
+# — that trade is always the wrong way round.
+#
+# The one thing still enforced is a decompression-ratio check, and it is a
+# different thing from a size cap: it rejects a body whose gzip expands
+# beyond ZIP_BOMB_RATIO, which is an attack signature rather than a big
+# experiment (real traces compress ~10x, nowhere near the bound). A legitimate
+# upload of any size passes it.
+#
+# The cost of having no cap is that this process reads the body whole,
+# gunzips it whole and json.loads it whole, so a request needs several times
+# its decompressed size in RAM. The client keeps requests small by streaming
+# its file and POSTing in bounded chunks, which is the right place to solve
+# it: the collector should accept whatever it is sent, and the sender should
+# not need to know the collector's memory to choose a chunk size.
+ZIP_BOMB_RATIO = int(os.environ.get("TRACE_ZIP_BOMB_RATIO", "200"))
 SCHEMA_VERSION = 1
 
 if not AUTH_TOKEN and not ALLOW_NO_AUTH:
@@ -117,6 +131,16 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_records_type   ON records(type);
             CREATE INDEX IF NOT EXISTS idx_records_t      ON records(t);
             CREATE INDEX IF NOT EXISTS idx_records_upload ON records(upload_id);
+            -- Hand-measured pairwise distances for an experiment's layout.
+            -- Kept server-side, not in a browser: the measurement is a fact
+            -- about the deployment, and it must not be lost with a cache or
+            -- be invisible from a different machine.
+            CREATE TABLE IF NOT EXISTS geometry (
+                exp        TEXT PRIMARY KEY,
+                devices    INTEGER NOT NULL,
+                pairs      TEXT NOT NULL,   -- {"1-2": 30.0, ...} metres
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -152,6 +176,97 @@ class Store:
                     )
                     for r in records
                 ],
+            )
+            self._conn.commit()
+
+    def experiments(self) -> List[Dict[str, Any]]:
+        """One row per recorded experiment, newest first.
+
+        The experiment name is the upload_id up to `.jsonl` — chunked uploads
+        append `:length:index` to it, so the prefix is the only stable handle.
+        """
+        # Grouped over `uploads`, not `records`: one row per upload rather than
+        # per record. The same query against records is a full scan of tens of
+        # millions of rows and took ~2 minutes on the 14 GB database, which is
+        # far too slow for something that only fills a dropdown.
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT substr(upload_id, 1, instr(upload_id, '.jsonl') + 5) AS exp,
+                       SUM(record_count), COUNT(DISTINCT device_id), MAX(received_at)
+                  FROM uploads
+                 WHERE instr(upload_id, '.jsonl') > 0
+                 GROUP BY exp
+                 ORDER BY MAX(received_at) DESC
+                """
+            ).fetchall()
+        out = []
+        for exp, n, devices, last in rows:
+            name = exp[4:-6] if exp.startswith("exp_") else exp
+            out.append({"id": exp, "name": name, "records": n or 0,
+                        "devices": devices, "lastUpload": last})
+        return out
+
+    def topology(self, exp: str) -> Dict[str, Any]:
+        """The link and marker records for one experiment, grouped by device.
+
+        These two types are all the topology view needs and are a tiny slice of
+        a recording — a few thousand rows out of tens of millions — so the
+        filtering belongs here rather than in the browser.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT device_id, type, body
+                  FROM records
+                 WHERE upload_id LIKE ? AND type IN ('marker', 'link', 'location')
+                 ORDER BY t
+                """,
+                (exp + "%",),
+            ).fetchall()
+        devices: Dict[str, Dict[str, List[Any]]] = {}
+        for device_id, rtype, body in rows:
+            try:
+                rec = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            d = devices.setdefault(
+                device_id, {"markers": [], "links": [], "locations": []}
+            )
+            if rtype == "marker":
+                d["markers"].append(rec)
+            elif rtype == "location":
+                d["locations"].append(rec)
+            elif rec.get("event") in ("connected", "drop"):
+                d["links"].append(rec)
+        return {
+            "exp": exp,
+            "devices": [
+                {"deviceId": k, "markers": v["markers"], "links": v["links"],
+                 "locations": v["locations"]}
+                for k, v in devices.items()
+            ],
+        }
+
+    def get_geometry(self, exp: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT devices, pairs, updated_at FROM geometry WHERE exp = ?",
+                (exp,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"exp": exp, "devices": row[0], "pairs": json.loads(row[1]),
+                "updatedAt": row[2]}
+
+    def put_geometry(self, exp: str, devices: int, pairs: Dict[str, float]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO geometry (exp, devices, pairs, updated_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(exp) DO UPDATE SET "
+                "devices=excluded.devices, pairs=excluded.pairs, "
+                "updated_at=excluded.updated_at",
+                (exp, devices, json.dumps(pairs), _utc_now_iso()),
             )
             self._conn.commit()
 
@@ -244,6 +359,78 @@ def stats(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]
     return STORE.stats()
 
 
+@app.get("/")
+def root() -> RedirectResponse:
+    """Bare domain opens the viewer — the point is to reach it from a phone
+    by typing the host and nothing else."""
+    return RedirectResponse(url="/dashboard")
+
+
+@app.get("/dashboard")
+def dashboard() -> HTMLResponse:
+    """The mesh topology viewer.
+
+    Served without auth because it carries no data — it fetches everything
+    from the endpoints below, which do check the token. Keeping the page
+    itself open avoids putting a bearer token in a URL to load it.
+    """
+    page = Path(__file__).with_name("mesh_dashboard.html")
+    if not page.exists():
+        raise HTTPException(status_code=404, detail="mesh_dashboard.html not found")
+    return HTMLResponse(
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "</head><body>" + page.read_text(encoding="utf-8") + "</body></html>"
+    )
+
+
+@app.get("/v1/experiments")
+def experiments(authorization: Optional[str] = Header(default=None)) -> List[Dict[str, Any]]:
+    _check_auth(authorization)
+    return STORE.experiments()
+
+
+@app.get("/v1/topology")
+def topology(exp: str, authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _check_auth(authorization)
+    if not exp:
+        raise HTTPException(status_code=400, detail="exp is required")
+    return STORE.topology(exp)
+
+
+class GeometryIn(BaseModel):
+    exp: str
+    devices: int = Field(ge=2, le=64)
+    # {"1-2": 30.0} in metres. A pair may be omitted (not measured); it is
+    # NOT stored as zero, because "we did not measure this" and "these two
+    # phones were in the same place" are different facts.
+    pairs: Dict[str, float]
+
+
+@app.get("/v1/geometry")
+def get_geometry(exp: str, authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    return STORE.get_geometry(exp) or {"exp": exp, "devices": 0, "pairs": {}}
+
+
+@app.put("/v1/geometry")
+def put_geometry(body: GeometryIn,
+                 authorization: Optional[str] = Header(default=None)):
+    _check_auth(authorization)
+    clean = {}
+    for k, v in body.pairs.items():
+        a, _, b = k.partition("-")
+        if not (a.isdigit() and b.isdigit()):
+            raise HTTPException(status_code=400, detail=f"bad pair key {k!r}")
+        if v < 0:
+            raise HTTPException(status_code=400, detail=f"negative distance {k}")
+        # Canonical low-high, so "2-1" and "1-2" can never both be stored.
+        lo, hi = sorted((int(a), int(b)))
+        clean[f"{lo}-{hi}"] = float(v)
+    STORE.put_geometry(body.exp, body.devices, clean)
+    return {"stored": len(clean)}
+
+
 @app.post("/v1/traces")
 async def upload_traces(
     request: Request,
@@ -253,17 +440,23 @@ async def upload_traces(
     _check_auth(authorization)
 
     raw = await request.body()
-    if len(raw) > MAX_BODY_BYTES:
-        raise HTTPException(status_code=413, detail="upload too large")
 
     # The mobile client SHOULD gzip the body (traces compress ~10x).
     if content_encoding and "gzip" in content_encoding.lower():
+        compressed_len = len(raw)
         try:
             raw = gzip.decompress(raw)
         except OSError:
             raise HTTPException(status_code=400, detail="invalid gzip body")
-        if len(raw) > MAX_BODY_BYTES * 4:  # guard against zip bombs
-            raise HTTPException(status_code=413, detail="decompressed body too large")
+        # Ratio, not size: a real trace expands ~10x, so anything past 200x is
+        # a decompression bomb rather than a large experiment. Size alone is
+        # never a reason to refuse an upload.
+        if compressed_len and len(raw) > compressed_len * ZIP_BOMB_RATIO:
+            raise HTTPException(
+                status_code=413,
+                detail=f"decompression ratio {len(raw) // compressed_len}x "
+                       f"exceeds {ZIP_BOMB_RATIO}x — refusing a likely bomb",
+            )
 
     try:
         payload = json.loads(raw)
@@ -274,9 +467,6 @@ async def upload_traces(
         upload = TraceUpload.model_validate(payload)
     except Exception as e:  # pydantic ValidationError
         raise HTTPException(status_code=422, detail=f"invalid envelope: {e}")
-
-    if len(upload.records) > MAX_RECORDS_PER_UPLOAD:
-        raise HTTPException(status_code=413, detail="too many records in one upload")
 
     # Idempotency: a repeated uploadId is a successful no-op.
     if STORE.upload_exists(upload.uploadId):

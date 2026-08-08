@@ -6,6 +6,7 @@ import 'package:cryptography/cryptography.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:uuid/uuid.dart';
 import 'package:grassroots_networking/src/routing/message_router.dart';
+import 'package:grassroots_networking/src/trace/experiment_recorder.dart';
 import 'package:grassroots_networking/src/protocol/protocol_handler.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/session/noise_session_manager.dart';
@@ -177,7 +178,7 @@ void main() {
       test('drops ANNOUNCE whose self-signature does not verify', () async {
         bool announced = false;
         router.onPeerAnnounced =
-            (_, __, {bool isNew = false, String? udpPeerId}) =>
+            (_, __, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) =>
                 announced = true;
 
         // Tamper the trailing signature bytes of a valid payload.
@@ -195,10 +196,35 @@ void main() {
         expect(store.state.peers.getPeerByPubkey(otherPubkey), isNull);
       });
 
+      test('a verified ANNOUNCE reports the path it arrived on', () async {
+        // ANNOUNCE is the moment a path becomes attributable: it carries the
+        // pubkey and arrives on exactly one link. Without passing that
+        // through, a topology reconstruction can only learn path->peer from
+        // `drop`, so it loses every link that never dropped — which is what
+        // the longest-lived links do.
+        String? seenPath;
+        router.onPeerAnnounced = (_, __,
+                {bool isNew = false,
+                String? udpPeerId,
+                String? bleDeviceId}) =>
+            seenPath = bleDeviceId;
+
+        await router.processPacket(
+          GrassrootsPacket(
+              type: PacketType.announce,
+              payload: otherProtocolHandler.createAnnouncePayload()),
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'peripheral:AA:BB:CC:DD:EE:FF',
+          rssi: -60,
+        );
+
+        expect(seenPath, 'peripheral:AA:BB:CC:DD:EE:FF');
+      });
+
       test('drops ANNOUNCE whose body was tampered after signing', () async {
         bool announced = false;
         router.onPeerAnnounced =
-            (_, __, {bool isNew = false, String? udpPeerId}) =>
+            (_, __, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) =>
                 announced = true;
 
         // Flip a body byte (the protocol version) — the signature no longer
@@ -386,7 +412,7 @@ void main() {
         AnnounceData? receivedData;
         PeerTransport? receivedTransport;
         router.onPeerAnnounced =
-            (data, transport, {bool isNew = false, String? udpPeerId}) {
+            (data, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
           receivedData = data;
           receivedTransport = transport;
         };
@@ -413,7 +439,7 @@ void main() {
 
         int announceCount = 0;
         router.onPeerAnnounced =
-            (_, __, {bool isNew = false, String? udpPeerId}) => announceCount++;
+            (_, __, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) => announceCount++;
 
         await router.processPacket(
           p,
@@ -763,7 +789,7 @@ void main() {
         expect(relayCount, equals(1));
       });
 
-      test('custody is kept per recipient and ends on removeCustody',
+      test('packets are kept per recipient and leave on dropFromDtnBuffer',
           () async {
         router.onRelay = (packet, {String? excludeBlePeerId}) {};
 
@@ -776,16 +802,99 @@ void main() {
         );
 
         // Recipient is not a reachable peer -> first sighting relays AND the
-        // sealed packet enters custody, retrievable per recipient.
+        // sealed packet enters the buffer, retrievable per recipient.
         await router.processPacket(p,
             transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
-        expect(router.custodyFor(thirdParty).map((c) => c.packetId),
+        expect(router.dtnBufferFor(thirdParty).map((c) => c.packetId),
             contains(p.packetId));
 
-        // The end-to-end ACK ends custody.
-        router.removeCustody([p.packetId]);
-        expect(router.custodyFor(thirdParty), isEmpty);
+        // The end-to-end ACK empties the buffer.
+        router.dropFromDtnBuffer([p.packetId]);
+        expect(router.dtnBufferFor(thirdParty), isEmpty);
       });
+
+      test('a testbedStart frame reaches the coordinator with its experiment id',
+        () async {
+      // One phone is tapped and signals the rest over the mesh; tapping eight
+      // phones in sequence would skew their timelines by the walk between
+      // them. The router only surfaces it — whether to act is the
+      // coordinator's call, and an unarmed device ignores it.
+      final trace = _CapturingRecorder();
+      final traced = MessageRouter(
+        identity: identity,
+        store: store,
+        protocolHandler: protocolHandler,
+        fragmentHandler: fragmentHandler,
+        trace: trace,
+      );
+      String? gotExp;
+      Uint8List? gotPeer;
+      traced.onTestbedStart = (expId, peer) {
+        gotExp = expId;
+        gotPeer = peer;
+      };
+      traced.trialDecrypt = (packet) async => (
+            packet.copyWith(
+                payload: SecureFrame(
+              contentType: ContentType.testbedStart,
+              messageId: const Uuid().v4(),
+              chunk: Uint8List.fromList('mesh-scale-1'.codeUnits),
+            ).encode()),
+            otherPubkey,
+          );
+
+      await traced.processPacket(
+        GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 5,
+          recipientPubkey: identity.publicKey,
+          payload: Uint8List.fromList([1, 2, 3]),
+        ),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'leg',
+      );
+
+      expect(gotExp, 'mesh-scale-1');
+      expect(gotPeer, otherPubkey,
+          reason: 'the sender is authenticated by the decrypt that produced it');
+      expect(
+          trace.records.where(
+              (r) => r['type'] == 'runner' && r['event'] == 'startRx'),
+          hasLength(1));
+    });
+
+  test('a relay record carries the rx->tx dwell on one clock', () async {
+      // The dwell is the single-clock half of end-to-end latency: summing it
+      // across hops (plus the DTN carry times) reconstructs delivery time
+      // without the phones' clocks having to agree, which subtracting a send
+      // timestamp on one device from a delivery timestamp on another does.
+      final trace = _CapturingRecorder();
+      final traced = MessageRouter(
+        identity: identity,
+        store: store,
+        protocolHandler: protocolHandler,
+        fragmentHandler: fragmentHandler,
+        trace: trace,
+      )..onRelay = (packet, {String? excludeBlePeerId}) {};
+
+      final stranger = Uint8List.fromList(List.generate(32, (i) => i + 11));
+      final packet = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 5,
+        recipientPubkey: stranger,
+        payload: Uint8List.fromList(List.filled(64, 7)),
+      );
+
+      await traced.processPacket(packet,
+          transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
+
+      final relay = trace.records
+          .where((r) => r['type'] == 'relay' && r['event'] != 'dup')
+          .toList();
+      expect(relay, hasLength(1), reason: 'the packet was relayed once');
+      expect(relay.single['dwellMs'], isA<int>());
+      expect(relay.single['dwellMs'], greaterThanOrEqualTo(0));
+    });
     });
 
     // =========================================================================
@@ -1141,7 +1250,7 @@ void main() {
       test('fires onPeerAnnounced callback with UDP transport', () async {
         PeerTransport? receivedTransport;
         router.onPeerAnnounced =
-            (_, transport, {bool isNew = false, String? udpPeerId}) {
+            (_, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
           receivedTransport = transport;
         };
 
@@ -1461,4 +1570,17 @@ void main() {
       });
     });
   });
+}
+
+/// Captures trace records in memory. The router only writes when the recorder
+/// reports itself active, so `active` must be true from construction.
+class _CapturingRecorder extends ExperimentRecorder {
+  final List<Map<String, dynamic>> records = [];
+
+  @override
+  bool get active => true;
+
+  @override
+  Future<void> log(Map<String, dynamic> record) async => records.add(record);
+
 }

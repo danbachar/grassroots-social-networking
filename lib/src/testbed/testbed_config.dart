@@ -171,9 +171,23 @@ class FieldStep {
   /// offered load until delivery breaks, and that break is the ceiling.
   final int sendLanes;
 
+  /// Set the BLE transport up/down at this step's start (null = leave
+  /// as-is). The power-baseline plan uses it to script BLE-off vs BLE-active
+  /// segments hands-free; the user's settings toggle is not touched. Applied
+  /// before the step marker, so the segment's power samples all see the
+  /// requested state.
+  final bool? bleOn;
+
+  /// Per-step override of [FieldPlan.resetSessions] (null = inherit). The
+  /// frontier toggler needs it: sessions must be dropped while its radio is
+  /// DOWN (the off step), so every one of its joins measures cold XX
+  /// handshakes — a plan-wide reset would also fire at the join step's start
+  /// and kill handshakes that legitimately began in the toggle window.
+  final bool? resetSessions;
+
   /// DEBUG raw-throughput mode: non-null selects the GATT leg ('notify',
   /// 'write' or 'stripe') and the step pushes MTU-sized raw blobs — no seal,
-  /// no custody, no ACK; the receiver counts bytes and drops them before the
+  /// no buffering, no ACK; the receiver counts bytes and drops them before the
   /// parser. Measures the naked GATT pipe; [sendCount]/[saturate] are
   /// ignored. Delivery accounting comes from the wire ledger alone.
   final String? rawLeg;
@@ -195,6 +209,8 @@ class FieldStep {
     this.sendLanes = 1,
     this.sendTo = 'all',
     this.rawLeg,
+    this.bleOn,
+    this.resetSessions,
   });
 
   Map<String, dynamic> toJson() => {
@@ -207,9 +223,16 @@ class FieldStep {
         if (sendCount > 0 || saturate) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
         if (saturate) 'saturate': saturate,
-        if (saturate) 'sendLanes': sendLanes,
+        // NOT gated on `saturate`. A step can carry a lane count while its
+        // own saturate flag is false — the mesh-scaling plan gives every
+        // step the same lanes and flips saturate per device — and gating the
+        // write dropped it on the round-trip while `==` still compared it,
+        // so a saved plan silently differed from the one built in memory.
+        if (sendLanes != 1) 'sendLanes': sendLanes,
         if (sendTo != 'all') 'sendTo': sendTo,
         if (rawLeg != null) 'rawLeg': rawLeg,
+        if (bleOn != null) 'bleOn': bleOn,
+        if (resetSessions != null) 'resetSessions': resetSessions,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
@@ -223,6 +246,8 @@ class FieldStep {
         sendLanes: json['sendLanes'] as int? ?? 1,
         sendTo: json['sendTo'] as String? ?? 'all',
         rawLeg: json['rawLeg'] as String?,
+        bleOn: json['bleOn'] as bool?,
+        resetSessions: json['resetSessions'] as bool?,
       );
 
   @override
@@ -237,12 +262,14 @@ class FieldStep {
       other.saturate == saturate &&
       other.sendLanes == sendLanes &&
       other.sendTo == sendTo &&
-      other.rawLeg == rawLeg;
+      other.rawLeg == rawLeg &&
+      other.bleOn == bleOn &&
+      other.resetSessions == resetSessions;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, sendLanes, sendTo, rawLeg);
+          saturate, sendLanes, sendTo, rawLeg, bleOn, resetSessions);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -255,7 +282,7 @@ class FieldPlan {
   final List<FieldStep> steps;
 
   /// Post-plan settle window before the recording stops — lets late ACKs and
-  /// custody deliveries land inside the trace.
+  /// buffered-packet deliveries land inside the trace.
   final int settleSec;
 
   /// Label→identity bindings for per-step sends. A device finds its own row
@@ -276,18 +303,60 @@ class FieldPlan {
   /// few seconds of re-dial per step.
   final bool resetLinks;
 
-  /// Empty the DTN custody store at the start of every step (default on):
-  /// without it, an overrun step's undelivered backlog survives in custody
+  /// Empty the DTN memory buffer at the start of every step (default on):
+  /// without it, an overrun step's undelivered backlog survives in the buffer
   /// and drains into the NEXT step's window via the sync exchange — the
   /// steps contaminate each other and `delivery_rate` never dips, because
-  /// custody eventually heals everything. Clearing makes each step's
+  /// the buffer eventually heals everything. Clearing makes each step's
   /// delivery its own verdict. Turn OFF for the mesh tests whose subject IS
-  /// custody surviving across steps (store-carry-forward, multi-hop).
-  final bool resetCustody;
+  /// the buffer surviving across steps (store-carry-forward, multi-hop).
+  final bool resetDtnBuffer;
 
   /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
+
+  /// This phone's join order in a multi-device plan (`role` in the mesh-scale
+  /// preset), stamped into every step marker. Null for plans where order is
+  /// meaningless.
+  ///
+  /// Without it the trace records WHICH step ran but not which slot this
+  /// device was configured to fill, so a misconfigured phone is
+  /// indistinguishable from one that failed to join: the 7-device smoke run's
+  /// `n=3` steps had only two devices in the mesh and the reason could only
+  /// be inferred from when links first appeared.
+  final int? deviceOrder;
+
+  /// Manual-join mode: system Bluetooth is toggled BY THE OPERATOR in the
+  /// phone's settings, never by the app. The run is anchored to a shared
+  /// wall-clock instant (the next 10-minute boundary at least [placementSec]
+  /// after the tap), so eight hand-tapped phones start with clock-sync
+  /// error instead of tap spread. bleOn on a step becomes pure intent — it
+  /// drives the `joined` marker and the on-screen join prompts, and the app
+  /// never touches the radio. Exists because Android 13+ ignores
+  /// programmatic Bluetooth enable anyway, and because the app-level toggle
+  /// leaves the chip on — the operator flipping settings-BT is the only real
+  /// radio silence.
+  final bool manualJoin;
+
+  /// Minimum seconds between the start tap and the shared wall-clock anchor:
+  /// the time to carry phones to their marks. The actual wait is this plus
+  /// however long until the next 10-minute boundary.
+  final int placementSec;
+
+  /// Wall-clock alignment granularity for the manual-join anchor, seconds.
+  /// Every phone rounds its start UP to the next multiple of this, so taps
+  /// spread over less than (alignSec - placementSec) all land on the same
+  /// instant. 600 for a field run (taps minutes apart while phones are
+  /// handed out); a table preflight uses less, because waiting most of ten
+  /// minutes for a five-minute test means the preflight never gets run.
+  final int alignSec;
+
+  /// Whether steps take a GPS fix at placement. Off for runs whose layout is
+  /// measured by hand — at 30 m spacing a phone fix carries the geometry's
+  /// own magnitude in error, so sampling adds noise and radio wakes for a
+  /// number the tape measure already gave exactly.
+  final bool sampleGps;
 
   const FieldPlan({
     required this.expId,
@@ -296,8 +365,13 @@ class FieldPlan {
     this.roster = const [],
     this.resetSessions = true,
     this.resetLinks = false,
-    this.resetCustody = true,
+    this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
+    this.deviceOrder,
+    this.manualJoin = false,
+    this.placementSec = 300,
+    this.alignSec = 600,
+    this.sampleGps = true,
   });
 
   Map<String, dynamic> toJson() => {
@@ -308,8 +382,13 @@ class FieldPlan {
           'roster': roster.map((r) => r.toJson()).toList(),
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
-        'resetCustody': resetCustody,
+        'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
+        if (deviceOrder != null) 'deviceOrder': deviceOrder,
+        if (manualJoin) 'manualJoin': true,
+        if (manualJoin) 'placementSec': placementSec,
+        if (manualJoin) 'alignSec': alignSec,
+        if (!sampleGps) 'sampleGps': false,
       };
 
   factory FieldPlan.fromJson(Map<String, dynamic> json) => FieldPlan(
@@ -325,8 +404,13 @@ class FieldPlan {
             const [],
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
-        resetCustody: json['resetCustody'] as bool? ?? true,
+        resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
+        deviceOrder: json['deviceOrder'] as int?,
+        manualJoin: json['manualJoin'] as bool? ?? false,
+        placementSec: json['placementSec'] as int? ?? 300,
+        alignSec: json['alignSec'] as int? ?? 600,
+        sampleGps: json['sampleGps'] as bool? ?? true,
       );
 
   @override
@@ -338,11 +422,17 @@ class FieldPlan {
       listEquals(other.roster, roster) &&
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
-      other.resetCustody == resetCustody &&
-      other.autoAdvanceGapSec == autoAdvanceGapSec;
+      other.resetDtnBuffer == resetDtnBuffer &&
+      other.autoAdvanceGapSec == autoAdvanceGapSec &&
+      other.deviceOrder == deviceOrder &&
+      other.manualJoin == manualJoin &&
+      other.placementSec == placementSec &&
+      other.alignSec == alignSec &&
+      other.sampleGps == sampleGps;
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
-      Object.hashAll(roster), resetSessions, resetLinks, resetCustody,
-      autoAdvanceGapSec);
+      Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
+      autoAdvanceGapSec, deviceOrder, manualJoin, placementSec, alignSec,
+      sampleGps);
 }

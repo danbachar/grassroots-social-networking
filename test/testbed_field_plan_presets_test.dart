@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
@@ -16,42 +17,8 @@ void main() {
       expect(FieldPlan.fromJson(p.toJson()), p);
     });
 
-    test('line sweep: approach sorted, retreat excludes near anchors', () {
-      final p = FieldPlanPresets.lineSweep(
-          distances: const [1, 5, 10, 40], retreat: true, repeat: 1);
-      final labels = p.steps.map((s) => s.label).toList();
-      expect(labels, [
-        'd=1 approach',
-        'd=5 approach',
-        'd=10 approach',
-        'd=40 approach',
-        'd=40 retreat',
-        'd=10 retreat',
-      ]);
-      // Anchors dwell shorter; every step resets links + sessions + sends.
-      expect(p.resetSessions, isTrue);
-      expect(p.resetLinks, isTrue,
-          reason: 'the sweep measures the full discovered→connected ladder');
-      expect(FieldPlan.fromJson(p.toJson()).resetLinks, isTrue);
-      expect(p.steps.every((s) => s.sendCount > 0), isTrue);
-      expect(FieldPlan.fromJson(p.toJson()), p);
-    });
 
-    test('line sweep without retreat is approach-only', () {
-      final p = FieldPlanPresets.lineSweep(
-          distances: const [5, 10, 20], retreat: false, repeat: 1);
-      expect(p.steps.map((s) => s.label),
-          ['d=5 approach', 'd=10 approach', 'd=20 approach']);
-    });
 
-    test('data plane: bulk steps, warm sessions', () {
-      final p = FieldPlanPresets.dataPlane(sideLengths: const [10, 20]);
-      expect(p.resetSessions, isFalse);
-      expect(p.steps.every((s) => s.bulk), isTrue);
-      expect(p.steps.every((s) => s.sendCount == 0), isTrue);
-      expect(p.steps.map((s) => s.label), ['side=10', 'side=20']);
-      expect(FieldPlan.fromJson(p.toJson()), p);
-    });
 
     test('repeat expands each step into N uniquely-labelled trials', () {
       final soak = FieldPlanPresets.homeSoak(dwellMin: 1, sends: 2, repeat: 3);
@@ -60,13 +27,6 @@ void main() {
       expect(soak.steps.map((s) => s.label).toSet(), hasLength(3),
           reason: 'labels unique so the analyzer keeps each trial separate');
 
-      final line = FieldPlanPresets.lineSweep(
-          distances: const [10], retreat: false, repeat: 2);
-      expect(line.steps.map((s) => s.label),
-          ['d=10 approach t1', 'd=10 approach t2']);
-
-      final dp = FieldPlanPresets.dataPlane(sideLengths: const [20], repeat: 2);
-      expect(dp.steps.map((s) => s.label), ['side=20 t1', 'side=20 t2']);
     });
 
     test('cycleCheck: tap the first, auto-advance the other four', () {
@@ -81,13 +41,6 @@ void main() {
       expect(FieldPlan.fromJson(p.toJson()), p);
     });
 
-    test('lineSweep: autoAdvance only on same-distance repeats', () {
-      final p = FieldPlanPresets.lineSweep(
-          distances: const [10, 20], retreat: false, repeat: 2);
-      // d=10 t1 (tap), d=10 t2 (auto), d=20 t1 (tap), d=20 t2 (auto)
-      expect(p.steps.map((s) => s.autoAdvance),
-          [false, true, false, true]);
-    });
 
     test('throughput lanes survive the round-trip', () {
       final p = FieldPlanPresets.throughput(sendLanes: 8);
@@ -164,58 +117,11 @@ void main() {
       // Every plan builder inherits it.
       expect(FieldPlanPresets.homeSoak().steps.single.sendBytes,
           defaultSendBytes);
-      expect(FieldPlanPresets.lineSweep().steps.first.sendBytes,
-          defaultSendBytes);
     });
 
-    test('multiHop: every step addresses the target alone', () {
-      final p = FieldPlanPresets.multiHop(targetPrefix: '9c46b4f3', repeat: 2);
-      expect(p.steps, hasLength(2));
-      expect(p.steps.every((s) => s.sendTo == '9c46b4f3'), isTrue,
-          reason: 'a delivery must prove it crossed the relay');
-      expect(p.resetSessions, isFalse);
-      expect(p.settleSec, greaterThanOrEqualTo(60),
-          reason: 'relayed paths deliver later than direct ones');
-      expect(FieldPlan.fromJson(p.toJson()), p);
-    });
 
-    test('storeCarry: seed step sends to the absent target, then holds', () {
-      final p = FieldPlanPresets.storeCarry(
-          targetPrefix: 'abcd1234', sends: 20, holdMin: 3);
-      expect(p.steps, hasLength(2));
-      expect(p.steps.first.sendCount, 20);
-      expect(p.steps.first.sendTo, 'abcd1234');
-      expect(p.steps.last.sendCount, 0, reason: 'the hold sends nothing');
-      expect(p.steps.last.dwellSec, 3 * 60);
-      expect(p.steps.last.autoAdvance, isTrue);
-      expect(FieldPlan.fromJson(p.toJson()), p);
-    });
 
-    test('lineSweep: every trial is fully cold — links, sessions, custody',
-        () {
-      final p = FieldPlanPresets.lineSweep();
-      expect(p.resetLinks, isTrue, reason: 'BLE stack bounced per step');
-      expect(p.resetSessions, isTrue, reason: 'Noise dropped per step');
-      expect(p.resetCustody, isTrue, reason: 'DTN store emptied per step');
-      expect(FieldPlan.fromJson(p.toJson()), p);
-    });
 
-    test(
-        'lineSweep field-day defaults: 10..100m, 30s, 10 cold trials, no retreat',
-        () {
-      final p = FieldPlanPresets.lineSweep();
-      expect(p.steps, hasLength(100)); // 10 distances x 10 trials
-      expect(p.steps.every((s) => s.label.contains('approach')), isTrue,
-          reason: 'fully cold trials are direction-independent — a retreat '
-              'pass would just repeat the same measurement; hysteresis '
-              'needs the warm variant (resets off, retreat on)');
-      expect(p.steps.every((s) => s.dwellSec == 30), isTrue);
-      expect(p.steps.every((s) => s.sendCount == 100), isTrue,
-          reason: '100 paced sends/30s = 3.3 msg/s, <10% of measured '
-              'capacity, ~1 in flight — 1000 delivery samples per distance');
-      // One tap per NEW distance; trials at the same distance auto-advance.
-      expect(p.steps.where((s) => !s.autoAdvance), hasLength(10));
-    });
 
     test('all named presets parse back and are non-empty', () {
       for (final entry in FieldPlanPresets.presets.entries) {
@@ -232,13 +138,6 @@ void main() {
       expect(soak.expId, 's1');
       expect(soak.steps.single.dwellSec, 600);
 
-      final line = FieldPlanWizard.build(
-          kind: FieldPlanKind.lineSweep, expId: 'l', distances: const [2, 8]);
-      expect(line.steps.first.label, 'd=2 approach');
-
-      final dp = FieldPlanWizard.build(
-          kind: FieldPlanKind.dataPlane, expId: 'd', sideLengths: const [30]);
-      expect(dp.steps.single.label, 'side=30');
     });
 
     test('empty id falls back to "exp"', () {
@@ -247,10 +146,10 @@ void main() {
     });
 
     test('reset toggles: null uses kind defaults, explicit overrides', () {
-      // Defaults: soak (sess on, links off); line (both on); data (both off).
+      // Defaults: soak (sess on, links off); throughput (both off).
       expect(FieldPlanWizard.resetDefaults(FieldPlanKind.homeSoak), (true, false));
-      expect(FieldPlanWizard.resetDefaults(FieldPlanKind.lineSweep), (true, true));
-      expect(FieldPlanWizard.resetDefaults(FieldPlanKind.dataPlane), (false, false));
+      expect(FieldPlanWizard.resetDefaults(FieldPlanKind.throughput),
+          (false, false));
 
       final def = FieldPlanWizard.build(kind: FieldPlanKind.homeSoak, expId: 'a');
       expect((def.resetSessions, def.resetLinks), (true, false));
@@ -282,20 +181,45 @@ void main() {
       expect(t.resetLinks, isTrue);
     });
 
-    test('custody resets per step by default; mesh kinds keep custody', () {
+    test('DTN buffer resets per step by default; mesh kinds keep it', () {
       // Measurement plans: an overrun step's backlog must not drain into the
       // next step's window.
-      expect(FieldPlanPresets.throughputCeiling().resetCustody, isTrue);
-      expect(FieldPlanPresets.throughput().resetCustody, isTrue);
-      expect(FieldPlanPresets.homeSoak().resetCustody, isTrue);
-      // Custody persistence IS the subject of these two.
-      expect(
-          FieldPlanPresets.storeCarry(targetPrefix: 'ab').resetCustody, isFalse);
-      expect(
-          FieldPlanPresets.multiHop(targetPrefix: 'ab').resetCustody, isFalse);
-      final p = FieldPlanPresets.storeCarry(targetPrefix: 'ab');
-      expect(FieldPlan.fromJson(p.toJson()).resetCustody, isFalse,
+      expect(FieldPlanPresets.throughputCeiling().resetDtnBuffer, isTrue);
+      expect(FieldPlanPresets.throughput().resetDtnBuffer, isTrue);
+      expect(FieldPlanPresets.homeSoak().resetDtnBuffer, isTrue);
+      // Buffer persistence IS the subject of the mesh-growth run.
+      final p = FieldPlanPresets.meshScale(role: 1);
+      expect(p.resetDtnBuffer, isFalse);
+      expect(FieldPlan.fromJson(p.toJson()).resetDtnBuffer, isFalse,
           reason: 'must survive the JSON round-trip');
+    });
+
+    test('powerBaseline conditions: subset keeps canonical order and one tap',
+        () {
+      final p = FieldPlanPresets.powerBaseline(
+          role: 1, reps: 1, conditions: const ['light', 'base', 'linked']);
+      expect(p.steps.map((s) => s.label), ['base', 'linked', 'light'],
+          reason: 'canonical order regardless of how the subset is written');
+      expect(p.steps.where((s) => !s.autoAdvance), hasLength(1));
+      // The subset must exercise the same behaviours as the full ladder.
+      expect(p.steps[0].bleOn, isFalse);
+      expect(p.steps[1].bleOn, isTrue);
+      expect(p.steps[2].sendCount, greaterThan(0));
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+
+    test('the pre-check preset is short and screen-off testable', () {
+      final pre = FieldPlanPresets
+          .presets['Power PRE-CHECK P1 (~3.5 min, screen off)']!;
+      expect(pre.steps, hasLength(3));
+      // 60s per condition — the same granularity as the real ladder, so a
+      // segment that survives screen-off here survives it there. Anything
+      // shorter would also starve the 10s power sampler.
+      expect(pre.steps.every((s) => s.dwellSec == 60), isTrue);
+      final total = pre.steps.fold<int>(0, (a, s) => a + s.dwellSec) +
+          pre.steps.length * pre.autoAdvanceGapSec +
+          pre.settleSec;
+      expect(total, lessThan(240), reason: 'a smoke test nobody will skip');
     });
 
     test('rawLink: one step per leg, leg in the label, raw mode set', () {
@@ -308,12 +232,53 @@ void main() {
           reason: 'the plugin GATT op queue is unbounded and survives every '
               'app-level reset; only a link teardown discards a blast '
               'step\'s backlog, so raw steps bounce the link by default');
-      expect(p.resetCustody, isFalse,
-          reason: 'raw blobs never touch custody — nothing to clear');
+      expect(p.resetDtnBuffer, isFalse,
+          reason: 'raw blobs never touch the DTN buffer — nothing to clear');
       expect(FieldPlanWizard.resetDefaults(FieldPlanKind.rawLink),
           (false, true));
       expect(FieldPlan.fromJson(p.toJson()), p,
           reason: 'rawLeg must survive the JSON round-trip');
+    });
+
+    test('powerBaseline: complementary roles under identical labels', () {
+      final p1 = FieldPlanPresets.powerBaseline(role: 1, reps: 2);
+      final p2 = FieldPlanPresets.powerBaseline(role: 2, reps: 2);
+      expect(p1.steps.map((s) => s.label), p2.steps.map((s) => s.label),
+          reason: 'both phones stamp the SAME segment labels so the '
+              'analyzer aligns their power samples');
+      expect(p1.steps, hasLength(16));
+      expect(p1.steps.map((s) => s.label).toSet(), hasLength(16),
+          reason: 'repeat suffixes keep every segment distinct');
+      // One tap total: only the very first step waits.
+      expect(p1.steps.where((s) => !s.autoAdvance), hasLength(1));
+
+      Map<String, FieldStep> by(FieldPlan p) =>
+          {for (final s in p.steps) s.label: s};
+      final a = by(p1), b = by(p2);
+      // base: both down. solo: exactly one up. linked: both up.
+      expect((a['base r1']!.bleOn, b['base r1']!.bleOn), (false, false));
+      expect((a['solo r1']!.bleOn, b['solo r1']!.bleOn), (true, false));
+      expect((a['solo2 r1']!.bleOn, b['solo2 r1']!.bleOn), (false, true));
+      expect((a['linked r1']!.bleOn, b['linked r1']!.bleOn), (true, true));
+      // light: exactly one sends; heavy: exactly one saturates (1 sender —
+      // the measured capacity knee).
+      expect((a['light r1']!.sendCount > 0, b['light r1']!.sendCount > 0),
+          (true, false));
+      expect((a['light2 r1']!.sendCount > 0, b['light2 r1']!.sendCount > 0),
+          (false, true));
+      expect((a['heavy r1']!.saturate, b['heavy r1']!.saturate),
+          (true, false));
+      expect(a['heavy r1']!.sendLanes, 1);
+      expect((a['heavy2 r1']!.saturate, b['heavy2 r1']!.saturate),
+          (false, true));
+      expect(FieldPlan.fromJson(p1.toJson()), p1,
+          reason: 'bleOn must survive the JSON round-trip');
+
+      // Every condition gets the SAME window, saturating ones included: a
+      // shorter heavy segment would trade measurement uniformity for an
+      // upload limit, which is the server's problem to fix, not the
+      // experiment's to design around.
+      expect(p1.steps.every((s) => s.dwellSec == 600), isTrue);
     });
 
     test('rawLink route threads legs through the wizard', () {
@@ -346,4 +311,202 @@ void main() {
       expect(FieldPlanWizard.parseInts('a, -3, 0, 7', const [99]), [7]);
     });
   });
+
+  group('bounceStress', () {
+    test('alternates down/up and every up step outlives the watchdog', () {
+      final plan = FieldPlanPresets.bounceStress();
+
+      expect(plan.steps.length, 8, reason: '4 down-times x (down + up)');
+      for (var i = 0; i < plan.steps.length; i += 2) {
+        expect(plan.steps[i].bleOn, isFalse);
+        expect(plan.steps[i + 1].bleOn, isTrue);
+        // A bleOn:true step at or below the 30s watchdog is never watched,
+        // which would make the whole diagnostic silently useless.
+        expect(plan.steps[i + 1].dwellSec, greaterThan(30));
+      }
+      expect(plan.steps.map((s) => s.dwellSec).where((d) => d != 60).toList(),
+          [120, 300, 600], reason: 'down-times increase');
+    });
+
+    test('only the first step waits for a tap', () {
+      final plan = FieldPlanPresets.bounceStress();
+      expect(plan.steps.first.autoAdvance, isFalse);
+      expect(plan.steps.skip(1).every((s) => s.autoAdvance), isTrue);
+    });
+  });
+
+  group('meshScale (stable dilating clique)', () {
+    test('join order decides presence; blocks n=3..N with stable reps', () {
+      final p = FieldPlanPresets.meshScale(role: 5, maxDevices: 6, repeat: 2);
+      final byLabel = {for (final st in p.steps) st.label: st};
+      expect(byLabel.keys.toSet(), {
+        for (var n = 3; n <= 6; n++) ...{'n=$n t1', 'n=$n t2'}
+      });
+      expect(byLabel['n=4 t1']!.bleOn, isFalse, reason: 'role 5 not yet in');
+      expect(byLabel['n=5 t1']!.bleOn, isTrue);
+      expect(byLabel['n=5 t1']!.saturate, isTrue,
+          reason: 'performance run: everyone up saturates');
+      // NO toggling inside blocks — churn belongs to the joinTime run.
+      expect(p.steps.where((st) => st.label.startsWith('off ')), isEmpty);
+      expect(p.steps.every((st) => st.resetSessions == null), isTrue);
+    });
+
+    test('manual by construction: no GPS, wall-clock anchor, order stamped',
+        () {
+      final p = FieldPlanPresets.meshScale(role: 4);
+      expect(p.manualJoin, isTrue);
+      expect(p.sampleGps, isFalse);
+      expect(p.deviceOrder, 4);
+      expect(p.resetDtnBuffer, isFalse,
+          reason: 'buffer persistence across steps IS part of the subject');
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
+  });
+
+  group('joinTime (toggling frontier, quiet mesh)', () {
+    test('the frontier toggles through its block, then stands', () {
+      final p = FieldPlanPresets.joinTime(role: 5, maxDevices: 6, repeat: 3);
+      final off = p.steps.firstWhere((st) => st.label == 'off n=5 t2');
+      expect(off.bleOn, isFalse);
+      expect(off.resetSessions, isTrue,
+          reason: 'reset while DARK so every join is a cold handshake');
+      final join = p.steps.firstWhere((st) => st.label == 'n=5 t2');
+      expect(join.bleOn, isTrue);
+      expect(join.resetSessions, isNull,
+          reason: 'a reset at the join step would measure itself');
+      expect(join.saturate, isFalse,
+          reason: 'the establishment run keeps the mesh QUIET');
+      // Annealed for block 6; dark before its turn.
+      expect(p.steps.where((st) => st.label == 'off n=6 t1'), isEmpty);
+      expect(p.steps.firstWhere((st) => st.label == 'n=6 t1').bleOn, isTrue);
+      expect(p.steps.firstWhere((st) => st.label == 'n=4 t1').bleOn, isFalse);
+    });
+
+    test('standing phones are quiet: no saturation, no sends', () {
+      final p = FieldPlanPresets.joinTime(role: 1, maxDevices: 5);
+      expect(p.steps.every((st) => !st.saturate && st.sendCount == 0), isTrue);
+      expect(p.steps.every((st) => st.bleOn == true), isTrue,
+          reason: 'the founding trio stands throughout');
+    });
+
+    test('all roles tick in exact wall-clock lockstep', () {
+      int span(FieldPlan p) => p.steps
+          .fold(0, (a, st) => a + st.dwellSec + p.autoAdvanceGapSec);
+      final frontier = FieldPlanPresets.joinTime(role: 5, maxDevices: 8);
+      final standing = FieldPlanPresets.joinTime(role: 1, maxDevices: 8);
+      final late_ = FieldPlanPresets.joinTime(role: 8, maxDevices: 8);
+      expect(span(frontier), span(standing));
+      expect(span(standing), span(late_));
+      expect(frontier.alignSec, standing.alignSec);
+    });
+
+    test('blocks start at the first frontier: k=4, trio unmeasured', () {
+      final p = FieldPlanPresets.joinTime(role: 1, maxDevices: 8);
+      final ks = p.steps
+          .where((st) => !st.label.startsWith('off '))
+          .map((st) => st.label.split(' ').first)
+          .toSet();
+      expect(ks, {for (var k = 4; k <= 8; k++) 'n=$k'});
+    });
+  });
+
+  group('wizard: mesh scaling', () {
+    test('device count, role and reps come from the wizard', () {
+      final plan = FieldPlanWizard.build(
+        kind: FieldPlanKind.meshScale,
+        expId: 'scale',
+        maxDevices: 5,
+        meshRole: 4,
+        dwellSec: 90,
+        repeat: 2,
+      );
+      // 5 devices -> sizes 3..5, 2 stable reps each; role 4 joins at n=4.
+      expect(plan.steps.map((s) => s.label).toList(), [
+        'n=3 t1', 'n=3 t2', 'n=4 t1', 'n=4 t2', 'n=5 t1', 'n=5 t2',
+      ]);
+      final byLabel = {for (final s in plan.steps) s.label: s};
+      expect(byLabel['n=3 t1']!.bleOn, isFalse);
+      expect(byLabel['n=4 t1']!.bleOn, isTrue);
+      expect(byLabel['n=4 t1']!.dwellSec, 90);
+    });
+
+    test('the joinTime kind routes with the id carrying the spacing', () {
+      final plan = FieldPlanWizard.build(
+        kind: FieldPlanKind.joinTime,
+        expId: 'join-time-30m',
+        meshRole: 4,
+        maxDevices: 5,
+        dwellSec: 45,
+        repeat: 2,
+      );
+      expect(plan.expId, 'join-time-30m');
+      expect(plan.steps.map((s) => s.label).toList(), [
+        'off n=4 t1', 'n=4 t1', 'off n=4 t2', 'n=4 t2', 'n=5 t1', 'n=5 t2',
+      ]);
+    });
+
+    test('the wizard keeps sessions and links warm plan-wide', () {
+      // Only the frontier's own off steps reset, and only while dark.
+      final plan = FieldPlanWizard.build(
+          kind: FieldPlanKind.meshScale, expId: 'scale');
+      expect(plan.resetSessions, isFalse);
+      expect(plan.resetLinks, isFalse);
+    });
+
+    test('the wizard can build the fixed-rate arm', () {
+      final plan = FieldPlanWizard.build(
+        kind: FieldPlanKind.meshScale,
+        expId: 'scale',
+        saturate: false,
+        sends: 40,
+        maxDevices: 4,
+        meshRole: 1,
+        repeat: 1,
+      );
+      // Role 1 is up from the start; fixed-rate sends thread through.
+      expect(plan.steps.every((s) => !s.saturate), isTrue);
+      expect(plan.steps.first.sendCount, 40);
+    });
+  });
+
+  group('PREFLIGHT preset (manual join, 4 devices)', () {
+    FieldPlan row(int r) => FieldPlanPresets.presets[
+        'PREFLIGHT 4 devices, manual join (~7 min) — this phone is #$r']!;
+
+    test('rehearses the real procedure: manual, no GPS, own id', () {
+      final p = row(1);
+      expect(p.manualJoin, isTrue);
+      expect(p.sampleGps, isFalse);
+      expect(p.expId, 'mesh-preflight',
+          reason: 'a rehearsal must never land in a real run\'s file');
+      expect(p.deviceOrder, 1);
+      // 4 devices -> sizes 3 and 4, two stable reps each.
+      expect(p.steps.map((s) => s.label),
+          ['n=3 t1', 'n=3 t2', 'n=4 t1', 'n=4 t2']);
+    });
+
+    test('phone 4 is dark at n=3 and joins at n=4', () {
+      final p = row(4);
+      expect(p.steps.firstWhere((s) => s.label == 'n=3 t1').bleOn, isFalse);
+      expect(p.steps.firstWhere((s) => s.label == 'n=4 t1').bleOn, isTrue);
+    });
+
+    test('aligns to 2 minutes, not 10 — a table test must start soon', () {
+      final p = row(2);
+      expect(p.alignSec, 120);
+      expect(p.placementSec, 60);
+    });
+
+    test('the dead procedures are gone from the preset list', () {
+      final names = FieldPlanPresets.presets.keys;
+      expect(names.where((n) => n.contains('SMOKE')), isEmpty);
+      expect(names.where((n) => n.contains('@ 30m')), isEmpty);
+      expect(names.where((n) => n.contains('@ 50m')), isEmpty);
+      expect(names.where((n) => n.contains('line sweep')), isEmpty);
+      expect(names.where((n) => n.contains('multi-hop')), isEmpty);
+      expect(names.where((n) => n.contains('store-carry')), isEmpty);
+    });
+  });
+
+
 }

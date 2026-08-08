@@ -136,6 +136,73 @@ class ProtocolHandler {
     );
   }
 
+  /// DEBUG/TESTBED ONLY. Remote run-start, addressed to one peer. The chunk
+  /// is the experiment id, so a receiver can refuse a signal meant for a
+  /// different run. Flooded like any recipient-addressed packet, so it
+  /// reaches peers that are not direct neighbours.
+  /// DEBUG/TESTBED. This phone's neighbour list for the armed-time mesh
+  /// gossip. Payload: seq (4B big-endian) then N x 32-byte pubkeys. The
+  /// sender's own key is not included — the recipient learns it from the
+  /// Noise session the frame decrypted under.
+  ///
+  /// [seq] lets a receiver drop a re-flood it has already merged. Without it
+  /// the gossip cannot terminate: each hop re-seals to its own peers, so new
+  /// packet ids are minted every time and the packetId bloom never fires.
+  GrassrootsPacket createTestbedNeighboursPacket({
+    required int seq,
+    required List<Uint8List> neighbours,
+    required Uint8List recipientPubkey,
+  }) {
+    final body = BytesBuilder()
+      ..add([(seq >> 24) & 0xff, (seq >> 16) & 0xff, (seq >> 8) & 0xff, seq & 0xff]);
+    for (final n in neighbours) {
+      if (n.length != 32) {
+        throw ArgumentError('neighbour pubkey must be 32 bytes, got ${n.length}');
+      }
+      body.add(n);
+    }
+    final frame = SecureFrame(
+      contentType: ContentType.testbedNeighbours,
+      messageId: const Uuid().v4(),
+      chunk: body.toBytes(),
+    );
+    return GrassrootsPacket(
+      type: PacketType.secure,
+      recipientPubkey: recipientPubkey,
+      payload: frame.encode(),
+    );
+  }
+
+  /// Decode a [ContentType.testbedNeighbours] payload into (seq, pubkeys).
+  static (int, List<Uint8List>) decodeTestbedNeighbours(Uint8List chunk) {
+    if (chunk.length < 4 || (chunk.length - 4) % 32 != 0) {
+      throw FormatException(
+          'malformed neighbour gossip: ${chunk.length} bytes');
+    }
+    final seq = (chunk[0] << 24) | (chunk[1] << 16) | (chunk[2] << 8) | chunk[3];
+    final out = <Uint8List>[];
+    for (var i = 4; i < chunk.length; i += 32) {
+      out.add(Uint8List.fromList(chunk.sublist(i, i + 32)));
+    }
+    return (seq, out);
+  }
+
+  GrassrootsPacket createTestbedStartPacket({
+    required String expId,
+    required Uint8List recipientPubkey,
+  }) {
+    final frame = SecureFrame(
+      contentType: ContentType.testbedStart,
+      messageId: const Uuid().v4(),
+      chunk: utf8.encode(expId),
+    );
+    return GrassrootsPacket(
+      type: PacketType.secure,
+      recipientPubkey: recipientPubkey,
+      payload: frame.encode(),
+    );
+  }
+
   // ===== Decoding =====
 
   /// Decode ANNOUNCE payload

@@ -36,8 +36,17 @@ late final Store<AppState> appStore;
 // Global persistence service
 late final PersistenceService persistenceService;
 
-// Global opt-in trace logger (enabled only after the user consents).
+// Global experiment recorder. DEBUG/TESTBED only: records nothing until the
+// experimenter explicitly starts a run from the testbed screen, and uploads
+// nothing without an explicit action. There is no consent setting because
+// there is no automatic collection to consent to.
 late final ExperimentRecorder experimentRecorder;
+
+/// The live coordinator, for the recorder's buffer probe and stop-time tail
+/// flush. The recorder is built in main() before the network exists, so the
+/// probes reach it through this late-bound reference (set on network
+/// creation, cleared on dispose).
+GrassrootsNetwork? traceProbeNetwork;
 
 // Global libsodium handle, initialized at app startup. Used by ProtocolHandler
 // for native Ed25519 sign on the main isolate; verifier worker isolates
@@ -294,6 +303,13 @@ void main() async {
   // device except via an explicit share.
   const powerChannel = MethodChannel('grassroots/power');
   experimentRecorder = ExperimentRecorder(
+    // Message-path buffer occupancy, sampled every 10s into `buf` records.
+    bufferProbe: () => traceProbeNetwork?.bufferSnapshot() ?? const {},
+    // Links already live at experiment start: without this snapshot the
+    // topology reconstruction draws pre-connected phones at degree 0.
+    linkSnapshot: () => traceProbeNetwork?.bleLinkSnapshot() ?? const [],
+    // Tail capture at stop: the wire ledger's last sub-10s delta.
+    preStopFlush: () async => traceProbeNetwork?.flushTraceTails(),
     // Raw fuel-gauge probe (Android BatteryManager). Failures return null —
     // a device without the channel (or a denied read) records no power
     // records rather than crashing the run.
@@ -443,6 +459,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
+    traceProbeNetwork = null;
     _grassroots?.dispose();
     // Flush persistence on exit
     persistenceService.flush(appStore.state);
@@ -453,6 +470,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
     debugPrint('[lifecycle] App state -> $state');
+    // Lifecycle into the trace: absolute draw is screen-dominated and
+    // Android changes BLE scan behaviour in background — a run where the
+    // app backgrounded mid-step was previously indistinguishable from a
+    // clean one.
+    if (experimentRecorder.active) {
+      unawaited(experimentRecorder.log({
+        'type': 'app',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': state.name,
+      }));
+    }
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       // Persist the log tail before a possible background kill.
@@ -486,6 +514,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         _identity = identity;
         _grassroots = grassroots;
       });
+      traceProbeNetwork = grassroots;
 
       final success = await grassroots.initialize();
       if (!success) {
@@ -2430,18 +2459,49 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
           onResetLinks:
               _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
-          onResetCustody:
-              _grassroots == null ? null : () => _grassroots!.clearCustody(),
+          onResetDtnBuffer:
+              _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
+          onCryptoBench:
+              _grassroots == null ? null : () => _grassroots!.runCryptoBench(),
+          bleWireBytes:
+              _grassroots == null ? null : () => _grassroots!.bleWireBytes,
+          bleUsable:
+              _grassroots == null ? null : () => _grassroots!.bleUsable,
+          bleUsableChanges: _grassroots?.bleUsableChanges,
           sendRaw: _grassroots == null
               ? null
               : (peer, {required leg, required seq}) =>
                   _grassroots!.sendRawBlob(peer, leg: leg, seq: seq),
+          onSetBle: _grassroots == null
+              ? null
+              : (on) => _grassroots!.setBleActiveForTestbed(on),
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
           registerAckListener: _grassroots == null
               ? null
               : (listener) => _grassroots!.onTestbedAck = listener,
+          // Multi-device runs: every phone arms and one signals the rest, so
+          // devices spread over hundreds of metres begin within the flood's
+          // latency of each other rather than however long the walk takes.
+          onBroadcastStart: _grassroots == null
+              ? null
+              : (expId) => _grassroots!.broadcastTestbedStart(expId),
+          // Armed-time only: each phone gossips who it can see, so every
+          // phone can show how many are actually in the mesh before the
+          // start signal is asked to cross it.
+          sessionPeerCount:
+              _grassroots == null ? null : () => _grassroots!.sessionPeerCount,
+          onGossipNeighbours: _grassroots == null
+              ? null
+              : () => _grassroots!.broadcastTestbedNeighbours(),
+          meshComponentSize:
+              _grassroots == null ? null : () => _grassroots!.meshComponentSize,
+          onClearMeshView:
+              _grassroots == null ? null : () => _grassroots!.clearMeshView(),
+          registerStartListener: _grassroots == null
+              ? null
+              : (listener) => _grassroots!.onTestbedStartRequested = listener,
         ),
       ),
     );

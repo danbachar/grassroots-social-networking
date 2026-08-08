@@ -1,0 +1,238 @@
+records: 400532   span: 426s
+
+sender1 (2537c7bf):
+  records by type: {'message': 38845, 'custody': 34161, 'relay': 21632, 'session': 11510, 'drop': 4547, 'packetDup': 1532, 'rssi': 367, 'link': 182, 'buf': 44, 'power': 44, 'wire': 44, 'marker': 17, 'app': 4, 'flow': 4}
+  link stages: {'discovered': 167, 'connected': 10, 'drop': 4, 'scanRestart': 1}
+  messages sent: 9653, received: 4351 (45%), ACK-confirmed: 3018 (31%)
+  wire RTT ms (send->ACK): median 3588, p90 9572, max 57807
+  app latency ms (create->ACK): median 3597, p90 9487 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 2432.0, acked 298.0 (39336.0 B), goodput n/a
+  flow saturate: sent 944.0, acked 1219.0 (160908.0 B), goodput n/a
+  flow saturate: sent 429.0, acked 555.0 (73260.0 B), goodput n/a
+  flow saturate: sent 537.0, acked 479.0 (63228.0 B), goodput n/a
+  wire bytes: {'rx:announce': 26712, 'rx:secure': 5183872, 'tx:announce': 34344, 'tx:secure': 8514696, 'tx:secure:ack': 2276400}
+
+sender2 (5abc4da1):
+  records by type: {'message': 28368, 'custody': 21976, 'relay': 6871, 'drop': 4849, 'session': 2596, 'packetDup': 909, 'rssi': 144, 'link': 93, 'buf': 44, 'power': 44, 'wire': 20, 'marker': 14, 'app': 4, 'flow': 2}
+  link stages: {'discovered': 79, 'scanRestart': 6, 'connected': 6, 'advertiseFailed': 2}
+  messages sent: 12501, received: 1197 (10%), ACK-confirmed: 632 (5%)
+  wire RTT ms (send->ACK): median 34366, p90 47161, max 78095
+  app latency ms (create->ACK): median 27847, p90 35634 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 2422.0, acked 69.0 (9108.0 B), goodput n/a
+  flow saturate: sent 1742.0, acked 39.0 (5148.0 B), goodput n/a
+  wire bytes: {'rx:announce': 12561, 'rx:secure': 1225784, 'tx:announce': 18921, 'tx:secure': 10005980, 'tx:secure:ack': 452060}
+
+sender3 (907a2f08):
+  records by type: {'message': 36930, 'custody': 25583, 'relay': 16253, 'session': 11965, 'drop': 5272, 'packetDup': 1294, 'rssi': 586, 'link': 162, 'buf': 44, 'power': 44, 'wire': 43, 'marker': 17, 'app': 8, 'flow': 4}
+  link stages: {'discovered': 152, 'connected': 8, 'drop': 2}
+  messages sent: 7856, received: 4515 (57%), ACK-confirmed: 3281 (42%)
+  wire RTT ms (send->ACK): median 1833, p90 11352, max 67854
+  app latency ms (create->ACK): median 1842, p90 10760 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 1433.0, acked 986.0 (130152.0 B), goodput n/a
+  flow saturate: sent 782.0, acked 860.0 (113520.0 B), goodput n/a
+  flow saturate: sent 588.0, acked 660.0 (87120.0 B), goodput n/a
+  flow saturate: sent 553.0, acked 337.0 (44484.0 B), goodput n/a
+  wire bytes: {'rx:announce': 24168, 'rx:secure': 4964324, 'tx:announce': 34026, 'tx:secure': 6817512, 'tx:secure:ack': 2350600}
+
+sender4 (d8254397):
+  records by type: {'message': 52693, 'custody': 37721, 'relay': 14021, 'session': 10159, 'drop': 6956, 'packetDup': 1268, 'rssi': 343, 'link': 146, 'buf': 44, 'power': 44, 'wire': 42, 'marker': 17, 'flow': 4, 'app': 2}
+  link stages: {'discovered': 135, 'connected': 8, 'drop': 2, 'scanRestart': 1}
+  messages sent: 17581, received: 8916 (51%), ACK-confirmed: 4913 (28%)
+  wire RTT ms (send->ACK): median 5206, p90 11830, max 67895
+  app latency ms (create->ACK): median 4827, p90 10202 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 3129.0, acked 1298.0 (171336.0 B), goodput n/a
+  flow saturate: sent 2520.0, acked 1192.0 (157344.0 B), goodput n/a
+  flow saturate: sent 1070.0, acked 734.0 (96888.0 B), goodput n/a
+  flow saturate: sent 1023.0, acked 713.0 (94116.0 B), goodput n/a
+  wire bytes: {'rx:announce': 21465, 'rx:secure': 3507572, 'tx:announce': 33072, 'tx:secure': 11859480, 'tx:secure:ack': 1322860}
+battery sender1 (2537c7bf): 94% -> 93%, median draw 352 mA (44 samples)
+battery sender2 (5abc4da1): 100% -> 99%, median draw 0 mA (44 samples)
+battery sender3 (907a2f08): 98% -> 95%, median draw 315 mA (44 samples)
+battery sender4 (d8254397): 82% -> 81%, median draw 357 mA (44 samples)
+
+=== mesh ===
+device clocks (from shared step markers): sender1 (2537c7bf) +0.001s sender2 (5abc4da1) -0.002s sender3 (907a2f08) +0.001s sender4 (d8254397) +0.000s — max spread 0.003s
+!! 99 impossible orderings (delivery logged before the send):
+!!   sender1 -> sender3: 43 msg, worst 0.1s
+!!   sender1 -> sender4: 31 msg, worst 0.1s
+!!   sender4 -> sender3: 25 msg, worst 0.1s
+!! the marker-measured clock spread is 0.003s; whatever part of 0.1s it cannot cover is the sender's own sent stamp lagging the wire write — every latency in this run is biased LOW by up to that lag
+messages sent: 47591, delivered: 18979 (40%)
+delivered by relay hops (receiver TTL view): {0: 13510, 1: 5174, 2: 287, 3: 8}
+  MULTI-HOP deliveries: 5469/18979
+messages observed being forwarded by a relay: 13963
+  sender1 -> sender2 -> sender2: 36 msg
+  sender1 -> sender2 -> sender2 -> sender3: 41 msg, median 1917 ms
+  sender1 -> sender2 -> sender2 -> sender3 -> sender3: 1 msg
+  sender1 -> sender2 -> sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender4: 2 msg, median 54043 ms
+  sender1 -> sender2 -> sender2 -> sender4: 17 msg, median 2194 ms
+  sender1 -> sender2 -> sender2 -> sender4 -> sender4 -> sender3: 2 msg, median 37651 ms
+  sender1 -> sender3 -> sender3: 686 msg
+  sender1 -> sender3 -> sender3 -> sender2: 47 msg, median 11636 ms
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2: 45 msg
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2 -> sender1 -> sender1: 1 msg
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2 -> sender1 -> sender1 -> sender4: 3 msg, median 25889 ms
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender4: 2 msg, median 6 ms
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2 -> sender3 -> sender3 -> sender4: 1 msg, median 13 ms
+  sender1 -> sender3 -> sender3 -> sender2 -> sender2 -> sender4: 124 msg, median 2126 ms
+  sender1 -> sender3 -> sender3 -> sender3 -> sender3 -> sender4: 1 msg, median 2928 ms
+  sender1 -> sender3 -> sender3 -> sender4: 710 msg, median 2616 ms
+  sender1 -> sender3 -> sender3 -> sender4 -> sender4: 113 msg
+  sender1 -> sender3 -> sender3 -> sender4 -> sender4 -> sender1 -> sender1: 1 msg
+  sender1 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2: 94 msg, median 9549 ms
+  sender1 -> sender3 -> sender3 -> sender4 -> sender4 -> sender3 -> sender3 -> sender4 -> sender4: 1 msg
+  sender1 -> sender3 -> sender4 -> sender3 -> sender4 -> sender2: 3 msg, median 387 ms
+  sender1 -> sender3 -> sender4 -> sender4 -> sender3: 1 msg
+  sender1 -> sender3 -> sender4 -> sender4 -> sender3 -> sender2: 3 msg, median 672 ms
+  sender1 -> sender4 -> sender3 -> sender4 -> sender3 -> sender2: 2 msg, median 646 ms
+  sender1 -> sender4 -> sender4: 314 msg
+  sender1 -> sender4 -> sender4 -> sender2: 31 msg, median 16995 ms
+  sender1 -> sender4 -> sender4 -> sender2 -> sender2: 22 msg
+  sender1 -> sender4 -> sender4 -> sender2 -> sender2 -> sender1 -> sender1 -> sender3: 7 msg, median 3803 ms
+  sender1 -> sender4 -> sender4 -> sender2 -> sender2 -> sender3: 129 msg, median 1513 ms
+  sender1 -> sender4 -> sender4 -> sender2 -> sender2 -> sender4 -> sender4 -> sender3: 1 msg, median -57 ms
+  sender1 -> sender4 -> sender4 -> sender3: 890 msg, median 1168 ms
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3: 97 msg
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender1 -> sender1: 3 msg
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2: 3 msg, median 11825 ms
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2: 41 msg, median 11082 ms
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender3 -> sender3: 1 msg
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2: 4 msg, median 10959 ms
+  sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2: 4 msg, median 4004 ms
+  sender2 -> sender1 -> sender1: 47 msg
+  sender2 -> sender1 -> sender1 -> sender3: 84 msg, median 15138 ms
+  sender2 -> sender1 -> sender1 -> sender3 -> sender3: 26 msg
+  sender2 -> sender1 -> sender1 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender4: 5 msg, median 20428 ms
+  sender2 -> sender1 -> sender1 -> sender3 -> sender3 -> sender1 -> sender1 -> sender4: 8 msg, median 18492 ms
+  sender2 -> sender1 -> sender1 -> sender3 -> sender3 -> sender4: 116 msg, median 13654 ms
+  sender2 -> sender1 -> sender1 -> sender4: 90 msg, median 16000 ms
+  sender2 -> sender1 -> sender1 -> sender4 -> sender4: 13 msg
+  sender2 -> sender1 -> sender1 -> sender4 -> sender4 -> sender1 -> sender1 -> sender3: 5 msg, median 18196 ms
+  sender2 -> sender1 -> sender1 -> sender4 -> sender4 -> sender3: 157 msg, median 13485 ms
+  sender2 -> sender1 -> sender4 -> sender1 -> sender4 -> sender2 -> sender2 -> sender3: 1 msg, median 22890 ms
+  sender2 -> sender1 -> sender4 -> sender1 -> sender4 -> sender3: 9 msg, median 16987 ms
+  sender2 -> sender3 -> sender1 -> sender1 -> sender3 -> sender4: 1 msg, median 18152 ms
+  sender2 -> sender3 -> sender1 -> sender3 -> sender1 -> sender2 -> sender2 -> sender4: 2 msg, median 21050 ms
+  sender2 -> sender3 -> sender3: 9 msg
+  sender2 -> sender3 -> sender3 -> sender1: 13 msg, median 47929 ms
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1: 3 msg
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2 -> sender2: 1 msg
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender4: 1 msg, median 38117 ms
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender3 -> sender3 -> sender4: 4 msg, median 36414 ms
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender4: 11 msg, median 23076 ms
+  sender2 -> sender3 -> sender3 -> sender1 -> sender1 -> sender4: 45 msg, median 40863 ms
+  sender2 -> sender3 -> sender3 -> sender4 -> sender4 -> sender1: 50 msg, median 36651 ms
+  sender2 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2 -> sender2 -> sender1: 4 msg, median 37194 ms
+  sender2 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2 -> sender2 -> sender3 -> sender3 -> sender4 -> sender4 -> sender1: 1 msg, median 35443 ms
+  sender2 -> sender4 -> sender1 -> sender1 -> sender4 -> sender2 -> sender2 -> sender3: 1 msg, median 22474 ms
+  sender2 -> sender4 -> sender1 -> sender4 -> sender1 -> sender3: 1 msg, median 21151 ms
+  sender2 -> sender4 -> sender3 -> sender4 -> sender3 -> sender2 -> sender2 -> sender1: 1 msg, median 32560 ms
+  sender2 -> sender4 -> sender4: 6 msg
+  sender2 -> sender4 -> sender4 -> sender1: 20 msg, median 34592 ms
+  sender2 -> sender4 -> sender4 -> sender1 -> sender1: 3 msg
+  sender2 -> sender4 -> sender4 -> sender1 -> sender1 -> sender2 -> sender2 -> sender3: 5 msg, median 34238 ms
+  sender2 -> sender4 -> sender4 -> sender1 -> sender1 -> sender2 -> sender2 -> sender4 -> sender4 -> sender1 -> sender1 -> sender3: 1 msg, median 32584 ms
+  sender2 -> sender4 -> sender4 -> sender1 -> sender1 -> sender2 -> sender2 -> sender4 -> sender4 -> sender3: 26 msg, median 30776 ms
+  sender2 -> sender4 -> sender4 -> sender1 -> sender1 -> sender3: 57 msg, median 35389 ms
+  sender2 -> sender4 -> sender4 -> sender3: 3 msg, median 37635 ms
+  sender2 -> sender4 -> sender4 -> sender3 -> sender3: 1 msg
+  sender2 -> sender4 -> sender4 -> sender3 -> sender3 -> sender1: 102 msg, median 14975 ms
+  sender2 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2 -> sender2 -> sender1: 12 msg, median 27817 ms
+  sender2 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2 -> sender2 -> sender4 -> sender4 -> sender1: 20 msg, median 35606 ms
+  sender2 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2 -> sender2 -> sender4 -> sender4 -> sender3 -> sender3 -> sender1: 2 msg, median 33459 ms
+  sender3 -> sender1 -> sender1: 608 msg
+  sender3 -> sender1 -> sender1 -> sender2: 57 msg, median 12382 ms
+  sender3 -> sender1 -> sender1 -> sender2 -> sender2: 43 msg
+  sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender1 -> sender1 -> sender4: 3 msg, median 2583 ms
+  sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender3 -> sender3 -> sender4: 1 msg, median 3121 ms
+  sender3 -> sender1 -> sender1 -> sender2 -> sender2 -> sender4: 174 msg, median 3238 ms
+  sender3 -> sender1 -> sender1 -> sender4: 714 msg, median 2952 ms
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4: 305 msg
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender2: 164 msg, median 10785 ms
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender3 -> sender3: 4 msg
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2: 5 msg, median 16155 ms
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender4 -> sender4: 5 msg
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender4 -> sender4 -> sender2: 2 msg, median 17621 ms
+  sender3 -> sender1 -> sender1 -> sender4 -> sender4 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2: 4 msg, median 8818 ms
+  sender3 -> sender1 -> sender4 -> sender1 -> sender4 -> sender2: 1 msg, median 4393 ms
+  sender3 -> sender1 -> sender4 -> sender1 -> sender4 -> sender4 -> sender4: 2 msg
+  sender3 -> sender1 -> sender4 -> sender1 -> sender4 -> sender4 -> sender4 -> sender2: 1 msg, median 27447 ms
+  sender3 -> sender1 -> sender4 -> sender1 -> sender4 -> sender4 -> sender4 -> sender3 -> sender3 -> sender2: 6 msg, median 13328 ms
+  sender3 -> sender1 -> sender4 -> sender4 -> sender1: 3 msg
+  sender3 -> sender1 -> sender4 -> sender4 -> sender1 -> sender2: 4 msg, median 1908 ms
+  sender3 -> sender1 -> sender4 -> sender4 -> sender1 -> sender4 -> sender4: 2 msg
+  sender3 -> sender1 -> sender4 -> sender4 -> sender1 -> sender4 -> sender4 -> sender2: 2 msg, median 5814 ms
+  sender3 -> sender2 -> sender2: 5 msg
+  sender3 -> sender2 -> sender2 -> sender1: 43 msg, median 3239 ms
+  sender3 -> sender2 -> sender2 -> sender1 -> sender1 -> sender4: 15 msg, median 24276 ms
+  sender3 -> sender2 -> sender2 -> sender4: 41 msg, median 10414 ms
+  sender3 -> sender2 -> sender2 -> sender4 -> sender4 -> sender1: 52 msg, median 292 ms
+  sender3 -> sender4 -> sender1 -> sender4 -> sender1 -> sender2: 1 msg, median 2789 ms
+  sender3 -> sender4 -> sender2 -> sender2 -> sender4 -> sender1: 2 msg, median 178 ms
+  sender3 -> sender4 -> sender2 -> sender4 -> sender2 -> sender1: 1 msg, median 181 ms
+  sender3 -> sender4 -> sender4: 399 msg
+  sender3 -> sender4 -> sender4 -> sender1: 628 msg, median 1106 ms
+  sender3 -> sender4 -> sender4 -> sender1 -> sender1: 9 msg
+  sender3 -> sender4 -> sender4 -> sender1 -> sender1 -> sender2: 27 msg, median 15469 ms
+  sender3 -> sender4 -> sender4 -> sender2: 31 msg, median 9686 ms
+  sender3 -> sender4 -> sender4 -> sender2 -> sender2 -> sender1: 82 msg, median 412 ms
+  sender4 -> sender1 -> sender1: 575 msg
+  sender4 -> sender1 -> sender1 -> sender2: 76 msg, median 10758 ms
+  sender4 -> sender1 -> sender1 -> sender2 -> sender2: 24 msg
+  sender4 -> sender1 -> sender1 -> sender2 -> sender2 -> sender1 -> sender1 -> sender3: 3 msg, median 3451 ms
+  sender4 -> sender1 -> sender1 -> sender2 -> sender2 -> sender3: 259 msg, median 3750 ms
+  sender4 -> sender1 -> sender1 -> sender3: 2559 msg, median 3816 ms
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3: 313 msg
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender1 -> sender1: 1 msg
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2: 2 msg, median 21630 ms
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender2: 230 msg, median 12308 ms
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender3 -> sender3: 8 msg
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender3 -> sender3 -> sender2: 1 msg, median 18717 ms
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2: 5 msg, median 13001 ms
+  sender4 -> sender1 -> sender1 -> sender3 -> sender3 -> sender4 -> sender4 -> sender2: 18 msg, median 5458 ms
+  sender4 -> sender1 -> sender3 -> sender1 -> sender3 -> sender2: 3 msg, median 1773 ms
+  sender4 -> sender1 -> sender3 -> sender3 -> sender1 -> sender2: 1 msg, median 2155 ms
+  sender4 -> sender2 -> sender2: 100 msg
+  sender4 -> sender2 -> sender2 -> sender1: 79 msg, median 2635 ms
+  sender4 -> sender2 -> sender2 -> sender1 -> sender1 -> sender3: 13 msg, median 32301 ms
+  sender4 -> sender2 -> sender2 -> sender3: 3 msg, median 8685 ms
+  sender4 -> sender2 -> sender2 -> sender3 -> sender3 -> sender1: 3 msg, median 2896 ms
+  sender4 -> sender3 -> sender1 -> sender1 -> sender3 -> sender2: 3 msg, median 836 ms
+  sender4 -> sender3 -> sender3: 429 msg
+  sender4 -> sender3 -> sender3 -> sender1: 1137 msg, median 2995 ms
+  sender4 -> sender3 -> sender3 -> sender1 -> sender1: 31 msg
+  sender4 -> sender3 -> sender3 -> sender1 -> sender1 -> sender2: 36 msg, median 20261 ms
+  sender4 -> sender3 -> sender3 -> sender2: 6 msg, median 15574 ms
+  sender4 -> sender3 -> sender3 -> sender2 -> sender2 -> sender1: 148 msg, median 1906 ms
+store-carry-forward: 13963 message(s) entered a relay's custody, carry→delivery median 3.4s
+custody events: {'store': 66572, 'end': 52869}
+packet redundancy: 5003 redundant packet arrival(s) for 18979 delivered message(s) = 1.26 copies on the air per message (1.00 = every packet arrived exactly once)
+message re-delivery: 4 (must be 0 — a duplicate of an already-delivered message triggers nothing)
+
+Packet loss by site (drop records)
+------------------------------------------------------------
+ _device        where      reason  count
+d8254397     ackIndex     evicted   4734
+5abc4da1     ackIndex     evicted   3936
+907a2f08        relay rateLimited   3914
+2537c7bf        relay rateLimited   2789
+2537c7bf      decrypt   noSession   1742
+d8254397      decrypt   noSession   1393
+907a2f08      decrypt   noSession   1355
+5abc4da1      decrypt   noSession    913
+d8254397        relay rateLimited    825
+2537c7bf bleBroadcast writeFailed     13
+907a2f08 bleBroadcast writeFailed      3
+2537c7bf      bleSend writeFailed      2
+d8254397 bleBroadcast writeFailed      2
+d8254397      bleSend      noPath      2
+2537c7bf        bleRx    notReady      1
+
+Session cap (LRU) sizing
+------------------------------------------------------------
+  inbound sealed packets that opened nothing: 5403 (12.672/s)
+  inbound sealed packets that opened: 30827
+  2537c7bf: 3 pairings with 3 distinct peers -> cheapest cap 8 (hit 0.00, 1.530% of one core)
+  5abc4da1: 4 pairings with 3 distinct peers -> cheapest cap 8 (hit 1.00, 1.331% of one core)
+  907a2f08: 4 pairings with 3 distinct peers -> cheapest cap 8 (hit 1.00, 1.331% of one core)
+  d8254397: 3 pairings with 3 distinct peers -> cheapest cap 8 (hit 0.00, 1.530% of one core)

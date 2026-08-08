@@ -19,16 +19,47 @@ enum ContentType {
   /// Hole-punch / address signaling. Chunk is a `SignalingCodec` payload.
   signaling(0x04),
 
-  /// Sync-on-connect custody summary: the packetIds this node's DTN store
+  /// Sync-on-connect buffer summary: the packetIds this node's DTN store
   /// carries. Neighbor-local (TTL 1, never relayed) but sealed like every
   /// other content — the Noise session with the neighbor exists before any
-  /// sync runs, so there is no reason to put the custody inventory on the
+  /// sync runs, so there is no reason to put the list of buffer contents on
+  /// the
   /// air in the clear.
   syncOffer(0x05),
 
   /// Reply to [syncOffer]: the subset of offered packetIds the sender wants
   /// conveyed. Sealed to the neighbor's session, same as the offer.
-  syncRequest(0x06);
+  syncRequest(0x06),
+
+  /// DEBUG/TESTBED ONLY. Remote start for a scripted field run: chunk is the
+  /// UTF-8 experiment id. One phone is tapped and every armed peer starts
+  /// its own already-loaded plan on receipt.
+  ///
+  /// This exists because a field run puts devices hundreds of metres apart,
+  /// where tapping them individually is impractical and tapping them in
+  /// sequence skews their timelines by however long the walk takes — which
+  /// smears the mesh composition at every step boundary. Broadcasting the
+  /// start collapses that to the flood's own latency.
+  ///
+  /// Sealed like all content, so only a peer holding a Noise session with us
+  /// can trigger a run — and the receiver additionally ignores it unless it
+  /// has been explicitly armed with a matching experiment id.
+  testbedStart(0x07),
+
+  /// DEBUG/TESTBED. A phone's own BLE neighbour list, gossiped while the
+  /// field runner sits ARMED so every phone can see how large the mesh
+  /// actually is before the run is started.
+  ///
+  /// A device only ever knows its own one-hop neighbours, which cannot answer
+  /// the question the operator has: is every phone reachable, or is one
+  /// stranded behind a gap? Flooding each node's adjacency and taking the
+  /// connected component containing self answers it, and the answer is what
+  /// decides whether pressing START ALL will reach everyone.
+  ///
+  /// Armed-only and never during a run: this is an operator aid, not part of
+  /// the measurement, and it must not put control traffic on the air while
+  /// throughput is being measured.
+  testbedNeighbours(0x08);
 
   final int value;
   const ContentType(this.value);

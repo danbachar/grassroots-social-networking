@@ -33,6 +33,19 @@ class WireLedger {
   final Map<String, int> _rxPackets = {};
   bool _dirty = false;
 
+  /// Every byte this ledger has seen, tx and rx together, NOT reset by
+  /// [drainRecord]. The field runner samples it to prove a `bleOn: true`
+  /// segment actually got the radio on the air: a segment that moves zero
+  /// bytes is a dead radio, and without this check the runner would dwell
+  /// out the full step and advance, which is how a 2-hour power ladder was
+  /// recorded against a radio that never came back up.
+  int _totalBytes = 0;
+
+  /// Monotonic tx+rx byte total since this ledger was created. A BLE bounce
+  /// disposes the transport and its ledger, so a fresh service starts at
+  /// zero — which is exactly the baseline a per-segment check wants.
+  int get totalBytes => _totalBytes;
+
   /// Resolves the inner content type of one of OUR sealed packets by its
   /// packetId (bytes 38..54 of the envelope). Only the sender knows this —
   /// the ledger sits below decryption — so tx `secure` bytes are split
@@ -67,6 +80,7 @@ class WireLedger {
     }
     bytes[name] = (bytes[name] ?? 0) + data.length;
     packets[name] = (packets[name] ?? 0) + 1;
+    _totalBytes += data.length;
     _dirty = true;
   }
 

@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/field_runner.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 import 'package:grassroots_networking/src/trace/experiment_recorder.dart';
@@ -28,8 +30,20 @@ class _FakeRecorder extends ExperimentRecorder {
     events.add('stop');
   }
 
+  /// Label and extras are recorded separately: `events` stays the plain
+  /// label stream every other assertion reads, `markerExtras` keeps the
+  /// per-step configuration stamped alongside it.
+  final List<(String, Map<String, Object?>)> markerExtras = [];
+
   @override
-  Future<void> logMarker(String label) async => events.add('marker:$label');
+  Future<void> logMarker(String label, {Map<String, Object?>? extra}) async {
+    events.add('marker:$label');
+    markerExtras.add((label, extra ?? const {}));
+  }
+
+  @override
+  Future<void> log(Map<String, dynamic> record) async =>
+      events.add('log:${record['type']}:${record['event']}');
 }
 
 void main() {
@@ -661,7 +675,7 @@ void main() {
         expId: 'raw',
         settleSec: 1,
         resetSessions: false,
-        resetCustody: false,
+        resetDtnBuffer: false,
         steps: [
           FieldStep(label: 'leg=notify', dwellSec: 5, rawLeg: 'notify'),
         ],
@@ -689,13 +703,42 @@ void main() {
     });
   });
 
-  test('resetCustody empties the store at each step start', () {
+  test('bleOn steps toggle the transport in schedule order', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final toggles = <bool>[];
+      final runner = FieldRunner(
+        recorder: recorder,
+        onSetBle: (on) async => toggles.add(on),
+      );
+      runner.start(const FieldPlan(
+        expId: 'pw',
+        settleSec: 1,
+        resetSessions: false,
+        resetDtnBuffer: false,
+        steps: [
+          FieldStep(label: 'base', dwellSec: 1, bleOn: false),
+          FieldStep(label: 'solo', dwellSec: 1, bleOn: true, autoAdvance: true),
+          FieldStep(label: 'off2', dwellSec: 1, bleOn: false, autoAdvance: true),
+          FieldStep(label: 'plain', dwellSec: 1, autoAdvance: true),
+        ],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.elapse(const Duration(seconds: 60));
+      expect(toggles, [false, true, false],
+          reason: 'a step without bleOn leaves the transport alone');
+      runner.dispose();
+    });
+  });
+
+  test('resetDtnBuffer empties the store at each step start', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       var clears = 0;
       final runner = FieldRunner(
         recorder: recorder,
-        onResetCustody: () => clears++,
+        onResetDtnBuffer: () => clears++,
       );
       runner.start(const FieldPlan(
         expId: 'cc',
@@ -716,19 +759,19 @@ void main() {
     });
   });
 
-  test('resetCustody false never fires the hook', () {
+  test('resetDtnBuffer false never fires the hook', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       var clears = 0;
       final runner = FieldRunner(
         recorder: recorder,
-        onResetCustody: () => clears++,
+        onResetDtnBuffer: () => clears++,
       );
       runner.start(const FieldPlan(
         expId: 'cc',
         settleSec: 1,
         resetSessions: false,
-        resetCustody: false,
+        resetDtnBuffer: false,
         steps: [FieldStep(label: 's1', dwellSec: 1)],
       ));
       async.flushMicrotasks();
@@ -865,5 +908,752 @@ void main() {
     expect(restored.steps.single.sendCount, 3);
     expect(restored.steps.single.sendBytes, 32);
     expect(restored.resetSessions, isTrue);
+  });
+
+  group('dead-radio watchdog', () {
+    /// A plan whose one step asks for the radio and dwells long enough for
+    /// the watchdog to fire inside it.
+    FieldPlan blePlan({int dwellSec = 120}) => FieldPlan(
+          expId: 'pw-base-1',
+          settleSec: 5,
+          steps: [FieldStep(label: 'linked', dwellSec: dwellSec, bleOn: true)],
+        );
+
+    test('a radio that is up but ALONE is not an abort', () {
+      // The power ladder's solo steps bring one phone's radio up while the
+      // peer's is deliberately off. No peer means no GATT path, and the wire
+      // ledger only counts at the GATT choke points — so a perfectly healthy
+      // lone radio moves zero bytes. Requiring bytes here would abort every
+      // solo segment of a good run.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => 0,
+          bleUsable: () => true,
+          knownPeers: () => const <Uint8List>[], // alone on purpose
+          bleWatchdogSec: 30,
+          upload: () async => 'ok',
+        );
+
+        runner.start(blePlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 45));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, isNull);
+        expect(runner.isRunning, isTrue);
+      });
+    });
+
+    test('aborts when the transport is not usable, peer or not', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => 0,
+          bleUsable: () => false, // bring-up silently failed
+          knownPeers: () => const <Uint8List>[],
+          bleWatchdogSec: 30,
+          upload: () async => 'ok',
+        );
+
+        runner.start(blePlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 45));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, contains('not usable'));
+        expect(runner.isRunning, isFalse);
+        expect(recorder.events, contains('log:runner:bleDead'));
+      });
+    });
+
+    test('aborts when a peer is in range but nothing moves', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var alerts = 0;
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => 0, // silent despite a peer being right there
+          bleUsable: () => true,
+          knownPeers: () => [Uint8List(32)],
+          bleWatchdogSec: 30,
+          onWindowElapsed: () => alerts++,
+          upload: () async => 'ok',
+        );
+
+        runner.start(blePlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+        expect(runner.phase, FieldPhase.dwelling);
+        expect(runner.abortReason, isNull, reason: 'watchdog has not fired yet');
+
+        async.elapse(const Duration(seconds: 29));
+        async.flushMicrotasks();
+        expect(runner.abortReason, isNull, reason: 'still inside the window');
+
+        async.elapse(const Duration(seconds: 2));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, contains('BLE dead'));
+        expect(runner.abortReason, contains('linked'));
+        expect(runner.abortReason, contains('0 bytes moved'));
+        expect(runner.isRunning, isFalse);
+        expect(runner.phase, FieldPhase.finished);
+        expect(recorder.events, contains('log:runner:bleDead'));
+        expect(recorder.events, contains('marker:aborted'));
+        expect(recorder.events, contains('stop'));
+        expect(alerts, greaterThan(0),
+            reason: 'the abort must be audible/haptic, not screen-only');
+      });
+    });
+
+    test('stays quiet when the radio is alive', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var bytes = 0;
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => bytes,
+          bleUsable: () => true,
+          knownPeers: () => [Uint8List(32)],
+          bleWatchdogSec: 30,
+          upload: () async => 'ok',
+        );
+
+        runner.start(blePlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+
+        // One ANNOUNCE goes out inside the window.
+        async.elapse(const Duration(seconds: 10));
+        bytes = 342;
+        async.elapse(const Duration(seconds: 25));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, isNull);
+        expect(runner.isRunning, isTrue);
+        expect(runner.phase, FieldPhase.dwelling);
+      });
+    });
+
+    test('a bleOn:false step is never watched', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => 0,
+          bleUsable: () => false,
+          knownPeers: () => [Uint8List(32)],
+          bleWatchdogSec: 30,
+          upload: () async => 'ok',
+        );
+
+        runner.start(const FieldPlan(
+          expId: 'pw-base-1',
+          settleSec: 5,
+          steps: [FieldStep(label: 'base', dwellSec: 120, bleOn: false)],
+        ));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 40));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, isNull,
+            reason: 'zero bytes is the POINT of a radio-down segment');
+        expect(runner.isRunning, isTrue);
+      });
+    });
+
+    test('a step shorter than the watchdog is not watched', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (_) async {},
+          bleWireBytes: () => 0,
+          bleUsable: () => false,
+          knownPeers: () => [Uint8List(32)],
+          bleWatchdogSec: 30,
+          upload: () async => 'ok',
+        );
+
+        // 20s dwell: the step is over before the watchdog would fire, so
+        // arming it would abort during the NEXT step instead.
+        runner.start(blePlan(dwellSec: 20));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 60));
+        async.flushMicrotasks();
+
+        expect(runner.abortReason, isNull);
+      });
+    });
+  });
+
+  group('remote start', () {
+    FieldPlan plan({String id = 'mesh-scale-1', int? order}) => FieldPlan(
+          expId: id,
+          settleSec: 5,
+          deviceOrder: order,
+          steps: const [FieldStep(label: 'n=3', dwellSec: 60, bleOn: false)],
+        );
+
+    test('arming brings the radio UP so the signal can be heard', () {
+      // A late joiner's first step turns BLE off, but it must be ON to hear
+      // the start at all — a previous run that ended dark would otherwise
+      // leave the phone permanently deaf, sitting armed while the rest ran.
+      fakeAsync((async) {
+        final ble = <bool>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          onSetBle: (on) async => ble.add(on),
+        );
+        runner.armForRemoteStart(plan());
+        async.flushMicrotasks();
+
+        expect(ble, [true]);
+        expect(runner.armedPlan?.expId, 'mesh-scale-1');
+        expect(runner.isRunning, isFalse, reason: 'armed is not running');
+      });
+    });
+
+    test('a matching signal starts the run and passes the first step', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final ble = <bool>[];
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (on) async => ble.add(on),
+          upload: () async => 'ok',
+        );
+        runner.armForRemoteStart(plan());
+        async.flushMicrotasks();
+
+        unawaited(runner.remoteStart('mesh-scale-1'));
+        async.flushMicrotasks();
+
+        expect(runner.isRunning, isTrue);
+        expect(runner.phase, FieldPhase.dwelling,
+            reason: 'no tap is coming — the signal IS the tap');
+        expect(runner.remotelyStarted, isTrue);
+        expect(runner.armedPlan, isNull, reason: 'consumed');
+        // Armed brought the radio up; the first step then took it down,
+        // which is how a late joiner listens, hears, and goes dark.
+        expect(ble, [true, false]);
+        expect(recorder.events, contains('marker:n=3'));
+      });
+    });
+
+    test('the step marker stamps this phone\'s join order and intent', () {
+      // Without these, a phone configured for the wrong slot looks exactly
+      // like one configured right that failed to join: both just have no
+      // links. `order` says which slot it was told to fill, `joined` says
+      // whether it believed it belonged in the mesh for this step.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+        );
+        runner.armForRemoteStart(plan(order: 4));
+        async.flushMicrotasks();
+        unawaited(runner.remoteStart('mesh-scale-1'));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
+        expect(extra['order'], 4);
+        expect(extra['joined'], isFalse);
+      });
+    });
+
+    test('a plan with no join order stamps no order field', () {
+      // Distance/power plans have no notion of order; the marker must not
+      // invent one.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+        );
+        runner.armForRemoteStart(plan());
+        async.flushMicrotasks();
+        unawaited(runner.remoteStart('mesh-scale-1'));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
+        expect(extra.containsKey('order'), isFalse);
+        expect(extra['joined'], isFalse);
+      });
+    });
+
+    test('a signal for a DIFFERENT experiment is ignored', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          onSetBle: (_) async {},
+        );
+        runner.armForRemoteStart(plan(id: 'mesh-scale-1'));
+        async.flushMicrotasks();
+
+        unawaited(runner.remoteStart('some-other-run'));
+        async.flushMicrotasks();
+
+        expect(runner.isRunning, isFalse);
+        expect(runner.armedPlan, isNotNull,
+            reason: 'still waiting for its own signal');
+      });
+    });
+
+    test('an unarmed runner ignores the signal entirely', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(recorder: _FakeRecorder());
+        unawaited(runner.remoteStart('mesh-scale-1'));
+        async.flushMicrotasks();
+        expect(runner.isRunning, isFalse);
+      });
+    });
+
+    test('disarm releases it', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          onSetBle: (_) async {},
+        );
+        runner.armForRemoteStart(plan());
+        async.flushMicrotasks();
+        runner.disarm();
+        expect(runner.armedPlan, isNull);
+
+        unawaited(runner.remoteStart('mesh-scale-1'));
+        async.flushMicrotasks();
+        expect(runner.isRunning, isFalse);
+      });
+    });
+  });
+
+  group('force finish', () {
+    test('ends the run without waiting, and keeps the files', () {
+      // A phone showing SETTLING 00:00 mid-upload is indistinguishable from
+      // a wedged one; on a field day the whole group waits on it.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          // An upload that never returns — exactly the case being escaped.
+          upload: () => Completer<String>().future,
+        );
+        runner.start(const FieldPlan(
+          expId: 'x',
+          settleSec: 2,
+          steps: [FieldStep(label: 's', dwellSec: 1)],
+        ));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 5)); // through dwell + settle
+        async.flushMicrotasks();
+
+        expect(runner.finishing, isTrue, reason: 'stuck in the upload');
+        expect(runner.phase, isNot(FieldPhase.finished));
+
+        unawaited(runner.forceFinish());
+        async.flushMicrotasks();
+
+        expect(runner.phase, FieldPhase.finished);
+        expect(runner.isRunning, isFalse);
+        expect(runner.finishing, isFalse);
+        // The recording was stopped, so the buffer reached disk — only the
+        // WAIT was abandoned, never the data.
+        expect(recorder.events, contains('stop'));
+        expect(runner.uploadResult, contains('files kept on device'));
+      });
+    });
+
+    test('is a no-op once the run has already finished', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          upload: () async => 'ok',
+        );
+        runner.start(const FieldPlan(
+          expId: 'x',
+          settleSec: 1,
+          steps: [FieldStep(label: 's', dwellSec: 1)],
+        ));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 4));
+        async.flushMicrotasks();
+        expect(runner.phase, FieldPhase.finished);
+        expect(runner.uploadResult, 'ok');
+
+        unawaited(runner.forceFinish());
+        async.flushMicrotasks();
+        expect(runner.uploadResult, 'ok', reason: 'not overwritten');
+      });
+    });
+  });
+
+  group('placement location fix', () {
+    FieldPlan geoPlan() => const FieldPlan(
+          expId: 'mesh-scale-1',
+          settleSec: 1,
+          deviceOrder: 2,
+          steps: [
+            FieldStep(label: 'distribute', dwellSec: 10, bleOn: false),
+            FieldStep(label: 'n=3 t1', dwellSec: 10, bleOn: true,
+                autoAdvance: true),
+            FieldStep(label: 'n=3 t2', dwellSec: 10, bleOn: true,
+                autoAdvance: true),
+          ],
+        );
+
+    test('one fix at placement, not on the walk-out and not per step', () {
+      // The walk-out step is when the phone is still being carried, and an
+      // auto-advanced step means it has not moved. A fix on either would be
+      // a wrong position or a needless radio wake.
+      fakeAsync((async) {
+        var calls = 0;
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+          onSampleLocation: () async {
+            calls++;
+            return {'lat': 48.265, 'lon': 11.671, 'accM': 4.0};
+          },
+        );
+        runner.start(geoPlan());
+        async.flushMicrotasks();
+
+        runner.inPosition();          // operator taps to begin the walk-out
+        async.flushMicrotasks();
+        expect(calls, 0, reason: 'the phone is still being carried');
+
+        // dwell 10s then a 5s auto-advance gap: n=3 t1 opens at t=15s.
+        async.elapse(const Duration(seconds: 16));
+        async.flushMicrotasks();
+        expect(calls, 1, reason: 'first measured step: it is now placed');
+        expect(runner.locationFixes, 1);
+
+        async.elapse(const Duration(seconds: 15));  // auto-advance into n=3 t2
+        async.flushMicrotasks();
+        expect(calls, 1, reason: 'a timer firing is not a placement');
+
+        expect(
+            recorder.events.where((e) => e.startsWith('log:location')).length, 1);
+        // The screen must be able to say a fix landed, and how good it is.
+        expect(runner.locationStatus, contains('position fixed'));
+        expect(runner.locationStatus, contains('4 m'));
+      });
+    });
+
+    test('a failed fix says so on screen instead of looking normal', () {
+      // Eight phones silently recording no position is the failure this is
+      // meant to make visible while there is still time to fix it.
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+          onSampleLocation: () async => null,
+        );
+        expect(runner.hasLocation, isTrue);
+        expect(runner.locationStatus, contains('when this phone is placed'));
+
+        runner.start(geoPlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 16));
+        async.flushMicrotasks();
+
+        expect(runner.locationStatus, contains('NO FIX'));
+      });
+    });
+
+    test('a null fix never blocks the run', () {
+      // No permission, services off, no sky view -- the step must still run.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+          onSampleLocation: () async => null,
+        );
+        runner.start(geoPlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 16));
+        async.flushMicrotasks();
+
+        expect(runner.isRunning, isTrue);
+        expect(recorder.events, contains('marker:n=3 t1'));
+        expect(recorder.events.where((e) => e.startsWith('log:location')), isEmpty);
+      });
+    });
+  });
+
+  group('manual-join wall-clock schedule', () {
+    // Base sits 100s past a 10-minute boundary, so the anchor maths is
+    // checkable by hand: tap+300s = B0+400s -> next boundary = B0+600s,
+    // a 500s placement wait.
+    const b0 = 1786500000000; // multiple of 600000
+    const base = b0 + 100000;
+
+    FieldPlan manualPlan({int order = 4}) => FieldPlanPresets.meshScale(
+          expId: 'mesh-manual-t',
+          role: order,
+          maxDevices: 4,
+          dwellSec: 120,
+          repeat: 1,
+        );
+
+    test('anchor is the next 10-minute boundary >= tap + placement', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          bleUsable: () => false,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan());
+        async.flushMicrotasks();
+
+        expect(runner.phase, FieldPhase.placement);
+        expect(runner.startTargetMs, b0 + 600000);
+        expect(runner.startTargetMs! % 600000, 0,
+            reason: 'every phone must round to the SAME instant');
+        expect(runner.startTargetMs! - base,
+            greaterThanOrEqualTo(runner.plan!.placementSec * 1000));
+        runner.dispose();
+      });
+    });
+
+    test('steps open at absolute offsets; the radio is never touched', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final ble = <bool>[];
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          onSetBle: (on) async => ble.add(on),
+          upload: () async => 'ok',
+        );
+        // bleUsable null: no observer, so ble[] records only step-driven calls.
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+
+        async.elapse(const Duration(milliseconds: 499999));
+        expect(runner.phase, FieldPhase.placement, reason: '1s early');
+        async.elapse(const Duration(milliseconds: 1001));
+        async.flushMicrotasks();
+        expect(runner.phase, FieldPhase.dwelling);
+        expect(recorder.events, contains('marker:n=3'));
+
+        // dwell 120s -> gap 30s -> next block at +150s exactly.
+        async.elapse(const Duration(seconds: 120));
+        async.flushMicrotasks();
+        expect(runner.phase, FieldPhase.positioning);
+        async.elapse(const Duration(seconds: 30));
+        async.flushMicrotasks();
+        expect(runner.phase, FieldPhase.dwelling);
+        expect(recorder.events, contains('marker:n=4'));
+
+        expect(ble, isEmpty,
+            reason: 'manual mode: system BT belongs to the operator');
+        final pl = recorder.markerExtras
+            .firstWhere((e) => e.$1 == 'placement')
+            .$2;
+        expect(pl['targetMs'], b0 + 600000);
+        runner.dispose();
+      });
+    });
+
+    test('no GPS fix is ever taken in manual mode', () {
+      fakeAsync((async) {
+        var fixes = 0;
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          onSampleLocation: () async {
+            fixes++;
+            return {'lat': 1.0, 'lon': 2.0, 'accM': 3.0};
+          },
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 800));
+        async.flushMicrotasks();
+        expect(fixes, 0, reason: 'the layout is measured by hand');
+        runner.dispose();
+      });
+    });
+
+    test('radio observer: schedule-aware bounce, transitions stamped', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var usable = false;
+        final changes = StreamController<bool>.broadcast(sync: true);
+        final bounces = <bool>[];
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          bleUsable: () => usable,
+          bleUsableChanges: changes.stream,
+          onSetBle: (on) async => bounces.add(on),
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan()); // order 4: dark until n=4
+        async.flushMicrotasks();
+
+        // The initial state is stamped, so the run opens with explicit
+        // radio ground truth instead of an implied one.
+        expect(recorder.events, contains('marker:bt-off'));
+
+        async.elapse(const Duration(seconds: 60));
+        expect(bounces, isEmpty,
+            reason: 'dark by schedule: bouncing would fight the operator');
+
+        // n=3 opens at +500s, n=4 (this phone\'s join) at +650s.
+        async.elapse(const Duration(seconds: 600));
+        async.flushMicrotasks();
+        expect(bounces, isNotEmpty,
+            reason: 'wanted ON and down: re-init so a settings toggle is '
+                'picked up without a tap');
+
+        // Operator flips Bluetooth on: the stamp is EVENT-driven — it lands
+        // with ZERO elapsed time, because a stamp that waits for a poll tick
+        // is up to 2s late and that lag once turned a formed session into a
+        // "peer that never formed" in analysis.
+        usable = true;
+        changes.add(true);
+        async.flushMicrotasks();
+        expect(recorder.events.where((e) => e == 'marker:bt-on').length, 1,
+            reason: 'stamped at the transition itself, no poll latency');
+        expect(runner.radioUp, isTrue);
+        expect(runner.radioSeenUp, isTrue);
+
+        // A mid-run outage is a transition too — stamped immediately.
+        usable = false;
+        changes.add(false);
+        async.flushMicrotasks();
+        expect(recorder.events.where((e) => e == 'marker:bt-off').length, 2);
+        usable = true;
+        changes.add(true);
+        async.flushMicrotasks();
+        expect(recorder.events.where((e) => e == 'marker:bt-on').length, 2);
+
+        // A duplicate emission is not a transition: no double stamp.
+        changes.add(true);
+        async.flushMicrotasks();
+        expect(recorder.events.where((e) => e == 'marker:bt-on').length, 2);
+        runner.dispose();
+        changes.close();
+      });
+    });
+
+
+    test('sessions count is stamped into every step marker', () {
+      // The formation assertion: each rep carries "was the topology up when
+      // this window opened" as a field, not an inference.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var sessions = 0;
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          sessionPeerCount: () => sessions,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        sessions = 3;
+        async.elapse(const Duration(seconds: 501));
+        async.flushMicrotasks();
+        final n3 = recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
+        expect(n3['sessions'], 3);
+        expect(n3['joined'], isTrue);
+        runner.dispose();
+      });
+    });
+
+    test('myJoinAtMs is the absolute start of the first joined step', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 4)); // joins at n=4, block 2
+        async.flushMicrotasks();
+        // n=3 at the anchor; n=4 at anchor + (120+30)s
+        expect(runner.myJoinAtMs, b0 + 600000 + 150000);
+        expect(runner.joinsLater, isTrue);
+        runner.dispose();
+      });
+    });
+
+    test('waitingToJoin runs to the TURN ON window, and only for joiners', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 4));
+        async.flushMicrotasks();
+        expect(runner.waitingToJoin, isTrue, reason: 'during placement');
+
+        // n=3 opens at +500s; the join window (gap before n=4) at +620s.
+        async.elapse(const Duration(seconds: 619));
+        expect(runner.waitingToJoin, isTrue, reason: '1s before the window');
+        async.elapse(const Duration(seconds: 2));
+        expect(runner.waitingToJoin, isFalse,
+            reason: 'the window itself shows TURN ON, not a countdown');
+        runner.dispose();
+      });
+    });
+
+    test('a founding phone never sees the waiting screen', () {
+      fakeAsync((async) {
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        expect(runner.waitingToJoin, isFalse);
+        async.elapse(const Duration(seconds: 600));
+        expect(runner.waitingToJoin, isFalse);
+        runner.dispose();
+      });
+    });
+
+    test('manual plan round-trips through JSON', () {
+      final p = manualPlan();
+      expect(p.manualJoin, isTrue);
+      expect(p.sampleGps, isFalse);
+      expect(FieldPlan.fromJson(p.toJson()), p);
+    });
   });
 }

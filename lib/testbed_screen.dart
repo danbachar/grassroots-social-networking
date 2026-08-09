@@ -1,0 +1,1361 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:redux/redux.dart';
+import 'package:share_plus/share_plus.dart';
+
+import 'field_runner_screen.dart';
+import 'src/store/app_state.dart';
+import 'src/store/settings_actions.dart';
+import 'src/testbed/field_plan_presets.dart';
+import 'src/testbed/field_runner.dart';
+import 'src/testbed/testbed_config.dart';
+import 'src/trace/experiment_recorder.dart';
+import 'src/trace/trace_config.dart';
+
+/// DEBUG/TESTBED ONLY screen for the evaluation in
+/// `docs/testbed_experiments.md`: experiment recording, the scripted field
+/// runner, and the bulk-flow config it triggers. Inert in production.
+class TestbedScreen extends StatefulWidget {
+  final Store<AppState> store;
+
+  /// This device's hex public key (for building/verifying the roster). Null if
+  /// the network isn't up yet.
+  final String? myPubkeyHex;
+
+  /// Trace logger for the experiment recording sink. Null hides the
+  /// experiment section (network not up yet).
+  final ExperimentRecorder? experimentRecorder;
+
+  final VoidCallback? onStartBulk;
+  final VoidCallback? onStopBulk;
+
+  /// Field-runner hooks: per-step message sends and the per-step Noise
+  /// session reset (the establishment-ladder measurement).
+  final Future<String?> Function(Uint8List recipient, Uint8List payload,
+      {String? messageId})? sendMessage;
+  final VoidCallback? onResetSessions;
+  final Future<void> Function()? onResetLinks;
+  final VoidCallback? onResetDtnBuffer;
+
+  /// Runs the on-device crypto bench (failed-AEAD and handshake cost).
+  final Future<Map<String, dynamic>> Function()? onCryptoBench;
+
+  /// Monotonic BLE tx+rx bytes — the field runner's dead-radio watchdog.
+  final int Function()? bleWireBytes;
+
+  /// Whether the BLE transport is up — the watchdog's primary signal, valid
+  /// even when the radio is deliberately alone.
+  final bool Function()? bleUsable;
+
+  /// BLE-usability transitions, delivered at the state change itself — the
+  /// runner's bt-on/bt-off stamps come from this, never from a poll.
+  final Stream<bool>? bleUsableChanges;
+  final Future<int?> Function(Uint8List peer,
+      {required String leg, required int seq})? sendRaw;
+  final Future<void> Function(bool on)? onSetBle;
+  final bool Function(Uint8List peer)? linkSettled;
+
+  /// Registers a listener for end-to-end ACKs (saturating throughput mode).
+  final void Function(void Function(String messageId)? listener)?
+      registerAckListener;
+
+  /// DEBUG/TESTBED. Tell every peer holding a session with us to start
+  /// [expId]; returns how many were signalled.
+  final Future<int> Function(String expId)? onBroadcastStart;
+
+  /// DEBUG/TESTBED. Registers the listener a peer's start signal reaches.
+  final void Function(void Function(String expId)? listener)?
+      registerStartListener;
+
+  /// DEBUG/TESTBED. Armed-time mesh gossip: tell peers who we can see.
+  final Future<int> Function()? onGossipNeighbours;
+
+  /// DEBUG/TESTBED. Peers this phone holds a session with.
+  final int Function()? sessionPeerCount;
+
+  /// DEBUG/TESTBED. Phones in the connected component containing this one.
+  final int Function()? meshComponentSize;
+
+  /// DEBUG/TESTBED. Forget the gossiped view (called when a run starts).
+  final VoidCallback? onClearMeshView;
+
+  const TestbedScreen({
+    super.key,
+    required this.store,
+    this.myPubkeyHex,
+    this.experimentRecorder,
+    this.onStartBulk,
+    this.onStopBulk,
+    this.sendMessage,
+    this.onResetSessions,
+    this.onResetLinks,
+    this.onResetDtnBuffer,
+    this.onCryptoBench,
+    this.bleWireBytes,
+    this.bleUsable,
+    this.bleUsableChanges,
+    this.sendRaw,
+    this.onSetBle,
+    this.linkSettled,
+    this.registerAckListener,
+    this.onBroadcastStart,
+    this.registerStartListener,
+    this.onGossipNeighbours,
+    this.sessionPeerCount,
+    this.meshComponentSize,
+    this.onClearMeshView,
+  });
+
+  @override
+  State<TestbedScreen> createState() => _TestbedScreenState();
+}
+
+class _TestbedScreenState extends State<TestbedScreen> {
+  late final TextEditingController _bulkController;
+  late final TextEditingController _expIdController;
+  late final TextEditingController _markerController;
+  late final TextEditingController _planController;
+  String? _planError;
+  Timer? _statusTimer;
+  String? _bulkError;
+  int _expFileBytes = 0;
+  bool _uploading = false;
+
+  /// Set only when a sweep reported every chunk accepted. Cleared whenever
+  /// the on-disk file set changes (a new run recorded, or files cleared), so
+  /// green can never refer to a file that has since grown.
+  bool _uploadComplete = false;
+  bool _benchRunning = false;
+  String? _benchResult;
+
+  @override
+  void initState() {
+    super.initState();
+    final settings = widget.store.state.settings;
+    _bulkController = TextEditingController(
+      text: settings.bulkFlowConfig == null
+          ? ''
+          : const JsonEncoder.withIndent('  ')
+              .convert(settings.bulkFlowConfig!.toJson()),
+    );
+    _expIdController = TextEditingController(
+        text: widget.experimentRecorder?.experimentId ?? '');
+    _markerController = TextEditingController();
+    _planController = TextEditingController();
+    _statusTimer = Timer.periodic(
+        const Duration(milliseconds: 500), (_) => _refreshStatus());
+  }
+
+  void _refreshStatus() {
+    final trace = widget.experimentRecorder;
+    if (trace != null && trace.active) {
+      unawaited(trace.experimentFileSize().then((bytes) {
+        if (!mounted) return;
+        setState(() {
+          // Any change in what is on disk invalidates a previous "all chunks
+          // landed": uploadId embeds the file length, so a grown file uploads
+          // under new ids and the old green would be a lie.
+          if (bytes != _expFileBytes) _uploadComplete = false;
+          _expFileBytes = bytes;
+        });
+      }));
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    _statusTimer?.cancel();
+    _bulkController.dispose();
+    _expIdController.dispose();
+    _markerController.dispose();
+    _planController.dispose();
+    super.dispose();
+  }
+
+  void _loadBulk() {
+    setState(() => _bulkError = null);
+    try {
+      final json = jsonDecode(_bulkController.text) as Map<String, dynamic>;
+      final config = BulkFlowConfig.fromJson(json);
+      widget.store.dispatch(SetBulkFlowConfigAction(config));
+      final me = widget.myPubkeyHex?.toLowerCase();
+      final myLabel = config.roster
+          .where((r) => r.pubkeyHex.toLowerCase() == me)
+          .map((r) => r.label)
+          .firstOrNull;
+      final mine = myLabel == null
+          ? 0
+          : config.flows.where((f) => f.srcLabel == myLabel).length;
+      _snack('Bulk config loaded — $mine flow(s) have this device as source');
+    } catch (e) {
+      setState(() => _bulkError = e.toString());
+    }
+  }
+
+  void _clearBulk() {
+    widget.store.dispatch(SetBulkFlowConfigAction(null));
+    setState(() => _bulkController.text = '');
+    _snack('Bulk config cleared');
+  }
+
+  void _fillBulkExample() {
+    final me = widget.myPubkeyHex ?? '<this-device-hex-pubkey>';
+    final example = {
+      'roster': [
+        {'label': 'A', 'pubkeyHex': me},
+        {'label': 'B', 'pubkeyHex': '<peer-B-hex-pubkey>'},
+        {'label': 'C', 'pubkeyHex': '<peer-C-hex-pubkey>'},
+      ],
+      // Baseline: one pair. Contended all-to-all: list every ordered pair.
+      'flows': [
+        {'src': 'A', 'dst': 'B'},
+      ],
+      'payloadBytes': 16384,
+      'durationMs': 120000,
+      'inFlight': 2,
+    };
+    _bulkController.text = const JsonEncoder.withIndent('  ').convert(example);
+    setState(() {});
+  }
+
+  Future<void> _toggleExperiment() async {
+    final trace = widget.experimentRecorder;
+    if (trace == null) return;
+    if (trace.active) {
+      await trace.stopExperiment();
+      _snack('Experiment stopped');
+    } else {
+      final id = _expIdController.text.trim();
+      if (id.isEmpty) {
+        _snack('Enter an experiment id first');
+        return;
+      }
+      await trace.startExperiment(id);
+      _snack('Recording experiment "${trace.experimentId}"');
+    }
+    setState(() {});
+  }
+
+  Future<void> _logMarker() async {
+    final trace = widget.experimentRecorder;
+    final label = _markerController.text.trim();
+    if (trace == null || label.isEmpty) return;
+    await trace.logMarker(label);
+    _snack('Marker: $label');
+  }
+
+  /// Accept no position vaguer than this. At 30 m spacing a fix claiming
+  /// +/-2 km is not a weak measurement, it is a different measurement: an
+  /// un-locked receiver falls back to cell towers and returns a point up to
+  /// a kilometre away. Two of eight phones did exactly that in the 30 m
+  /// field run and put 2.1 km pair distances into a 30 m graph.
+  static const double _maxFixAccuracyM = 30;
+
+  /// One GPS fix, for drawing a field run's topology to true scale.
+  ///
+  /// Takes the BEST of several attempts inside a budget rather than the
+  /// first thing offered, because the first fix after a cold start is
+  /// habitually the cell-tower one. Returns null rather than throwing on
+  /// every failure path — no permission, services off, nothing accurate
+  /// enough in time. A run must never be blocked or degraded because a
+  /// position could not be read.
+  ///
+  /// The caller does not await this, so the budget can be generous without
+  /// delaying a measurement window.
+  Future<Map<String, Object?>?> _sampleLocation() async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return null;
+      var perm = await Geolocator.checkPermission();
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+      }
+      if (perm == LocationPermission.denied ||
+          perm == LocationPermission.deniedForever) {
+        return null;
+      }
+
+      Position? best;
+      final deadline = DateTime.now().add(const Duration(seconds: 120));
+      while (DateTime.now().isBefore(deadline)) {
+        try {
+          final p = await Geolocator.getCurrentPosition(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.best,
+              timeLimit: Duration(seconds: 30),
+            ),
+          );
+          if (best == null || p.accuracy < best.accuracy) best = p;
+        } catch (_) {
+          // A timed-out attempt is not fatal: the receiver may still be
+          // acquiring, and the next attempt inside the budget often locks.
+        }
+        // Good enough to place a phone within a 30 m layout — stop early
+        // rather than keep the radio up for a better number nobody needs.
+        if (best != null && best.accuracy <= 10) break;
+        await Future<void>.delayed(const Duration(seconds: 5));
+      }
+
+      if (best == null || best.accuracy > _maxFixAccuracyM) {
+        debugPrint('[exp] no usable GPS fix'
+            '${best == null ? "" : " (best was ±${best.accuracy.round()} m)"}');
+        return null;
+      }
+      return {
+        'lat': best.latitude,
+        'lon': best.longitude,
+        'accM': best.accuracy,
+        'altM': best.altitude,
+        'fixAt': best.timestamp.millisecondsSinceEpoch,
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _uploadExperimentFiles() async {
+    final recorder = widget.experimentRecorder;
+    if (recorder == null) return;
+    if (!TraceConfig.isConfigured) {
+      _snack('No upload token baked into this build '
+          '(--dart-define=TRACE_TOKEN=...)');
+      return;
+    }
+    if (_uploading) return;
+    setState(() {
+      _uploading = true;
+      _uploadComplete = false; // a fresh attempt is not yet proven complete
+    });
+    UploadOutcome outcome;
+    try {
+      outcome = await recorder.uploadExperimentFiles(
+        url: TraceConfig.serverUrl,
+        token: TraceConfig.serverToken,
+        deviceId: widget.myPubkeyHex ?? 'unknown',
+      );
+    } catch (_) {
+      outcome = const UploadOutcome(message: 'Upload failed', complete: false);
+    }
+    if (!mounted) return;
+    setState(() {
+      _uploading = false;
+      _uploadComplete = outcome.complete;
+    });
+    _snack(outcome.message);
+  }
+
+  /// Parse the pasted plan, or show why it cannot be used.
+  FieldPlan? _parsePlan() {
+    final recorder = widget.experimentRecorder;
+    if (recorder == null) return null;
+    if (recorder.active) {
+      _snack('An experiment is already recording — stop it first');
+      return null;
+    }
+    try {
+      final json = jsonDecode(_planController.text) as Map<String, dynamic>;
+      final plan = FieldPlan.fromJson(json);
+      if (plan.steps.isEmpty) throw const FormatException('no steps');
+      setState(() => _planError = null);
+      return plan;
+    } catch (e) {
+      setState(() => _planError = e.toString());
+      return null;
+    }
+  }
+
+  FieldRunner _makeRunner(ExperimentRecorder recorder) {
+    return FieldRunner(
+      recorder: recorder,
+      // The formation assertion: each step marker stamps the session-peer
+      // count, so "was the topology up when this rep opened" is a field on
+      // the marker. The hook existed but was never handed to the runner —
+      // the home preflight's markers all read sessions:null.
+      sessionPeerCount: widget.sessionPeerCount,
+      onStartBulk: widget.onStartBulk,
+      onStopBulk: widget.onStopBulk,
+      myPubkeyHex: widget.myPubkeyHex,
+      send: widget.sendMessage,
+      onResetSessions: widget.onResetSessions,
+      onResetLinks: widget.onResetLinks,
+      onResetDtnBuffer: widget.onResetDtnBuffer,
+      sendRaw: widget.sendRaw,
+      onSetBle: widget.onSetBle,
+      onSampleLocation: _sampleLocation,
+      bleWireBytes: widget.bleWireBytes,
+      bleUsable: widget.bleUsable,
+      bleUsableChanges: widget.bleUsableChanges,
+      linkSettled: widget.linkSettled,
+      // Rosterless plans (the two-device default) target every peer the
+      // store currently knows.
+      knownPeers: () => widget.store.state.peers.peersList
+          .map((p) => p.publicKey)
+          .where((pk) => pk.length == 32)
+          .toList(),
+      onWindowElapsed: () => HapticFeedback.heavyImpact(),
+      // A token-less build must SAY so at the end of a run. Wiring this to
+      // null instead let a finished plan report nothing at all, which is how
+      // a multi-hour recording silently fails to reach the server — the data
+      // is still on the device, but nothing on screen says to go get it.
+      upload: TraceConfig.isConfigured
+          ? () async {
+              final outcome = await recorder.uploadExperimentFiles(
+                url: TraceConfig.serverUrl,
+                token: TraceConfig.serverToken,
+                deviceId: widget.myPubkeyHex ?? 'unknown',
+              );
+              // The end-of-run auto-upload drives the same indicator as the
+              // manual button, so a finished run shows green without needing
+              // a press to find out.
+              if (mounted) setState(() => _uploadComplete = outcome.complete);
+              return outcome.message;
+            }
+          : () async => 'NOT UPLOADED — this build has no TRACE_TOKEN. The '
+              'recording is safe on this device: rebuild with '
+              '--dart-define=TRACE_TOKEN=..., install with -r (app data is '
+              'kept), then press Upload files.',
+    );
+  }
+
+  /// Open the runner screen for [plan], wiring the listeners it needs and
+  /// tearing them down when the screen closes. [armed] waits for a peer's
+  /// start signal instead of a tap.
+  void _openRunner(FieldPlan plan, {required bool armed}) {
+    final recorder = widget.experimentRecorder;
+    if (recorder == null) return;
+    if (armed && plan.manualJoin) {
+      // Arming turns the radio ON and waits for a flooded start signal —
+      // both wrong for a manual-join plan, whose late phones must keep
+      // Bluetooth OFF and whose start is a wall-clock instant. Every phone
+      // is simply tapped.
+      _snack('Manual-join plans start by tap — no signal. '
+          'Press Run on every phone.');
+      return;
+    }
+    final runner = _makeRunner(recorder);
+    if (armed) {
+      runner.armForRemoteStart(plan);
+      widget.registerStartListener
+          ?.call((expId) => unawaited(runner.remoteStart(expId)));
+    }
+    // Saturating steps refill their window on each end-to-end ACK.
+    widget.registerAckListener?.call(runner.onAck);
+    Navigator.of(context)
+        .push(MaterialPageRoute(
+          fullscreenDialog: true,
+          builder: (_) => FieldRunnerScreen(
+            runner: runner,
+            plan: plan,
+            onBroadcastStart: widget.onBroadcastStart,
+            // Sessions, not live links: that is what the start signal
+            // travels on, and it is what survives the churn a joining phone
+            // causes. A live-link count drops to near zero mid-join while
+            // the flood is perfectly healthy.
+            neighbourCount: widget.sessionPeerCount,
+            meshComponentSize: widget.meshComponentSize,
+            onGossipNeighbours: widget.onGossipNeighbours,
+            onClearMeshView: widget.onClearMeshView,
+          ),
+        ))
+        .then((_) {
+      widget.registerAckListener?.call(null);
+      widget.registerStartListener?.call(null);
+      runner.dispose();
+    });
+  }
+
+  /// Arm for a peer's start signal. Every phone arms; ONE is then tapped and
+  /// signals the rest, so devices spread over hundreds of metres begin
+  /// within the flood's latency of each other rather than however long it
+  /// takes to walk between them.
+  void _armPlan() {
+    final plan = _parsePlan();
+    if (plan != null) _openRunner(plan, armed: true);
+  }
+
+  void _launchPlan() {
+    final plan = _parsePlan();
+    if (plan != null) _openRunner(plan, armed: false);
+  }
+
+  Future<void> _shareExperimentFiles() async {
+    final trace = widget.experimentRecorder;
+    if (trace == null) return;
+    final paths = await trace.experimentFilePaths();
+    if (paths.isEmpty) {
+      _snack('No experiment files on this device');
+      return;
+    }
+    await Share.shareXFiles(paths.map(XFile.new).toList(),
+        subject: 'Grassroots experiment traces');
+  }
+
+  Future<void> _clearExperimentFiles() async {
+    final trace = widget.experimentRecorder;
+    if (trace == null) return;
+    if (trace.active) {
+      _snack('Stop the experiment before clearing');
+      return;
+    }
+    final paths = await trace.experimentFilePaths();
+    if (paths.isEmpty) {
+      _snack('Nothing to clear');
+      return;
+    }
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete experiment files?'),
+        content: Text('${paths.length} recorded experiment file(s) will be '
+            'permanently deleted from this device. Share them first.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await trace.clearExperimentFiles();
+    if (mounted) setState(() => _uploadComplete = false);
+    _snack('Experiment files deleted');
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Testbed (debug)')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (widget.experimentRecorder != null) ...[
+            ..._experimentSection(widget.experimentRecorder!),
+            const Divider(height: 40),
+            ..._autoRunnerSection(),
+            const Divider(height: 40),
+          ],
+          const Divider(height: 40),
+          ..._bulkSection(),
+          const SizedBox(height: 24),
+          ..._benchSection(),
+          if (widget.myPubkeyHex != null) ...[
+            const SizedBox(height: 16),
+            // Roster building: every config in this screen keys on full
+            // pubkeys — tap to copy this device's.
+            _copyableKey('This device', widget.myPubkeyHex!),
+          ],
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _experimentSection(ExperimentRecorder trace) {
+    final active = trace.active;
+    return [
+      _sectionHeader('Experiment recording',
+          'Local ground-truth trace for the evaluation chapter'),
+      const Text(
+        'While recording, every trace record (RSSI samples, link stages, '
+        'wire bytes, messages, markers) is appended to a local exp file — '
+        'independent of the upload consent setting. Share it out when the '
+        'run is done.',
+        style: TextStyle(fontSize: 13, color: Colors.grey),
+      ),
+      const SizedBox(height: 8),
+      Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _expIdController,
+            enabled: !active,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'Experiment id',
+              hintText: 'cp-line-1',
+              isDense: true,
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        FilledButton.icon(
+          onPressed: () async => _toggleExperiment(),
+          icon: Icon(active ? Icons.stop : Icons.fiber_manual_record),
+          label: Text(active ? 'Stop' : 'Record'),
+        ),
+      ]),
+      const SizedBox(height: 6),
+      Text(
+        active
+            ? 'RECORDING "${trace.experimentId}" — '
+                '${(_expFileBytes / 1024).toStringAsFixed(1)} KiB'
+            : 'Not recording',
+        style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: active ? Colors.red : Colors.grey),
+      ),
+      const SizedBox(height: 12),
+      Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _markerController,
+            style: const TextStyle(fontSize: 13),
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              labelText: 'Ground-truth marker',
+              hintText: 'd=80m approaching',
+              isDense: true,
+            ),
+            onSubmitted: (_) => unawaited(_logMarker()),
+          ),
+        ),
+        const SizedBox(width: 8),
+        OutlinedButton(
+          onPressed: active ? () async => _logMarker() : null,
+          child: const Text('Mark'),
+        ),
+      ]),
+      const SizedBox(height: 12),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton.icon(
+          onPressed: () async => _shareExperimentFiles(),
+          icon: const Icon(Icons.ios_share),
+          label: const Text('Share files'),
+        ),
+        // Green means every chunk of every file was accepted. Without it the
+        // only way to know an upload finished was to press it again, which is
+        // safe only while the file is unchanged: uploadId embeds the file
+        // LENGTH, so a press after the file has grown derives new ids the
+        // server cannot recognise as already-stored.
+        OutlinedButton.icon(
+          onPressed: _uploading ? null : () async => _uploadExperimentFiles(),
+          style: _uploadComplete
+              ? OutlinedButton.styleFrom(
+                  foregroundColor: Colors.green.shade700,
+                  side: BorderSide(color: Colors.green.shade700, width: 2),
+                )
+              : null,
+          icon: _uploading
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Icon(_uploadComplete
+                  ? Icons.cloud_done
+                  : Icons.cloud_upload_outlined),
+          label: Text(_uploading
+              ? 'Uploading…'
+              : _uploadComplete
+                  ? 'Uploaded ✓'
+                  : 'Upload files'),
+        ),
+        OutlinedButton.icon(
+          onPressed: () async => _clearExperimentFiles(),
+          icon: const Icon(Icons.delete_outline),
+          label: const Text('Clear files'),
+        ),
+      ]),
+    ];
+  }
+
+  List<Widget> _autoRunnerSection() {
+    return [
+      _sectionHeader('Auto runner', 'Scripted field experiment'),
+      const Text(
+        'Load the shared plan JSON (identical on every device), tap Launch, '
+        'and follow the full-screen prompts: it starts recording, stamps each '
+        'step marker on your IN POSITION tap, holds the dwell (running bulk '
+        'flows on bulk steps), then marks end, settles, stops, and uploads.',
+        style: TextStyle(fontSize: 13, color: Colors.grey),
+      ),
+      const SizedBox(height: 8),
+      Row(children: [
+        Expanded(
+          child: DropdownButtonFormField<String>(
+            isExpanded: true,
+            initialValue: null,
+            decoration: const InputDecoration(
+              border: OutlineInputBorder(),
+              isDense: true,
+              labelText: 'Preset',
+            ),
+            hint: const Text('Pick a preset…'),
+            items: [
+              for (final name in FieldPlanPresets.presets.keys)
+                DropdownMenuItem(value: name, child: Text(name)),
+            ],
+            onChanged: (name) {
+              if (name == null) return;
+              _setPlan(FieldPlanPresets.presets[name]!);
+            },
+          ),
+        ),
+        const SizedBox(width: 8),
+        OutlinedButton.icon(
+          onPressed: _openPlanWizard,
+          icon: const Icon(Icons.auto_fix_high),
+          label: const Text('Wizard'),
+        ),
+      ]),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _planController,
+        maxLines: 10,
+        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        decoration: const InputDecoration(
+          border: OutlineInputBorder(),
+          hintText: 'FieldPlan JSON — pick a preset, run the Wizard, or paste',
+        ),
+      ),
+      if (_planError != null) ...[
+        const SizedBox(height: 6),
+        Text('Parse error: $_planError',
+            style: const TextStyle(color: Colors.red, fontSize: 12)),
+      ],
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        FilledButton.icon(
+          onPressed: _launchPlan,
+          icon: const Icon(Icons.play_circle_fill),
+          label: const Text('Launch here'),
+        ),
+        // Multi-device runs: every phone arms, then ONE is tapped and
+        // signals the rest over the mesh. Tapping phones in sequence would
+        // otherwise skew their timelines by however long the walk between
+        // them takes, smearing the mesh composition at every step boundary.
+        if (widget.onBroadcastStart != null)
+          OutlinedButton.icon(
+            onPressed: _armPlan,
+            icon: const Icon(Icons.podcasts_rounded),
+            label: const Text('Arm (wait for signal)'),
+          ),
+      ]),
+    ];
+  }
+
+  void _setPlan(FieldPlan plan) {
+    _planController.text =
+        const JsonEncoder.withIndent('  ').convert(plan.toJson());
+    setState(() => _planError = null);
+  }
+
+  Future<void> _openPlanWizard() async {
+    final result = await showDialog<_WizardResult>(
+      context: context,
+      builder: (_) => const _PlanWizardDialog(),
+    );
+    if (result == null) return;
+    if (result.plan != null) {
+      // Moving device: fill the plan, ready to Launch.
+      _setPlan(result.plan!);
+    } else if (result.staticExpId != null) {
+      // Static device: no plan. Point the experiment id at Record; the mover's
+      // markers segment this device's trace offline.
+      _expIdController.text = result.staticExpId!;
+      setState(() {});
+      _snack('Static device: scroll up to Experiment recording and press '
+          'Record (id filled in). Stop + Upload when the sweep ends.');
+    }
+  }
+
+  List<Widget> _bulkSection() {
+    return [
+      _sectionHeader('Bulk flows', 'Sustained throughput (dilating clique)'),
+      const Text(
+        'Paste the shared bulk-flow JSON (identical on every device) and '
+        'Load it. The auto runner starts/stops these flows on steps marked '
+        'bulk: true; each device runs only the flows where it is the source.',
+        style: TextStyle(fontSize: 13, color: Colors.grey),
+      ),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _bulkController,
+        maxLines: 10,
+        style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        decoration: const InputDecoration(
+          border: OutlineInputBorder(),
+          hintText: 'BulkFlowConfig JSON',
+        ),
+      ),
+      if (_bulkError != null) ...[
+        const SizedBox(height: 6),
+        Text('Parse error: $_bulkError',
+            style: const TextStyle(color: Colors.red, fontSize: 12)),
+      ],
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, runSpacing: 8, children: [
+        OutlinedButton(
+            onPressed: _fillBulkExample, child: const Text('Fill example')),
+        FilledButton(onPressed: _loadBulk, child: const Text('Load config')),
+        OutlinedButton(onPressed: _clearBulk, child: const Text('Clear')),
+      ]),
+    ];
+  }
+
+  Future<void> _runCryptoBench() async {
+    final bench = widget.onCryptoBench;
+    if (bench == null || _benchRunning) return;
+    setState(() {
+      _benchRunning = true;
+      _benchResult = null;
+    });
+    try {
+      final r = await bench();
+      final rows = (r['decrypt'] as List).cast<Map<String, dynamic>>();
+      final hs = (r['handshake'] as Map)['tHandshakeUs'] as double;
+      final buf = StringBuffer()
+        ..writeln('sessions  failed-AEAD   miss     hit')
+        ..writeln('-' * 40);
+      for (final row in rows) {
+        buf.writeln('${row['sessions'].toString().padLeft(8)}  '
+            '${(row['tFailUs'] as double).toStringAsFixed(1).padLeft(8)}us  '
+            '${(row['missUs'] as double).toStringAsFixed(0).padLeft(6)}us  '
+            '${(row['hitUs'] as double).toStringAsFixed(1).padLeft(6)}us');
+      }
+      buf
+        ..writeln('-' * 40)
+        ..writeln('Noise XX handshake (CPU only): '
+            '${(hs / 1000).toStringAsFixed(2)} ms')
+        ..writeln('1 handshake = ${(hs / (rows.last['tFailUs'] as double)).round()} '
+            'failed AEAD opens');
+      if (!mounted) return;
+      setState(() => _benchResult = buf.toString());
+      unawaited(widget.experimentRecorder?.log({
+        'type': 'bench',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'crypto',
+        'decrypt': rows,
+        'tHandshakeUs': hs,
+      }) ?? Future<void>.value());
+    } catch (e) {
+      if (mounted) setState(() => _benchResult = 'Bench failed: $e');
+    } finally {
+      if (mounted) setState(() => _benchRunning = false);
+    }
+  }
+
+  List<Widget> _benchSection() {
+    return [
+      _sectionHeader('Crypto bench', 'Sizes the session cap'),
+      const Text(
+        'Times one failed AEAD open and one Noise XX handshake on THIS '
+        'device. A packet not addressed to us costs sessions x failed-AEAD, '
+        'so that number is the price of holding one more session — and the '
+        'price of dropping the recipient field from the envelope, which '
+        'would send every transit packet through the same walk. Run it on '
+        'the slowest phone in the fleet; a development machine understates '
+        'it by roughly 10x. Takes a few seconds and pins the CPU.',
+        style: TextStyle(fontSize: 13, color: Colors.grey),
+      ),
+      const SizedBox(height: 8),
+      FilledButton.icon(
+        onPressed:
+            widget.onCryptoBench == null || _benchRunning ? null : _runCryptoBench,
+        icon: _benchRunning
+            ? const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2))
+            : const Icon(Icons.speed_rounded),
+        label: Text(_benchRunning ? 'Running…' : 'Run crypto bench'),
+      ),
+      if (_benchResult != null) ...[
+        const SizedBox(height: 10),
+        SelectableText(
+          _benchResult!,
+          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+        ),
+      ],
+    ];
+  }
+
+  Widget _sectionHeader(String title, String subtitle) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(title,
+                style: const TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(subtitle,
+                style: const TextStyle(fontSize: 13, color: Colors.grey)),
+          ],
+        ),
+      );
+
+  Widget _copyableKey(String label, String hex) => InkWell(
+        onTap: () {
+          Clipboard.setData(ClipboardData(text: hex));
+          _snack('$label pubkey copied');
+        },
+        child: Row(children: [
+          const Icon(Icons.copy, size: 14, color: Colors.grey),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text('$label: $hex',
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+                overflow: TextOverflow.ellipsis),
+          ),
+        ]),
+      );
+}
+
+/// Wizard outcome: a plan to run (this device moves) OR just the shared
+/// experiment id for a record-only static device.
+class _WizardResult {
+  final FieldPlan? plan;
+  final String? staticExpId;
+  const _WizardResult.plan(this.plan) : staticExpId = null;
+  const _WizardResult.static(this.staticExpId) : plan = null;
+}
+
+/// DEBUG/TESTBED ONLY. A few-question wizard that builds a [FieldPlan] (or a
+/// static record-only request) and pops it back to the caller. Pure plan
+/// construction lives in [FieldPlanWizard]; this is only the form.
+class _PlanWizardDialog extends StatefulWidget {
+  const _PlanWizardDialog();
+
+  @override
+  State<_PlanWizardDialog> createState() => _PlanWizardDialogState();
+}
+
+class _PlanWizardDialogState extends State<_PlanWizardDialog> {
+  FieldPlanKind _kind = FieldPlanKind.homeSoak;
+  late final TextEditingController _expId =
+      TextEditingController(text: 'home-soak-1');
+  late final TextEditingController _dwellMin =
+      TextEditingController(text: '40');
+  late final TextEditingController _sends = TextEditingController(text: '40');
+  late final TextEditingController _dwellSec =
+      TextEditingController(text: '180');
+  late final TextEditingController _repeat = TextEditingController(text: '1');
+  // Payload ARM: one saturating step per size. 132 B is exactly one sealed
+  // packet at the BLE floor MTU, 264 B exactly two, 1200 B ten — so the
+  // per-message cost of fragmentation comes out as a measured curve.
+  late final TextEditingController _payloadBytes =
+      TextEditingController(text: '$defaultSendBytes, 264, 1200');
+  late final TextEditingController _sendLanes =
+      TextEditingController(text: '1');
+  late final TextEditingController _laneCounts =
+      TextEditingController(text: '1, 4, 16, 64');
+  late final TextEditingController _rawLegs =
+      TextEditingController(text: 'notify, write, stripe');
+  /// Power baseline: which of the two complementary schedules this phone
+  /// runs. Both use the SAME labels; role decides who is up during solo and
+  /// who sends during light/heavy.
+  int _powerRole = 1;
+  // Mesh scaling: total devices taking part, and this phone's join order.
+  final TextEditingController _maxDevices =
+      TextEditingController(text: '8');
+  final TextEditingController _meshRole = TextEditingController(text: '1');
+  bool _meshSaturate = true;
+
+  /// Manual Bluetooth join (operator toggles settings-BT; wall-clock
+  /// anchored start). Default ON — it is the current field procedure, and
+  /// forgetting it on one of eight phones would silently give that phone a
+  /// different timeline.
+  bool _meshManual = true;
+  /// Whether THIS device walks the sweep (mover) or stays put (static,
+  /// record-only). Drives the whole form.
+  bool _moves = true;
+  // null = use the kind's default; set once the user toggles a switch.
+  bool? _resetSessions;
+  bool? _resetLinks;
+
+  @override
+  void dispose() {
+    for (final c in [
+      _expId,
+      _dwellMin,
+      _sends,
+      _dwellSec,
+      _repeat,
+      _payloadBytes,
+      _sendLanes,
+      _laneCounts,
+      _rawLegs,
+    ]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  int _int(TextEditingController c, int fallback) =>
+      int.tryParse(c.text.trim()) ?? fallback;
+
+  /// True once the experimenter has typed in the id field. Changing the
+  /// experiment kind then leaves their id ALONE — silently overwriting it is
+  /// how a run ends up filed under the wrong name, which only surfaces hours
+  /// later when the analysis cannot find it.
+  bool _idEdited = false;
+
+  void _suggestId(FieldPlanKind kind) {
+    if (_idEdited) return;
+    _expId.text = switch (kind) {
+      FieldPlanKind.meshScale => 'mesh-scale-1',
+      // The spacing belongs in the id: the sweep is run per distance.
+      FieldPlanKind.joinTime => 'join-time-30m',
+      FieldPlanKind.homeSoak => 'home-soak-1',
+      FieldPlanKind.throughput => 'throughput-1',
+      FieldPlanKind.throughputCeiling => 'throughput-ceiling-1',
+      FieldPlanKind.rawLink => 'raw-link-1',
+      FieldPlanKind.powerBaseline => 'pw-base-1',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Landscape is the working orientation in the field (a phone on a tripod
+    // does not rotate), and there the viewport is short: a fixed-width box
+    // with no height bound let the content exceed what AlertDialog will give
+    // it, so the scroll view was handed a box it could not scroll inside and
+    // the lower fields became unreachable. Bound BOTH axes against the actual
+    // viewport, minus the insets the keyboard takes when a field is focused.
+    final media = MediaQuery.of(context);
+    final maxH = media.size.height - media.viewInsets.bottom - 140;
+    return AlertDialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      title: const Text('Build a field plan'),
+      content: SizedBox(
+        width: media.size.width < 460 ? media.size.width * 0.86 : 400,
+        height: maxH.clamp(200.0, 560.0),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _resetSwitch(
+                'This device moves during the test',
+                _moves,
+                (v) => setState(() => _moves = v),
+              ),
+              const SizedBox(height: 4),
+              TextField(
+                controller: _expId,
+                onChanged: (_) => _idEdited = true,
+                decoration: const InputDecoration(
+                    labelText: 'Experiment id (same on both devices)',
+                    isDense: true),
+              ),
+              if (!_moves)
+                const Padding(
+                  padding: EdgeInsets.only(top: 12),
+                  child: Text(
+                    'Static device: it just records + ACKs. Generate fills '
+                    'the id into Experiment recording — press Record there, '
+                    'then Stop + Upload when the moving device finishes. The '
+                    'moving device\'s markers define the distance segments.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+              if (_moves) ...[
+                const SizedBox(height: 12),
+                DropdownButtonFormField<FieldPlanKind>(
+                  initialValue: _kind,
+                  decoration: const InputDecoration(
+                      labelText: 'Experiment', isDense: true),
+                  items: [
+                    for (final k in FieldPlanKind.values)
+                      DropdownMenuItem(value: k, child: Text(k.label)),
+                  ],
+                  onChanged: (k) => setState(() {
+                    _kind = k!;
+                    _suggestId(k);
+                    _suggestTiming(k);
+                    // Reset toggles fall back to the new kind's defaults.
+                    _resetSessions = null;
+                    _resetLinks = null;
+                  }),
+                ),
+                ...[
+                  const SizedBox(height: 4),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    title: Text(_meshManual
+                        ? 'Manual running logic: you toggle Bluetooth in '
+                            'Settings; all phones start at the same '
+                            'wall-clock instant'
+                        : 'Legacy: app-controlled radio, tap-anchored start'),
+                    value: _meshManual,
+                    onChanged: (v) => setState(() => _meshManual = v),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                ..._fieldsForKind(),
+                const Divider(height: 24),
+                _num(_repeat, 'Repeat each step (trials)'),
+                _resetSwitch(
+                  'Reset sessions each step',
+                  _resetSessions ?? _defSessions,
+                  (v) => setState(() => _resetSessions = v),
+                ),
+                _resetSwitch(
+                  'Reset BLE links each step',
+                  _resetLinks ?? _defLinks,
+                  (v) => setState(() => _resetLinks = v),
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    'Tap IN POSITION at each new distance; repeat trials at '
+                    'the same distance auto-advance.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+              context,
+              _moves
+                  ? _WizardResult.plan(_build())
+                  : _WizardResult.static(
+                      _expId.text.trim().isEmpty ? 'exp' : _expId.text.trim())),
+          child: Text(_moves ? 'Generate' : 'Use static'),
+        ),
+      ],
+    );
+  }
+
+  List<Widget> _fieldsForKind() {
+    switch (_kind) {
+      case FieldPlanKind.homeSoak:
+        return [
+          _num(_dwellMin, 'Dwell (minutes)'),
+          const SizedBox(height: 12),
+          _num(_sends, 'Messages over the dwell'),
+        ];
+      case FieldPlanKind.throughput:
+        return [
+          _num(_dwellSec, 'Saturate for (s)'),
+          const SizedBox(height: 12),
+          _num(_payloadBytes, 'Message sizes (bytes, comma-separated)'),
+          const SizedBox(height: 12),
+          _num(_sendLanes, 'Concurrent send lanes'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Fires as many messages as the link carries: pushes '
+              'as fast as the send path drains, never waiting for an '
+              'ACK. Each size is its own step — $defaultSendBytes B is one '
+              'sealed packet, larger sizes fragment. A NON-zero window is '
+              'ACK-clocked and caps the rate at window/RTT.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.throughputCeiling:
+        return [
+          _num(_dwellSec, 'Saturate for (s)'),
+          const SizedBox(height: 12),
+          _num(_payloadBytes, 'Message size (bytes) — first value is used'),
+          const SizedBox(height: 12),
+          _num(_laneCounts, 'Lane counts to sweep (comma-separated)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Each lane pushes independently, none ACK-gated, so offered '
+              'load rises with the lane count. The ceiling is where delivery '
+              'drops below 100% and goodput stops climbing.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.rawLink:
+        return [
+          _num(_dwellSec, 'Blast for (s)'),
+          const SizedBox(height: 12),
+          _num(_rawLegs, 'Legs to test (notify, write, stripe)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'MTU-sized raw blobs, no seal/ACK/buffering — the naked GATT '
+              'pipe. notify = this device\'s peripheral leg, write = its '
+              'central leg, stripe = alternate blobs across both.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.meshScale:
+        return [
+          _num(_maxDevices, 'Total devices taking part'),
+          const SizedBox(height: 12),
+          _num(_meshRole, "This phone's join order (1 = present from the start)"),
+          const SizedBox(height: 12),
+          _num(_dwellSec, 'Step length (s)'),
+          const SizedBox(height: 12),
+          _num(_repeat, 'Repeats per device count'),
+          const SizedBox(height: 12),
+          _num(_sendLanes, 'Concurrent send lanes'),
+          const SizedBox(height: 12),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: Text(_meshSaturate
+                ? 'Saturate (every device pushes as fast as it can)'
+                : 'Fixed rate — sends per step below'),
+            value: _meshSaturate,
+            onChanged: (v) => setState(() => _meshSaturate = v),
+          ),
+          if (!_meshSaturate) ...[
+            const SizedBox(height: 12),
+            _num(_sends, 'Send rounds per step (each round hits every peer)'),
+          ],
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Run on EVERY phone with the same total and a different join '
+              'order. Devices 1-3 are present from the start; device k joins '
+              'at step n=k by turning its radio on — so all phones run the '
+              'same timeline and must be STARTED together.\n\n'
+              'If the phones end up far apart, set a walk-out window: tap '
+              'them all at one spot, then carry them into position while it '
+              'runs. Measurement starts only after it elapses, and that step '
+              'is excluded from the analysis.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.joinTime:
+        return [
+          _num(_meshRole, "This phone's join order (the block-k phone is the frontier)"),
+          const SizedBox(height: 12),
+          _num(_maxDevices, 'Total devices taking part'),
+          const SizedBox(height: 12),
+          _num(_dwellSec, 'Join window per rep (s)'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Establishment only — the standing mesh stays QUIET so link '
+              'formation is not measured through traffic churn; mesh '
+              'performance is the separate Mesh scaling run. The block-k '
+              'phone toggles Bluetooth at the prompts ("Repeat" times per '
+              'block), then anneals and the next phone takes over. Put the '
+              'SPACING in the experiment id (join-time-30m).',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+      case FieldPlanKind.powerBaseline:
+        return [
+          _num(_dwellSec, 'Segment length (s)'),
+          const SizedBox(height: 12),
+          _num(_repeat, 'Ladder repeats'),
+          const SizedBox(height: 12),
+          _num(_sends, 'Light-segment sends (per dwell)'),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: Text('This phone is P1 (up in solo, sends in '
+                'light/heavy)${_powerRole == 1 ? '' : ' — currently P2'}'),
+            value: _powerRole == 1,
+            onChanged: (v) => setState(() => _powerRole = v ? 1 : 2),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Run UNPLUGGED at minimum brightness on both phones, one P1 '
+              'and one P2, launched within a few seconds of each other. The '
+              'runner toggles BLE itself — one tap, then hands-free.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
+    }
+  }
+
+  Widget _num(TextEditingController c, String label) => TextField(
+        controller: c,
+        keyboardType: TextInputType.text,
+        decoration: InputDecoration(labelText: label, isDense: true),
+      );
+
+  Widget _resetSwitch(String title, bool value, ValueChanged<bool> onChanged) =>
+      SwitchListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        title: Text(title),
+        value: value,
+        onChanged: onChanged,
+      );
+
+  /// Load the kind's canonical dwell/repeat when the experiment changes —
+  /// a shared text field keeping the PREVIOUS kind's numbers is how a line
+  /// sweep ends up with a 180s dwell nobody chose.
+  void _suggestTiming(FieldPlanKind kind) {
+    final (dwell, repeat, sends) = switch (kind) {
+      // 10 reps per device count: the power ladder showed between-rep spread
+      // is where the uncertainty lives, so one pass per size is not enough.
+      FieldPlanKind.meshScale => (120, 10, 60),
+      // dwell = the frontier's join window per rep; repeat = cold joins per N.
+      FieldPlanKind.joinTime => (60, 5, 0),
+      FieldPlanKind.homeSoak => (60, 1, 40),
+      FieldPlanKind.throughput => (60, 1, 0),
+      FieldPlanKind.throughputCeiling => (60, 1, 0),
+      FieldPlanKind.rawLink => (30, 10, 0),
+      FieldPlanKind.powerBaseline => (600, 2, 600),
+    };
+    _dwellSec.text = '$dwell';
+    _repeat.text = '$repeat';
+    if (sends > 0) _sends.text = '$sends';
+  }
+
+  bool get _defSessions => FieldPlanWizard.resetDefaults(_kind).$1;
+  bool get _defLinks => FieldPlanWizard.resetDefaults(_kind).$2;
+
+  FieldPlan _build() {
+    final plan = _buildKind();
+    // The manual running logic is how ALL experiments run — operator toggles
+    // system Bluetooth, wall-clock anchored start, no GPS. Kinds that build
+    // it in (mesh scale, join time) pass through untouched; everything else
+    // is wrapped here.
+    if (_meshManual && !plan.manualJoin) {
+      return FieldPlanPresets.manualized(plan);
+    }
+    return plan;
+  }
+
+  FieldPlan _buildKind() => FieldPlanWizard.build(
+        kind: _kind,
+        expId: _expId.text,
+        dwellMin: _int(_dwellMin, 40),
+        sends: _int(_sends, 40),
+        dwellSec: _int(_dwellSec, 180),
+        repeat: _int(_repeat, 1),
+        resetSessions: _resetSessions,
+        resetLinks: _resetLinks,
+        payloadSizes: FieldPlanWizard.parseInts(
+            _payloadBytes.text, const [defaultSendBytes]),
+        sendLanes: _int(_sendLanes, 1),
+        laneCounts:
+            FieldPlanWizard.parseInts(_laneCounts.text, const [1, 4, 16, 64]),
+        powerRole: _powerRole,
+        maxDevices: int.tryParse(_maxDevices.text.trim()) ?? 8,
+        meshRole: int.tryParse(_meshRole.text.trim()) ?? 1,
+        saturate: _meshSaturate,
+        manualJoin: _meshManual,
+        rawLegs: [
+          for (final leg in _rawLegs.text.split(','))
+            if (const {'notify', 'write', 'stripe'}.contains(leg.trim()))
+              leg.trim(),
+        ],
+      );
+}

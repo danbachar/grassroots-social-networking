@@ -1,0 +1,8 @@
+# CryptoBench, Nexus 5X (bullhead, Android 8.1), release build, 2026-08-04
+# tFailUs converges to ~350; S=1 carries residual JIT warm-up.
+sessions,tFailUs,missUs,hitUs
+1,583.7,584,364.9
+8,366.3,2931,283.1
+32,360.8,11546,319.1
+128,350.1,44810,333.8
+# handshake (CPU only): 84100 us. Laptop reference: tFail 35 us, handshake 4250 us.

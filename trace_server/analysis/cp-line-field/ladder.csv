@@ -1,0 +1,5 @@
+stage,trials,reached,reach_rate,median_s,p90_s,max_s
+discovered,100,75,0.75,3.22,20.64,68.85
+connected,100,75,0.75,3.17,20.34,68.59
+session,100,74,0.74,6.34,25.48,69.7
+usable,100,59,0.59,7.54,20.29,30.81

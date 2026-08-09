@@ -1,0 +1,2 @@
+d,direction,trials,discovered_rate,connected_rate,session_rate,usable_rate,drop_rate,advCoverage_mean,rssi_adv_mean,delivery_rate,rtt_median_ms
+3.0,,5,1.0,1.0,1.0,1.0,0.8,0.714,-52.3,1.0,100

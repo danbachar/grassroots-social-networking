@@ -106,6 +106,23 @@ void main() {
 
       test('service UUID rotates every 15-minute slot; candidates cover '
           'prev/current/next', () {
+        if (!GrassrootsIdentity.bleSlotRotationEnabled) {
+          // EXPERIMENT KILL-SWITCH active: the slot is pinned, so the UUID is
+          // stable and the candidate set collapses to exactly one entry.
+          final pinned = GrassrootsIdentity.currentBleSlot();
+          expect(
+              GrassrootsIdentity.currentBleSlot(
+                  now: DateTime.fromMillisecondsSinceEpoch(0)
+                      .add(const Duration(days: 30))),
+              equals(pinned),
+              reason: 'Rotation disabled — the slot must never advance.');
+          expect(
+              GrassrootsIdentity.candidateServiceUuids(identity.publicKey),
+              equals({identity.bleServiceUuid.toLowerCase()}),
+              reason: 'Rotation disabled — exactly one stable candidate.');
+          return;
+        }
+
         final t0 = DateTime.fromMillisecondsSinceEpoch(0);
         final slot0 = GrassrootsIdentity.currentBleSlot(now: t0);
         final uuid0 = GrassrootsIdentity.deriveServiceUuidForSlot(

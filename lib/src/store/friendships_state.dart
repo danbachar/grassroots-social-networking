@@ -39,14 +39,6 @@ class FriendshipState {
   /// Optional message sent with the friend request
   final String? message;
 
-  /// Rendezvous servers this friend uses, learned via the RV_LIST signaling
-  /// exchange. Keyed by lowercase RV pubkey hex; value is the "ip:port"
-  /// address. Stable, friendship-scoped data — persisted alongside the rest
-  /// of the friendship record so it survives app restart and is available
-  /// before the friend's first reconnect (avoids a `target RV count=0`
-  /// window where AVAILABLE fan-out has nowhere to go).
-  final Map<String, String> knownRvServers;
-
   const FriendshipState({
     required this.peerPubkeyHex,
     this.udpAddress,
@@ -55,7 +47,6 @@ class FriendshipState {
     required this.createdAt,
     required this.updatedAt,
     this.message,
-    this.knownRvServers = const {},
   });
 
   /// Whether this is an established friendship
@@ -77,7 +68,6 @@ class FriendshipState {
     FriendshipStatus? status,
     String? message,
     DateTime? updatedAt,
-    Map<String, String>? knownRvServers,
   }) {
     return FriendshipState(
       peerPubkeyHex: peerPubkeyHex,
@@ -87,7 +77,6 @@ class FriendshipState {
       createdAt: createdAt,
       updatedAt: updatedAt ?? DateTime.now(),
       message: message ?? this.message,
-      knownRvServers: knownRvServers ?? this.knownRvServers,
     );
   }
 
@@ -99,14 +88,9 @@ class FriendshipState {
         'createdAt': createdAt.toIso8601String(),
         'updatedAt': updatedAt.toIso8601String(),
         'message': message,
-        if (knownRvServers.isNotEmpty) 'knownRvServers': knownRvServers,
       };
 
   factory FriendshipState.fromJson(Map<String, dynamic> json) {
-    final rawRvServers = json['knownRvServers'] as Map<String, dynamic>?;
-    final knownRvServers = rawRvServers == null
-        ? const <String, String>{}
-        : {for (final e in rawRvServers.entries) e.key: e.value as String};
     return FriendshipState(
       peerPubkeyHex: json['peerPubkeyHex'] as String,
       udpAddress: json['udpAddress'] as String?,
@@ -115,7 +99,6 @@ class FriendshipState {
       createdAt: DateTime.parse(json['createdAt'] as String),
       updatedAt: DateTime.parse(json['updatedAt'] as String),
       message: json['message'] as String?,
-      knownRvServers: knownRvServers,
     );
   }
 
@@ -128,8 +111,7 @@ class FriendshipState {
           udpAddress == other.udpAddress &&
           nickname == other.nickname &&
           status == other.status &&
-          message == other.message &&
-          mapEquals(knownRvServers, other.knownRvServers);
+          message == other.message;
 
   @override
   int get hashCode => Object.hash(
@@ -138,8 +120,6 @@ class FriendshipState {
         nickname,
         status,
         message,
-        Object.hashAllUnordered(knownRvServers.entries
-            .map((e) => Object.hash(e.key, e.value))),
       );
 
   @override
@@ -197,24 +177,6 @@ class FriendshipsState {
       .where((f) => f.udpAddress != null)
       .map((f) => f.udpAddress!)
       .toList();
-
-  /// Rendezvous servers advertised by accepted friends via RV_LIST.
-  ///
-  /// Keyed by lowercase rendezvous pubkey hex; value is the advertised
-  /// "ip:port" address. These servers are trusted only as reconnect
-  /// facilitators because a friend explicitly told us to use them.
-  Map<String, String> get friendRvServers {
-    final servers = <String, String>{};
-    for (final friend in friends) {
-      for (final entry in friend.knownRvServers.entries) {
-        final hex = entry.key.toLowerCase();
-        final address = entry.value.trim();
-        if (hex.isEmpty || address.isEmpty) continue;
-        servers[hex] = address;
-      }
-    }
-    return Map.unmodifiable(servers);
-  }
 
   // ===== Copy With =====
 

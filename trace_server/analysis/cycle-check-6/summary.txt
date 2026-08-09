@@ -1,0 +1,21 @@
+records: 4144   span: 537s
+
+receiver (adbed3e0):
+  records by type: {'message': 500, 'custody': 500, 'rssi': 337, 'link': 111, 'wire': 42, 'marker': 2}
+  link stages: {'discovered': 86, 'drop': 10, 'connected': 10, 'session': 5}
+  wire bytes: {'rx:announce': 14364, 'rx:handshake': 1000, 'rx:secure': 118000, 'tx:announce': 14364, 'tx:handshake': 700, 'tx:secure:ack': 88760, 'tx:secure:sync': 3308}
+
+sender (ba2af95f):
+  records by type: {'custody': 1000, 'message': 1000, 'rssi': 384, 'link': 107, 'packetDup': 102, 'wire': 36, 'marker': 23}
+  link stages: {'discovered': 82, 'connected': 10, 'drop': 5, 'session': 5, 'usable': 5}
+  messages sent: 500, delivered: 500 (100%)
+  wire RTT ms (send->ACK): median 98, p90 156, max 274
+  wire bytes: {'rx:announce': 13338, 'rx:handshake': 700, 'rx:secure': 91688, 'tx:announce': 13680, 'tx:handshake': 1000, 'tx:secure': 118000}
+
+=== mesh ===
+messages sent: 500, delivered: 500 (100%)
+delivered by relay hops (receiver TTL view): {0: 500}
+  MULTI-HOP deliveries: 0/500
+custody events: {'store': 1000, 'end': 500}
+packet redundancy: 102 redundant packet arrival(s) for 500 delivered message(s) = 1.20 copies on the air per message (1.00 = every packet arrived exactly once)
+message re-delivery: 0 (must be 0 — a duplicate of an already-delivered message triggers nothing)

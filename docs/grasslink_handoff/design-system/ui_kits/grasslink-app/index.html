@@ -1,0 +1,43 @@
+<!-- @dsCard group="grasslink app" viewport="390x760" name="grasslink app" subtitle="Mesh messaging — login, threads, conversation, mesh status, compose" -->
+<!-- @startingPoint section="grasslink app" subtitle="Interactive mesh-messaging mobile app" viewport="390x760" -->
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>grasslink app</title>
+<link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>
+html,body{margin:0;height:100%;background:var(--bg-sunken);font-family:var(--font-sans)}
+#root{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px}
+.phone{width:390px;height:760px;background:var(--surface-card);border-radius:44px;box-shadow:0 40px 80px rgba(58,46,36,.28),0 0 0 10px #2b241d,0 0 0 12px #43392e;overflow:hidden;position:relative}
+.screen{position:absolute;inset:0;display:flex;flex-direction:column}
+.body{flex:1;overflow:hidden;display:flex;flex-direction:column}
+</style></head>
+<body><div id="root"></div>
+<script type="text/babel" src="screens.jsx"></script>
+<script type="text/babel">
+function App(){
+  const [route,setRoute]=React.useState('login');
+  const [tab,setTab]=React.useState('threads');
+  const [thread,setThread]=React.useState(null);
+  const openThread=(t)=>{setThread(t);setRoute('conversation');};
+  let screen, showNav=false;
+  if(route==='login'){ screen=<LoginScreen onJoin={()=>{setRoute('home');setTab('threads');}}/>; }
+  else if(route==='conversation'){ screen=<ConversationScreen thread={thread} onBack={()=>setRoute('home')}/>; }
+  else if(route==='compose'){ screen=<ComposeScreen onClose={()=>setRoute('home')} onSend={()=>setRoute('home')}/>; }
+  else {
+    showNav=true;
+    if(tab==='threads') screen=<ThreadsScreen onOpen={openThread}/>;
+    else if(tab==='mesh') screen=<MeshScreen/>;
+    else screen=<ThreadsScreen onOpen={openThread}/>;
+  }
+  const onTab=(t)=>{ if(t==='compose'){setRoute('compose');return;} setRoute('home'); setTab(t); };
+  return (<div className="phone"><div className="screen">
+    <div className="body">{screen}</div>
+    {showNav && <BottomNav tab={tab} onTab={onTab}/>}
+  </div></div>);
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+<script src="https://unpkg.com/lucide@0.544.0/dist/umd/lucide.js"></script>
+</body></html>

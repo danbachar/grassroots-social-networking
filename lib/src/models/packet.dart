@@ -13,7 +13,9 @@ enum PacketType {
   /// Session-sealed envelope. Everything that is not an ANNOUNCE or a handshake
   /// is one opaque `secure` packet: the content type and any fragmentation live
   /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
-  /// an opaque, recipient-addressed blob — never the message class.
+  /// an opaque, recipient-addressed blob — never the message class. Sync-on-
+  /// connect control frames ride inside it too, so buffer contents are
+  /// never on the air in the clear.
   secure(0x03);
 
   final int value;
@@ -50,6 +52,12 @@ enum PacketType {
 /// framer: stream transports (UDP/UDX) accumulate bytes until
 /// `headerSize + payloadLength` are available before treating a buffer as
 /// one packet.
+/// DEBUG/TESTBED ONLY outer type byte for raw-throughput blobs: not a
+/// [PacketType], never deserialized. A raw blob is [rawPacketType, ...fill]
+/// — the receiver counts its bytes in the wire ledger and drops it before
+/// the parser. Measures the GATT pipe with zero protocol on top.
+const int rawPacketType = 0x7F;
+
 class GrassrootsPacket {
   static const int headerSize = 58;
   static const int payloadLengthOffset = 54; // byte index of length field
@@ -157,7 +165,7 @@ class GrassrootsPacket {
     offset += 32;
 
     // Packet ID (16 bytes - UUID as bytes)
-    final idBytes = _uuidToBytes(packetId);
+    final idBytes = uuidToBytes(packetId);
     bytes.setRange(offset, offset + 16, idBytes);
     offset += 16;
 
@@ -199,7 +207,7 @@ class GrassrootsPacket {
 
     // Packet ID
     final idBytes = data.sublist(offset, offset + 16);
-    final packetId = _bytesToUuid(idBytes);
+    final packetId = bytesToUuid(idBytes);
     offset += 16;
 
     // Payload length
@@ -236,7 +244,7 @@ class GrassrootsPacket {
   }
 
   /// Convert UUID string to 16 bytes
-  static Uint8List _uuidToBytes(String uuid) {
+  static Uint8List uuidToBytes(String uuid) {
     final hex = uuid.replaceAll('-', '');
     final bytes = Uint8List(16);
     for (var i = 0; i < 16; i++) {
@@ -246,7 +254,7 @@ class GrassrootsPacket {
   }
 
   /// Convert 16 bytes to UUID string
-  static String _bytesToUuid(Uint8List bytes) {
+  static String bytesToUuid(Uint8List bytes) {
     if (bytes.length != 16) throw ArgumentError('UUID must be 16 bytes');
     final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     return '${hex.substring(0, 8)}-'

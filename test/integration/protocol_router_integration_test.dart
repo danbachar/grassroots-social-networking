@@ -161,7 +161,7 @@ void main() {
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
       bobRouter.onPeerAnnounced =
-          (data, transport, {bool isNew = false, String? udpPeerId}) {
+          (data, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -177,7 +177,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.bleDirect));
 
       // Verify Bob's Redux store was updated.
@@ -195,7 +194,7 @@ void main() {
 
       AnnounceData? receivedAnnounce;
       bobRouter.onPeerAnnounced =
-          (data, transport, {bool isNew = false, String? udpPeerId}) {
+          (data, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         receivedAnnounce = data;
       };
 
@@ -229,7 +228,7 @@ void main() {
 
       var announceFired = false;
       bobRouter.onPeerAnnounced =
-          (_, __, {bool isNew = false, String? udpPeerId}) {
+          (_, __, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         announceFired = true;
       };
 
@@ -444,7 +443,7 @@ void main() {
       AnnounceData? receivedAnnounce;
       PeerTransport? receivedTransport;
       bobRouter.onPeerAnnounced =
-          (data, transport, {bool isNew = false, String? udpPeerId}) {
+          (data, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         receivedAnnounce = data;
         receivedTransport = transport;
       };
@@ -458,7 +457,6 @@ void main() {
       expect(receivedAnnounce, isNotNull);
       expect(receivedAnnounce!.publicKey, equals(aliceIdentity.publicKey));
       expect(receivedAnnounce!.nickname, equals('Alice'));
-      expect(receivedAnnounce!.protocolVersion, equals(1));
       expect(receivedTransport, equals(PeerTransport.udp));
 
       // Verify Bob's Redux store was updated.
@@ -475,7 +473,7 @@ void main() {
 
       AnnounceData? receivedAnnounce;
       bobRouter.onPeerAnnounced =
-          (data, transport, {bool isNew = false, String? udpPeerId}) {
+          (data, transport, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         receivedAnnounce = data;
       };
 
@@ -651,7 +649,7 @@ void main() {
 
       int announceCount = 0;
       bobRouter.onPeerAnnounced =
-          (_, __, {bool isNew = false, String? udpPeerId}) {
+          (_, __, {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
         announceCount++;
       };
 

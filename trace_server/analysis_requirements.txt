@@ -1,0 +1,4 @@
+# For analyze.py only — NOT needed by the upload server / Docker image.
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7

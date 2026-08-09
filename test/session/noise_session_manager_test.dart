@@ -277,4 +277,155 @@ void main() {
     expect(finished.sessionEstablished, isFalse);
     expect(bobSessions.hasSession(alice.publicKey), isFalse);
   });
+
+  test(
+      'concurrent startHandshake calls yield exactly one msg1 '
+      '(dual-leg ANNOUNCE race: both legs deliver the same announce '
+      'milliseconds apart and both fire the eager handshake)', () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions =
+        NoiseSessionManager(identity: alice, sodium: sodium);
+
+    // Fire both calls WITHOUT awaiting the first — models the per-leg
+    // arrivals racing through the async gap in the in-flight guard.
+    final results = await Future.wait([
+      aliceSessions.startHandshake(bob.publicKey),
+      aliceSessions.startHandshake(bob.publicKey),
+    ]);
+
+    expect(results.where((r) => r != null), hasLength(1),
+        reason: 'The second concurrent call must be rejected — two live '
+            'initiator states poison each other\'s msg2 processing.');
+  });
+
+  test(
+      'a msg2 that fails its AEAD check leaves the handshake intact: '
+      'the matching msg2 still completes (stale-reply poisoning)', () async {
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions =
+        NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+
+    final msg1 = await aliceSessions.startHandshake(bob.publicKey);
+    final msg2 = await bobSessions.handleHandshakePacket(
+      handshakePacket(msg1!),
+      remotePubkey: alice.publicKey,
+    );
+
+    // A stale/corrupted msg2 (the reply to a discarded duplicate msg1, as
+    // observed live): flip a byte inside the encrypted-static portion.
+    final poisoned = Uint8List.fromList(msg2.responsePayload!);
+    poisoned[poisoned.length - 1] ^= 0xff;
+    await expectLater(
+      aliceSessions.handleHandshakePacket(
+        handshakePacket(poisoned),
+        remotePubkey: bob.publicKey,
+      ),
+      throwsA(anything),
+    );
+
+    // The GENUINE msg2 must still be readable — before the fix, the failed
+    // read had already mutated the symmetric state, so this threw too and
+    // the handshake wedged until timeout, repeating every announce cycle.
+    final msg3 = await aliceSessions.handleHandshakePacket(
+      handshakePacket(msg2.responsePayload!),
+      remotePubkey: bob.publicKey,
+    );
+    expect(msg3.sessionEstablished, isTrue);
+    expect(aliceSessions.hasSession(bob.publicKey), isTrue);
+
+    final done = await bobSessions.handleHandshakePacket(
+      handshakePacket(msg3.responsePayload!),
+      remotePubkey: alice.publicKey,
+    );
+    expect(done.sessionEstablished, isTrue);
+    expect(bobSessions.hasSession(alice.publicKey), isTrue);
+  });
+
+  group('session retention', () {
+    /// Gives [hub] a session with each of [n] fresh peers, in order. Sessions
+    /// are retained without bound, so this is also how the trial-decrypt
+    /// table grows in the field.
+    Future<List<GrassrootsIdentity>> meetPeers(
+      NoiseSessionManager hub,
+      GrassrootsIdentity hubId,
+      int n,
+    ) async {
+      final peers = <GrassrootsIdentity>[];
+      for (var i = 0; i < n; i++) {
+        final peer = await identity('peer$i');
+        final peerSessions = NoiseSessionManager(identity: peer, sodium: sodium);
+        await completeHandshake(
+          initiator: peerSessions,
+          initPub: peer.publicKey,
+          responder: hub,
+          respPub: hubId.publicKey,
+        );
+        peers.add(peer);
+      }
+      return peers;
+    }
+
+    test('every peer met is retained — nothing evicts a live session',
+        () async {
+      final hubId = await identity('Hub');
+      final hub = NoiseSessionManager(identity: hubId, sodium: sodium);
+
+      final peers = await meetPeers(hub, hubId, 5);
+
+      expect(hub.sessionCount, 5);
+      for (final p in peers) {
+        expect(hub.hasSession(p.publicKey), isTrue);
+      }
+    });
+
+    test('a handshake nobody awaits is reaped, not kept forever', () async {
+      final hubId = await identity('Hub');
+      final hub = NoiseSessionManager(
+        identity: hubId,
+        sodium: sodium,
+        handshakeTimeout: const Duration(milliseconds: 20),
+      );
+
+      // A peer that sends msg1 and vanishes: nothing ever awaits this entry,
+      // so before the reaper it would live for the life of the process.
+      final ghost = await identity('Ghost');
+      expect(await hub.startHandshake(ghost.publicKey), isNotNull);
+
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      // A completed handshake runs the reaper.
+      await meetPeers(hub, hubId, 1);
+
+      expect(await hub.startHandshake(ghost.publicKey), isNotNull,
+          reason: 'the dead handshake was reaped, so a fresh one can start');
+    });
+
+    test('trialDecrypt tries most-recently-used first', () async {
+      final hubId = await identity('Hub');
+      final hub = NoiseSessionManager(identity: hubId, sodium: sodium);
+
+      final peers = await meetPeers(hub, hubId, 4);
+      // Rebuild the newest peer's side and seal from it.
+      final newest = NoiseSessionManager(identity: peers[3], sodium: sodium);
+      await completeHandshake(
+        initiator: newest,
+        initPub: peers[3].publicKey,
+        responder: hub,
+        respPub: hubId.publicKey,
+      );
+      final sealed = await newest.encryptPacket(
+        securePacket(
+          recipient: hubId.publicKey,
+          content: Uint8List.fromList([7]),
+        ),
+        remotePubkey: hubId.publicKey,
+      );
+
+      final result = await hub.trialDecrypt(sealed);
+      expect(result, isNotNull);
+      expect(result!.$2, peers[3].publicKey);
+    });
+  });
 }

@@ -8,22 +8,37 @@ import '../models/packet.dart';
 /// reappears (on their ANNOUNCE / peer-connected event). The relay only ever
 /// holds opaque, recipient-addressed, end-to-end-sealed bytes it cannot read.
 ///
-/// Everything is bounded — number of recipients, depth per recipient, and age —
-/// so an intermediary can never be made to hold unbounded traffic. Eviction is
-/// oldest-first.
+/// Everything is bounded — number of recipients, total packets across the
+/// store, and age — so an intermediary can never be made to hold unbounded
+/// traffic. Eviction is oldest-first. The bound is deliberately store-wide
+/// rather than per-recipient: a per-recipient depth silently dropped a busy
+/// peer's oldest undelivered packets while the rest of the store sat empty,
+/// and pinned held confirmations (which only age-expires) at exactly the
+/// cap on every reconnection.
 class DtnStore {
   /// Max distinct recipients held at once.
   final int maxRecipients;
 
-  /// Max cached packets per recipient.
-  final int maxPerRecipient;
+  /// Max cached packets across ALL recipients (globally-oldest evicted
+  /// first). 8192 packets ≈ 2 MB at typical sealed sizes.
+  final int maxTotal;
 
   /// Packets older than this are dropped.
   final Duration maxAge;
 
+  /// Fired for every packet that leaves the buffer WITHOUT an ACK — age
+  /// expiry ('expired'), store-wide cap eviction ('evictedTotal'), or
+  /// recipient-cap eviction ('evictedRecipients'). ACK-driven removal goes
+  /// through [removeById] and is reported by the caller, not here. Without
+  /// this, a `custody store` record with no `end` is ambiguous between
+  /// "still held" and "silently expired" — which is exactly the packet-loss
+  /// evidence the testbed needs.
+  void Function(String reason, String recipientHex, GrassrootsPacket packet)?
+      onDrop;
+
   DtnStore({
     this.maxRecipients = 256,
-    this.maxPerRecipient = 32,
+    this.maxTotal = 8192,
     this.maxAge = const Duration(hours: 6),
   });
 
@@ -33,6 +48,15 @@ class DtnStore {
 
   int get totalCount =>
       _byRecipient.values.fold(0, (sum, list) => sum + list.length);
+
+  /// Total payload bytes currently buffered — the memory-utilization figure
+  /// for the periodic `buf` trace record. Maintained incrementally: the
+  /// store is consulted on every sync round and a fold over 8k packets per
+  /// query would be wasted work.
+  int get totalBytes => _totalBytes;
+  int _totalBytes = 0;
+
+  int _entryBytes(_Entry e) => e.packet.payload.length;
 
   /// Cache [packet] for later delivery to [recipientHex]. Idempotent per
   /// packetId. [now] defaults to wall-clock; injectable for tests.
@@ -45,10 +69,28 @@ class DtnStore {
       return; // already carrying this exact packet
     }
     list.add(_Entry(packet, at));
+    _totalBytes += packet.payload.length;
 
-    // Bound per-recipient depth (drop oldest).
-    while (list.length > maxPerRecipient) {
-      list.removeAt(0);
+    // Bound the store as a whole: evict the globally-oldest packet. Each
+    // per-recipient list is append-ordered, so the oldest entry overall is
+    // the oldest list head.
+    while (totalCount > maxTotal) {
+      String? evictKey;
+      DateTime? oldestHead;
+      for (final entry in _byRecipient.entries) {
+        if (entry.value.isEmpty) continue;
+        final head = entry.value.first.storedAt;
+        if (oldestHead == null || head.isBefore(oldestHead)) {
+          oldestHead = head;
+          evictKey = entry.key;
+        }
+      }
+      if (evictKey == null) break;
+      final evictList = _byRecipient[evictKey]!;
+      final evicted = evictList.removeAt(0);
+      _totalBytes -= _entryBytes(evicted);
+      onDrop?.call('evictedTotal', evictKey, evicted.packet);
+      if (evictList.isEmpty) _byRecipient.remove(evictKey);
     }
 
     // Bound number of recipients (evict the one whose oldest packet is oldest).
@@ -63,28 +105,81 @@ class DtnStore {
           evictKey = entry.key;
         }
       }
-      if (evictKey != null) _byRecipient.remove(evictKey);
+      if (evictKey != null) {
+        final evictedList = _byRecipient.remove(evictKey)!;
+        for (final e in evictedList) {
+          _totalBytes -= _entryBytes(e);
+          onDrop?.call('evictedRecipients', evictKey, e.packet);
+        }
+      }
     }
   }
 
-  /// Remove and return all (non-expired) cached packets for [recipientHex],
-  /// called when that recipient reappears so the relay can re-flood toward them.
-  List<GrassrootsPacket> takeFor(String recipientHex, {DateTime? now}) {
-    final at = now ?? DateTime.now();
-    _prune(at);
-    final list = _byRecipient.remove(recipientHex);
+  /// All (non-expired) packetIds currently carried, across recipients —
+  /// the buffer summary offered to a newly-connected neighbor during
+  /// sync-on-connect. Non-destructive: sync replicates buffer entries, it
+  /// does not
+  /// transfer it.
+  List<String> carriedPacketIds({DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    return [
+      for (final list in _byRecipient.values)
+        for (final e in list) e.packet.packetId,
+    ];
+  }
+
+  /// Look up a carried packet by [packetId] without removing it — used to
+  /// convey a copy to a neighbor that requested it from our sync offer.
+  /// Returns null if expired/evicted since the offer.
+  GrassrootsPacket? packetById(String packetId, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    for (final list in _byRecipient.values) {
+      for (final e in list) {
+        if (e.packet.packetId == packetId) return e.packet;
+      }
+    }
+    return null;
+  }
+
+  /// All (non-expired) packets held for [recipientHex] — non-destructive.
+  /// Used to convey a reconnecting recipient's messages directly over a
+  /// freshly established session (the entry is kept until ACKed or expired).
+  List<GrassrootsPacket> packetsFor(String recipientHex, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    final list = _byRecipient[recipientHex];
     if (list == null || list.isEmpty) return const [];
     return list.map((e) => e.packet).toList(growable: false);
   }
 
-  void _prune(DateTime now) {
+  /// Drop the packet with [packetId] wherever it is held — called when the
+  /// end-to-end ACK proves delivery, dropping it from our buffer.
+  void removeById(String packetId) {
     _byRecipient.removeWhere((_, list) {
-      list.removeWhere((e) => now.difference(e.storedAt) > maxAge);
+      list.removeWhere((e) {
+        if (e.packet.packetId != packetId) return false;
+        _totalBytes -= _entryBytes(e);
+        return true;
+      });
       return list.isEmpty;
     });
   }
 
-  void clear() => _byRecipient.clear();
+  void _prune(DateTime now) {
+    _byRecipient.removeWhere((recipientHex, list) {
+      list.removeWhere((e) {
+        if (now.difference(e.storedAt) <= maxAge) return false;
+        _totalBytes -= _entryBytes(e);
+        onDrop?.call('expired', recipientHex, e.packet);
+        return true;
+      });
+      return list.isEmpty;
+    });
+  }
+
+  void clear() {
+    _byRecipient.clear();
+    _totalBytes = 0;
+  }
 }
 
 class _Entry {

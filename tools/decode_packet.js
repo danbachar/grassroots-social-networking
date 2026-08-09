@@ -1,22 +1,27 @@
 #!/usr/bin/env node
 
-// Decode BitchatPacket from byte array
+// Decode a GrassrootsPacket from a byte array.
 //
-// Usage: node decode_packet.js '[6, 7, 105, ...]'
+// Wire format (lib/src/models/packet.dart, header = 58 bytes):
+//   type(1) + ttl(1) + timestamp u32 BE(4) + recipient pubkey(32, zeros =
+//   broadcast) + packetId UUID(16) + payloadLength u32 BE(4) + payload
+//
+// The outer envelope deliberately carries NO sender and NO signature —
+// sender identity and authentication live inside the Noise-sealed payload
+// (ANNOUNCE is the one exception: its payload embeds the pubkey and a
+// trailing Ed25519 signature; see lib/src/protocol/protocol_handler.dart).
+//
+// Usage: node decode_packet.js '[1, 7, 105, ...]'
 // Or paste the array when prompted
 
 const PACKET_TYPES = {
   0x01: 'ANNOUNCE',
-  0x02: 'MESSAGE',
-  0x03: 'FRAGMENT_START',
-  0x04: 'FRAGMENT_CONTINUE',
-  0x05: 'FRAGMENT_END',
-  0x06: 'ACK',
-  0x07: 'NACK',
-  0x08: 'READ_RECEIPT',
+  0x02: 'NOISE_HANDSHAKE',
+  0x03: 'SECURE',
 };
 
-const HEADER_SIZE = 152;
+const HEADER_SIZE = 58;
+const SIGNATURE_SIZE = 64;
 
 function toHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -40,7 +45,9 @@ function isAllZeros(bytes) {
 }
 
 function decodeAnnouncePayload(payload) {
-  // Format: [pubkey(32) + version(2) + nickLen(1) + nick + addrLen(2) + addr?]
+  // Format: [pubkey(32) + version(2) + platform(1) + flags(1) + nickLen(1)
+  //          + nick + candidateCount(2) + repeated(candidateLen(2) + candidate)
+  //          + signature(64)]
   let offset = 0;
 
   const pubkey = payload.slice(offset, offset + 32);
@@ -49,30 +56,47 @@ function decodeAnnouncePayload(payload) {
   const version = readUint16BE(payload, offset);
   offset += 2;
 
+  const platform = payload[offset] === 1 ? 'ios' : 'other';
+  offset += 1;
+
+  const flags = payload[offset];
+  const willingToFacilitate = (flags & 0x01) !== 0;
+  offset += 1;
+
   const nickLen = payload[offset];
   offset += 1;
 
   const nickname = new TextDecoder().decode(new Uint8Array(payload.slice(offset, offset + nickLen)));
   offset += nickLen;
 
-  let address = null;
+  const candidates = [];
   if (offset + 2 <= payload.length) {
-    const addrLen = readUint16BE(payload, offset);
+    const candidateCount = readUint16BE(payload, offset);
     offset += 2;
-    if (addrLen > 0 && offset + addrLen <= payload.length) {
-      address = new TextDecoder().decode(new Uint8Array(payload.slice(offset, offset + addrLen)));
+    for (let i = 0; i < candidateCount; i++) {
+      if (offset + 2 > payload.length) break;
+      const candidateLen = readUint16BE(payload, offset);
+      offset += 2;
+      if (offset + candidateLen > payload.length) break;
+      candidates.push(new TextDecoder().decode(new Uint8Array(payload.slice(offset, offset + candidateLen))));
+      offset += candidateLen;
     }
   }
 
+  const signature = payload.slice(payload.length - SIGNATURE_SIZE);
+
   console.log('  --- ANNOUNCE Payload ---');
-  console.log(`  Pubkey:    ${toHex(pubkey)}`);
-  console.log(`  Version:   ${version}`);
-  console.log(`  Nickname:  "${nickname}" (${nickLen} bytes)`);
-  if (address) {
-    console.log(`  Address:   ${address}`);
+  console.log(`  Pubkey:     ${toHex(pubkey)}`);
+  console.log(`  Version:    ${version}`);
+  console.log(`  Platform:   ${platform}`);
+  console.log(`  Facilitate: ${willingToFacilitate}`);
+  console.log(`  Nickname:   "${nickname}" (${nickLen} bytes)`);
+  if (candidates.length > 0) {
+    candidates.forEach((c, i) => console.log(`  Candidate:  [${i}] ${c}`));
   } else {
-    console.log(`  Address:   (none)`);
+    console.log('  Candidates: (none)');
   }
+  console.log(`  Signature:  ${toHex(signature.slice(0, 8))}... (Ed25519 over the body)`);
 }
 
 function decodePacket(bytes) {
@@ -91,45 +115,36 @@ function decodePacket(bytes) {
   // TTL (1 byte)
   const ttl = bytes[offset++];
 
-  // Timestamp (4 bytes, big-endian)
+  // Timestamp (4 bytes, big-endian, seconds)
   const timestamp = readUint32BE(bytes, offset);
   offset += 4;
   const date = new Date(timestamp * 1000);
 
-  // Sender pubkey (32 bytes)
-  const senderPubkey = bytes.slice(offset, offset + 32);
-  offset += 32;
-
-  // Recipient pubkey (32 bytes)
+  // Recipient pubkey (32 bytes, all-zeros = broadcast). No sender on the
+  // wire — relays must not learn who originated a packet.
   const recipientPubkey = bytes.slice(offset, offset + 32);
   const isBroadcast = isAllZeros(recipientPubkey);
   offset += 32;
-
-  // Payload length (2 bytes, big-endian)
-  const payloadLength = readUint16BE(bytes, offset);
-  offset += 2;
 
   // Packet ID (16 bytes UUID)
   const packetIdBytes = bytes.slice(offset, offset + 16);
   const packetId = bytesToUuid(packetIdBytes);
   offset += 16;
 
-  // Signature (64 bytes)
-  const signature = bytes.slice(offset, offset + 64);
-  offset += 64;
+  // Payload length (4 bytes, big-endian)
+  const payloadLength = readUint32BE(bytes, offset);
+  offset += 4;
 
   // Payload
   const payload = bytes.slice(offset, offset + payloadLength);
 
-  console.log('=== BitchatPacket ===');
+  console.log('=== GrassrootsPacket ===');
   console.log(`Type:        ${typeName} (0x${typeValue.toString(16).padStart(2, '0')})`);
   console.log(`TTL:         ${ttl}`);
   console.log(`Timestamp:   ${timestamp} (${date.toISOString()})`);
-  console.log(`Sender:      ${toHex(senderPubkey)}`);
   console.log(`Recipient:   ${isBroadcast ? '(broadcast)' : toHex(recipientPubkey)}`);
-  console.log(`Payload len: ${payloadLength}`);
   console.log(`Packet ID:   ${packetId}`);
-  console.log(`Signature:   ${toHex(signature.slice(0, 8))}...`);
+  console.log(`Payload len: ${payloadLength}`);
   console.log(`Total bytes: ${bytes.length} (header: ${HEADER_SIZE}, payload: ${payloadLength})`);
 
   if (payload.length > 0) {
@@ -137,24 +152,11 @@ function decodePacket(bytes) {
 
     if (typeName === 'ANNOUNCE') {
       decodeAnnouncePayload(payload);
-    } else if (typeName === 'ACK' || typeName === 'READ_RECEIPT') {
-      const text = new TextDecoder().decode(new Uint8Array(payload));
-      console.log(`  --- ${typeName} Payload ---`);
-      console.log(`  Message ID: ${text}`);
-    } else if (typeName === 'MESSAGE') {
-      const text = new TextDecoder().decode(new Uint8Array(payload));
-      const isPrintable = /^[\x20-\x7e\n\r\t]+$/.test(text);
-      console.log('  --- MESSAGE Payload ---');
-      if (isPrintable) {
-        console.log(`  Text: ${text}`);
-      } else {
-        console.log(`  Hex:  ${toHex(payload)}`);
-        console.log(`  Raw:  [${payload.join(', ')}]`);
-      }
     } else {
-      console.log(`  --- Payload (raw) ---`);
+      // NOISE_HANDSHAKE / SECURE payloads are sealed bytes — nothing to
+      // decode without the session keys.
+      console.log(`  --- ${typeName} Payload (sealed) ---`);
       console.log(`  Hex:  ${toHex(payload)}`);
-      console.log(`  Raw:  [${payload.join(', ')}]`);
     }
   }
 }
@@ -179,8 +181,8 @@ if (arg) {
     if (data.trim()) {
       decodePacket(parseInput(data));
     } else {
-      console.log('Usage: node decode_packet.js \'[6, 7, 105, ...]\'');
-      console.log('   or: echo \'[6, 7, ...]\' | node decode_packet.js');
+      console.log('Usage: node decode_packet.js \'[1, 7, 105, ...]\'');
+      console.log('   or: echo \'[1, 7, ...]\' | node decode_packet.js');
     }
   });
 }

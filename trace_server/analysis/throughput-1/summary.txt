@@ -1,0 +1,19 @@
+records: 69845   span: 419s
+
+sender (ba2af95f):
+  records by type: {'custody': 49662, 'message': 19617, 'rssi': 395, 'link': 84, 'wire': 42, 'marker': 21, 'packetDup': 18, 'flow': 6}
+  link stages: {'discovered': 84}
+  messages sent: 9809, delivered: 9808 (100%)
+  wire RTT ms (send->ACK): median 157, p90 253, max 640
+  app latency ms (create->ACK): median 234, p90 645 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 2994.0, acked 2986.0 (394152.0 B), goodput n/a
+  flow saturate: sent 2264.0, acked 2256.0 (297792.0 B), goodput n/a
+  flow saturate: sent 1582.0, acked 1574.0 (415536.0 B), goodput n/a
+  flow saturate: sent 1660.0, acked 1652.0 (436128.0 B), goodput n/a
+  flow saturate: sent 713.0, acked 705.0 (846000.0 B), goodput n/a
+  flow saturate: sent 596.0, acked 588.0 (705600.0 B), goodput n/a
+  wire bytes: {'rx:announce': 14364, 'rx:secure': 1373120, 'tx:announce': 14022, 'tx:secure': 1292168, 'tx:secure:data:testbed': 4411104}
+
+=== mesh ===
+messages sent: 9809, delivered: 0 (0%)
+custody events: {'store': 24832, 'end': 24830}

@@ -89,14 +89,23 @@ class GrassrootsIdentity {
   /// rotate together and neither outlives the other as a tracking handle.
   static const Duration bleSlotDuration = Duration(minutes: 15);
 
+  /// EXPERIMENT KILL-SWITCH: slot rotation disabled for hardware testing
+  /// (Dan, Jul 20 2026). With rotation off every device derives a single
+  /// stable UUID per pubkey (slot 0): no destructive re-advertise, no
+  /// rotation link-drops, no slot/clock-skew mismatches. Set back to true to
+  /// restore the 15-minute unlinkability rotation.
+  static const bool bleSlotRotationEnabled = false;
+
   /// The current BLE time slot: wall-clock milliseconds since epoch divided by
   /// [bleSlotDuration]. Local and unsynchronized across devices — which is why
   /// recognition always matches the current AND adjacent slots
   /// ([candidateServiceUuids]); adjacent-slot coverage absorbs clock skew and
-  /// slot-boundary races.
-  static int currentBleSlot({DateTime? now}) =>
-      (now ?? DateTime.now()).millisecondsSinceEpoch ~/
-      bleSlotDuration.inMilliseconds;
+  /// slot-boundary races. Pinned to slot 0 while [bleSlotRotationEnabled] is
+  /// off.
+  static int currentBleSlot({DateTime? now}) => !bleSlotRotationEnabled
+      ? 0
+      : (now ?? DateTime.now()).millisecondsSinceEpoch ~/
+          bleSlotDuration.inMilliseconds;
 
   /// Derive a peer's BLE service UUID for a specific time [slot]: the fixed
   /// Grassroots prefix (8 bytes) + the first 8 bytes of
@@ -135,6 +144,11 @@ class GrassrootsIdentity {
   /// never break friend recognition.
   static Set<String> candidateServiceUuids(Uint8List pubkey, {DateTime? now}) {
     final slot = currentBleSlot(now: now);
+    if (!bleSlotRotationEnabled) {
+      // Rotation off → exactly one stable UUID per pubkey; no adjacent-slot
+      // fuzz needed (and scan filters stay 1 entry per peer).
+      return {deriveServiceUuidForSlot(pubkey, slot).toLowerCase()};
+    }
     return {
       for (var delta = -1; delta <= 1; delta++)
         deriveServiceUuidForSlot(pubkey, slot + delta).toLowerCase(),

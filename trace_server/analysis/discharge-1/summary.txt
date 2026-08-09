@@ -1,0 +1,9 @@
+records: 3430   span: 18450s
+
+receiver1 (0e7dde40):
+  records by type: {'power': 1569, 'marker': 8}
+
+receiver2 (1ce83c92):
+  records by type: {'power': 1847, 'marker': 6}
+battery receiver1 (0e7dde40): 100% -> 15%, median draw 428 mA (1569 samples)
+battery receiver2 (1ce83c92): 100% -> 15%, median draw 407 mA (1847 samples)

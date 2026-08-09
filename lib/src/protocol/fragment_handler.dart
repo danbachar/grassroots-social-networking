@@ -10,24 +10,51 @@ import '../models/secure_frame.dart';
 /// `fragCount > 1`. Relays never see fragment boundaries; only the recipient,
 /// after decrypting, reassembles by [SecureFrame.messageId].
 class FragmentHandler {
-  /// Maximum chunk size per fragment. Session security adds ~25 bytes of
-  /// payload overhead (version + nonce + AEAD tag), so a chunk stays below the
-  /// BLE target after encryption.
-  static const int maxFragmentPayload = 270;
+  /// Maximum chunk size per fragment.
+  ///
+  /// Each fragment is sent as ONE BLE GATT write — the plugin does not
+  /// split/reassemble, so a sealed packet larger than `ATT_MTU - 3` is
+  /// silently truncated on the wire and the receiver can't parse it. A flooded
+  /// packet reaches peers with different MTUs, so we size for the floor MTU we
+  /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
+  ///   58 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
+  ///   = 104 bytes.
+  /// So chunk ≤ 244 − 104 = 140; we use 132 for margin (236-byte packet).
+  static const int _bleFloorMtu = 247;
+  static const int _packetFixedOverhead = 58 + 25 + 21; // = 104
+  static const int maxFragmentPayload =
+      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 132
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
-  /// BLE packet.
-  static const int fragmentThreshold = 320;
+  /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a
+  /// single frame carries no more than a fragment does).
+  static const int fragmentThreshold = maxFragmentPayload;
 
   /// Inter-fragment send delay (avoids overwhelming the BLE buffer).
   static const Duration fragmentDelay = Duration(milliseconds: 20);
 
-  /// Timeout for an incomplete reassembly. Sized to outlast slow receivers
-  /// draining a large picture's fragments.
-  static const Duration reassemblyTimeout = Duration(minutes: 2);
+  /// Timeout for an incomplete reassembly. Must outlast the slowest transfer
+  /// we allow: a capped file at ~132 B/fragment × 20 ms/fragment. Sized for
+  /// the ~1 MB attachment cap (~8k fragments ≈ 160 s) plus slack.
+  static const Duration reassemblyTimeout = Duration(minutes: 4);
 
   final Map<String, _ReassemblyState> _reassemblyBuffer = {};
   Timer? _cleanupTimer;
+
+  /// Fired when a partial reassembly is abandoned: the 4-minute timeout swept
+  /// it ('timeout') or reassembly failed despite a complete count — an
+  /// out-of-range fragIndex was counted ('broken'). Both are whole-message
+  /// losses that were previously invisible; the coordinator wires this to a
+  /// `drop` trace record.
+  void Function(String reason, String messageId, int have, int total)?
+      onAbandon;
+
+  /// In-progress reassembly count — `buf` trace record occupancy.
+  int get reassemblyCount => _reassemblyBuffer.length;
+
+  /// Bytes currently held across all partial reassemblies.
+  int get reassemblyBytes => _reassemblyBuffer.values
+      .fold(0, (sum, s) => sum + s.bufferedBytes);
 
   FragmentHandler() {
     _startCleanupTimer();
@@ -88,15 +115,26 @@ class FragmentHandler {
     if (!state.isComplete) return null;
 
     _reassemblyBuffer.remove(frame.messageId);
-    return state.reassemble();
+    final whole = state.reassemble();
+    if (whole == null) {
+      // Count-complete but unassemblable: an out-of-range fragIndex was
+      // counted toward isComplete. The state is already removed, so the
+      // message is gone for good — say so.
+      onAbandon?.call(
+          'broken', frame.messageId, state.chunkCount, state.totalFragments);
+    }
+    return whole;
   }
 
   void _startCleanupTimer() {
     _cleanupTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       final now = DateTime.now();
-      _reassemblyBuffer.removeWhere(
-        (_, state) => now.difference(state.startedAt) > reassemblyTimeout,
-      );
+      _reassemblyBuffer.removeWhere((messageId, state) {
+        if (now.difference(state.startedAt) <= reassemblyTimeout) return false;
+        onAbandon?.call(
+            'timeout', messageId, state.chunkCount, state.totalFragments);
+        return true;
+      });
     });
   }
 
@@ -114,6 +152,11 @@ class _ReassemblyState {
   _ReassemblyState({required this.totalFragments});
 
   void addChunk(int index, Uint8List data) => _chunks[index] = data;
+
+  int get chunkCount => _chunks.length;
+
+  int get bufferedBytes =>
+      _chunks.values.fold(0, (sum, c) => sum + c.length);
 
   bool get isComplete => _chunks.length == totalFragments;
 

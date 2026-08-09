@@ -1,0 +1,29 @@
+services:
+  trace:
+    build: .
+    environment:
+      TRACE_UPLOAD_TOKEN: ${TRACE_UPLOAD_TOKEN:?set TRACE_UPLOAD_TOKEN in the environment}
+      TRACE_DATA_DIR: /app/data
+      # Overridable per deployment; see server.py for why a bound exists at
+      # all (whole-body reads). Defaults already fit multi-hour saturating
+      # runs — override only if an experiment genuinely exceeds them.
+      TRACE_MAX_BODY_BYTES: ${TRACE_MAX_BODY_BYTES:-67108864}
+      TRACE_MAX_RECORDS: ${TRACE_MAX_RECORDS:-5000000}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - trace
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:

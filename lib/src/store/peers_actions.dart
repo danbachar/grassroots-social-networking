@@ -11,7 +11,8 @@ abstract class PeerAction {}
 
 // ===== BLE Discovery Actions =====
 
-/// A BLE device was discovered during scan
+/// A BLE device was discovered during scan (also dispatched on every
+/// subsequent advertisement to refresh RSSI/lastSeen — the reducer merges).
 class BleDeviceDiscoveredAction extends PeerAction {
   final String deviceId;
   final String? displayName;
@@ -24,14 +25,6 @@ class BleDeviceDiscoveredAction extends PeerAction {
     required this.rssi,
     this.serviceUuid,
   });
-}
-
-/// RSSI updated for a discovered BLE device
-class BleDeviceRssiUpdatedAction extends PeerAction {
-  final String deviceId;
-  final int rssi;
-
-  BleDeviceRssiUpdatedAction({required this.deviceId, required this.rssi});
 }
 
 /// Mark a discovered BLE device as connecting
@@ -90,7 +83,10 @@ class ClearDiscoveredBlePeersAction extends PeerAction {}
 class PeerAnnounceReceivedAction extends PeerAction {
   final Uint8List publicKey;
   final String nickname;
-  final int protocolVersion;
+
+  /// Whether the peer advertised willingness to introduce strangers (from the
+  /// signed ANNOUNCE flags).
+  final bool willingToFacilitate;
 
   /// BLE signal strength in dBm. Non-null only when the ANNOUNCE arrived over
   /// BLE (carries `payload.rssi` from the plugin). Null for UDP ANNOUNCEs —
@@ -112,7 +108,7 @@ class PeerAnnounceReceivedAction extends PeerAction {
   PeerAnnounceReceivedAction({
     required this.publicKey,
     required this.nickname,
-    required this.protocolVersion,
+    this.willingToFacilitate = false,
     this.rssi,
     this.transport = PeerTransport.bleDirect,
     this.bleCentralDeviceId,
@@ -173,6 +169,15 @@ class PeerUdpSeenAction extends PeerAction {
   PeerUdpSeenAction(this.publicKey);
 }
 
+/// Any authenticated packet arrived DIRECT from this peer over BLE.
+/// Refreshes BLE liveness so the stale sweep doesn't kill a working link
+/// whose ANNOUNCEs are getting lost (marginal range).
+class PeerBleSeenAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerBleSeenAction(this.publicKey);
+}
+
 /// Mark peer as disconnected from UDP
 class PeerUdpDisconnectedAction extends PeerAction {
   final Uint8List publicKey;
@@ -205,19 +210,6 @@ class StalePeersRemovedAction extends PeerAction {
 class ClearAllPeersAction extends PeerAction {}
 
 // ===== Association Actions =====
-
-/// Associate a BLE device ID with a pubkey for a specific role
-class AssociateBleDeviceAction extends PeerAction {
-  final Uint8List publicKey;
-  final String deviceId;
-  final BleRole role;
-
-  AssociateBleDeviceAction({
-    required this.publicKey,
-    required this.deviceId,
-    required this.role,
-  });
-}
 
 /// Associate a UDP address with a pubkey
 class AssociateUdpAddressAction extends PeerAction {

@@ -34,7 +34,6 @@ void main() {
       state = peersReducer(state, PeerAnnounceReceivedAction(
         publicKey: pk,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -55,
         bleCentralDeviceId: pathId,
       ));
@@ -56,7 +55,6 @@ void main() {
       state = peersReducer(state, PeerAnnounceReceivedAction(
         publicKey: pk,
         nickname: 'Bob',
-        protocolVersion: 1,
         rssi: -50,
         blePeripheralDeviceId: pathId,
       ));
@@ -80,7 +78,6 @@ void main() {
       aView = peersReducer(aView, PeerAnnounceReceivedAction(
         publicKey: pubkey(20),
         nickname: 'B',
-        protocolVersion: 1,
         rssi: -55,
         bleCentralDeviceId: aPath,
       ));
@@ -91,7 +88,6 @@ void main() {
       bView = peersReducer(bView, PeerAnnounceReceivedAction(
         publicKey: pubkey(10),
         nickname: 'A',
-        protocolVersion: 1,
         rssi: -55,
         blePeripheralDeviceId: bPath,
       ));
@@ -112,7 +108,6 @@ void main() {
       state = peersReducer(state, PeerAnnounceReceivedAction(
         publicKey: pk,
         nickname: 'Carol',
-        protocolVersion: 1,
         rssi: -50,
         bleCentralDeviceId: 'central:cmac',
         blePeripheralDeviceId: 'peripheral:cmac',
@@ -139,7 +134,6 @@ void main() {
       state = peersReducer(state, PeerAnnounceReceivedAction(
         publicKey: pk,
         nickname: 'Dave',
-        protocolVersion: 1,
         rssi: -50,
         bleCentralDeviceId: 'central:dmac',
       ));

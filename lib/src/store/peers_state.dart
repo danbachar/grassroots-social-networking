@@ -116,6 +116,11 @@ class PeerState {
   final PeerConnectionState connectionState;
   final PeerTransport transport;
 
+  /// Whether the peer advertises willingness to introduce strangers redeeming
+  /// a friend's invite (from its signed ANNOUNCE). Used to pick eligible
+  /// introducers when creating an invite.
+  final bool willingToFacilitate;
+
   /// Latest BLE signal strength in dBm.
   ///
   /// Null when the peer has no live BLE link or when the BLE stack cannot
@@ -124,7 +129,6 @@ class PeerState {
   /// BLE path drops.
   final int? rssi;
 
-  final int protocolVersion;
   final DateTime? lastSeen;
 
   /// PathId of our central → their peripheral path, when one is currently
@@ -185,8 +189,8 @@ class PeerState {
     required this.nickname,
     this.connectionState = PeerConnectionState.discovered,
     this.transport = PeerTransport.bleDirect,
+    this.willingToFacilitate = false,
     this.rssi,
-    this.protocolVersion = 1,
     this.lastSeen,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
@@ -285,8 +289,8 @@ class PeerState {
     String? nickname,
     PeerConnectionState? connectionState,
     PeerTransport? transport,
+    bool? willingToFacilitate,
     int? rssi,
-    int? protocolVersion,
     DateTime? lastSeen,
     String? bleCentralDeviceId,
     String? blePeripheralDeviceId,
@@ -306,8 +310,8 @@ class PeerState {
       nickname: nickname ?? this.nickname,
       connectionState: connectionState ?? this.connectionState,
       transport: transport ?? this.transport,
+      willingToFacilitate: willingToFacilitate ?? this.willingToFacilitate,
       rssi: rssi ?? this.rssi,
-      protocolVersion: protocolVersion ?? this.protocolVersion,
       lastSeen: lastSeen ?? this.lastSeen,
       bleCentralDeviceId: bleCentralDeviceId ?? this.bleCentralDeviceId,
       blePeripheralDeviceId:
@@ -335,6 +339,7 @@ class PeerState {
           nickname == other.nickname &&
           connectionState == other.connectionState &&
           transport == other.transport &&
+          willingToFacilitate == other.willingToFacilitate &&
           rssi == other.rssi &&
           bleCentralDeviceId == other.bleCentralDeviceId &&
           blePeripheralDeviceId == other.blePeripheralDeviceId &&
@@ -351,6 +356,7 @@ class PeerState {
         nickname,
         connectionState,
         transport,
+        willingToFacilitate,
         rssi,
         bleCentralDeviceId,
         blePeripheralDeviceId,
@@ -446,14 +452,6 @@ class PeersState {
   /// Direct accepted friend public keys.
   Set<String> get friendPubkeyHexes =>
       friends.map((friend) => friend.pubkeyHex).toSet();
-
-  /// Common friends between us and [friendPubkeyHex], based on the last
-  /// FRIEND_LIST received from that direct friend.
-  Set<String> commonFriendHexesWith(String friendPubkeyHex) {
-    final advertised = friendsOfFriends[friendPubkeyHex.toLowerCase()];
-    if (advertised == null || advertised.isEmpty) return const {};
-    return advertised.intersection(friendPubkeyHexes);
-  }
 
   /// Connected direct friends that can mediate to [targetPubkeyHex] because
   /// their advertised friend list contains the target.

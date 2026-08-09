@@ -7,6 +7,7 @@ import 'package:sodium_libs/sodium_libs_sumo.dart' as libsodium;
 
 import '../models/identity.dart';
 import '../models/packet.dart';
+import '../trace/experiment_recorder.dart';
 
 const _noiseProtocolName = 'Noise_XX_25519_ChaChaPoly_SHA256';
 const _handshakePayloadVersion = 1;
@@ -52,6 +53,18 @@ class NoiseHandshakeResult {
 /// in `docs/GLP_Networking_API/sections/ip.tex` §IP Connection. Handshake
 /// authenticity rests solely on the Noise transcript plus this static-key
 /// check; the sender-anonymous mesh envelope carries no per-packet signature.
+///
+/// Sessions are retained without bound. They are keyed by peer identity and
+/// survive the link that formed them, so the table grows with every distinct
+/// peer the device has ever handshaked with, and [trialDecrypt] walks it once
+/// per inbound sealed packet. This is a deliberate, documented exception to
+/// the project's bound-everything rule, not an oversight: an LRU cap trades a
+/// standing per-packet cost against a one-off re-handshake cost, and where
+/// that optimum sits depends on whether the envelope keeps carrying a
+/// recipient — a decision not yet made. Capping now would bake in an answer to
+/// a question still open. The measurement tooling is built and idle:
+/// `CryptoBench` for the two device constants, `analyze.py session_cap()` and
+/// `contact_trace.py` for the re-encounter distribution.
 class NoiseSessionManager {
   final GrassrootsIdentity identity;
 
@@ -61,9 +74,16 @@ class NoiseSessionManager {
 
   final Duration handshakeTimeout;
 
+  /// Optional trace sink for the session-cap sizing experiment (null in tests
+  /// and when recording is off).
+  final ExperimentRecorder? trace;
+
   /// Active sessions / in-flight handshakes, keyed by the peer's Ed25519 public
   /// key (hex). A mesh session is end-to-end and path-independent, so it is NOT
   /// keyed by transport — the same session serves direct and relayed paths.
+  ///
+  /// Iteration order is the LRU order: least-recently-used first, most-recently
+  /// used last. [_touch] maintains it by re-inserting on use.
   final Map<String, _SessionEntry> _entries = {};
 
   Future<SimpleKeyPair>? _staticKeyPairFuture;
@@ -72,7 +92,13 @@ class NoiseSessionManager {
     required this.identity,
     required this.sodium,
     this.handshakeTimeout = const Duration(seconds: 5),
+    this.trace,
   });
+
+  /// Sessions currently retained — the `S` of the `S × trialDecryptCost`
+  /// per-packet receive cost, and deliberately unbounded (see the class doc).
+  int get sessionCount =>
+      _entries.values.where((e) => e.session != null).length;
 
   bool hasSession(Uint8List remotePubkey) {
     return _entries[_hex(remotePubkey)]?.session != null;
@@ -84,21 +110,28 @@ class NoiseSessionManager {
   Future<Uint8List?> startHandshake(Uint8List remotePubkey) async {
     final hex = _hex(remotePubkey);
     final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
-    if (entry.session != null || entry.handshake != null) {
+    if (entry.session != null || entry.handshake != null || entry.starting) {
       return null;
     }
-    entry.remotePubkey = Uint8List.fromList(remotePubkey);
+    // Reserve BEFORE the first await: concurrent callers (one per BLE leg
+    // delivering the same ANNOUNCE) must not both reach the async work.
+    entry.starting = true;
+    try {
+      entry.remotePubkey = Uint8List.fromList(remotePubkey);
 
-    final handshake = await _NoiseHandshakeState.create(
-      role: NoiseHandshakeRole.initiator,
-      localStaticKeyPair: await _staticKeyPair(),
-    );
-    final body = await handshake.writeMessage1();
-    entry
-      ..session = null
-      ..handshake = handshake
-      ..completer = Completer<bool>();
-    return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
+      final handshake = await _NoiseHandshakeState.create(
+        role: NoiseHandshakeRole.initiator,
+        localStaticKeyPair: await _staticKeyPair(),
+      );
+      final body = await handshake.writeMessage1();
+      entry
+        ..session = null
+        ..handshake = handshake
+        ..completer = Completer<bool>();
+      return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
+    } finally {
+      entry.starting = false;
+    }
   }
 
   Future<bool> waitForSession(Uint8List remotePubkey) async {
@@ -112,6 +145,7 @@ class NoiseSessionManager {
       return await completer.future.timeout(
         handshakeTimeout,
         onTimeout: () {
+          _traceHandshakeDrop('timeout', _hex(remotePubkey));
           reset(remotePubkey);
           return false;
         },
@@ -150,10 +184,14 @@ class NoiseSessionManager {
   }) async {
     if (packet.type != PacketType.secure) return packet;
 
-    final session = _entries[_hex(remotePubkey)]?.session;
+    final hex = _hex(remotePubkey);
+    final session = _entries[hex]?.session;
     if (session == null) {
-      throw StateError('No Noise session for ${_hex(remotePubkey)}');
+      throw StateError('No Noise session for $hex');
     }
+    // Sending is use: an outbound-only peer must not age out under a peer we
+    // merely receive from.
+    _touch(hex);
 
     final encryptedPayload =
         await session.encryptPayload(packet, identity.publicKey);
@@ -166,29 +204,150 @@ class NoiseSessionManager {
   /// outer envelope has no sender to look it up by). Returns the cleartext
   /// packet (still typed `secure`; the caller decodes its [SecureFrame]) plus
   /// the recovered sender pubkey, or null if no session opens it.
+  ///
+  /// Sessions are tried most-recently-used first. Conversational traffic
+  /// arrives from the peer we just spoke to, so the hit is usually on the first
+  /// attempt instead of after S/2 failures; a miss still costs the full S.
+  /// The attempt count is traced — it is the measured quantity behind both
+  /// open questions on this class: what a session cap would cost, and what
+  /// dropping the envelope's recipient field would cost (that change routes
+  /// every transit packet through this loop instead of a header compare).
   Future<(GrassrootsPacket, Uint8List)?> trialDecrypt(
     GrassrootsPacket packet,
   ) async {
     if (packet.type != PacketType.secure) return null;
+    final startedUs =
+        (trace?.active ?? false) ? DateTime.now().microsecondsSinceEpoch : 0;
 
-    for (final entry in _entries.values) {
+    // Snapshot: a successful decrypt re-orders _entries, and the winning
+    // session must be touched only after iteration finishes.
+    final candidates = _entries.entries.toList(growable: false);
+    var attempts = 0;
+    for (var i = candidates.length - 1; i >= 0; i--) {
+      final entry = candidates[i].value;
       final session = entry.session;
       final peer = entry.remotePubkey;
       if (session == null || peer == null) continue;
+      attempts++;
       try {
         final clearPayload = await session.decryptPayload(packet, peer);
+        _touch(candidates[i].key);
+        _traceDecrypt(
+            hit: true,
+            attempts: attempts,
+            packetId: packet.packetId,
+            startedUs: startedUs);
         return (packet.copyWith(payload: clearPayload), peer);
       } catch (_) {
         // Wrong session (AEAD tag mismatch) or replay — try the next.
         continue;
       }
     }
+    _traceDecrypt(
+        hit: false,
+        attempts: attempts,
+        packetId: packet.packetId,
+        startedUs: startedUs);
     return null;
   }
 
   void reset(Uint8List remotePubkey) {
     final removed = _entries.remove(_hex(remotePubkey));
     removed?.complete(false);
+  }
+
+  /// Mark [hex] most-recently-used. A Dart map keeps insertion order and
+  /// assigning to an existing key does NOT move it, so the entry is removed
+  /// and re-inserted to land at the MRU end.
+  void _touch(String hex) {
+    final entry = _entries.remove(hex);
+    if (entry != null) _entries[hex] = entry;
+  }
+
+  /// Drop handshake entries that can no longer complete: older than twice
+  /// [handshakeTimeout] and holding no session. A peer that vanishes after
+  /// msg1 leaves one behind, and nothing else removes a handshake that no
+  /// caller is awaiting, so without this they accumulate for the life of the
+  /// process. Any waiter is released with `false` so it fails fast rather
+  /// than hanging to its own timeout.
+  void _reapDeadHandshakes() {
+    final cutoffMs = DateTime.now().millisecondsSinceEpoch -
+        handshakeTimeout.inMilliseconds * 2;
+    final dead = <String>[];
+    for (final e in _entries.entries) {
+      final entry = e.value;
+      if (entry.session != null || entry.starting) continue;
+      if (entry.createdAtMs <= cutoffMs) dead.add(e.key);
+    }
+    for (final hex in dead) {
+      _entries.remove(hex)?.complete(false);
+      _traceHandshakeDrop('reaped', hex);
+    }
+  }
+
+  void _traceDecrypt({
+    required bool hit,
+    required int attempts,
+    required String packetId,
+    required int startedUs,
+  }) {
+    if (!(trace?.active ?? false)) return;
+    unawaited(trace!.log({
+      'type': 'session',
+      'event': hit ? 'decryptHit' : 'decryptMiss',
+      't': DateTime.now().millisecondsSinceEpoch,
+      // Join key to the recv/relay/packetDup records for the same packet —
+      // decrypt cost per packet becomes exact instead of nearest-in-time.
+      'packetId': packetId,
+      'attempts': attempts,
+      'decryptUs': DateTime.now().microsecondsSinceEpoch - startedUs,
+      'sessions': _entries.length,
+    }));
+  }
+
+  /// A handshake or session died without producing anything — a
+  /// security-relevant or availability-relevant event that was previously
+  /// silent. `why`: 'verifyFailed' (delivered static key does not match the
+  /// claimed identity — tampering or impersonation), 'timeout' (peer never
+  /// answered within [handshakeTimeout]), 'reaped' (stalled handshake swept).
+  void _traceHandshakeDrop(String why, String remoteHex) {
+    if (!(trace?.active ?? false)) return;
+    unawaited(trace!.log({
+      'type': 'drop',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': 'handshake',
+      'reason': why,
+      'peer': remoteHex,
+    }));
+  }
+
+  /// Record a completed handshake: the peer becomes most-recently-used, and
+  /// handshakes that can no longer finish are reaped. Traced because the
+  /// handshake rate is one half of the retention trade-off documented on this
+  /// class — the other half is the trial-decrypt attempt count.
+  void _onSessionEstablished(String hex) {
+    _touch(hex);
+    _reapDeadHandshakes();
+    if (trace?.active ?? false) {
+      unawaited(trace!.log({
+        'type': 'session',
+        'event': 'established',
+        'peer': hex,
+        'sessions': _entries.length,
+      }));
+    }
+  }
+
+  /// TESTBED ONLY. Drop every session and in-flight handshake. The field
+  /// runner calls this at each experiment step so the full establishment
+  /// ladder (handshake → session → first ACK) is measured per step instead
+  /// of riding a session formed at setup range. The next send to any peer
+  /// re-handshakes lazily.
+  void resetAll() {
+    for (final entry in _entries.values) {
+      entry.complete(false);
+    }
+    _entries.clear();
   }
 
   void dispose() {
@@ -247,6 +406,7 @@ class NoiseSessionManager {
     if (!_verifyRemoteStatic(handshake, remotePubkey)) {
       _entries.remove(remoteHex);
       entry.complete(false);
+      _traceHandshakeDrop('verifyFailed', remoteHex);
       return const NoiseHandshakeResult();
     }
     final responseBody = await handshake.writeMessage3();
@@ -255,6 +415,7 @@ class NoiseSessionManager {
       ..session = session
       ..handshake = null;
     entry.complete(true);
+    _onSessionEstablished(remoteHex);
     return NoiseHandshakeResult(
       responsePayload: _encodeHandshakePayload(
         _NoiseHandshakeMessage.message3,
@@ -281,6 +442,7 @@ class NoiseSessionManager {
     if (!_verifyRemoteStatic(handshake, remotePubkey)) {
       _entries.remove(remoteHex);
       entry.complete(false);
+      _traceHandshakeDrop('verifyFailed', remoteHex);
       return const NoiseHandshakeResult();
     }
     final session = await handshake.splitForResponder();
@@ -288,6 +450,7 @@ class NoiseSessionManager {
       ..session = session
       ..handshake = null;
     entry.complete(true);
+    _onSessionEstablished(remoteHex);
     return const NoiseHandshakeResult(sessionEstablished: true);
   }
 
@@ -352,6 +515,18 @@ class _SessionEntry {
   _NoiseTransportSession? session;
   _NoiseHandshakeState? handshake;
   Completer<bool>? completer;
+
+  /// When this entry was created, used to reap handshakes that never finished
+  /// and that nobody is awaiting. Sessions are exempt — they age out by LRU.
+  final int createdAtMs = DateTime.now().millisecondsSinceEpoch;
+
+  /// Synchronous in-flight reservation for [NoiseSessionManager.startHandshake].
+  /// The dual-leg BLE pair delivers a peer's ANNOUNCE twice within
+  /// milliseconds, and the eager handshake fires per arrival — without a
+  /// pre-await reservation both calls pass the `handshake == null` check and
+  /// spawn two initiator states (two msg1s on the air), which then poison
+  /// each other's msg2 processing.
+  bool starting = false;
 
   /// The peer's Ed25519 public key (set once known). Used as the AAD sender
   /// when trial-decrypting an inbound sealed packet against this session.
@@ -437,23 +612,37 @@ class _NoiseHandshakeState {
     if (body.length != 32 + 48) {
       throw const FormatException('Noise message 2 must be 80 bytes');
     }
-    final localEphemeral = _requireLocalEphemeral();
-    final remoteEphemeralBytes = body.sublist(0, 32);
-    _remoteEphemeralPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteEphemeralBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixHash(remoteEphemeralBytes);
-    await symmetric.mixKey(
-      await _dh(localEphemeral, _remoteEphemeralPublicKey!),
-    );
+    // Validate-then-commit: a msg2 that fails its AEAD check (e.g. the stale
+    // reply to a discarded duplicate msg1) must not mutate this handshake.
+    final snap = symmetric.snapshot();
+    final prevEphemeral = _remoteEphemeralPublicKey;
+    final prevStatic = _remoteStaticPublicKey;
+    try {
+      final localEphemeral = _requireLocalEphemeral();
+      final remoteEphemeralBytes = body.sublist(0, 32);
+      _remoteEphemeralPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteEphemeralBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixHash(remoteEphemeralBytes);
+      await symmetric.mixKey(
+        await _dh(localEphemeral, _remoteEphemeralPublicKey!),
+      );
 
-    final remoteStaticBytes = await symmetric.decryptAndHash(body.sublist(32));
-    _remoteStaticPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteStaticBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixKey(await _dh(localEphemeral, _remoteStaticPublicKey!));
+      final remoteStaticBytes =
+          await symmetric.decryptAndHash(body.sublist(32));
+      _remoteStaticPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteStaticBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixKey(
+          await _dh(localEphemeral, _remoteStaticPublicKey!));
+    } catch (_) {
+      symmetric.restore(snap);
+      _remoteEphemeralPublicKey = prevEphemeral;
+      _remoteStaticPublicKey = prevStatic;
+      rethrow;
+    }
   }
 
   Future<Uint8List> writeMessage3() async {
@@ -468,13 +657,23 @@ class _NoiseHandshakeState {
     if (body.length != 48) {
       throw const FormatException('Noise message 3 must be 48 bytes');
     }
-    final localEphemeral = _requireLocalEphemeral();
-    final remoteStaticBytes = await symmetric.decryptAndHash(body);
-    _remoteStaticPublicKey = SimplePublicKey(
-      Uint8List.fromList(remoteStaticBytes),
-      type: KeyPairType.x25519,
-    );
-    await symmetric.mixKey(await _dh(localEphemeral, _remoteStaticPublicKey!));
+    // Validate-then-commit, same as readMessage2.
+    final snap = symmetric.snapshot();
+    final prevStatic = _remoteStaticPublicKey;
+    try {
+      final localEphemeral = _requireLocalEphemeral();
+      final remoteStaticBytes = await symmetric.decryptAndHash(body);
+      _remoteStaticPublicKey = SimplePublicKey(
+        Uint8List.fromList(remoteStaticBytes),
+        type: KeyPairType.x25519,
+      );
+      await symmetric.mixKey(
+          await _dh(localEphemeral, _remoteStaticPublicKey!));
+    } catch (_) {
+      symmetric.restore(snap);
+      _remoteStaticPublicKey = prevStatic;
+      rethrow;
+    }
   }
 
   Future<_NoiseTransportSession> splitForInitiator() async {
@@ -537,6 +736,25 @@ class _NoiseSymmetricState {
       chainingKey: Uint8List.fromList(initialHash),
       handshakeHash: Uint8List.fromList(initialHash),
     );
+  }
+
+  /// Copy of the mutable state, for validate-then-commit message reads: a
+  /// handshake message that fails its AEAD check must leave the state exactly
+  /// as it was, or the mismatched message poisons the handshake and even the
+  /// matching one subsequently fails (observed live: a raced duplicate msg1
+  /// produced a stale msg2 whose failed read corrupted the survivor).
+  (Uint8List, Uint8List, Uint8List?, int) snapshot() => (
+        Uint8List.fromList(chainingKey),
+        Uint8List.fromList(handshakeHash),
+        cipherKey == null ? null : Uint8List.fromList(cipherKey!),
+        nonce,
+      );
+
+  void restore((Uint8List, Uint8List, Uint8List?, int) snap) {
+    chainingKey = snap.$1;
+    handshakeHash = snap.$2;
+    cipherKey = snap.$3;
+    nonce = snap.$4;
   }
 
   Future<void> mixHash(List<int> data) async {

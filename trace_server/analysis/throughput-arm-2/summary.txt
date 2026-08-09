@@ -1,0 +1,28 @@
+records: 54135   span: 419s
+
+receiver (adbed3e0):
+  records by type: {'message': 7288, 'custody': 7288, 'rssi': 342, 'link': 84, 'wire': 41, 'packetDup': 10, 'marker': 2}
+  link stages: {'discovered': 84}
+  wire bytes: {'rx:announce': 14022, 'rx:secure': 2782672, 'tx:announce': 14022, 'tx:secure': 40320, 'tx:secure:ack': 980000}
+
+sender (ba2af95f):
+  records by type: {'custody': 23944, 'message': 14576, 'rssi': 402, 'link': 84, 'wire': 42, 'marker': 21, 'flow': 6, 'packetDup': 5}
+  link stages: {'discovered': 84}
+  messages sent: 7288, delivered: 7288 (100%)
+  wire RTT ms (send->ACK): median 203, p90 14662, max 17064
+  app latency ms (create->ACK): median 332, p90 14676 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 3427.0, acked 3422.0 (451704.0 B), goodput n/a
+  flow saturate: sent 2025.0, acked 2020.0 (266640.0 B), goodput n/a
+  flow saturate: sent 744.0, acked 743.0 (196152.0 B), goodput n/a
+  flow saturate: sent 736.0, acked 735.0 (194040.0 B), goodput n/a
+  flow saturate: sent 178.0, acked 177.0 (212400.0 B), goodput n/a
+  flow saturate: sent 178.0, acked 177.0 (212400.0 B), goodput n/a
+  wire bytes: {'rx:announce': 14364, 'rx:secure': 1020320, 'tx:announce': 14022, 'tx:secure': 1290448, 'tx:secure:data:testbed': 1492224}
+
+=== mesh ===
+messages sent: 7288, delivered: 7288 (100%)
+delivered by relay hops (receiver TTL view): {0: 7288}
+  MULTI-HOP deliveries: 0/7288
+custody events: {'store': 19260, 'end': 11972}
+packet redundancy: 15 redundant packet arrival(s) for 7288 delivered message(s) = 1.00 copies on the air per message (1.00 = every packet arrived exactly once)
+message re-delivery: 0 (must be 0 — a duplicate of an already-delivered message triggers nothing)

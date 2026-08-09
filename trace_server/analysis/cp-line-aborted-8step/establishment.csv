@@ -1,0 +1,9 @@
+d,direction,trials,discovered_rate,connected_rate,session_rate,usable_rate,drop_rate,advCoverage_mean,rssi_adv_mean,delivery_rate,rtt_median_ms
+10.0,approach,1,1.0,0.0,0.0,0.0,0.0,0.0,,,
+20.0,approach,1,1.0,0.0,0.0,0.0,0.0,0.043,-90.5,,
+40.0,approach,1,1.0,1.0,0.0,0.0,1.0,0.447,-89.5,,
+80.0,approach,1,1.0,1.0,0.0,0.0,0.0,0.05,-89.1,,
+120.0,approach,1,0.0,0.0,0.0,0.0,0.0,0.0,,,
+20.0,retreat,1,1.0,0.0,0.0,0.0,0.0,0.0,,,
+40.0,retreat,1,1.0,0.0,0.0,0.0,0.0,0.0,,,
+80.0,retreat,1,0.0,0.0,0.0,0.0,1.0,0.013,-87.7,,

@@ -18,11 +18,18 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
-    <!-- BLE scanning required FINE_LOCATION on API 23-30. With
-         `neverForLocation` set on BLUETOOTH_SCAN, API 31+ no longer needs it. -->
-    <uses-permission
-        android:name="android.permission.ACCESS_FINE_LOCATION"
-        android:maxSdkVersion="30" />
+    <!-- FINE_LOCATION serves two unrelated purposes here:
+         1. BLE scanning required it on API 23-30. `neverForLocation` on
+            BLUETOOTH_SCAN means API 31+ does not need it for that.
+         2. The testbed takes ONE GPS fix per phone when it is placed, so a
+            field run's topology can be drawn to true scale. That needs fine
+            accuracy on every API level, which is why there is no
+            maxSdkVersion here any more — coarse location is network-derived
+            and lands kilometres out, useless for a 50 m triangle.
+         Holding it does not weaken `neverForLocation`: that flag is an
+         assertion about what we derive from SCAN RESULTS, and is unaffected
+         by holding location permission for GPS. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <!-- Opt-in diagnostic traces: coarse location (all API levels) and, for
          sampling while backgrounded, background location. Requested at runtime

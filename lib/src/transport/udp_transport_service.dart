@@ -10,6 +10,7 @@ import '../transport/address_utils.dart';
 import '../models/identity.dart';
 import '../models/packet.dart';
 import '../protocol/protocol_handler.dart';
+import '../trace/experiment_recorder.dart';
 import '../store/store.dart';
 
 enum UdpConnectFailureKind {
@@ -66,6 +67,24 @@ class UdpTransportService extends TransportService {
   /// Protocol handler for encoding/decoding
   final ProtocolHandler protocolHandler;
 
+  /// Optional trace logger (null in tests / when recording is off). The UDP
+  /// transport previously emitted NO trace records at all — every failure
+  /// mode was a debugPrint — while the BLE side had full coverage.
+  final ExperimentRecorder? trace;
+
+  void _traceDrop(String where, String reason,
+      [Map<String, dynamic> extra = const {}]) {
+    if (!(trace?.active ?? false)) return;
+    unawaited(trace!.log({
+      'type': 'drop',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': where,
+      'reason': reason,
+      'transport': 'udp',
+      ...extra,
+    }));
+  }
+
   // --- Socket and UDX state ---
 
   /// Preferred raw UDP socket. We own it — UDX wraps it but doesn't create it.
@@ -96,9 +115,9 @@ class UdpTransportService extends TransportService {
   // Per-multiplexer monotonic stream-id counter. UDX peers refuse new SYNs
   // for a stream-id whose prior stream just closed (the id is in tear-down
   // state for some time). If we reused id=1 for every reconnect to the same
-  // remote, the second add of a rendezvous server would be silently dropped
-  // by the server's UDX layer. Bumping the id per connect avoids the
-  // collision entirely.
+  // remote, a quick disconnect + reconnect would be silently dropped by the
+  // remote's UDX layer. Bumping the id per connect avoids the collision
+  // entirely.
   int _nextStreamId = 1;
 
   // --- Stream controllers ---
@@ -129,6 +148,7 @@ class UdpTransportService extends TransportService {
     required this.store,
     required this.protocolHandler,
     this.connectHandshakeTimeout = _defaultHandshakeTimeout,
+    this.trace,
   });
 
   // ===== Public Getters =====
@@ -497,6 +517,10 @@ class UdpTransportService extends TransportService {
     } catch (e) {
       _lastConnectFailureKind = _classifyConnectFailure(lastSocketError ?? e);
       debugPrint('Failed to connect to peer $pubkeyHex: $e');
+      // Includes the 10s UDX handshake timeout — a connect that dies here
+      // was previously classified in memory and never reached the trace.
+      _traceDrop('udpConnect', _lastConnectFailureKind?.name ?? 'unknown',
+          {'peer': pubkeyHex});
 
       // Clean up the UDX socket on failure to prevent resource leaks.
       // Without this, each failed attempt leaves a dangling socket in the
@@ -520,6 +544,7 @@ class UdpTransportService extends TransportService {
     final conn = _peerConnections[peerId];
     if (conn == null || conn.stream == null) {
       debugPrint('Cannot send to $peerId: not connected');
+      _traceDrop('udpSend', 'notConnected', {'peer': peerId});
       return false;
     }
 
@@ -528,6 +553,7 @@ class UdpTransportService extends TransportService {
       return true;
     } catch (e) {
       debugPrint('Failed to send to peer $peerId: $e');
+      _traceDrop('udpSend', 'streamFailed', {'peer': peerId});
       return false;
     }
   }
@@ -568,13 +594,14 @@ class UdpTransportService extends TransportService {
   @override
   Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
     var sent = 0;
-    // Send via UDX connections
-    for (final entry in _peerConnections.entries) {
+    // Send via UDX connections. Count SUCCESSES: the returned neighbour
+    // count feeds delivery accounting, and the old unconditional sent++
+    // overstated reach whenever a stream was dead.
+    for (final entry in _peerConnections.entries.toList()) {
       if (excludePeerIds != null && excludePeerIds.contains(entry.key)) {
         continue;
       }
-      await sendToPeer(entry.key, data);
-      sent++;
+      if (await sendToPeer(entry.key, data)) sent++;
     }
     // Also send via raw UDP to peers where UDX failed
     for (final entry in _rawPeerAddresses.entries) {
@@ -584,8 +611,9 @@ class UdpTransportService extends TransportService {
       if (_peerConnections.containsKey(entry.key)) {
         continue; // Already sent via UDX
       }
-      sendRawTo(entry.key, entry.value.ip, entry.value.port, data);
-      sent++;
+      if (sendRawTo(entry.key, entry.value.ip, entry.value.port, data)) {
+        sent++;
+      }
     }
     return sent;
   }
@@ -614,13 +642,6 @@ class UdpTransportService extends TransportService {
     ));
 
     debugPrint('Disconnected from peer $pubkeyHex');
-  }
-
-  @override
-  void associatePeerWithPubkey(String peerId, Uint8List pubkey) {
-    // Peer connections are already keyed by pubkey hex.
-    // This is used for incoming connections where we learn the pubkey from ANNOUNCE.
-    debugPrint('associatePeerWithPubkey: $peerId (managed via ANNOUNCE)');
   }
 
   @override

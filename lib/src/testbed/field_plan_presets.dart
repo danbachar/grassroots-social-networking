@@ -688,6 +688,21 @@ class FieldPlanPresets {
         ));
       }
     }
+    // A trailing DISCARDED step, so the last arm is measured on the same terms
+    // as the others. What closes an arm's delivery window is the buffer reset
+    // at the NEXT warm step: arms before the last get `return` plus the
+    // auto-advance gap and are then wiped. The last arm had no following warm,
+    // so its window ran to the `end` marker and on into the settle — a longer
+    // drain, under quieter air, for the one arm that also carries the heaviest
+    // load. This step is that missing warm: same shape, same reset, and its
+    // label is excluded from the per-arm tables.
+    steps.add(FieldStep(
+      label: 'drain',
+      dwellSec: warmSec,
+      bleOn: true,
+      resetDtnBuffer: true,
+      autoAdvance: true,
+    ));
     return FieldPlan(
       expId: expId,
       settleSec: 60,

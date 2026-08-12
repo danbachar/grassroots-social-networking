@@ -74,8 +74,11 @@ void main() {
       expect(plan.resetDtnBuffer, isFalse,
           reason: 'plan-level would fire on every step, wiping the backlog');
       for (final s in plan.steps) {
-        expect(s.resetDtnBuffer, s.label.startsWith('warm') ? isTrue : isNull,
-            reason: 'only warm clears: ${s.label}');
+        // The trailing drain step is the last arm's missing warm, so it
+        // clears on exactly the same terms.
+        final clears = s.label.startsWith('warm') || s.label == 'drain';
+        expect(s.resetDtnBuffer, clears ? isTrue : isNull,
+            reason: 'only warm and the trailing drain clear: ${s.label}');
       }
       // Sessions and links are deliberately NOT reset — the arm starts warm.
       expect(plan.resetSessions, isFalse);
@@ -105,7 +108,8 @@ void main() {
       // distribution.
       final plan =
           FieldPlanPresets.presets['SCF desk — sender (everyone else)']!;
-      expect(plan.steps, hasLength(3 * 10 * 3));
+      expect(plan.steps, hasLength(3 * 10 * 3 + 1),
+          reason: 'the arms plus one trailing discarded drain step');
       for (final arm in ['low', 'medium', 'high']) {
         expect(plan.steps.where((s) => s.label == 'dark $arm t1'), hasLength(1));
         expect(plan.steps.where((s) => s.label == 'dark $arm t10'), hasLength(1));
@@ -136,12 +140,34 @@ void main() {
           isTrue);
     });
 
+    test('a trailing drain step closes the last arm like any other', () {
+      // An arm's delivery window is closed by the buffer reset at the NEXT
+      // warm step. Without a trailing step the last arm alone ran to the end
+      // marker and on through the settle window — a longer drain, in quieter
+      // air, for the arm carrying the heaviest load. The drain step is that
+      // missing warm.
+      for (final role in [1, 2]) {
+        final plan = FieldPlanPresets.storeCarryForward(role: role);
+        final drain = plan.steps.last;
+        final warm = plan.steps.firstWhere((s) => s.label == 'warm high');
+        expect(drain.label, 'drain');
+        expect(drain.dwellSec, warm.dwellSec);
+        expect(drain.resetDtnBuffer, isTrue,
+            reason: 'the reset is what actually closes the window');
+        expect(drain.sendCount, 0);
+        expect(drain.saturate, isFalse);
+        expect(drain.bleOn, isTrue,
+            reason: 'the traveller is back for it, exactly as at a warm step');
+      }
+    });
+
     test('all three arms are present, warm-dark-return each', () {
       final plan = FieldPlanPresets.storeCarryForward(role: 2);
       expect(plan.steps.map((s) => s.label).toList(), [
         'warm low', 'dark low', 'return low',
         'warm medium', 'dark medium', 'return medium',
         'warm high', 'dark high', 'return high',
+        'drain',
       ]);
       // Carrying the backlog across the dark step IS the experiment.
       expect(plan.resetDtnBuffer, isFalse);

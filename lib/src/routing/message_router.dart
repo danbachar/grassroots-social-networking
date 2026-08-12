@@ -715,7 +715,19 @@ class MessageRouter {
           'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
           'payloadSize': payload.length,
           'receivedAt': now,
+          // The copy that actually ARRIVED, so the delivery can be joined to
+          // the hand-off that produced it — the conveying node's `custody
+          // convey` or the relaying node's `relay` record, both keyed by
+          // packetId. Without it a delivery named only a messageId and the
+          // join had to detour through the sender's `sealed` record, which is
+          // on a different device and absent if that device never uploaded.
+          // For a fragmented message this is the LAST fragment to land.
+          'packetId': packet.packetId,
+          'ttl': packet.ttl,
           'relayHops': relayHops,
+          // Derived from relayHops, so it is a relabelling and NOT independent
+          // evidence: it cannot tell a carried delivery from a flooded one.
+          // Use the packetId join above for that.
           'deliveryMethod': relayHops <= 0 ? 'direct' : 'relayed',
           // The FINAL topology edge: the neighbour that handed us the packet,
           // which is the original sender only on a direct delivery. `peer`
@@ -1198,6 +1210,18 @@ class MessageRouter {
           'event': 'convey',
           'packetId': id,
           'toDevice': link.bleDeviceId,
+          // The peer identity behind that path — `toDevice` is a BLE path id
+          // and the MAC rotates, so without this the carry edge cannot be
+          // attributed to a node offline.
+          'toPeer': _pubkeyToHex(link.peerPubkey),
+          // The TTL this copy leaves with. A conveyance sends the packet AS
+          // HELD (its decrement was paid on arrival), so this is also the TTL
+          // it will arrive with — which is what makes the carry path's hop
+          // accounting checkable against the receiver's own view instead of
+          // taken on trust. Without it the flood path was fully instrumented
+          // (ttlIn/ttlOut on every relay) and the carry path was not, so a
+          // delivery could not be attributed to a carry rather than a flood.
+          'ttl': stored.ttl,
         }));
       }
     }

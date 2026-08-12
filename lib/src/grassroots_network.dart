@@ -83,16 +83,6 @@ class _BurnedNonce {
 /// A message created before any Noise session with its recipient exists —
 /// held as plaintext until the eager handshake on an accepted pairing makes
 /// it sealable and bufferable.
-class _PendingSealMessage {
-  final Uint8List recipientPubkey;
-  final Uint8List payload;
-
-  _PendingSealMessage({
-    required Uint8List recipientPubkey,
-    required Uint8List payload,
-  })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
-        payload = Uint8List.fromList(payload);
-}
 
 /// Whether a settings change that just brought a transport up must complete a
 /// deferred [GrassrootsNetwork.start].
@@ -111,28 +101,6 @@ class _PendingSealMessage {
 /// itself, so an unrelated settings change must not start on its behalf; the
 /// disable paths (no transport available) and the warm path (already started)
 /// also return false.
-/// Whether an outgoing message has nothing to work with yet and must be parked
-/// as plaintext in the pre-seal hold, rather than sealed into the DTN buffer.
-///
-/// Sealing needs a SESSION; opening one needs a peer RECORD to handshake
-/// against. Either is enough to make progress, so only the absence of both is
-/// a reason to hold.
-///
-/// The record alone is not the gate, and treating it as one was a real defect:
-/// the stale sweep deletes a non-friend peer from `peersList` after two
-/// announce cycles of silence while its Noise session survives, so a recipient
-/// that had merely gone quiet lost its record and every message to it bypassed
-/// sealing — no packetId, never in the DTN buffer, never floodable, never
-/// offerable in a sync exchange, and dropped once the capped pre-seal hold
-/// filled. That is the exact case store-carry-forward exists to serve.
-/// Measured on 2026-08-10: 34 consecutive sends to a quiet peer, all parked.
-@visibleForTesting
-bool shouldParkUnsealedSend({
-  required bool hasPeerRecord,
-  required bool hasSession,
-}) =>
-    !hasPeerRecord && !hasSession;
-
 @visibleForTesting
 bool shouldColdStartAfterSettingsChange({
   required bool autoStart,
@@ -441,18 +409,6 @@ class GrassrootsNetwork {
   /// These hold application payloads that could not be sent because no live
   /// BLE/UDP path was available. They drain when the peer announces or a UDP
   /// connection event reports the peer as connected.
-  /// Messages awaiting their first Noise session with the recipient — the
-  /// plaintext cannot be sealed and buffered until the eager handshake on an
-  /// accepted pairing completes. Keyed by messageId.
-  ///
-  /// BOUNDED: this holds full payloads, so a peer that never pairs would
-  /// otherwise let it grow without limit — the sealed DTN store is capped
-  /// (32 packets per recipient) and this pre-seal buffer must be too, or the
-  /// unsealed side becomes the leak the sealed side was designed to avoid.
-  /// Insertion-ordered, so eviction drops the oldest hold first.
-  final Map<String, _PendingSealMessage> _pendingSeal = {};
-  static const int _maxPendingSeal = 256;
-
   /// messageId → the buffered packetIds belonging to it (one for a
   /// single-packet message, N for fragments) so the ACK can drop them from
   /// the buffer.
@@ -1409,34 +1365,16 @@ class GrassrootsNetwork {
       return messageId;
     }
 
-    // No Noise session with the recipient yet, so the message cannot be
-    // sealed and buffered. Hold the plaintext until the eager handshake on
-    // the next accepted pairing establishes the session —
-    // [_onNoiseSessionEstablished] then seals, buffers them, and floods.
-    _pendingSeal[messageId] = _PendingSealMessage(
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-    );
-    // Entry into the pre-seal hold: the queued->sealed gap is the session
-    // wait, previously folded invisibly into appLatencyMs.
-    _traceMessage('queued', messageId, {
-      'peer': _pubkeyToHex(recipientPubkey),
-      'payloadSize': payload.length,
-      'held': _pendingSeal.length,
-    });
-    while (_pendingSeal.length > _maxPendingSeal) {
-      final oldest = _pendingSeal.keys.first;
-      _pendingSeal.remove(oldest);
-      // Surfaced as failed: the user retries, we never silently re-attempt.
-      store.dispatch(MessageFailedAction(messageId: oldest));
-      _traceMessage('failed', oldest, {'reason': 'preSealEvicted'});
-      debugPrint('[dtn] pre-seal buffer full ($_maxPendingSeal) — '
-          'dropped the oldest hold');
-    }
-    store.dispatch(MessageQueuedAction(messageId: messageId));
+    // No session with the recipient and none could be established, so no
+    // packet was ever created and there is nothing to hold. The message fails
+    // here and the user retries once the peer is actually reachable — a
+    // plaintext hold waiting for a first pairing is exactly the thing this
+    // design refuses to keep.
+    store.dispatch(MessageFailedAction(messageId: messageId));
     debugPrint(
-      '[dtn] No session for ${_pubkeyToHex(recipientPubkey).substring(0, 8)} '
-      'yet; holding ${_pendingSeal.length} message(s) until pairing',
+      '[send] No session with '
+      '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; nothing created, '
+      'message failed',
     );
     return messageId;
   }
@@ -1446,32 +1384,42 @@ class GrassrootsNetwork {
     required Uint8List payload,
     required String messageId,
   }) async {
+    // A PACKET MAY NOT EXIST BEFORE A SESSION WITH ITS TARGET DOES. This is
+    // the invariant, and it is enforced by ordering: establish the session
+    // first, and return without ever calling `createMessagePacket` if none can
+    // be had. Nothing is held, nothing is queued, nothing half-formed survives
+    // this function — a send to a peer we have never handshaked with simply
+    // fails, and the user retries once the peer is actually there.
+    //
     // A peer RECORD is not what sending needs — a session is. The stale sweep
     // deletes a non-friend peer from `peersList` after two announce cycles of
     // silence while its Noise session survives untouched, so a recipient that
-    // has merely gone quiet has no record. Requiring one here meant every
-    // message to an ABSENT recipient skipped sealing altogether: no packetId,
-    // never in the DTN buffer, so no relay could carry it and no
-    // sync-on-connect exchange could ever offer it. It sat in the capped
-    // PLAINTEXT pre-seal hold instead and was dropped once that filled —
-    // precisely inverting what store-carry-forward exists to do. Measured on
-    // 2026-08-10: 34 sends to a quiet peer, every one parked, none buffered.
-    //
-    // So: seal when we hold a session, handshake when we hold a record, and
-    // park only when neither exists.
+    // has merely gone quiet has no record but is still perfectly sendable:
+    // `hasSession` short-circuits the establish below and the message seals,
+    // buffers and floods as normal. That is the store-carry-forward case, and
+    // it is why the gate is the SESSION and never the record.
+    // The send path does NOT establish sessions. Pairing is eager and lives
+    // where it belongs: every accepted ANNOUNCE drives a Noise handshake, any
+    // sessionless side initiates, and by the time a user can address a peer
+    // the session either exists or that peer is not someone we can talk to.
+    // Handshaking from inside send would put session setup on the message
+    // latency path and, worse, make "sending" the thing that decides who we
+    // have met.
     final peer = _peersState.getPeerByPubkey(recipientPubkey);
-    if (shouldParkUnsealedSend(
-      hasPeerRecord: peer != null,
-      hasSession: _noiseSessions.hasSession(recipientPubkey),
-    )) {
-      debugPrint('Cannot send now: no peer record and no session with '
-          '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; holding');
+    if (!_noiseSessions.hasSession(recipientPubkey)) {
+      debugPrint('Cannot send: no session with '
+          '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; no packet created');
+      _traceMessage('failed', messageId, {
+        'reason': 'noSession',
+        'peer': _pubkeyToHex(recipientPubkey),
+      });
       return false;
     }
 
-    // Create the message packet. Its payload is sealed to the recipient's Noise
-    // session before flooding; the sender-anonymous envelope carries no wire
-    // signature (authentication is end-to-end inside Noise).
+    // Only now, with a session in hand, may a packet exist. Its payload is
+    // sealed to the recipient's Noise session before flooding; the
+    // sender-anonymous envelope carries no wire signature (authentication is
+    // end-to-end inside Noise).
     // packetId == messageId so the recipient's ACK (which echoes the
     // packetId back) matches the entry we just stored under `messageId`
     // in `MessageSendingAction`. Otherwise `MessageDeliveredAction` would
@@ -1763,37 +1711,10 @@ class GrassrootsNetwork {
     }
   }
 
-  /// Seal-and-dispatch every [_pendingSeal] message destined for [pubkey] —
-  /// their first Noise session just formed, so they can finally be buffered.
-  void _sealPendingFor(Uint8List pubkey) {
-    final hex = _pubkeyToHex(pubkey);
-    final ready = _pendingSeal.entries
-        .where((e) => _pubkeyToHex(e.value.recipientPubkey) == hex)
-        .toList(growable: false);
-    for (final entry in ready) {
-      _pendingSeal.remove(entry.key);
-      debugPrint('[dtn] Session up — sealing held message ${entry.key}');
-      unawaited(_trySendMessageNow(
-        recipientPubkey: entry.value.recipientPubkey,
-        payload: entry.value.payload,
-        messageId: entry.key,
-      ).then((sent) {
-        if (sent) return;
-        // The retry failed AFTER the hold was removed (transport lost in the
-        // race): unlike send(), nothing re-parks the plaintext here, so this
-        // is a permanent, previously-silent message loss. Record it and
-        // surface it — the trace-side hole was a 'queued' with no 'sealed'.
-        _traceMessage('failed', entry.key, {'reason': 'sealSendFailed'});
-        store.dispatch(MessageFailedAction(messageId: entry.key));
-      }));
-    }
-  }
-
   /// The recipient confirmed delivery (ACK or read receipt): drop it from
   /// our buffer
   /// of every sealed packet belonging to [messageId].
   void _dropFromDtnBufferFor(String messageId) {
-    _pendingSeal.remove(messageId);
     final ids = _dtnPacketIds.remove(messageId);
     _messageRouter.dropFromDtnBuffer(ids ?? [messageId]);
   }
@@ -2195,16 +2116,10 @@ class GrassrootsNetwork {
   /// `buf` record. Synchronous in-memory reads only — this runs every 10s
   /// inside the measurement window and must not itself become a load.
   Map<String, dynamic> bufferSnapshot() {
-    var preSealBytes = 0;
-    for (final e in _pendingSeal.values) {
-      preSealBytes += e.payload.length;
-    }
     return {
       'dtnPackets': _messageRouter.dtnBufferedCount,
       'dtnRecipients': _messageRouter.dtnBufferedRecipients,
       'dtnBytes': _messageRouter.dtnBufferedBytes,
-      'preSeal': _pendingSeal.length,
-      'preSealBytes': preSealBytes,
       'ackIndex': _dtnPacketIds.length,
       'sessions': _noiseSessions.sessionCount,
       'reassembly': _fragmentHandler.reassemblyCount,
@@ -2219,9 +2134,6 @@ class GrassrootsNetwork {
   Future<void> flushTraceTails() async {
     _bleService?.drainWireLedgerNow();
   }
-
-  @visibleForTesting
-  int get pendingSealCount => _pendingSeal.length;
 
   /// Send a read receipt to the original sender of a message.
   /// Call this when the user has read/viewed a message.
@@ -2311,6 +2223,10 @@ class GrassrootsNetwork {
               await Future.delayed(FragmentHandler.fragmentDelay);
             }
           } else {
+            // Same gate as the fragmenting branch above: no session, no
+            // packet. Relying on the sealer to return null let a packet be
+            // built for a peer we had never handshaked with.
+            if (!_noiseSessions.hasSession(pubkey)) continue;
             final packet = _protocolHandler.createMessagePacket(
               payload: payload,
               recipientPubkey: pubkey,
@@ -2338,6 +2254,8 @@ class GrassrootsNetwork {
           if (_udpService!.getPeerIdForPubkey(peer.publicKey) == null) {
             continue;
           }
+          // No session, no packet.
+          if (!_noiseSessions.hasSession(peer.publicKey)) continue;
           final packet = _protocolHandler.createMessagePacket(
             payload: payload,
             recipientPubkey: peer.publicKey,
@@ -2595,6 +2513,12 @@ class GrassrootsNetwork {
         'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
       }));
     }
+    // The transport-independent fact: we now hold a session with this peer and
+    // can seal to them. It outlives the link below and never goes false, which
+    // is what lets the UI enable composing for a peer that has since walked out
+    // of range — the store-carry-forward case.
+    store.dispatch(PeerNoiseSessionEstablishedAction(pubkey));
+
     switch (transport) {
       case PeerTransport.udp:
         store.dispatch(
@@ -2608,10 +2532,6 @@ class GrassrootsNetwork {
         store.dispatch(PeerBleAuthenticatedAction(pubkey));
         break;
     }
-
-    // Messages created before this session existed can now be sealed into
-    // buffered and flooded.
-    _sealPendingFor(pubkey);
 
     // Buffered packets move ONLY through the sync exchange: offer packetIds,
     // let the
@@ -5005,7 +4925,6 @@ class GrassrootsNetwork {
     _introducedNonceUses.clear();
     _issuedNonceUses.clear();
     _invitedContacts.clear();
-    _pendingSeal.clear();
     _dtnPacketIds.clear();
 
     _messageRouter.dispose();

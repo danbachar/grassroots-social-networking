@@ -299,6 +299,18 @@ PeersState peersReducer(PeersState state, dynamic action) {
     return state;
   }
 
+  if (action is PeerNoiseSessionEstablishedAction) {
+    final pubkeyHex = _pubkeyToHex(action.publicKey);
+    final existing = state.peers[pubkeyHex];
+    if (existing != null) {
+      return state.copyWith(
+        peers: Map.from(state.peers)
+          ..[pubkeyHex] = existing.copyWith(hasNoiseSession: true),
+      );
+    }
+    return state;
+  }
+
   if (action is PeerBleAuthenticatedAction) {
     final pubkeyHex = _pubkeyToHex(action.publicKey);
     final existing = state.peers[pubkeyHex];

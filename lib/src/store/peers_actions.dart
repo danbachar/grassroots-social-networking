@@ -159,6 +159,21 @@ class PeerBleAuthenticatedAction extends PeerAction {
   PeerBleAuthenticatedAction(this.publicKey);
 }
 
+/// An end-to-end Noise session with this peer now exists.
+///
+/// TRANSPORT-INDEPENDENT, and deliberately distinct from [isReachable]. A
+/// session is keyed by peer identity and outlives the link that formed it, so
+/// "we can seal to this peer" and "this peer is reachable right now" are
+/// different facts and the UI needs the first one: sealing is what a send
+/// requires, and a session survives the peer walking out of range (that is
+/// precisely the store-carry-forward case). `bleAuthenticated` cannot stand in
+/// for it — it is BLE-only and it goes false when the link drops.
+class PeerNoiseSessionEstablishedAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerNoiseSessionEstablishedAction(this.publicKey);
+}
+
 /// A verified UDP packet was received from a peer.
 ///
 /// Updates UDP-specific freshness so stale UDX sessions can be aged out even

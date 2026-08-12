@@ -23,20 +23,55 @@ Confirmed against the handsets by Dan (nickname = join order):
 | `6b819f64b80724df3023daf45b665c8a7b8554b7084fb1c0a2479c0fb08738a3` | Pixel 7a | 1 |
 | `f5aee069c6a61bf8ad6c908af35356d89cdaf26ec0246f69993a9cf9414a619c` | Pixel 10 Pro | 2 |
 | `c3cba74287fbc882e762e4746064c773a2c0aed36d1130c887e453fc29921e33` | Pixel 2 | 3 |
-| `be3a5ef56240eb49764a9be72930f5a2fbc0c2fe99dbd04a13a19944a26ec4d8` | — | 4 |
-| `18130c0f5a36449cc5c1d5e0c17e83ba4d248625655035b08e971693fb29ae40` | — | 5 |
-| `b7d04acb9336998acae81afd20b42895b035f3fea83f1e2dd73d0f54799e7997` | — | 6 |
-| `44a266c4c9912ec34ea7934fbbffae1745ab82df0229f8972440ae3f43862fa4` | — | 7 |
+| `be3a5ef56240eb49764a9be72930f5a2fbc0c2fe99dbd04a13a19944a26ec4d8` | Huawei HMA-L09 | 4 |
+| `18130c0f5a36449cc5c1d5e0c17e83ba4d248625655035b08e971693fb29ae40` | Nexus 5X* | 5 |
+| `b7d04acb9336998acae81afd20b42895b035f3fea83f1e2dd73d0f54799e7997` | Nexus 5X* | 6 |
+| `44a266c4c9912ec34ea7934fbbffae1745ab82df0229f8972440ae3f43862fa4` | Nexus 5X* | 7 |
 
-The four unnamed ones are the Nexus 5X units (and whichever other handset
-filled slot 4). They are indistinguishable by model, so their serials have to
-be paired by reading each phone's own key.
+\* Slots 5–7 are inferred, not read off the handsets: slot 4 turned out to be
+the Huawei, which leaves the three remaining Nexus 5X units for 5–7 and
+matches their serial format. Confirm on the phone before relying on it.
 
-## Pairing the remaining phones
+## The eighth and ninth handsets
 
-Open the app on the phone, Settings → Testbed: the screen prints **This
-device** with its pubkey. Match the first 8 hex characters against the table
-and write the serial down. Ten seconds per phone, once.
+Two more phones carry keys and appear in later runs, so the fleet is not
+seven:
+
+| pubkey | phone | nickname |
+|---|---|---|
+| `d5aedd63c7ff00e66c30d6b4274c2ec79b2c6e1afcb5553017621423d348ee12` | Nexus 5X | 8 |
+| `929a022c32a603e468f7e8d6f049c13afafcedfd8bc87530ce14862acf478208` | Galaxy S10e | `User_929a022c` |
+
+The S10e's nickname is **not** a number, and the nickname IS the join order
+the testbed screen reads (`int.tryParse`, strict — `pixel-2` must not
+silently become node 2). A non-numeric nickname falls back to 1, which is how
+`load-sweep-1` ended up with several phones believing they were node 1 and
+only 45 of its 300 steps ever reaching `connected`. Rename it to a free
+number before any plan whose steps gate on `role <= n`.
+
+## Verified on 2026-08-12
+
+Read off each handset's own **You** screen (nickname, fingerprint and public
+key are all on it) rather than inferred:
+
+| serial | phone | pubkey | nickname |
+|---|---|---|---|
+| `00d98aa1795bc454` | Nexus 5X | `d5aedd63…` | 8 |
+| `56261FDCH00B50` | Pixel 10 Pro | `f5aee069…` | 2 |
+| `8DM0218B02000956` | Huawei HMA-L09 | `be3a5ef5…` | 4 |
+
+All three agree with `fleet_map.json`.
+
+## Pairing a phone by hand
+
+Open the app and stay on the **You** tab: it prints the nickname, the
+fingerprint and the full public key together. (Settings → Testbed also prints
+**This device** with the pubkey, but not the nickname.) Match the first 8 hex
+characters against the table and write the serial down. Ten seconds per
+phone, once.
+
+The app is a release build, so `adb shell run-as` cannot read the app's
+private storage: the nickname can only be read and changed through the UI.
 
 ## Checking it
 

@@ -1352,6 +1352,11 @@ class GrassrootsNetwork {
   Future<void> setColdCallTrustLevel(ColdCallTrustLevel level) async {
     if (store.state.settings.coldCallTrustLevel == level) return;
     store.dispatch(SetColdCallTrustLevelAction(level));
+    // Re-filter the scanner immediately. Closed trust scans for the friend
+    // set alone; open trust goes back to the prefix scan. Waiting for the
+    // scan watchdog would leave a closed node meeting strangers for up to a
+    // silence window after the user asked it to stop.
+    await _bleService?.applyTrustModeChange();
   }
 
   static const _uuid = Uuid();

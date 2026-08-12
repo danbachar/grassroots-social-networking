@@ -2443,6 +2443,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),
+          onColdCallTrustChanged: _grassroots == null
+              ? null
+              : (level) => _grassroots!.setColdCallTrustLevel(level),
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),

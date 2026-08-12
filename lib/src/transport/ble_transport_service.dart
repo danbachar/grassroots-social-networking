@@ -477,7 +477,7 @@ class BleTransportService extends TransportService {
       }
 
       if (shouldScan) {
-        _scanTargetUuids = _reverseLegScanTargets();
+        _scanTargetUuids = _scanTargets();
         if (await _startContinuousScan()) {
           anyStarted = true;
           _lastAdvertisementAt = DateTime.now();
@@ -604,7 +604,7 @@ class BleTransportService extends TransportService {
     // Silence means the scan is dead. If we have pending reverse legs, restart
     // it hardware-FILTERED for exactly those identities — a filterless restart
     // just re-enters the same Android muting that stranded us here.
-    _scanTargetUuids = _reverseLegScanTargets();
+    _scanTargetUuids = _scanTargets();
     debugPrint(
       _scanTargetUuids.isEmpty
           ? '[ble] scan-watchdog: no advertisements for '
@@ -631,6 +631,52 @@ class BleTransportService extends TransportService {
         'ok': restarted,
       }));
     }
+  }
+
+  /// Whether this device refuses to meet peers it has not friended.
+  bool get _closedTrust =>
+      store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed;
+
+  /// Candidate service UUIDs of every accepted friend — the scan filter that
+  /// makes a closed-trust node BLIND to strangers.
+  ///
+  /// The service UUID is a pure function of the peer's public key
+  /// ([GrassrootsIdentity.deriveServiceUuidForSlot]), so we can compute what
+  /// each friend will be advertising without ever having met them this slot.
+  /// Handing that list to the OS moves the filter into the scanner — hardware
+  /// filters on Android, and the only form of scanning iOS honours in the
+  /// background — so a stranger's advertisement never reaches us at all,
+  /// rather than reaching us and being discarded a layer up.
+  ///
+  /// This is the discovery half of closed trust; the dial half already lives
+  /// in [connectToDevice]. What it deliberately does NOT do is stop us
+  /// relaying: the outer envelope carries only a recipient, so packets that
+  /// cross a friend link are still forwarded and still buffered for ANY
+  /// recipient. Closed trust narrows which LINKS traffic may travel over, not
+  /// whose traffic it is.
+  Set<String> _friendScanTargets() {
+    final targets = <String>{};
+    for (final friend in _peersState.friends) {
+      targets.addAll(GrassrootsIdentity.candidateServiceUuids(
+        friend.publicKey,
+      ));
+    }
+    return targets;
+  }
+
+  /// The UUIDs the scanner should filter on right now: the friend set when
+  /// trust is closed, plus any stuck reverse legs in either mode.
+  ///
+  /// In closed trust a stuck reverse leg is necessarily a friend already, so
+  /// the union costs nothing; in open trust the friend set is omitted, because
+  /// filtering to friends is exactly the behaviour open trust exists to
+  /// refuse — an open node must keep meeting strangers.
+  Set<String> _scanTargets() {
+    final targets = <String>{
+      if (_closedTrust) ..._friendScanTargets(),
+      ..._reverseLegScanTargets(),
+    };
+    return targets;
   }
 
   /// Candidate service UUIDs of every peer we hold a live inbound peripheral
@@ -661,6 +707,21 @@ class BleTransportService extends TransportService {
   /// scan started. `allowDuplicates` keeps already-discovered peers surfacing
   /// so RSSI refreshes and reverse-leg retries keep flowing.
   Future<bool> _startContinuousScan() async {
+    // Closed trust with nobody to look for. An unfiltered prefix scan here
+    // would surface precisely the strangers closed trust exists to ignore, so
+    // the honest thing is to not scan at all: there is no peer on the air we
+    // are willing to link with. Advertising continues, so a friend added later
+    // can still find US, and the watchdog's recompute picks them up.
+    if (_closedTrust && _scanTargetUuids.isEmpty) {
+      try {
+        await _ble.stopScan();
+      } catch (_) {}
+      debugPrint(
+        '[ble] scan: closed trust with no friends — not scanning '
+        '(an unfiltered scan would surface only strangers)',
+      );
+      return false;
+    }
     try {
       await _ble.startScan(
         serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
@@ -671,7 +732,8 @@ class BleTransportService extends TransportService {
       if (_scanTargetUuids.isNotEmpty) {
         debugPrint(
           '[ble] scan: hardware-filtered for ${_scanTargetUuids.length} '
-          'candidate UUID(s) covering stuck reverse-leg peers',
+          'candidate UUID(s) — '
+          '${_closedTrust ? 'closed trust (friends only)' : 'stuck reverse-leg peers'}',
         );
       }
       return true;
@@ -688,10 +750,32 @@ class BleTransportService extends TransportService {
   Future<void> _applyScanTargets() async {
     if (_stopped) return;
     if (state != TransportState.active) return;
-    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
-    final targets = _reverseLegScanTargets();
+    // Reverse-leg targets are an auto-mode concern, but the closed-trust
+    // friend filter is not: it must hold in every role mode that scans, or a
+    // central-only node would quietly keep meeting strangers.
+    if (!_closedTrust &&
+        store.state.settings.bleRoleMode != BleRoleMode.auto) {
+      return;
+    }
+    final targets = _scanTargets();
     if (setEquals(targets, _scanTargetUuids)) return;
     _scanTargetUuids = targets;
+    if (await _startContinuousScan()) {
+      _lastAdvertisementAt = DateTime.now();
+    }
+  }
+
+  /// Apply a runtime trust-level change (open ⇄ closed).
+  ///
+  /// Closing must take effect at once — the whole point is to stop meeting
+  /// strangers — and opening must too, or the node would stay blind to
+  /// everyone it has not already friended. Live links are left alone: a
+  /// friend link survives either way, and a stranger link that predates the
+  /// switch is torn down by the layer that refuses to ANNOUNCE to it, not
+  /// here.
+  Future<void> applyTrustModeChange() async {
+    if (state != TransportState.active) return;
+    _scanTargetUuids = _scanTargets();
     if (await _startContinuousScan()) {
       _lastAdvertisementAt = DateTime.now();
     }

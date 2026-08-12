@@ -972,6 +972,78 @@ void main() {
       expect(hostApi.calls.where((c) => c == 'connect:$friendRemoteId'),
           hasLength(1));
     });
+
+    test('closed trust scans ONLY for its friends\' derived UUIDs', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      expect(hostApi.scanRequests, hasLength(1));
+      final request = hostApi.scanRequests.single;
+      // The prefix stays — it is what makes the filter a Grassroots filter —
+      // but the scan now carries the friend's candidate UUIDs, so a stranger's
+      // advertisement is dropped by the scanner and never reaches us.
+      expect(request.serviceUuidPrefix,
+          equals(GrassrootsIdentity.grassrootsUuidPrefix));
+      expect(
+        request.serviceUuids.map((u) => u!.toLowerCase()).toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
+
+    test('closed trust with no friends does not scan at all', () async {
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // An unfiltered prefix scan here would surface exactly the strangers
+      // closed trust exists to ignore, so we scan nothing.
+      expect(hostApi.scanRequests, isEmpty);
+      expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty);
+      expect(hostApi.calls, contains('stopScan'));
+      // Advertising continues regardless: a friend added later must still be
+      // able to find US, and being findable is not the same as meeting.
+      expect(hostApi.calls.where((c) => c.startsWith('startAdvertising:')),
+          hasLength(1));
+    });
+
+    test('open trust never filters the scan to friends', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // Filtering to friends is the behaviour open trust exists to refuse.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(hostApi.scanRequests.single.serviceUuids, isEmpty);
+    });
+
+    test('closing trust at runtime re-filters the live scan at once', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      await transport.start();
+      hostApi.scanRequests.clear();
+
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      await transport.applyTrustModeChange();
+
+      // Waiting for the scan watchdog would leave the node meeting strangers
+      // for up to a silence window after the user asked it to stop.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(
+        hostApi.scanRequests.single.serviceUuids
+            .map((u) => u!.toLowerCase())
+            .toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
   });
 
   group('BleTransportService — symmetric connection invariants', () {

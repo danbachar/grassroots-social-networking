@@ -24,6 +24,12 @@ class SettingsScreen extends StatefulWidget {
   /// Debug-only: switch which BLE roles the local device runs.
   final Future<void> Function(BleRoleMode mode)? onBleRoleModeChanged;
 
+  /// Apply an open ⇄ closed trust change. Routed through the network rather
+  /// than dispatched here, because closing has to re-filter the BLE scanner
+  /// at once — a store dispatch alone would leave the node meeting strangers
+  /// until the scan watchdog next fires.
+  final Future<void> Function(ColdCallTrustLevel level)? onColdCallTrustChanged;
+
   /// Re-run public-address (seeip) discovery, invoked by the "Retry" button
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
@@ -74,6 +80,7 @@ class SettingsScreen extends StatefulWidget {
     required this.store,
     this.onSettingsChanged,
     this.onBleRoleModeChanged,
+    this.onColdCallTrustChanged,
     this.onRetryPublicAddressDiscovery,
     this.myPubkeyHex,
     this.myNickname,
@@ -645,10 +652,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
             selected: {level},
-            onSelectionChanged: (selection) {
+            onSelectionChanged: (selection) async {
               if (selection.isEmpty) return;
-              widget.store
-                  .dispatch(SetColdCallTrustLevelAction(selection.first));
+              final next = selection.first;
+              if (widget.onColdCallTrustChanged != null) {
+                await widget.onColdCallTrustChanged!(next);
+              } else {
+                widget.store.dispatch(SetColdCallTrustLevelAction(next));
+              }
+              if (!mounted) return;
+              setState(() {});
               widget.onSettingsChanged?.call();
             },
           ),

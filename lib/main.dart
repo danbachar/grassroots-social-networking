@@ -2449,6 +2449,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           myPubkeyHex: _grassroots?.identity.publicKey
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(),
+          myNickname: _grassroots?.identity.nickname,
           experimentRecorder: experimentRecorder,
           onStartBulk:
               _grassroots == null ? null : () => _grassroots!.startBulkFlows(),
@@ -2461,6 +2462,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
+          onSetRelayBudgetDisabled: _grassroots == null
+              ? null
+              : (disabled) => _grassroots!.setRelayBudgetDisabled(disabled),
           onCryptoBench:
               _grassroots == null ? null : () => _grassroots!.runCryptoBench(),
           bleWireBytes:
@@ -2492,6 +2496,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           // start signal is asked to cross it.
           sessionPeerCount:
               _grassroots == null ? null : () => _grassroots!.sessionPeerCount,
+          sessionTableCount:
+              _grassroots == null ? null : () => _grassroots!.noiseSessionCount,
           onGossipNeighbours: _grassroots == null
               ? null
               : () => _grassroots!.broadcastTestbedNeighbours(),

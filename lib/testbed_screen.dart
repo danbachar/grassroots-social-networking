@@ -26,6 +26,12 @@ class TestbedScreen extends StatefulWidget {
   /// the network isn't up yet.
   final String? myPubkeyHex;
 
+  /// This device's ANNOUNCE nickname. When it is a plain integer it IS
+  /// the join order — the number is set once, on the phone, and shown on
+  /// its own screen, so deriving the order from it removes the per-run
+  /// retyping that put two devices on one node number.
+  final String? myNickname;
+
   /// Trace logger for the experiment recording sink. Null hides the
   /// experiment section (network not up yet).
   final ExperimentRecorder? experimentRecorder;
@@ -40,6 +46,7 @@ class TestbedScreen extends StatefulWidget {
   final VoidCallback? onResetSessions;
   final Future<void> Function()? onResetLinks;
   final VoidCallback? onResetDtnBuffer;
+  final void Function(bool disabled)? onSetRelayBudgetDisabled;
 
   /// Runs the on-device crypto bench (failed-AEAD and handshake cost).
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
@@ -77,6 +84,9 @@ class TestbedScreen extends StatefulWidget {
   /// DEBUG/TESTBED. Peers this phone holds a session with.
   final int Function()? sessionPeerCount;
 
+  /// Sessions in the Noise table (see FieldRunner.sessionTableCount).
+  final int Function()? sessionTableCount;
+
   /// DEBUG/TESTBED. Phones in the connected component containing this one.
   final int Function()? meshComponentSize;
 
@@ -87,6 +97,7 @@ class TestbedScreen extends StatefulWidget {
     super.key,
     required this.store,
     this.myPubkeyHex,
+    this.myNickname,
     this.experimentRecorder,
     this.onStartBulk,
     this.onStopBulk,
@@ -94,6 +105,7 @@ class TestbedScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetDtnBuffer,
+    this.onSetRelayBudgetDisabled,
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
@@ -106,6 +118,7 @@ class TestbedScreen extends StatefulWidget {
     this.registerStartListener,
     this.onGossipNeighbours,
     this.sessionPeerCount,
+    this.sessionTableCount,
     this.meshComponentSize,
     this.onClearMeshView,
   });
@@ -377,13 +390,16 @@ class _TestbedScreenState extends State<TestbedScreen> {
       // the marker. The hook existed but was never handed to the runner —
       // the home preflight's markers all read sessions:null.
       sessionPeerCount: widget.sessionPeerCount,
+      sessionTableCount: widget.sessionTableCount,
       onStartBulk: widget.onStartBulk,
       onStopBulk: widget.onStopBulk,
       myPubkeyHex: widget.myPubkeyHex,
+      myNickname: widget.myNickname,
       send: widget.sendMessage,
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
       onResetDtnBuffer: widget.onResetDtnBuffer,
+      onSetRelayBudgetDisabled: widget.onSetRelayBudgetDisabled,
       sendRaw: widget.sendRaw,
       onSetBle: widget.onSetBle,
       onSampleLocation: _sampleLocation,
@@ -758,7 +774,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
   Future<void> _openPlanWizard() async {
     final result = await showDialog<_WizardResult>(
       context: context,
-      builder: (_) => const _PlanWizardDialog(),
+      builder: (_) => _PlanWizardDialog(myNickname: widget.myNickname),
     );
     if (result == null) return;
     if (result.plan != null) {
@@ -929,7 +945,10 @@ class _WizardResult {
 /// static record-only request) and pops it back to the caller. Pure plan
 /// construction lives in [FieldPlanWizard]; this is only the form.
 class _PlanWizardDialog extends StatefulWidget {
-  const _PlanWizardDialog();
+  const _PlanWizardDialog({this.myNickname});
+
+  /// This device's ANNOUNCE nickname, used to seed the join order.
+  final String? myNickname;
 
   @override
   State<_PlanWizardDialog> createState() => _PlanWizardDialogState();
@@ -961,10 +980,24 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   /// who sends during light/heavy.
   int _powerRole = 1;
   // Mesh scaling: total devices taking part, and this phone's join order.
+  /// Store-carry-forward: which phone the senders address while it is dark.
+  final TextEditingController _travellerPrefix = TextEditingController();
   final TextEditingController _maxDevices =
       TextEditingController(text: '8');
-  final TextEditingController _meshRole = TextEditingController(text: '1');
+  /// Join order, seeded from the nickname: on this fleet the nickname IS the
+  /// node number, so the operator no longer retypes it per run. Falls back to
+  /// 1 for a non-numeric nickname, and stays editable either way.
+  late final TextEditingController _meshRole =
+      TextEditingController(text: _nicknameOrder()?.toString() ?? '1');
   bool _meshSaturate = true;
+
+  /// The nickname read as a join order, or null when it is not a plain
+  /// positive integer. Deliberately strict: a nickname like "pixel-2" must
+  /// NOT silently become node 2.
+  int? _nicknameOrder() {
+    final n = int.tryParse(widget.myNickname?.trim() ?? '');
+    return (n != null && n > 0) ? n : null;
+  }
 
   /// Manual Bluetooth join (operator toggles settings-BT; wall-clock
   /// anchored start). Default ON — it is the current field procedure, and
@@ -1011,6 +1044,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       FieldPlanKind.meshScale => 'mesh-scale-1',
       // The spacing belongs in the id: the sweep is run per distance.
       FieldPlanKind.joinTime => 'join-time-30m',
+      FieldPlanKind.storeCarryForward => 'scf-desk-1',
       FieldPlanKind.homeSoak => 'home-soak-1',
       FieldPlanKind.throughput => 'throughput-1',
       FieldPlanKind.throughputCeiling => 'throughput-ceiling-1',
@@ -1236,6 +1270,31 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
               style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
         ];
+      case FieldPlanKind.storeCarryForward:
+        return [
+          _num(_meshRole, "This phone's role (1 = the TRAVELLER that goes dark)"),
+          const SizedBox(height: 12),
+          _num(_travellerPrefix,
+              "Traveller's pubkey prefix — optional, blank = message everyone"),
+          const SizedBox(height: 12),
+          _num(_dwellSec, 'Dark window and return window each (s)'),
+          const SizedBox(height: 12),
+          _num(_sends, 'Medium-arm messages over the dark window'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Set the role and leave the rest: the role is seeded from this '
+              'phone\'s nickname, and a blank prefix means everyone messages '
+              'everyone with one member away — the field-day shape. '
+              'Desk test — distance is not the variable, offered load is. '
+              'Three arms run back to back: low, medium, then HIGH, which is '
+              'the field-day setting exactly (saturate, one lane, 132 B). '
+              'Phone 1 drops its radio for the dark window while everyone '
+              'else messages it; on return nobody sends, so every delivery in '
+              'that window came out of a buffer. Start all phones together.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
       case FieldPlanKind.joinTime:
         return [
           _num(_meshRole, "This phone's join order (the block-k phone is the frontier)"),
@@ -1307,6 +1366,9 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       FieldPlanKind.meshScale => (120, 10, 60),
       // dwell = the frontier's join window per rep; repeat = cold joins per N.
       FieldPlanKind.joinTime => (60, 5, 0),
+      // dwell = the dark AND the return window; sends = the MEDIUM arm's
+      // count (low is a trickle, high saturates and ignores it).
+      FieldPlanKind.storeCarryForward => (120, 1, 60),
       FieldPlanKind.homeSoak => (60, 1, 40),
       FieldPlanKind.throughput => (60, 1, 0),
       FieldPlanKind.throughputCeiling => (60, 1, 0),
@@ -1350,6 +1412,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         powerRole: _powerRole,
         maxDevices: int.tryParse(_maxDevices.text.trim()) ?? 8,
         meshRole: int.tryParse(_meshRole.text.trim()) ?? 1,
+        travellerPrefix: _travellerPrefix.text.trim(),
         saturate: _meshSaturate,
         manualJoin: _meshManual,
         rawLegs: [

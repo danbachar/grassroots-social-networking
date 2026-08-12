@@ -8,11 +8,27 @@ import '../models/packet.dart';
 /// Payload format: `[count:1][packetId:16] × count`.
 ///
 /// A single BLE GATT write carries at most 244 bytes (247 floor MTU − 3), and
-/// the packet header is 58 bytes, leaving 186 for payload → ⌊(186−1)/16⌋ = 11
-/// ids per packet. Larger sets are chunked into multiple self-contained
-/// packets — sync packets are neighbor-local single-hop, so there is no
-/// reassembly: each chunk is acted on independently.
-const int maxSyncIdsPerPacket = 11;
+/// a sealed sync packet costs [syncPacketOverhead] on top of this payload —
+/// the same three layers [FragmentHandler] budgets for. Only the packet
+/// header was subtracted here originally, which put 11 ids in a 281-byte
+/// packet: 37 over. These are WRITE_TYPE_NO_RESPONSE writes, so the stack
+/// cannot promote them to a GATT long write — it clamps at MTU−3 and the peer
+/// gets an unparseable prefix. Reproduced on hardware 2026-08-10: the sender
+/// logged `OVERSIZED sendToPeer 281B > 244B` and the receiver
+/// `deserialize failed after 244B … Incomplete payload: expected 223 bytes`.
+///
+/// Larger sets are chunked into multiple self-contained packets — sync packets
+/// are neighbor-local single-hop, so there is no reassembly: each chunk is
+/// acted on independently.
+const int syncUsableWrite = 247 - 3;
+
+/// Packet header + Noise seal + frame header, per
+/// [FragmentHandler] — header + 25 + 21.
+const int syncPacketOverhead = GrassrootsPacket.headerSize + 25 + 21;
+
+/// Ids that fit one sealed write: one count byte, then 16 bytes each.
+const int maxSyncIdsPerPacket =
+    (syncUsableWrite - syncPacketOverhead - 1) ~/ 16;
 
 /// Encode up to [maxSyncIdsPerPacket] packetId UUID strings as one payload.
 Uint8List encodeSyncIds(List<String> packetIds) {

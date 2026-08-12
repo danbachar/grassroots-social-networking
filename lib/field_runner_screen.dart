@@ -306,10 +306,20 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     );
   }
 
+  /// The shared anchor, rendered in UTC.
+  ///
+  /// This string is the fleet's alignment CHECK — every phone must show the
+  /// same one — and the anchor itself is an epoch instant, identical on every
+  /// phone regardless of timezone. Rendering it in LOCAL time made the check
+  /// test the timezone instead: on 2026-08-08 a phone whose zone was two
+  /// hours out displayed a start time two hours off while computing exactly
+  /// the same anchor, which read as a broken clock and cost a restart. In
+  /// UTC, phones that agree show identical text and phones that disagree
+  /// really do disagree.
   static String _hhmmss(int epochMs) {
-    final d = DateTime.fromMillisecondsSinceEpoch(epochMs);
+    final d = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}Z';
   }
 
   /// "BLUETOOTH ON in 12:30 (at 14:52:30)" for a phone that joins later.

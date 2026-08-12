@@ -111,6 +111,28 @@ class _PendingSealMessage {
 /// itself, so an unrelated settings change must not start on its behalf; the
 /// disable paths (no transport available) and the warm path (already started)
 /// also return false.
+/// Whether an outgoing message has nothing to work with yet and must be parked
+/// as plaintext in the pre-seal hold, rather than sealed into the DTN buffer.
+///
+/// Sealing needs a SESSION; opening one needs a peer RECORD to handshake
+/// against. Either is enough to make progress, so only the absence of both is
+/// a reason to hold.
+///
+/// The record alone is not the gate, and treating it as one was a real defect:
+/// the stale sweep deletes a non-friend peer from `peersList` after two
+/// announce cycles of silence while its Noise session survives, so a recipient
+/// that had merely gone quiet lost its record and every message to it bypassed
+/// sealing — no packetId, never in the DTN buffer, never floodable, never
+/// offerable in a sync exchange, and dropped once the capped pre-seal hold
+/// filled. That is the exact case store-carry-forward exists to serve.
+/// Measured on 2026-08-10: 34 consecutive sends to a quiet peer, all parked.
+@visibleForTesting
+bool shouldParkUnsealedSend({
+  required bool hasPeerRecord,
+  required bool hasSession,
+}) =>
+    !hasPeerRecord && !hasSession;
+
 @visibleForTesting
 bool shouldColdStartAfterSettingsChange({
   required bool autoStart,
@@ -1419,9 +1441,26 @@ class GrassrootsNetwork {
     required Uint8List payload,
     required String messageId,
   }) async {
+    // A peer RECORD is not what sending needs — a session is. The stale sweep
+    // deletes a non-friend peer from `peersList` after two announce cycles of
+    // silence while its Noise session survives untouched, so a recipient that
+    // has merely gone quiet has no record. Requiring one here meant every
+    // message to an ABSENT recipient skipped sealing altogether: no packetId,
+    // never in the DTN buffer, so no relay could carry it and no
+    // sync-on-connect exchange could ever offer it. It sat in the capped
+    // PLAINTEXT pre-seal hold instead and was dropped once that filled —
+    // precisely inverting what store-carry-forward exists to do. Measured on
+    // 2026-08-10: 34 sends to a quiet peer, every one parked, none buffered.
+    //
+    // So: seal when we hold a session, handshake when we hold a record, and
+    // park only when neither exists.
     final peer = _peersState.getPeerByPubkey(recipientPubkey);
-    if (peer == null) {
-      debugPrint('Cannot send now: peer not found; message will remain queued');
+    if (shouldParkUnsealedSend(
+      hasPeerRecord: peer != null,
+      hasSession: _noiseSessions.hasSession(recipientPubkey),
+    )) {
+      debugPrint('Cannot send now: no peer record and no session with '
+          '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; holding');
       return false;
     }
 
@@ -1448,14 +1487,19 @@ class GrassrootsNetwork {
       // null when the recipient is not a direct neighbor; the handshake inside
       // _ensureNoiseSession only succeeds for a direct neighbor, but an existing
       // session lets us flood to a non-adjacent recipient.
-      final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
+      // Null for a delisted or non-adjacent recipient. That is fine: with a
+      // session in hand _ensureNoiseSession short-circuits before it needs a
+      // path, and the sealed packets flood to whoever is in range.
+      final bleDeviceId =
+          peer == null ? null : _connectedBleDeviceIdForPeer(peer);
       final ready = await _ensureNoiseSession(
         transport: PeerTransport.bleDirect,
         recipientPubkey: recipientPubkey,
         peerId: bleDeviceId,
       );
       if (ready) {
-        debugPrint('Flooding message into BLE mesh for ${peer.displayName}');
+        debugPrint('Flooding message into BLE mesh for '
+            '${peer?.displayName ?? _pubkeyToHex(recipientPubkey).substring(0, 8)}');
         // Seal ONCE; the sealed packets are simultaneously the wire bytes and
         // our own buffer entries — the sender holds its outgoing packets
         // exactly as a relay would. Offered in sync-on-connect, kept until ACK.
@@ -1531,6 +1575,10 @@ class GrassrootsNetwork {
     if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
       // Re-read peer — state may have changed during BLE attempt.
       final resolvedPeer = _peersState.getPeerByPubkey(recipientPubkey) ?? peer;
+      // UDP addresses a peer by its record, so without one there is nothing to
+      // dial — unlike BLE above, where the session carries the identity and
+      // the flood needs no address. Park the plaintext for the next pairing.
+      if (resolvedPeer == null) return false;
 
       // Try existing UDX connection first
       if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
@@ -1621,7 +1669,9 @@ class GrassrootsNetwork {
     }
 
     debugPrint(
-      'No transport currently available for ${peer.displayName}; queuing message',
+      'No transport currently available for '
+      '${peer?.displayName ?? _pubkeyToHex(recipientPubkey).substring(0, 8)}; '
+      'queuing message',
     );
     return false;
   }
@@ -1893,6 +1943,16 @@ class GrassrootsNetwork {
           p.publicKey.length == 32 && _noiseSessions.hasSession(p.publicKey))
       .length;
 
+  /// Sessions actually held, straight from the session table.
+  ///
+  /// [sessionPeerCount] intersects the table with Redux `peersList`, and a
+  /// non-friend peer is pruned from that list after two announce cycles of
+  /// silence while its Noise session survives untouched — so the two numbers
+  /// diverge exactly when a link goes quiet, which is the case field runs
+  /// care about. Recording both makes "the session is gone" distinguishable
+  /// from "the peer stopped being listed".
+  int get noiseSessionCount => _noiseSessions.sessionCount;
+
   /// Number of phones in the connected component containing this one,
   /// including itself. 1 means nothing has been heard from anyone.
   int get meshComponentSize {
@@ -1984,6 +2044,15 @@ class GrassrootsNetwork {
     debugPrint('[testbed] Clearing DTN memory buffer');
     _messageRouter.clearDtnBuffer();
     _dtnPacketIds.clear();
+  }
+
+  /// DEBUG/TESTBED ONLY. Lift or restore the per-neighbour relay cap. See
+  /// [MessageRouter.relayBudgetDisabled]: TTL and the packetId bloom still
+  /// bound the flood, only the rate ceiling moves.
+  void setRelayBudgetDisabled(bool disabled) {
+    debugPrint('[testbed] Per-neighbour relay budget '
+        '${disabled ? 'DISABLED' : 'enabled'}');
+    _messageRouter.relayBudgetDisabled = disabled;
   }
 
   void resetAllSessions() {
@@ -2547,6 +2616,10 @@ class GrassrootsNetwork {
     // therefore redelivered over BLE alone — see the docs' note on the
     // UDP-only-friend gap this leaves.
     if (transport == PeerTransport.bleDirect) {
+      // A new session is the one signal that the peer's seen-set may have
+      // gone with it (a restart drops both), so its earlier declines stop
+      // being trustworthy and everything we hold is offerable again.
+      _messageRouter.clearSyncDeclines(pubkey);
       final bleDeviceId =
           _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
       if (bleDeviceId != null) _sendSyncOffers(bleDeviceId);
@@ -2627,9 +2700,20 @@ class GrassrootsNetwork {
 
     if (transport == PeerTransport.bleDirect) {
       final id = peerId ?? _bleService?.getPeerIdForPubkey(recipientPubkey);
-      if (id == null) return false;
+      if (id == null) {
+        // Untraced until now, and it is the denominator: without it a run
+        // reports handshake TIMEOUTS without reporting how many handshakes
+        // were never even put on the air, so no failure rate can be formed.
+        _traceDrop('handshake', 'noPath',
+            {'peer': _pubkeyToHex(recipientPubkey)});
+        return false;
+      }
       final service = _bleService;
-      if (service == null) return false;
+      if (service == null) {
+        _traceDrop('handshake', 'noTransport',
+            {'peer': _pubkeyToHex(recipientPubkey)});
+        return false;
+      }
       return service.sendToPeer(id, bytes);
     }
 
@@ -4023,6 +4107,25 @@ class GrassrootsNetwork {
               ? udpPeerId
               : _connectedBleDeviceIdForPeer(peer),
         ));
+      } else if (transport == PeerTransport.bleDirect) {
+        // A peer we ALREADY hold a session with has just announced — it went
+        // away and came back. Offer what we are carrying for it.
+        //
+        // Sync-on-connect used to hang off session establishment alone, and
+        // sessions outlive the link that formed them: a neighbour whose radio
+        // cycles returns with its session intact, so no establishment fires
+        // and the buffer it left behind is never offered. That is precisely
+        // the case store-carry-forward exists to serve, and it was the one
+        // case that could not work — measured on the desk 2026-08-10, where
+        // every one of three return windows delivered nothing at all.
+        //
+        // ANNOUNCE is the "recipient appears" signal CLAUDE.md names for the
+        // re-flood. It repeats every ~10 s; `_sendSyncOffers` carries its own
+        // per-address debounce, and offers cost ids rather than packets, so
+        // the steady-state cost of asking again is bounded.
+        final peer = _peersState.getPeerByPubkey(data.publicKey);
+        final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
+        if (bleDeviceId != null) _sendSyncOffers(bleDeviceId);
       }
     };
 
@@ -4994,45 +5097,65 @@ class GrassrootsNetwork {
   /// §BLE Discovery: ANNOUNCE is exchanged upon successful BLE connection).
   /// Receivers treat repeated ANNOUNCEs from the same pubkey as idempotent,
   /// so racing with the periodic broadcast is harmless.
-  /// Last time we sent sync offers to a given neighbor (keyed by the pathId's
-  /// address part so the pair's two legs — central: and peripheral: — share
-  /// one debounce). Entries are pruned by age; BLE address rotation naturally
-  /// retires old keys.
+  /// Last time we sent sync offers to a given neighbor, keyed by PEER
+  /// IDENTITY. Keying by the pathId's address made the pair's two legs share
+  /// one debounce only while both rode a single ACL; the 19% of field-day
+  /// pairs that held two separate ACLs have two addresses for one peer and
+  /// were offered the same buffer twice per round. An offer is a statement
+  /// about a peer, so identity is its natural key. Entries are pruned by age.
   final Map<String, DateTime> _lastSyncOfferAt = {};
-  static const Duration _syncOfferDebounce = Duration(seconds: 60);
+  /// Collapses the two connect events a dual-role pair fires (one per leg)
+  /// into a single offer round — they arrive milliseconds apart.
+  ///
+  /// Deliberately SHORTER than the 10 s announce interval, so a peer that has
+  /// reappeared gets an offer on every announce cycle rather than once a
+  /// minute. At 60 s a returning neighbour could sit for most of a minute
+  /// with the carrier holding packets for it and saying nothing.
+  static const Duration _syncOfferDebounce = Duration(seconds: 5);
 
   /// Offer our DTN buffer summary to a newly-connected neighbor
   /// (sync-on-connect). Dual-role pairs fire two connect events (one per
-  /// leg); the per-address debounce collapses them into one offer round.
+  /// leg); the per-peer debounce collapses them into one offer round.
   void _sendSyncOffers(String deviceId) {
     if (_bleService == null || !_bleAvailable) return;
-    final addr = deviceId.substring(deviceId.indexOf(':') + 1);
+    final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
+    if (pubkey == null) return; // path not yet identified; retry next connect
+    final peerHex = _pubkeyToHex(pubkey);
     final now = DateTime.now();
     _lastSyncOfferAt.removeWhere(
         (_, at) => now.difference(at) > const Duration(minutes: 10));
-    final last = _lastSyncOfferAt[addr];
+    final last = _lastSyncOfferAt[peerHex];
     if (last != null && now.difference(last) < _syncOfferDebounce) return;
 
-    final offers = _messageRouter.buildSyncOffers();
-    if (offers.isEmpty) return; // carrying nothing — offer nothing
-    final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
-    if (pubkey == null) return; // path not yet identified; retry next connect
-    _lastSyncOfferAt[addr] = now;
+    // Offers are per peer: what this one has already declined is not offered
+    // to it again, so a converged pair falls silent instead of re-listing the
+    // same buffer on every announce cycle.
+    final offers = _messageRouter.buildSyncOffers(pubkey);
+    if (offers.isEmpty) return; // carrying nothing it wants — offer nothing
+    _lastSyncOfferAt[peerHex] = now;
     debugPrint(
         '[sync] Offering ${_messageRouter.dtnBufferedCount} carried '
         'packet(s) to $deviceId in ${offers.length} sealed offer(s)');
     final link = SyncLink(pubkey, deviceId);
     for (final payload in offers) {
-      unawaited(_sealAndSendSyncFrame(ContentType.syncOffer, payload, link));
+      // The round is opened by the chunks that actually GO OUT, not by the
+      // ones we built: a chunk lost to a dead session or a refused write was
+      // never seen by the peer, and counting it would let its ids be declined
+      // for an offer that was never made.
+      unawaited(_sealAndSendSyncFrame(ContentType.syncOffer, payload, link)
+          .then((sent) {
+        if (sent) _messageRouter.noteSyncOfferSent(pubkey, payload);
+      }));
     }
   }
 
   /// Seal a sync control frame to the link's peer and send it back over the
   /// link. No session yet (a pairing still handshaking) simply skips the
-  /// exchange — sync-on-connect retries on the next pairing.
-  Future<void> _sealAndSendSyncFrame(
+  /// exchange — sync-on-connect retries on the next pairing. Returns whether
+  /// the frame reached the link; the offer round is built from that answer.
+  Future<bool> _sealAndSendSyncFrame(
       ContentType type, Uint8List payload, SyncLink link) async {
-    if (!_noiseSessions.hasSession(link.peerPubkey)) return;
+    if (!_noiseSessions.hasSession(link.peerPubkey)) return false;
     try {
       final packet = _protocolHandler.createSyncPacket(
         type: type,
@@ -5044,9 +5167,12 @@ class GrassrootsNetwork {
         remotePubkey: link.peerPubkey,
       );
       _noteSealedContent(sealed.packetId, type);
-      await _bleService?.sendToPeer(link.bleDeviceId, sealed.serialize());
+      return await _bleService?.sendToPeer(
+              link.bleDeviceId, sealed.serialize()) ??
+          false;
     } catch (e) {
       debugPrint('[sync] Failed to seal/send ${type.name}: $e');
+      return false;
     }
   }
 
@@ -5278,6 +5404,17 @@ class GrassrootsNetwork {
         '[ble-stale] No BLE traffic from ${peer.displayName} for '
         '${staleThreshold.inSeconds}s; synthesizing disconnect',
       );
+      // This is the ONLY code path that voluntarily disconnects a live link,
+      // and before a session exists ANNOUNCE is the only thing that refreshes
+      // the clock it watches — so a pairing can be torn down mid-handshake
+      // and the teardown was, until now, invisible outside debug output. It
+      // is a measurement: it separates "the pairing was never attempted"
+      // from "the attempt lost its 5s race".
+      _traceDrop('bleStale', 'sweep', {
+        'peer': pubkeyHex,
+        'silentSec': staleThreshold.inSeconds,
+        'hadSession': _noiseSessions.hasSession(peer.publicKey),
+      });
       // Redux is a strict projection of transport facts — so when we
       // synthesize a disconnect, make it a fact: physically tear down any
       // plugin paths still attached to this peer. An ANNOUNCE-quiet link is

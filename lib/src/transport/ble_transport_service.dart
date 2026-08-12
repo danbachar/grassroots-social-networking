@@ -302,6 +302,22 @@ class BleTransportService extends TransportService {
     }));
   }
 
+  /// A write that failed on one leg and landed on the pair's other one. Its
+  /// own record type, not a `drop`: the failure is already traced as one, and
+  /// counting the save as a drop too would make a recovered packet look like
+  /// a lost one. How often this fires is the measure of what the second leg
+  /// is worth.
+  void _traceRetry(String where, Map<String, dynamic> extra) {
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'retry',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': where,
+      'transport': 'ble',
+      ...extra,
+    }));
+  }
+
   void _drainWireLedger() {
     if (!_tracing) return;
     final record = _wireLedger.drainRecord(transport: 'ble');
@@ -751,6 +767,34 @@ class BleTransportService extends TransportService {
     }
   }
 
+  /// Refuse nothing, but NAME a write the link cannot carry intact.
+  ///
+  /// These writes are WRITE_TYPE_NO_RESPONSE, so the stack cannot promote an
+  /// oversized payload to a GATT long write — it clamps at `MTU - 3` and the
+  /// receiver gets a prefix it cannot parse (`bleRx`/`deserialize` on the far
+  /// side, with nothing on this one). Every regular packet is sized against
+  /// the floor MTU by FragmentHandler, so anything over is a budgeting bug in
+  /// the code that built it, not a property of the peer. Logged with the
+  /// negotiated MTU because a peer that settled below the floor is a
+  /// different fault from a payload that was mis-sized.
+  ///
+  /// It is deliberately NOT dropped here: what the run needs to measure is
+  /// how often this happens and to whom, and a silent local drop would move
+  /// the evidence rather than produce it.
+  void _checkWritable(Uint8List data, ble.BlePath path, String site) {
+    final usable = path.mtu - 3;
+    if (data.length <= usable) return;
+    debugPrint('[ble-mtu] OVERSIZED $site ${data.length}B > ${usable}B usable '
+        '(mtu ${path.mtu}) on ${path.pathId} — the stack will truncate this '
+        'write and the peer cannot parse it');
+    _traceDrop(site, 'oversized', {
+      'path': path.pathId,
+      'bytes': data.length,
+      'usable': usable,
+      'mtu': path.mtu,
+    });
+  }
+
   @override
   Future<bool> sendToPeer(String peerId, Uint8List data) async {
     final path = _paths[peerId];
@@ -762,15 +806,86 @@ class BleTransportService extends TransportService {
           {'path': peerId});
       return false;
     }
+    return _writeToPeer(path, data, 'bleSend');
+  }
+
+  /// Write [data] on [path], and if that write never got in, write it on the
+  /// pair's OTHER leg.
+  ///
+  /// This is the redundancy the second leg is kept for, and it is not the
+  /// double-send the one-leg-per-flood rule forbids: the fallback runs only
+  /// after a throw, and a throw means the bytes never reached the controller.
+  /// Both platforms fail *before* transmitting — Android's `sendCentral`
+  /// throws while validating the path and `sendPeripheral` when
+  /// `notifyCharacteristicChanged` refuses the buffer, iOS on `valueTooLarge`
+  /// or a full pending queue — so the packet cannot end up on the air twice.
+  ///
+  /// Until now a refused write was final: it was traced and the packet was
+  /// gone for that peer, with no retry anywhere in the stack. The peripheral
+  /// leg has no queue at all (the notify goes straight at the stack), so it is
+  /// the leg that refuses under load, and it is also the leg the flood
+  /// prefers.
+  Future<bool> _writeToPeer(
+      ble.BlePath path, Uint8List data, String site) async {
+    if (await _writeLeg(path, data, site)) return true;
+    final other = otherLegFor(
+      path: path,
+      ready: _readyPaths,
+      pubkeyFor: getPubkeyForPeerId,
+      bytes: data.length,
+    );
+    if (other == null) return false;
+    if (!await _writeLeg(other, data, '$site:otherLeg')) return false;
+    _traceRetry(site, {'path': path.pathId, 'via': other.pathId});
+    return true;
+  }
+
+  /// One write attempt on one leg. False means the bytes did not get in.
+  Future<bool> _writeLeg(
+      ble.BlePath path, Uint8List data, String site) async {
     try {
-      await _ble.send(peerId, data);
+      _checkWritable(data, path, site);
+      await _ble.send(path.pathId, data);
       if (_tracing) _wireLedger.onTx(data);
       return true;
     } catch (e) {
-      debugPrint('send() failed for $peerId: $e');
-      _traceDrop('bleSend', 'writeFailed', {'path': peerId});
+      debugPrint('send() failed for ${path.pathId}: $e');
+      _traceDrop(site, 'writeFailed', {'path': path.pathId});
       return false;
     }
+  }
+
+  /// The same peer's other GATT leg, when the pair has converged, that leg is
+  /// ready, and [bytes] fits its MTU.
+  ///
+  /// The MTU test is not paranoia: the two legs negotiate separately (and on
+  /// iOS the notify limit is a per-central property), so a packet sized for
+  /// one leg can exceed the other. Retrying onto a leg that will truncate it
+  /// puts an unparseable write on the air and reports success.
+  ///
+  /// An unidentified path has no known pair and gets no fallback: without a
+  /// pubkey there is no way to tell the pair's other leg from a stranger's.
+  @visibleForTesting
+  static ble.BlePath? otherLegFor({
+    required ble.BlePath path,
+    required Iterable<ble.BlePath> ready,
+    required Uint8List? Function(String pathId) pubkeyFor,
+    required int bytes,
+  }) {
+    final pubkey = pubkeyFor(path.pathId);
+    if (pubkey == null) return null;
+    final key = _pubkeyHex(pubkey);
+    for (final other in ready) {
+      if (other.pathId == path.pathId) continue;
+      // Same role is not the other leg — it is another connection in the same
+      // direction, which a converged pair does not have.
+      if (other.role == path.role) continue;
+      final otherKey = pubkeyFor(other.pathId);
+      if (otherKey == null || _pubkeyHex(otherKey) != key) continue;
+      if (bytes > other.mtu - 3) continue;
+      return other;
+    }
+    return null;
   }
 
   @override
@@ -788,17 +903,10 @@ class BleTransportService extends TransportService {
     );
     var sent = 0;
     for (final path in targets) {
-      try {
-        await _ble.send(path.pathId, data);
-        if (_tracing) _wireLedger.onTx(data);
-        sent++;
-      } catch (e) {
-        debugPrint('broadcast send() failed for ${path.pathId}: $e');
-        // A flood leg that failed: the packet reached fewer neighbours than
-        // selectBroadcastTargets chose. aired counts successes; this names
-        // the leg that missed.
-        _traceDrop('bleBroadcast', 'writeFailed', {'path': path.pathId});
-      }
+      // A refused write falls back to the pair's other leg rather than
+      // dropping the packet for that neighbour: the flood chose ONE of the
+      // two legs, and the one it did not choose is still connected.
+      if (await _writeToPeer(path, data, 'bleBroadcast')) sent++;
     }
     return sent;
   }
@@ -1250,8 +1358,23 @@ class BleTransportService extends TransportService {
         bleRole: bleRole,
       );
     } catch (e) {
-      debugPrint('Failed to deserialize packet: $e');
-      _traceDrop('bleRx', 'deserialize', {'path': fromDeviceId});
+      // The far side's counterpart to `bleSend`/`oversized`: a payload the
+      // sender's stack clamped at `MTU - 3` arrives as a parseable-looking
+      // prefix and dies here. Recording the LENGTH is what distinguishes a
+      // truncation (a length that sits suspiciously at a usable-MTU
+      // boundary, and a header whose declared size overruns what arrived)
+      // from a corrupt or foreign packet — without it, every cause looks
+      // identical in the drop table.
+      final mtu = _paths[fromDeviceId]?.mtu;
+      debugPrint('[ble-rx] deserialize failed after ${data.length}B'
+          '${mtu == null ? '' : ' (peer mtu $mtu, usable ${mtu - 3})'}'
+          ' from $fromDeviceId: $e');
+      _traceDrop('bleRx', 'deserialize', {
+        'path': fromDeviceId,
+        'bytes': data.length,
+        if (mtu != null) 'mtu': mtu,
+        if (mtu != null) 'atUsableLimit': data.length == mtu - 3,
+      });
     }
   }
 

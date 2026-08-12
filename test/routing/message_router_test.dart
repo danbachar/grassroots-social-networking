@@ -746,14 +746,97 @@ void main() {
         expect(excluded, equals('inbound-leg'));
       });
 
-      test('does not relay a packet whose ttl has reached 1', () async {
+      test('a relayed packet consumes exactly one budget unit', () async {
+        // Regression: the relay decision used to evaluate _allowRelayFrom in
+        // two arms of the same if/else-if chain, and the predicate increments
+        // as well as tests — so every relayed packet was charged twice and the
+        // effective cap was 256, not the 512 the constant states.
+        int relayCount = 0;
+        router.onRelay = (_, {String? excludeBlePeerId}) => relayCount++;
+
+        final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 11));
+        // One more than the documented ceiling: if each relay were charged
+        // twice, this would stop relaying around the halfway mark.
+        for (var i = 0; i < 512; i++) {
+          await router.processPacket(
+            GrassrootsPacket(
+              type: PacketType.secure,
+              ttl: 5,
+              recipientPubkey: thirdParty,
+              payload: Uint8List.fromList([i & 0xff]),
+            ),
+            transport: PeerTransport.bleDirect,
+            bleDeviceId: 'budget-leg',
+            rssi: -60,
+          );
+        }
+        expect(relayCount, equals(512));
+
+        // The 513th in the same window is over budget and must be refused.
+        await router.processPacket(
+          GrassrootsPacket(
+            type: PacketType.secure,
+            ttl: 5,
+            recipientPubkey: thirdParty,
+            payload: Uint8List.fromList([0xff, 0xff]),
+          ),
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'budget-leg',
+          rssi: -60,
+        );
+        expect(relayCount, equals(512));
+      });
+
+      test('both legs of one peer share a single relay budget', () async {
+        // The cap bounds a NEIGHBOUR, and a neighbour is an identity. Keying by
+        // path id gave a converged dual-leg pair two full budgets (and minted a
+        // fresh one on every ~30 s MAC rotation).
+        int relayCount = 0;
+        router.onRelay = (_, {String? excludeBlePeerId}) => relayCount++;
+
+        // Attribute both GATT legs to the same peer identity.
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: otherPubkey,
+          nickname: 'Alice',
+          rssi: -44,
+          bleCentralDeviceId: 'central:alice',
+        ));
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: otherPubkey,
+          nickname: 'Alice',
+          rssi: -44,
+          blePeripheralDeviceId: 'peripheral:alice',
+        ));
+
+        final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 13));
+        // Alternate legs; a per-path budget would allow all 600.
+        for (var i = 0; i < 600; i++) {
+          await router.processPacket(
+            GrassrootsPacket(
+              type: PacketType.secure,
+              ttl: 5,
+              recipientPubkey: thirdParty,
+              payload: Uint8List.fromList([i & 0xff, i >> 8]),
+            ),
+            transport: PeerTransport.bleDirect,
+            bleDeviceId: i.isEven ? 'central:alice' : 'peripheral:alice',
+            rssi: -60,
+          );
+        }
+        expect(relayCount, equals(512));
+      });
+
+      test('does not relay a packet whose ttl has already reached 0', () async {
+        // The refusal is for a count that is ALREADY spent. A packet arriving
+        // at 1 still gets its last hop (see below); one arriving at 0 does
+        // not, because there is nothing left to subtract.
         bool relayed = false;
         router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
           type: PacketType.secure,
-          ttl: 1,
+          ttl: 0,
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([1]),
         );
@@ -766,6 +849,28 @@ void main() {
         );
 
         expect(relayed, isFalse);
+      });
+
+      test('relays a packet at ttl 1 once, at 0', () async {
+        // That final broadcast is worth making: the destination is exempt from
+        // the refusal, so a neighbour who is the recipient still accepts it.
+        final relayed = <GrassrootsPacket>[];
+        router.onRelay = (p, {String? excludeBlePeerId}) => relayed.add(p);
+
+        final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
+        await router.processPacket(
+          GrassrootsPacket(
+            type: PacketType.secure,
+            ttl: 1,
+            recipientPubkey: thirdParty,
+            payload: Uint8List.fromList([1]),
+          ),
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'inbound-leg',
+          rssi: -60,
+        );
+
+        expect(relayed.single.ttl, 0);
       });
 
       test('relays a packet only on first sighting (dedup prevents loops)',

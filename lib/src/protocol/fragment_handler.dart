@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../models/packet.dart';
 import '../models/secure_frame.dart';
 
 /// Splits large payloads into [SecureFrame]s and reassembles them.
@@ -17,11 +18,12 @@ class FragmentHandler {
   /// silently truncated on the wire and the receiver can't parse it. A flooded
   /// packet reaches peers with different MTUs, so we size for the floor MTU we
   /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
-  ///   58 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
-  ///   = 104 bytes.
-  /// So chunk ≤ 244 − 104 = 140; we use 132 for margin (236-byte packet).
+  ///   54 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
+  ///   = 100 bytes.
+  /// So chunk ≤ 244 − 100 = 144; we use 136 for margin (236-byte packet).
   static const int _bleFloorMtu = 247;
-  static const int _packetFixedOverhead = 58 + 25 + 21; // = 104
+  static const int _packetFixedOverhead =
+      GrassrootsPacket.headerSize + 25 + 21; // = 100
   static const int maxFragmentPayload =
       _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 132
 

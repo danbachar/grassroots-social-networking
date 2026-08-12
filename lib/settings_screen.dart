@@ -31,6 +31,10 @@ class SettingsScreen extends StatefulWidget {
   /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
   /// is not up. [myPubkeyHex] is this device's hex identity.
   final String? myPubkeyHex;
+
+  /// This device's ANNOUNCE nickname, forwarded to the testbed so a field
+  /// run can derive its join order from it.
+  final String? myNickname;
   final ExperimentRecorder? experimentRecorder;
   final VoidCallback? onStartBulk;
   final VoidCallback? onStopBulk;
@@ -38,6 +42,7 @@ class SettingsScreen extends StatefulWidget {
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
   final VoidCallback? onResetDtnBuffer;
+  final void Function(bool disabled)? onSetRelayBudgetDisabled;
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
   final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
@@ -47,6 +52,9 @@ class SettingsScreen extends StatefulWidget {
   /// DEBUG/TESTBED. Armed-time mesh gossip, and the view it builds.
   final Future<int> Function()? onGossipNeighbours;
   final int Function()? sessionPeerCount;
+
+  /// Sessions in the Noise table, forwarded to the testbed.
+  final int Function()? sessionTableCount;
   final int Function()? meshComponentSize;
   final VoidCallback? onClearMeshView;
   final void Function(void Function(String expId)? listener)?
@@ -68,12 +76,14 @@ class SettingsScreen extends StatefulWidget {
     this.onBleRoleModeChanged,
     this.onRetryPublicAddressDiscovery,
     this.myPubkeyHex,
+    this.myNickname,
     this.experimentRecorder,
     this.onStartBulk,
     this.onStopBulk,
     this.sendMessage,
     this.onResetSessions,
     this.onResetDtnBuffer,
+    this.onSetRelayBudgetDisabled,
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
@@ -82,6 +92,7 @@ class SettingsScreen extends StatefulWidget {
     this.registerStartListener,
     this.onGossipNeighbours,
     this.sessionPeerCount,
+    this.sessionTableCount,
     this.meshComponentSize,
     this.onClearMeshView,
     this.sendRaw,
@@ -312,12 +323,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context) => TestbedScreen(
                       store: widget.store,
                       myPubkeyHex: widget.myPubkeyHex,
+                      myNickname: widget.myNickname,
                       experimentRecorder: widget.experimentRecorder,
                       onStartBulk: widget.onStartBulk,
                       onStopBulk: widget.onStopBulk,
                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetDtnBuffer: widget.onResetDtnBuffer,
+                      onSetRelayBudgetDisabled:
+                          widget.onSetRelayBudgetDisabled,
                       onCryptoBench: widget.onCryptoBench,
                       bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,
@@ -326,6 +340,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       registerStartListener: widget.registerStartListener,
                       onGossipNeighbours: widget.onGossipNeighbours,
                       sessionPeerCount: widget.sessionPeerCount,
+                      sessionTableCount: widget.sessionTableCount,
                       meshComponentSize: widget.meshComponentSize,
                       onClearMeshView: widget.onClearMeshView,
                       sendRaw: widget.sendRaw,

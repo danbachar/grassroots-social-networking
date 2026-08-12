@@ -60,3 +60,6 @@ claude/
 # a 735 MB tarball once rode a bulk git add into history and killed a push.
 *.tar.gz
 trace_server/data/
+
+# Build-time secrets (TRACE_TOKEN). Never commit.
+.env

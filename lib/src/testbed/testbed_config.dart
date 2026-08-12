@@ -9,7 +9,7 @@ import '../protocol/fragment_handler.dart';
 /// message, the old default, was silently TWO packets — 132 + 52 — costing
 /// 392 wire bytes to move 184), which is worth measuring deliberately as a
 /// payload arm rather than baking into every experiment.
-const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 132
+const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 136
 
 /// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:
 /// [BulkFlowConfig] (sustained throughput) and [FieldPlan] (scripted field
@@ -185,6 +185,17 @@ class FieldStep {
   /// and kill handshakes that legitimately began in the toggle window.
   final bool? resetSessions;
 
+  /// Per-step override of [FieldPlan.resetDtnBuffer] (null = inherit).
+  ///
+  /// The plan-level flag fires at the start of EVERY step, which is useless
+  /// for a store-carry-forward run: clearing at `return` would delete the
+  /// very backlog that window exists to measure, so the plan has to leave it
+  /// off and the buffer then never resets at all — one arm's leftovers get
+  /// counted as the next arm's delivery. Set it on the arm's FIRST step
+  /// instead. Clearing the buffer touches nothing else: sessions and links
+  /// survive, so an arm still starts warm.
+  final bool? resetDtnBuffer;
+
   /// DEBUG raw-throughput mode: non-null selects the GATT leg ('notify',
   /// 'write' or 'stripe') and the step pushes MTU-sized raw blobs — no seal,
   /// no buffering, no ACK; the receiver counts bytes and drops them before the
@@ -211,6 +222,7 @@ class FieldStep {
     this.rawLeg,
     this.bleOn,
     this.resetSessions,
+    this.resetDtnBuffer,
   });
 
   Map<String, dynamic> toJson() => {
@@ -233,6 +245,7 @@ class FieldStep {
         if (rawLeg != null) 'rawLeg': rawLeg,
         if (bleOn != null) 'bleOn': bleOn,
         if (resetSessions != null) 'resetSessions': resetSessions,
+        if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
@@ -248,6 +261,7 @@ class FieldStep {
         rawLeg: json['rawLeg'] as String?,
         bleOn: json['bleOn'] as bool?,
         resetSessions: json['resetSessions'] as bool?,
+        resetDtnBuffer: json['resetDtnBuffer'] as bool?,
       );
 
   @override
@@ -264,12 +278,14 @@ class FieldStep {
       other.sendTo == sendTo &&
       other.rawLeg == rawLeg &&
       other.bleOn == bleOn &&
-      other.resetSessions == resetSessions;
+      other.resetSessions == resetSessions &&
+      other.resetDtnBuffer == resetDtnBuffer;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, sendLanes, sendTo, rawLeg, bleOn, resetSessions);
+          saturate, sendLanes, sendTo, rawLeg, bleOn, resetSessions,
+          resetDtnBuffer);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -312,6 +328,20 @@ class FieldPlan {
   /// the buffer surviving across steps (store-carry-forward, multi-hop).
   final bool resetDtnBuffer;
 
+  /// DEBUG/TESTBED ONLY. Run with the per-neighbour relay cap LIFTED.
+  ///
+  /// The cap is a charter requirement, so this is false everywhere except an
+  /// arm that exists to measure what the cap costs. It became worth measuring
+  /// when `relay / rateLimited` fired ~3,400 times across seven of eight
+  /// phones on scf-check-4: at that rate the ceiling is shaping delivery, and
+  /// the only honest way to size its effect is the same plan with and without
+  /// it. It rides in the plan rather than in a build flag so the trace records
+  /// which arm produced which numbers.
+  ///
+  /// TTL and the packetId bloom still bound the flood; only the per-neighbour
+  /// rate ceiling is removed.
+  final bool relayBudgetDisabled;
+
   /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
@@ -352,6 +382,17 @@ class FieldPlan {
   /// minutes for a five-minute test means the preflight never gets run.
   final int alignSec;
 
+  /// Let the runner drive [FieldStep.bleOn] even though the start is
+  /// wall-clock anchored.
+  ///
+  /// [manualJoin] conflated two separate things: WHEN the run starts (a shared
+  /// instant every phone computes) and WHO works the radio. For the join
+  /// experiments the operator does it, and the runner must keep its hands off
+  /// or it would fight them. A desk plan that scripts a phone going dark needs
+  /// the same shared start but no operator at all — hands-free is the point,
+  /// since the dark window has to open on every phone at once.
+  final bool scriptedRadio;
+
   /// Whether steps take a GPS fix at placement. Off for runs whose layout is
   /// measured by hand — at 30 m spacing a phone fix carries the geometry's
   /// own magnitude in error, so sampling adds noise and radio wakes for a
@@ -366,11 +407,13 @@ class FieldPlan {
     this.resetSessions = true,
     this.resetLinks = false,
     this.resetDtnBuffer = true,
+    this.relayBudgetDisabled = false,
     this.autoAdvanceGapSec = 5,
     this.deviceOrder,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
+    this.scriptedRadio = false,
     this.sampleGps = true,
   });
 
@@ -383,11 +426,13 @@ class FieldPlan {
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
         'resetDtnBuffer': resetDtnBuffer,
+        'relayBudgetDisabled': relayBudgetDisabled,
         'autoAdvanceGapSec': autoAdvanceGapSec,
         if (deviceOrder != null) 'deviceOrder': deviceOrder,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
+        if (scriptedRadio) 'scriptedRadio': true,
         if (!sampleGps) 'sampleGps': false,
       };
 
@@ -405,11 +450,14 @@ class FieldPlan {
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
+        relayBudgetDisabled:
+            json['relayBudgetDisabled'] as bool? ?? false,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
         deviceOrder: json['deviceOrder'] as int?,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
+        scriptedRadio: json['scriptedRadio'] as bool? ?? false,
         sampleGps: json['sampleGps'] as bool? ?? true,
       );
 
@@ -423,16 +471,20 @@ class FieldPlan {
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
       other.resetDtnBuffer == resetDtnBuffer &&
+      other.relayBudgetDisabled == relayBudgetDisabled &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
       other.deviceOrder == deviceOrder &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
+      other.scriptedRadio == scriptedRadio &&
       other.sampleGps == sampleGps;
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
       Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
+      relayBudgetDisabled,
       autoAdvanceGapSec, deviceOrder, manualJoin, placementSec, alignSec,
+      scriptedRadio,
       sampleGps);
 }

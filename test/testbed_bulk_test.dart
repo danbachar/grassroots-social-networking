@@ -6,6 +6,7 @@ import 'package:grassroots_networking/src/store/settings_reducer.dart';
 import 'package:grassroots_networking/src/store/settings_actions.dart';
 import 'package:grassroots_networking/src/store/settings_state.dart';
 import 'package:grassroots_networking/src/models/block.dart';
+import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/testbed/bulk_flow_driver.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 import 'package:grassroots_networking/src/trace/wire_ledger.dart';
@@ -220,15 +221,16 @@ void main() {
       final ledger = WireLedger()
         ..secureContentFor = (id) => id.startsWith('aaaaaaaa') ? 'data:say'
             : id.startsWith('bbbbbbbb') ? 'ack' : '';
-      // packetId occupies bytes 38..54 of the envelope.
-      Uint8List sealed(String idHex, int length) {
-        final p = Uint8List(length);
-        p[0] = 0x03; // secure
-        for (var i = 0; i < 16; i++) {
-          p[38 + i] = int.parse(idHex.substring(i * 2, i * 2 + 2), radix: 16);
-        }
-        return p;
-      }
+      // Built by the REAL serializer, never by hand. This fixture used to
+      // write the id at a hardcoded offset — the same one the ledger read —
+      // so the pair agreed with each other and with nothing else: the header
+      // shrank, the ledger kept reading the old offset, and this test stayed
+      // green while the split it guards was dead in production.
+      Uint8List sealed(String idHex, int length) => GrassrootsPacket(
+            packetId: idHex,
+            type: PacketType.secure,
+            payload: Uint8List(length - GrassrootsPacket.headerSize),
+          ).serialize();
 
       final dataId = 'aaaaaaaa' + '0' * 24;
       final ackId = 'bbbbbbbb' + '0' * 24;

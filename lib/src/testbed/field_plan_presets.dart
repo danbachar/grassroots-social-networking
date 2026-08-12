@@ -47,7 +47,7 @@ class FieldPlanPresets {
   ///
   /// [payloadSizes] is the PAYLOAD ARM: one saturating step per size, so the
   /// per-message cost of fragmentation is a measured result instead of a
-  /// hidden constant. [defaultSendBytes] (132 B) is exactly one sealed packet;
+  /// hidden constant. [defaultSendBytes] (136 B) is exactly one sealed packet;
   /// 264 B is exactly two; 1200 B is ten. Every step runs from the same spot,
   /// so only the very first waits for the tap — a whole arm is hands-free
   /// after one press. Labels carry the size (`p=264B`) so the analyzer
@@ -494,6 +494,212 @@ class FieldPlanPresets {
     );
   }
 
+  /// LOAD SWEEP: delivery as a function of mesh size AND offered rate.
+  ///
+  /// The two-variable baseline. [nRange] members participate (the rest hold
+  /// their radios down), each participant offers [rates] messages per second,
+  /// and every (n, rate) cell repeats [repeat] times so a cell is a
+  /// distribution rather than an anecdote. A rate of 0 means SATURATE — push
+  /// as fast as the send path drains, which is the overload tail.
+  ///
+  /// The rate is PER DESTINATION: at 1/s with six peers up a device puts six
+  /// messages a second on the air, and the same 1/s at n=2 puts one. The
+  /// send rate itself is what stays fixed across the sweep — the fleet's
+  /// total naturally rises with n, and that rise is the thing being measured.
+  ///
+  /// So `sendCount` is simply `rate x dwell`, and nothing here divides by a
+  /// target count. The previous form divided by (n-1) to hold the per-device
+  /// TOTAL flat, which was both the wrong quantity to fix and unsound: the
+  /// runner fans out to however many peers are identified at fire time, and
+  /// in load-sweep-1 phones the plan had dark were still linked, so the real
+  /// rate was off by that ratio. Never scale a load by a number the plan
+  /// merely assumes to be true of the radios.
+  ///
+  /// Each cell clears the DTN buffer at its first step so a cell never drains
+  /// its predecessor's backlog, while sessions and links stay warm: this
+  /// measures the data plane, not establishment.
+  static FieldPlan loadSweep({
+    String expId = 'load-sweep-1',
+    required int role,
+    List<int> nRange = const [2, 3, 4, 5, 6, 7],
+    // 0 = saturate. Density matters more at the bottom than the top: the
+    // medium carried ~207 sealed packets/s across the whole fleet, so at n=7
+    // even 5 msg/s per device is already ~30 msg/s offered and fanning out
+    // six ways. The knee is expected between 1 and 5, not near 20.
+    List<int> rates = const [1, 5, 10, 20, 0],
+    int repeat = 10,
+    int dwellSec = 60,
+    int sendBytes = defaultSendBytes,
+    int sendLanes = 1,
+    int placementSec = 60,
+    int alignSec = 300,
+  }) {
+    final trials = repeat < 1 ? 1 : repeat;
+    final steps = <FieldStep>[];
+    for (final n in nRange) {
+      final joined = role <= n;
+      for (final rate in rates) {
+        final saturating = rate == 0;
+        // Sends per dwell at the wanted rate. Each one fans out to every
+        // peer, so this is the per-destination rate and it holds across n.
+        final ticks =
+            saturating ? 0 : (rate * dwellSec).clamp(1, 1 << 20);
+        for (var t = 1; t <= trials; t++) {
+          final tag = saturating ? 'sat' : '${rate}ps';
+          steps.add(FieldStep(
+            label: 'n=$n r=$tag t$t',
+            dwellSec: dwellSec,
+            bleOn: joined,
+            saturate: joined && saturating,
+            sendLanes: sendLanes,
+            sendBytes: sendBytes,
+            sendCount: (joined && !saturating) ? ticks : 0,
+            // First rep of a cell starts from an empty buffer; the rest carry
+            // on, so a cell measures its own load and not the last one's tail.
+            resetDtnBuffer: t == 1,
+            autoAdvance: steps.isNotEmpty,
+          ));
+        }
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: 60,
+      autoAdvanceGapSec: 10,
+      // Warm throughout: this is the data plane, not establishment.
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: false,
+      deviceOrder: role,
+      manualJoin: true,
+      alignSec: alignSec,
+      placementSec: placementSec,
+      scriptedRadio: true,
+      sampleGps: false,
+      steps: steps,
+    );
+  }
+
+  /// TIER 3 — store-carry-forward under load, on a desk.
+  ///
+  /// One phone is the TRAVELLER: its radio goes down, everyone else keeps
+  /// messaging it, and then it comes back. What is measured is what survives
+  /// the absence — how much of the backlog is delivered on reunion and how
+  /// long each message was carried. Nothing here needs distance, so it runs on
+  /// a desk: the variable is OFFERED LOAD, not geometry.
+  ///
+  /// Three arms, run back to back:
+  ///   low     — a trickle; the buffer holds tens of packets
+  ///   medium  — steady traffic
+  ///   high    — the field-day setting (saturate, ONE lane, one sealed packet
+  ///             per message), so a desk result is comparable to
+  ///             mesh-scale-30m-2. The packet header lost its unused 4-byte
+  ///             timestamp after that run, so the payload is 136 B where the
+  ///             field day sent 132 B — the packet on the wire is 236 B in
+  ///             both, which is what contention actually sees.
+  ///
+  /// Each arm is three steps. `warm` lets sessions form (SEALING NEEDS A
+  /// SESSION — a recipient never paired with is held unsealed and is a
+  /// different measurement). `dark` drops the traveller's radio while the
+  /// senders push. `return` brings it back and sends NOTHING, so every
+  /// delivery in that window came out of a buffer rather than off the wire.
+  ///
+  /// The DTN buffer is deliberately NOT reset between the steps of an arm —
+  /// carrying the backlog across the dark step IS the experiment — but it is
+  /// reset at each arm's `warm` step so one arm's leftovers cannot be counted
+  /// as the next arm's delivery.
+  /// [travellerPrefix] concentrates the load on the absent phone. Leave it
+  /// empty and the senders address EVERYONE, which is both easier to set up
+  /// (no pubkey to type on six phones) and closer to the field day: every
+  /// phone messaging every other, with one member away. The absent peer's
+  /// share is the part that has to be carried, and it is identified in the
+  /// trace by recipient, not by how the load was aimed.
+  static FieldPlan storeCarryForward({
+    String expId = 'scf-desk-1',
+    required int role,
+    String travellerPrefix = '',
+    int warmSec = 60,
+    int darkSec = 120,
+    int returnSec = 120,
+    int lowSends = 10,
+    int mediumSends = 60,
+    int repeat = 1,
+    bool relayBudgetDisabled = false,
+  }) {
+    final traveller = role == 1;
+    final steps = <FieldStep>[];
+    final trials = repeat < 1 ? 1 : repeat;
+    for (final arm in const ['low', 'medium', 'high']) {
+      for (var t = 1; t <= trials; t++) {
+        final tag = trials > 1 ? '$arm t$t' : arm;
+        steps.add(FieldStep(
+          label: 'warm $tag',
+          dwellSec: warmSec,
+          bleOn: true,
+          // Clear the buffer where it is safe to: the arm's first step, before
+          // anything it will measure has been sent. The plan-level flag cannot
+          // express this (it fires on every step, which would wipe the backlog
+          // at `return`), so without this an arm inherits the previous arm's
+          // undelivered packets and scores them as its own deliveries.
+          // Sessions and links are untouched, so the arm still starts warm.
+          resetDtnBuffer: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
+        steps.add(FieldStep(
+          label: 'dark $tag',
+          dwellSec: darkSec,
+          // The traveller is unreachable; everyone else keeps sending TO it,
+          // addressed by prefix so the load lands on the absent peer rather
+          // than being shared out among the phones that are present.
+          bleOn: traveller ? false : true,
+          sendTo: (traveller || travellerPrefix.isEmpty)
+              ? 'all'
+              : travellerPrefix,
+          saturate: !traveller && arm == 'high',
+          sendLanes: 1,
+          sendCount: traveller
+              ? 0
+              : switch (arm) {
+                  'low' => lowSends,
+                  'medium' => mediumSends,
+                  _ => 0,
+                },
+          autoAdvance: true,
+        ));
+        steps.add(FieldStep(
+          label: 'return $tag',
+          dwellSec: returnSec,
+          bleOn: true,
+          // Nobody sends: every delivery inside this window came from a
+          // buffer, which is the whole measurement.
+          autoAdvance: true,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: 60,
+      autoAdvanceGapSec: 10,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: false,
+      deviceOrder: role,
+      // Wall-clock anchored so every phone opens the dark window at the same
+      // instant — a stagger would let a sender push while the traveller was
+      // still up, and those messages would deliver instead of being carried.
+      // A 5-minute grid is enough to tap six phones without a second pair of
+      // hands, and `scriptedRadio` keeps the toggling with the runner: nobody
+      // is standing over the desk to work the radio at the boundary.
+      manualJoin: true,
+      alignSec: 300,
+      placementSec: 60,
+      scriptedRadio: true,
+      relayBudgetDisabled: relayBudgetDisabled,
+      sampleGps: false,
+      steps: steps,
+    );
+  }
+
   /// Pre-field validation: five back-to-back link-teardown→re-establish
   /// cycles at desk distance (~6 min). Success = five complete
   /// drop→discovered→connected→session→usable ladders in the trace.
@@ -534,6 +740,45 @@ class FieldPlanPresets {
 
   /// Named presets for the dropdown (label → ready-to-run plan).
   static Map<String, FieldPlan> get presets => {
+        // Two entries because the traveller runs a different script from
+        // everyone else; picking the right one IS the per-phone setup, which
+        // is what makes this launchable from the dropdown with no typing.
+        // 10 reps per arm. One rep per arm is a single draw from a spread
+        // that the power ladder already showed is where the uncertainty
+        // lives; ten gives a distribution instead of an anecdote. Windows
+        // stay fixed at 60/120/120 s so every arm gets the same wall-clock
+        // exposure and the arms differ ONLY in offered load. ~2h45m.
+        // A one-rep shakedown of the SAME plan shape, under its own id: ~17
+        // min to prove the traveller really goes dark and comes back, the
+        // backlog moves, and the analysis reads it — before committing 2h45m.
+        // Its own id keeps the check out of the measured data.
+        // A/B PAIR on the per-neighbour relay cap. Identical plans under two
+        // ids, so the only difference between the traces is whether the cap
+        // fires. It is worth measuring because the cap bit hard on
+        // scf-check-4 — `relay/rateLimited` ~3,400 times across seven of
+        // eight phones, and `sync/budgetExhausted` at the top of the drop
+        // table — which is the cap shaping delivery rather than bounding
+        // abuse. Lifting it leaves TTL and the packetId bloom in place; only
+        // the per-neighbour rate ceiling goes.
+        //
+        // Run them BACK TO BACK on the same fleet with the same traveller,
+        // capped first as the baseline, so any drift over the session is
+        // attributable by order rather than confounded with the arm.
+        'SCF cap — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-cap-1', role: 1, relayBudgetDisabled: false),
+        'SCF cap — sender (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-cap-1', role: 2, relayBudgetDisabled: false),
+        'SCF nocap — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-nocap-1', role: 1, relayBudgetDisabled: true),
+        'SCF nocap — sender (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-nocap-1', role: 2, relayBudgetDisabled: true),
+        // A FRESH id per campaign: the recorder appends, so reusing an id
+        // merges runs into one file and one upload. The shakedown runs live
+        // under scf-desk-1; this is the measured one.
+        'SCF desk — TRAVELLER (this phone goes dark)':
+            storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
+        'SCF desk — sender (everyone else)':
+            storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),
         'Link-cycle check (5×1 min)': manualized(cycleCheck()),
         'Throughput (saturate 60s)': manualized(throughput()),
@@ -609,6 +854,14 @@ class FieldPlanPresets {
         // rehearsal never lands in a real run's file. Aligns to 2 minutes
         // instead of 10, because waiting most of ten minutes for a
         // five-minute test means the preflight never gets run.
+        // LOAD SWEEP, one entry per device order. n=2..7 x {1,5,10,20,sat}
+        // msg/s per device x 10 reps at a 30 s dwell = 300 cells, ~3.4 h.
+        // The role decides which n this phone joins at: #1 and #2 are in every
+        // cell, #7 only in the n=7 cells.
+        for (var r = 1; r <= 7; r++)
+          'Load sweep n=2..7 x rate (~3.4 h) — this phone is #$r':
+              loadSweep(expId: 'load-sweep-1', role: r, dwellSec: 30,
+                  repeat: 10),
         for (var r = 1; r <= 4; r++)
           'PREFLIGHT 4 devices, manual join (~7 min) — this phone is #$r':
               meshScale(
@@ -627,6 +880,7 @@ class FieldPlanPresets {
 enum FieldPlanKind {
   meshScale,
   joinTime,
+  storeCarryForward,
   homeSoak,
   throughput,
   throughputCeiling,
@@ -638,6 +892,8 @@ extension FieldPlanKindLabel on FieldPlanKind {
   String get label => switch (this) {
         FieldPlanKind.meshScale => 'Mesh: scale N devices (all send)',
         FieldPlanKind.joinTime => 'Establishment: frontier join (quiet mesh)',
+        FieldPlanKind.storeCarryForward =>
+          'Store-carry-forward vs load (desk)',
         FieldPlanKind.homeSoak => 'Home soak (stationary)',
         FieldPlanKind.throughput => 'Throughput (saturate)',
         FieldPlanKind.throughputCeiling => 'Throughput: ceiling sweep',
@@ -656,6 +912,7 @@ class FieldPlanWizard {
         // joining, not by tearing down what is already established.
         FieldPlanKind.meshScale => (false, false),
         FieldPlanKind.joinTime => (false, false),
+        FieldPlanKind.storeCarryForward => (false, false),
         FieldPlanKind.homeSoak => (true, false),
         FieldPlanKind.throughput => (false, false),
         FieldPlanKind.throughputCeiling => (false, false),
@@ -683,6 +940,10 @@ class FieldPlanWizard {
     int meshRole = 1,
     bool saturate = true,
     bool manualJoin = false,
+
+    /// Store-carry-forward: the pubkey prefix of the traveller (join order 1),
+    /// so senders address the absent phone rather than each other.
+    String travellerPrefix = '',
   }) {
     final id = expId.trim().isEmpty ? 'exp' : expId.trim();
     final (defSessions, defLinks) = resetDefaults(kind);
@@ -755,6 +1016,16 @@ class FieldPlanWizard {
           role: meshRole,
           maxDevices: maxDevices,
           joinDwellSec: dwellSec,
+          repeat: repeat,
+        );
+      case FieldPlanKind.storeCarryForward:
+        return FieldPlanPresets.storeCarryForward(
+          expId: id,
+          role: meshRole,
+          travellerPrefix: travellerPrefix,
+          darkSec: dwellSec,
+          returnSec: dwellSec,
+          mediumSends: sends,
           repeat: repeat,
         );
     }

@@ -27,7 +27,6 @@ void main() {
 
       expect(deserialized.type, equals(packet.type));
       expect(deserialized.ttl, equals(packet.ttl));
-      expect(deserialized.timestamp, equals(packet.timestamp));
       expect(deserialized.packetId, equals(packet.packetId));
       expect(deserialized.recipientPubkey, isNull);
       expect(deserialized.payload, equals(packet.payload));
@@ -92,8 +91,8 @@ void main() {
         type: PacketType.secure,
         payload: Uint8List(0),
       );
-      expect(GrassrootsPacket.headerSize, equals(58));
-      expect(packet.serialize().length, equals(58));
+      expect(GrassrootsPacket.headerSize, equals(54));
+      expect(packet.serialize().length, equals(54));
     });
 
     test('relay-decremented TTL survives a serialize round-trip', () {

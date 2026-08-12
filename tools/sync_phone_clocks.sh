@@ -16,12 +16,28 @@
 # Run at home before a field day. Quartz drift is ~1 s/day, so a morning
 # sync covers an afternoon offline.
 #
-# Usage: tools/sync_phone_clocks.sh          # set + verify
-#        tools/sync_phone_clocks.sh --check  # measure only, touch nothing
+# The measured offsets are the ONLY trustworthy clock numbers a field run
+# has. A trace cannot recover them after the fact: in a manual-join run every
+# phone stamps its step markers at the same SCHEDULED epoch, so all phones
+# write identical marker timestamps no matter how far off their clocks are —
+# a constant offset is invisible there by construction. Hence --json: write
+# the table next to the recordings and hand it to analyze.py --clocks.
+#
+# Usage: tools/sync_phone_clocks.sh                  # set + verify
+#        tools/sync_phone_clocks.sh --check          # measure only
+#        tools/sync_phone_clocks.sh --json PATH      # also write the table
 set -u
 
 CHECK_ONLY=0
-[ "${1:-}" = "--check" ] && CHECK_ONLY=1
+JSON_OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK_ONLY=1 ;;
+    --json)  shift; JSON_OUT="${1:-}" ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 serials=$(adb devices | awk 'NR>1 && $2=="device" {print $1}')
 skipped=$(adb devices | awk 'NR>1 && $1!="" && $2!="device" {print $1" ("$2")"}')
@@ -37,10 +53,11 @@ if command -v sntp >/dev/null 2>&1; then
   echo "host vs NTP: $(sntp time.apple.com 2>/dev/null | tail -1)"
 fi
 
-CHECK_ONLY="$CHECK_ONLY" python3 - "$serials" <<'PY'
-import os, subprocess, sys, time
+CHECK_ONLY="$CHECK_ONLY" JSON_OUT="$JSON_OUT" python3 - "$serials" <<'PY'
+import json, os, pathlib, subprocess, sys, time
 
 check_only = os.environ["CHECK_ONLY"] == "1"
+json_out = os.environ.get("JSON_OUT") or ""
 
 def sh(serial, *cmd, timeout=10):
     return subprocess.run(["adb", "-s", serial, "shell", *cmd],
@@ -99,6 +116,39 @@ for serial, model, before, after, err, result in rows:
         verdict += f" (set-time said: {result[:60]})"
     print(f"{serial:<24} {model:<14} {before:>+8.3f}s {after:>+8.3f}s "
           f"{err:>6.3f}s  {verdict}")
+
+if json_out:
+    # A one-time serial -> pubkey map, because the pubkey cannot be read off
+    # the phone: recordings live in app-private storage. Fill it once (the
+    # device_id in any upload IS the pubkey hex) and every later sync carries
+    # the identity the traces are keyed by.
+    fleet = {}
+    try:
+        fleet = json.loads(pathlib.Path("tools/fleet_map.json").read_text())
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        print(f"  tools/fleet_map.json unreadable ({e}) — writing without "
+              f"pubkeys")
+    payload = {
+        "measuredAtMs": int(time.time() * 1000),
+        "checkOnly": check_only,
+        "devices": [
+            {"serial": serial, "model": model,
+             "offsetBeforeS": round(before, 4),
+             "offsetS": round(after, 4),
+             "errS": round(err, 4),
+             **({"pubkey": fleet[serial]} if serial in fleet else {})}
+            for serial, model, before, after, err, _ in rows
+        ],
+    }
+    pathlib.Path(json_out).write_text(json.dumps(payload, indent=2))
+    unmapped = [r[0] for r in rows if r[0] not in fleet]
+    print(f"wrote {json_out}")
+    if unmapped:
+        print(f"  no pubkey for {len(unmapped)} device(s): add them to "
+              f"tools/fleet_map.json as {{\"<serial>\": \"<pubkey hex>\"}} "
+              f"so analyze.py --clocks can match them")
 
 print()
 if worst > 0.3:

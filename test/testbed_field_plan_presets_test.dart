@@ -1,12 +1,260 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 
 void main() {
+  group('storeCarryForward', () {
+    test('the traveller goes dark and never sends; senders address IT', () {
+      final traveller =
+          FieldPlanPresets.storeCarryForward(role: 1, travellerPrefix: 'abcd1234');
+      final sender =
+          FieldPlanPresets.storeCarryForward(role: 2, travellerPrefix: 'abcd1234');
+
+      final dark = traveller.steps.where((s) => s.label.startsWith('dark'));
+      expect(dark, isNotEmpty);
+      for (final s in dark) {
+        expect(s.bleOn, isFalse, reason: 'the traveller is the one that leaves');
+        expect(s.sendCount, 0);
+        expect(s.saturate, isFalse);
+      }
+
+      for (final s in sender.steps.where((s) => s.label.startsWith('dark'))) {
+        expect(s.bleOn, isTrue);
+        expect(s.sendTo, 'abcd1234',
+            reason: 'a prefix concentrates the load on the absent phone');
+      }
+
+      // Empty prefix is the desk default: address everyone, one member away.
+      final broad = FieldPlanPresets.storeCarryForward(role: 2);
+      for (final s in broad.steps.where((s) => s.label.startsWith('dark'))) {
+        expect(s.sendTo, 'all');
+      }
+    });
+
+    test('the high arm is the field-day setting exactly', () {
+      // mesh-scale-30m-2 ran saturate + ONE lane at 132 B; the desk arm has to
+      // match it or the two results are not comparable.
+      final sender = FieldPlanPresets.storeCarryForward(role: 2);
+      final high =
+          sender.steps.firstWhere((s) => s.label == 'dark high');
+      expect(high.saturate, isTrue);
+      expect(high.sendLanes, 1);
+      expect(high.sendBytes, defaultSendBytes);
+
+      final low = sender.steps.firstWhere((s) => s.label == 'dark low');
+      final medium = sender.steps.firstWhere((s) => s.label == 'dark medium');
+      expect(low.saturate, isFalse);
+      expect(medium.saturate, isFalse);
+      expect(low.sendCount, lessThan(medium.sendCount),
+          reason: 'the arms must actually differ in offered load');
+    });
+
+    test('nobody sends during the return window', () {
+      // Otherwise a delivery there could have come off the wire instead of
+      // out of a buffer, and the measurement means nothing.
+      for (final role in [1, 2, 3]) {
+        final plan = FieldPlanPresets.storeCarryForward(role: role);
+        for (final s in plan.steps.where((s) => s.label.startsWith('return'))) {
+          expect(s.sendCount, 0);
+          expect(s.saturate, isFalse);
+          expect(s.bleOn, isTrue, reason: 'the traveller must come back');
+        }
+      }
+    });
+
+    test('each arm clears the buffer at warm, and nowhere else', () {
+      // Carrying the backlog across dark->return IS the experiment, so the
+      // plan-level flag must stay off; but an arm that inherits the previous
+      // arm's undelivered packets scores them as its own deliveries. The only
+      // safe boundary is the arm's first step.
+      final plan = FieldPlanPresets.storeCarryForward(role: 2);
+      expect(plan.resetDtnBuffer, isFalse,
+          reason: 'plan-level would fire on every step, wiping the backlog');
+      for (final s in plan.steps) {
+        expect(s.resetDtnBuffer, s.label.startsWith('warm') ? isTrue : isNull,
+            reason: 'only warm clears: ${s.label}');
+      }
+      // Sessions and links are deliberately NOT reset — the arm starts warm.
+      expect(plan.resetSessions, isFalse);
+      expect(plan.resetLinks, isFalse);
+      expect(FieldPlan.fromJson(plan.toJson()), plan,
+          reason: 'the override has to survive the JSON the phones load');
+    });
+
+    test('the relay cap is ON unless a plan explicitly lifts it', () {
+      // The cap is a charter requirement, so the default must never drift to
+      // off; lifting it is an arm you opt into, and it has to survive the
+      // JSON the phones actually load or the run silently keeps the cap.
+      expect(FieldPlanPresets.storeCarryForward(role: 2).relayBudgetDisabled,
+          isFalse,
+          reason: 'the builder default stays capped; lifting is per-plan');
+      // The shipped nocap arm runs UNCAPPED, deliberately; its twin does not.
+      expect(
+          FieldPlanPresets
+              .presets['SCF nocap — sender (1 rep, ~17 min)']!
+              .relayBudgetDisabled,
+          isTrue);
+      expect(
+          FieldPlanPresets
+              .presets['SCF cap — sender (1 rep, ~17 min)']!
+              .relayBudgetDisabled,
+          isFalse);
+      final lifted = FieldPlanPresets.storeCarryForward(
+          role: 2, relayBudgetDisabled: true);
+      expect(lifted.relayBudgetDisabled, isTrue);
+      expect(lifted.toJson()['relayBudgetDisabled'], isTrue);
+      expect(FieldPlan.fromJson(lifted.toJson()).relayBudgetDisabled, isTrue);
+      expect(FieldPlan.fromJson(lifted.toJson()), lifted);
+    });
+
+    test('anchored to a 5-minute grid, with the runner working the radio', () {
+      // The dark window has to open on every phone at the same instant, and
+      // nobody is standing at the desk to toggle six radios at that instant.
+      // Those are separate needs: manualJoin gives the shared anchor,
+      // scriptedRadio keeps the toggling with the runner.
+      final plan = FieldPlanPresets.storeCarryForward(role: 1);
+      expect(plan.manualJoin, isTrue);
+      expect(plan.alignSec, 300);
+      expect(plan.scriptedRadio, isTrue,
+          reason: 'hands-free is the point of a desk run');
+      expect(plan.toJson()['scriptedRadio'], isTrue,
+          reason: 'it has to survive the JSON the phones actually load');
+      expect(FieldPlan.fromJson(plan.toJson()).scriptedRadio, isTrue);
+    });
+
+    test('the dropdown entries run 10 reps of every arm, windows unchanged', () {
+      // The arms must differ only in offered load, so each keeps the same
+      // wall-clock exposure; and one rep per arm is an anecdote, not a
+      // distribution.
+      final plan =
+          FieldPlanPresets.presets['SCF desk — sender (everyone else)']!;
+      expect(plan.steps, hasLength(3 * 10 * 3));
+      for (final arm in ['low', 'medium', 'high']) {
+        expect(plan.steps.where((s) => s.label == 'dark $arm t1'), hasLength(1));
+        expect(plan.steps.where((s) => s.label == 'dark $arm t10'), hasLength(1));
+      }
+      final darks = plan.steps.where((s) => s.label.startsWith('dark'));
+      expect(darks.map((s) => s.dwellSec).toSet(), {120},
+          reason: 'every arm gets the same window');
+      expect(plan.steps.where((s) => s.label.startsWith('warm'))
+          .map((s) => s.dwellSec).toSet(), {60});
+    });
+
+    test('the A/B pair differs ONLY in the relay cap', () {
+      // The whole point of a pair is that one variable moves. If anything
+      // else differs the two traces are not comparable and the run is wasted.
+      final capped = FieldPlanPresets.presets['SCF cap — sender (1 rep, ~17 min)']!;
+      final nocap = FieldPlanPresets.presets['SCF nocap — sender (1 rep, ~17 min)']!;
+      expect(capped.relayBudgetDisabled, isFalse);
+      expect(nocap.relayBudgetDisabled, isTrue);
+      expect(capped.expId, isNot(nocap.expId),
+          reason: 'separate ids or the two runs merge into one file');
+      expect(capped.steps.map((s) => s.label).toList(),
+          nocap.steps.map((s) => s.label).toList());
+      expect(capped.steps.map((s) => s.dwellSec).toList(),
+          nocap.steps.map((s) => s.dwellSec).toList());
+      expect(capped.steps.map((s) => s.saturate).toList(),
+          nocap.steps.map((s) => s.saturate).toList());
+      expect(capped.alignSec, nocap.alignSec);
+      expect(capped.scriptedRadio, nocap.scriptedRadio);
+      // Exactly one traveller preset per arm, and it is the one that goes dark.
+      for (final arm in ['cap', 'nocap']) {
+        final t = FieldPlanPresets.presets['SCF $arm — TRAVELLER (1 rep, ~17 min)']!;
+        expect(t.steps.firstWhere((s) => s.label.startsWith('dark')).bleOn,
+            isFalse);
+      }
+    });
+
+    test('both dropdown entries exist and differ in who goes dark', () {
+      final measured =
+          FieldPlanPresets.presets.keys.where((k) => k.startsWith('SCF desk'));
+      final checks = FieldPlanPresets.presets.keys
+          .where((k) => k.startsWith('SCF cap') || k.startsWith('SCF nocap'));
+      expect(measured, hasLength(2));
+      expect(checks, hasLength(4),
+          reason: 'the A/B pair ships beside the measured run: a traveller '
+              'and a sender for each arm');
+      final traveller =
+          FieldPlanPresets.presets['SCF desk — TRAVELLER (this phone goes dark)']!;
+      final sender =
+          FieldPlanPresets.presets['SCF desk — sender (everyone else)']!;
+      expect(traveller.steps.firstWhere((s) => s.label == 'dark low t1').bleOn,
+          isFalse);
+      expect(sender.steps.firstWhere((s) => s.label == 'dark low t1').bleOn,
+          isTrue);
+    });
+
+    test('all three arms are present, warm-dark-return each', () {
+      final plan = FieldPlanPresets.storeCarryForward(role: 2);
+      expect(plan.steps.map((s) => s.label).toList(), [
+        'warm low', 'dark low', 'return low',
+        'warm medium', 'dark medium', 'return medium',
+        'warm high', 'dark high', 'return high',
+      ]);
+      // Carrying the backlog across the dark step IS the experiment.
+      expect(plan.resetDtnBuffer, isFalse);
+    });
+  });
+
+  group('loadSweep', () {
+    test('the send rate is per destination and does not move with n', () {
+      // Each scheduled send fans out to every peer, so this count is the rate
+      // TO EACH destination: 1/s with six peers is six messages a second on
+      // the air, 1/s with one peer is one. What the sweep holds fixed is the
+      // rate itself; the fleet total rising with n is the measurement, not a
+      // confound to divide away. The old form divided by (n-1) — the wrong
+      // quantity, and computed from a target count the plan only assumed.
+      for (final rate in [1, 5, 10, 20]) {
+        for (final n in [2, 4, 7]) {
+          final plan = FieldPlanPresets.loadSweep(
+              role: 1, nRange: [n], rates: [rate], repeat: 1, dwellSec: 60);
+          final step = plan.steps.single;
+          expect(step.sendCount / step.dwellSec, closeTo(rate.toDouble(), 1e-9),
+              reason: 'n=\$n sent \${step.sendCount / step.dwellSec}/s to '
+                  'each peer, wanted \$rate');
+        }
+      }
+    });
+
+    test('rate 0 means saturate, and only participants send', () {
+      final plan = FieldPlanPresets.loadSweep(
+          role: 5, nRange: [2, 7], rates: [0], repeat: 1, dwellSec: 30);
+      final small = plan.steps.firstWhere((s) => s.label.startsWith('n=2'));
+      final big = plan.steps.firstWhere((s) => s.label.startsWith('n=7'));
+      // #5 is not in an n=2 mesh: radio down, sends nothing.
+      expect(small.bleOn, isFalse);
+      expect(small.saturate, isFalse);
+      expect(small.sendCount, 0);
+      // In an n=7 mesh it participates and saturates.
+      expect(big.bleOn, isTrue);
+      expect(big.saturate, isTrue);
+    });
+
+    test('each cell starts from an empty buffer, links and sessions warm', () {
+      final plan = FieldPlanPresets.loadSweep(
+          role: 1, nRange: [3], rates: [1, 5], repeat: 3, dwellSec: 30);
+      expect(plan.steps, hasLength(6));
+      for (final s in plan.steps) {
+        expect(s.resetDtnBuffer, s.label.endsWith('t1') ? isTrue : isFalse,
+            reason: 'only the first rep of a cell clears: \${s.label}');
+      }
+      expect(plan.resetSessions, isFalse);
+      expect(plan.resetLinks, isFalse);
+    });
+
+    test('the shipped sweep is 300 cells across seven device orders', () {
+      final entries = FieldPlanPresets.presets.keys
+          .where((k) => k.startsWith('Load sweep'));
+      expect(entries, hasLength(7));
+      final plan = FieldPlanPresets.presets[entries.first]!;
+      expect(plan.steps, hasLength(6 * 5 * 10));
+      expect(plan.steps.map((s) => s.dwellSec).toSet(), {30});
+    });
+  });
+
   group('FieldPlanPresets', () {
     test('home soak: one long rosterless dwell with sends', () {
       final p = FieldPlanPresets.homeSoak(dwellMin: 40, sends: 40);

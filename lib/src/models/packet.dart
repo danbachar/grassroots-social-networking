@@ -41,14 +41,13 @@ enum PacketType {
 /// ```
 /// [0]      : Packet type (1 byte)
 /// [1]      : TTL (1 byte, decremented at each relay hop, dropped at 0)
-/// [2-5]    : Timestamp (4 bytes, seconds since epoch, big-endian)
-/// [6-37]   : Recipient public key (32 bytes, zeros for broadcast)
-/// [38-53]  : Packet ID (16 bytes, UUID — dedup / loop prevention)
-/// [54-57]  : Payload length (4 bytes, big-endian)
-/// [58-N]   : Payload (variable length; Noise-sealed for session types)
+/// [2-33]   : Recipient public key (32 bytes, zeros for broadcast)
+/// [34-49]  : Packet ID (16 bytes, UUID — dedup / loop prevention)
+/// [50-53]  : Payload length (4 bytes, big-endian)
+/// [54-N]   : Payload (variable length; Noise-sealed for session types)
 /// ```
 ///
-/// Total header size: 58 bytes. The 4-byte payload length is the on-wire
+/// Total header size: 54 bytes. The 4-byte payload length is the on-wire
 /// framer: stream transports (UDP/UDX) accumulate bytes until
 /// `headerSize + payloadLength` are available before treating a buffer as
 /// one packet.
@@ -59,12 +58,13 @@ enum PacketType {
 const int rawPacketType = 0x7F;
 
 class GrassrootsPacket {
-  static const int headerSize = 58;
-  static const int payloadLengthOffset = 54; // byte index of length field
+  static const int headerSize = 54;
+  static const int packetIdOffset = 34; // byte index of the 16-byte packet id
+  static const int payloadLengthOffset = 50; // byte index of length field
 
   /// Soft target for fragmented payloads — chosen to keep a single
   /// encrypted packet under ~500 byte MTU on BLE.
-  static const int maxPayloadSize = 442; // 500 - 58
+  static const int maxPayloadSize = 446; // 500 - 54
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();
@@ -78,9 +78,6 @@ class GrassrootsPacket {
   /// Time-to-live: decremented at each hop, dropped when 0
   int ttl;
 
-  /// Creation timestamp (Unix seconds)
-  final int timestamp;
-
   /// Recipient's public key (null/zeros for broadcast)
   final Uint8List? recipientPubkey;
 
@@ -92,11 +89,9 @@ class GrassrootsPacket {
     String? packetId,
     required this.type,
     this.ttl = defaultTtl,
-    int? timestamp,
     this.recipientPubkey,
     required this.payload,
-  })  : packetId = packetId ?? _uuid.v4(),
-        timestamp = timestamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 {
+  }) : packetId = packetId ?? _uuid.v4() {
     if (recipientPubkey != null && recipientPubkey!.length != 32) {
       throw ArgumentError('Recipient public key must be 32 bytes');
     }
@@ -115,7 +110,6 @@ class GrassrootsPacket {
       packetId: packetId,
       type: type,
       ttl: ttl - 1,
-      timestamp: timestamp,
       recipientPubkey: recipientPubkey,
       payload: payload,
     );
@@ -125,7 +119,6 @@ class GrassrootsPacket {
     String? packetId,
     PacketType? type,
     int? ttl,
-    int? timestamp,
     Uint8List? recipientPubkey,
     Uint8List? payload,
   }) {
@@ -133,7 +126,6 @@ class GrassrootsPacket {
       packetId: packetId ?? this.packetId,
       type: type ?? this.type,
       ttl: ttl ?? this.ttl,
-      timestamp: timestamp ?? this.timestamp,
       recipientPubkey: recipientPubkey ?? this.recipientPubkey,
       payload: payload ?? this.payload,
     );
@@ -149,10 +141,6 @@ class GrassrootsPacket {
 
     // TTL (1 byte)
     buffer.setUint8(offset++, ttl);
-
-    // Timestamp (4 bytes, big-endian)
-    buffer.setUint32(offset, timestamp, Endian.big);
-    offset += 4;
 
     final bytes = buffer.buffer.asUint8List();
 
@@ -194,10 +182,6 @@ class GrassrootsPacket {
     // TTL
     final ttl = buffer.getUint8(offset++);
 
-    // Timestamp
-    final timestamp = buffer.getUint32(offset, Endian.big);
-    offset += 4;
-
     // Recipient pubkey
     final recipientBytes = data.sublist(offset, offset + 32);
     final recipientPubkey = recipientBytes.every((b) => b == 0)
@@ -226,7 +210,6 @@ class GrassrootsPacket {
       packetId: packetId,
       type: type,
       ttl: ttl,
-      timestamp: timestamp,
       recipientPubkey: recipientPubkey,
       payload: payload,
     );

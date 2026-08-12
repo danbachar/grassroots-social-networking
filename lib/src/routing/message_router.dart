@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:redux/redux.dart';
 import '../mesh/bloom_filter.dart';
+import '../mesh/delivered_messages.dart';
 import '../mesh/dtn_store.dart';
 import '../mesh/sync_codec.dart';
 import '../trace/experiment_recorder.dart';
@@ -57,7 +58,7 @@ class MessageRouter {
   /// sharing one filter would let the relay-dedup insert of `packetId` poison
   /// the delivery check and the message would be dropped as a "duplicate" on
   /// its very first receipt (ACKed but never shown).
-  final BloomFilter _deliveredMessages = BloomFilter();
+  final DeliveredMessages _deliveredMessages = DeliveredMessages();
 
   /// Store-carry-forward cache: packets held for recipients not currently in
   /// range. Conveyed ONLY through the sync exchange — a peer offers the ids it
@@ -68,9 +69,32 @@ class MessageRouter {
   /// Per-neighbor relay budget (managed-flooding abuse cap). A single inbound
   /// neighbor may have at most [_maxRelaysPerWindow] packets relayed on its
   /// behalf per [_relayWindow]; excess is dropped.
+  ///
+  /// Keyed by the neighbour's PEER IDENTITY (pubkey hex) where the inbound path
+  /// is authenticated, falling back to the raw path id only while it is not.
+  /// Keying by path id alone leaked budget two ways: a converged pair holds two
+  /// GATT legs, so a neighbour got one full budget per leg, and the OS rotates
+  /// the radio MAC roughly every 30 s, which minted a fresh key — and a fresh
+  /// 512-packet allowance — several times per window. The cap is meant to bound
+  /// a *neighbour*, and a neighbour is an identity.
   static const Duration _relayWindow = Duration(seconds: 10);
   static const int _maxRelaysPerWindow = 512;
   final Map<String, _RelayBudget> _relayBudgets = {};
+
+  /// DEBUG/TESTBED ONLY. Lift the per-neighbour relay cap for a measurement.
+  ///
+  /// The cap is a charter requirement (CLAUDE.md: "per-neighbor relay rate
+  /// are all capped — an unbounded flood/cache is an abuse and battery
+  /// sink"), so this defaults to false and production never touches it. It
+  /// exists because the cap became load-bearing in a measured run — `relay /
+  /// rateLimited` fired ~3,400 times across seven of eight phones on
+  /// scf-check-4 — and the only way to know what it cost is to run the same
+  /// plan with it lifted and diff the delivery.
+  ///
+  /// Lifting it does NOT make flooding unbounded: TTL still bounds hop count
+  /// and the packetId bloom still relays each packet at most once. It removes
+  /// only the per-neighbour rate ceiling.
+  bool relayBudgetDisabled = false;
 
   /// Called when a message is received. [transport] is the transport the packet
   /// actually arrived on — authoritative, taken from the receive path rather
@@ -307,6 +331,20 @@ class MessageRouter {
 
     final forUs = _isForUs(packet);
 
+    // Two thresholds, and they are tested against different values because
+    // they are different acts. DELIVERING is not a hop: it is judged on the
+    // TTL as it arrived, which need only be >= 0, so a packet that reaches
+    // the node it is addressed to with nothing left is still delivered.
+    // FORWARDING is a hop: it subtracts one first and needs the result above
+    // zero, since anything else would put a dead packet on the air.
+    if (packet.ttl < 0) {
+      _traceDrop('rx', 'ttlExhausted', {
+        'packetId': packet.packetId,
+        'forUs': forUs,
+      });
+      return;
+    }
+
     // The BloomFilter is the "seen packetId" set: it both prevents relay loops
     // (relay each packet at most once) and gates re-processing.
     final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
@@ -331,7 +369,20 @@ class MessageRouter {
       // toward its recipient, unverified and without decrypting. Only the first
       // sighting is relayed; TTL bounds the hop count; a per-neighbor budget
       // caps flooding abuse.
-      if (firstSeen && packet.ttl <= 1) {
+      // Consume EXACTLY ONE budget unit per relayed packet. _allowRelayFrom
+      // both tests and increments, so it must be called once and the result
+      // reused: evaluating it in two arms of this chain charged every relayed
+      // packet twice and silently halved the effective cap to 256.
+      // A node refuses a relay whose count has ALREADY reached 0; anything
+      // above that is accepted, decremented, and forwarded once. So a packet
+      // with one hop left is still passed on — it goes out at 0, which is
+      // useful precisely because the destination is exempt from this check:
+      // that last broadcast can still be accepted by a neighbour who is the
+      // recipient. It simply cannot be relayed again after that.
+      final relayAllowed =
+          firstSeen && packet.ttl > 0 && _allowRelayFrom(bleDeviceId);
+
+      if (firstSeen && packet.ttl <= 0) {
         // The flood dies here: hop budget exhausted on a first sighting.
         // Previously fully silent — the one place a multi-hop delivery
         // failure leaves evidence on the node that killed it.
@@ -339,16 +390,21 @@ class MessageRouter {
           'packetId': packet.packetId,
           'fromPeer': _peerHexForBleDevice(bleDeviceId),
         });
-      } else if (firstSeen && !_allowRelayFrom(bleDeviceId)) {
+      } else if (firstSeen && !relayAllowed) {
         // Refused by the per-neighbour budget: not relayed AND not carried
         // (carry lives inside the relay branch, deliberately).
         _traceDrop('relay', 'rateLimited', {
           'packetId': packet.packetId,
           'fromPeer': _peerHexForBleDevice(bleDeviceId),
         });
-      } else if (firstSeen && packet.ttl > 1 && _allowRelayFrom(bleDeviceId)) {
+      } else if (relayAllowed) {
+        // ONE decrement per arrival. The hopped copy is what we forward AND
+        // what we hold: storing the packet as received would make the buffered
+        // copy a hop richer than the forwarded one, and it would then pay for
+        // this same arrival a second time when conveyed.
+        final hopped = packet.decrementTtl();
         onRelay?.call(
-          packet.decrementTtl(),
+          hopped,
           excludeBlePeerId:
               transport == PeerTransport.bleDirect ? bleDeviceId : null,
         );
@@ -358,7 +414,7 @@ class MessageRouter {
         final recipientHex = _recipientHex(packet);
         final carried = recipientHex != null && !_recipientReachable(packet);
         if (carried) {
-          _dtnStore.store(recipientHex, packet);
+          _dtnStore.store(recipientHex, hopped);
         }
         if (trace?.active ?? false) {
           // The relay's own view: this node forwarded someone else's sealed
@@ -830,11 +886,19 @@ class MessageRouter {
 
   /// Per-neighbor flooding cap. Returns false when the inbound neighbor has had
   /// too many packets relayed on its behalf this window.
+  ///
+  /// SIDE-EFFECTING: a call that returns true consumes one unit of the
+  /// neighbour's budget. Call it once per relay decision and reuse the result —
+  /// never twice for the same packet.
   bool _allowRelayFrom(String? inboundPeerId) {
+    if (relayBudgetDisabled) return true; // DEBUG/TESTBED: cap lifted
     if (inboundPeerId == null) return true; // unattributable (e.g. UDP)
+    // Charge the identity, not the path: both legs of a converged pair and
+    // every MAC rotation of the same neighbour share one budget.
+    final budgetKey = _peerHexForBleDevice(inboundPeerId) ?? inboundPeerId;
     final now = DateTime.now();
     final budget =
-        _relayBudgets.putIfAbsent(inboundPeerId, () => _RelayBudget(now));
+        _relayBudgets.putIfAbsent(budgetKey, () => _RelayBudget(now));
     if (now.difference(budget.windowStart) > _relayWindow) {
       budget.windowStart = now;
       budget.count = 0;
@@ -970,14 +1034,136 @@ class MessageRouter {
   // sealed end-to-end and no buffer entry is ever *transferred*, only
   // replicated.
 
-  /// Build the sync offer packets advertising packetIds currently in the DTN
-  /// store (chunked to fit single BLE writes). Empty when carrying nothing —
-  /// the common case, costing zero packets.
+  /// Ids a peer has already told us it does not want, keyed by peer pubkey
+  /// hex. Insertion-ordered, so the cap evicts the oldest decline.
   ///
-  List<Uint8List> buildSyncOffers() {
+  /// Without this, offers are pure repetition: a carrier holding N packets
+  /// re-offers all N on every announce cycle to a neighbour that answered
+  /// "I have them all" the first time, and the ceil(N/8) sealed offer packets
+  /// are spent to learn nothing. The peer's seen-set only grows, so a decline
+  /// stays true for the life of the session — [clearSyncDeclines] drops it
+  /// when a NEW session with that peer says its state may have reset.
+  final Map<String, Set<String>> _declinedByPeer = {};
+
+  /// The offer round currently open with each peer. The diff
+  /// `offered − requested` is the decline, and it is taken when the NEXT round
+  /// opens rather than on the request itself: an offer of more than
+  /// [maxSyncIdsPerPacket] ids is several packets, each answered by its own
+  /// request, so no single request is the whole answer.
+  final Map<String, _SyncRound> _openRound = {};
+
+  /// Per-peer decline cap and peer-table cap. Declines are pruned to the
+  /// buffer's live ids on every build, so a per-peer set cannot outgrow the
+  /// DTN store; these bound the pathological cases (a peer table that grows
+  /// with every neighbour ever met). Both tables are capped: an open round
+  /// holds a Set the size of the buffer, so a stranger offered to once and
+  /// never met again would otherwise pin it for the life of the process.
+  static const int _maxDeclinedPerPeer = 2048;
+  static const int _maxDeclinePeers = 64;
+
+  /// Evict the oldest entry until [table] is within [_maxDeclinePeers].
+  static void _capPeerTable(Map<String, Object?> table) {
+    while (table.length > _maxDeclinePeers) {
+      table.remove(table.keys.first);
+    }
+  }
+
+  /// Build the sync offer packets advertising packetIds currently in the DTN
+  /// store (chunked to fit single BLE writes), minus what [peerPubkey] has
+  /// already declined. Empty when carrying nothing — or when the peer has
+  /// declined everything we hold, which is the steady state of a converged
+  /// pair and costs zero packets.
+  List<Uint8List> buildSyncOffers(Uint8List peerPubkey) {
+    final peerHex = _pubkeyToHex(peerPubkey);
+    _settleSyncRound(peerHex);
     final ids = _dtnStore.carriedPacketIds();
+    // Prune first, and unconditionally: an id that left the buffer (ACKed,
+    // expired, evicted) can never be offered again, so keeping its decline
+    // only grows the set. This is what keeps the declines bounded by the
+    // buffer instead of by the number of packets ever held.
+    final declined = _declinedByPeer[peerHex];
+    if (declined != null) {
+      declined.retainAll(ids.toSet());
+      if (declined.isEmpty) _declinedByPeer.remove(peerHex);
+    }
     if (ids.isEmpty) return const [];
-    return buildSyncPayloads(ids);
+    final offerable = declined == null || declined.isEmpty
+        ? ids
+        : ids.where((id) => !declined.contains(id)).toList();
+    if (offerable.isEmpty) return const [];
+    return buildSyncPayloads(offerable);
+  }
+
+  /// One offer chunk reached the peer's link. The round is built from what was
+  /// actually WRITTEN, never from what [buildSyncOffers] returned: a chunk
+  /// that failed to seal or to send was never seen by the peer, and counting
+  /// it would let its ids be declined for a round the peer never answered.
+  void noteSyncOfferSent(Uint8List peerPubkey, Uint8List payload) {
+    final List<String> ids;
+    try {
+      ids = decodeSyncIds(payload);
+    } on FormatException {
+      return; // we built it; if it will not decode, do not open a round on it
+    }
+    final round = _openRound.putIfAbsent(
+        _pubkeyToHex(peerPubkey), () => _SyncRound());
+    round.offered.addAll(ids);
+    round.chunksSent++;
+    _capPeerTable(_openRound);
+  }
+
+  /// How many ids [peerPubkey] has declined and we still hold. Diagnostic:
+  /// a set that keeps growing while the buffer does not is a pruning bug.
+  int declinedCountFor(Uint8List peerPubkey) =>
+      _declinedByPeer[_pubkeyToHex(peerPubkey)]?.length ?? 0;
+
+  /// A new Noise session with [peerPubkey]: forget what it declined. The
+  /// declines were statements about a seen-set we can no longer vouch for —
+  /// a peer that restarted lost its bloom filter along with its session, and
+  /// silently withholding packets from it would strand them forever.
+  void clearSyncDeclines(Uint8List peerPubkey) {
+    final peerHex = _pubkeyToHex(peerPubkey);
+    _declinedByPeer.remove(peerHex);
+    _openRound.remove(peerHex);
+  }
+
+  /// Close the previous offer round: everything offered and never asked for is
+  /// declined — but ONLY if the peer answered every chunk we put on the link.
+  ///
+  /// Silence is not a decline. An offer rides an unacknowledged notification,
+  /// and the peer can walk out of range, lose a chunk on the air, or be gone
+  /// before its reply is written. Treating that silence as "it has them all"
+  /// removes those ids from every future offer to that peer, and since Noise
+  /// sessions survive link loss, [clearSyncDeclines] never runs to undo it —
+  /// the packets would sit in the buffer until age expiry with the sync
+  /// exchange, their only way out, permanently suppressed. So an incomplete
+  /// exchange declines NOTHING and the whole set is offered again next round.
+  /// The cost of being wrong that way is one repeated offer; the cost of the
+  /// other way is a lost message.
+  ///
+  /// A REQUESTED id is not declined either, even though it was almost
+  /// certainly conveyed — the relay budget can cut a conveyance short
+  /// mid-request. Re-offering a packet the peer already has costs one id.
+  void _settleSyncRound(String peerHex) {
+    final round = _openRound.remove(peerHex);
+    if (round == null) return;
+    if (round.repliesSeen < round.chunksSent) {
+      _traceDrop('sync', 'roundUnanswered', {
+        'peer': peerHex,
+        'chunks': round.chunksSent,
+        'replies': round.repliesSeen,
+        'ids': round.offered.length,
+      });
+      return;
+    }
+    final declined = _declinedByPeer.putIfAbsent(peerHex, () => <String>{});
+    for (final id in round.offered) {
+      if (!round.requested.contains(id)) declined.add(id);
+    }
+    while (declined.length > _maxDeclinedPerPeer) {
+      declined.remove(declined.first);
+    }
+    _capPeerTable(_declinedByPeer);
   }
 
   /// A neighbor offered the packetIds it carries: request the ones our
@@ -994,11 +1180,20 @@ class MessageRouter {
     }
     final wanted =
         offered.where((id) => !_seenPackets.mightContain(id)).toList();
-    if (wanted.isEmpty) return;
     debugPrint(
         '[sync] Requesting ${wanted.length}/${offered.length} offered '
         'packet(s) from ${link.bleDeviceId}');
-    for (final payload in buildSyncPayloads(wanted)) {
+    // An EMPTY request is still sent, and the answer is MANDATORY so that it
+    // cannot be confused with its absence. If a peer wanting nothing simply
+    // stayed quiet, the offerer could not tell that from "never heard you" or
+    // "gone", and would re-offer the same ids on every announce cycle for as
+    // long as the pair was up. Because the reply is obligatory, silence now
+    // carries information instead: it means the exchange did not complete,
+    // which is what _settleSyncRound keys on when it declines nothing.
+    final payloads = wanted.isEmpty
+        ? [encodeSyncIds(const [])]
+        : buildSyncPayloads(wanted);
+    for (final payload in payloads) {
       onSyncFrame?.call(ContentType.syncRequest, payload, link);
     }
   }
@@ -1015,6 +1210,17 @@ class MessageRouter {
       debugPrint('[sync] Malformed request from ${link.bleDeviceId}: $e');
       _traceDrop('sync', 'malformedRequest', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
+    }
+    // Feeds the decline diff taken when the next round opens, and counts the
+    // reply: one request frame answers one offer chunk (each chunk is handled
+    // on its own and always answered, empty if the peer wants nothing), so
+    // replies < chunks means the exchange did not complete. Only while a round
+    // of ours is open — a request that answers no offer belongs to no diff.
+    final peerHex = _pubkeyToHex(link.peerPubkey);
+    final round = _openRound[peerHex];
+    if (round != null) {
+      round.requested.addAll(requested);
+      round.repliesSeen++;
     }
     var conveyed = 0;
     for (var i = 0; i < requested.length; i++) {
@@ -1035,6 +1241,23 @@ class MessageRouter {
         });
         break;
       }
+      // A conveyance IS a hop: the packet moves from this node's radio to
+      // another's exactly as a flood does, so it pays TTL on the same terms.
+      // Sending the stored packet untouched left the sync path outside the hop
+      // bound entirely — a packet could be carried between buffers for as long
+      // as age allowed, and every carried delivery arrived reporting zero hops.
+      //
+      // The refusal is for TRANSIT only. Carrying a spent packet one buffer
+      // further is pointless — it would arrive with nothing left and the next
+      // node would refuse it — so a packet with no budget stops here. But when
+      // the node asking IS the recipient, this conveyance is the delivery, and
+      // a message that has reached its destination is not thrown away over a
+      // hop count. It still pays the hop and simply arrives at 0.
+      // Conveyed AS HELD. The buffered packet already paid its decrement when
+      // it arrived here, and the node receiving it will pay the next one — so
+      // decrementing again would charge this hop twice. Nothing unforwardable
+      // is in the buffer to begin with: a packet that could not be forwarded
+      // on arrival was dropped rather than stored.
       onSyncSend?.call(stored, link);
       conveyed++;
       if (trace?.active ?? false) {
@@ -1062,6 +1285,8 @@ class MessageRouter {
     _deliveredMessages.clear();
     _dtnStore.clear();
     _relayBudgets.clear();
+    _declinedByPeer.clear();
+    _openRound.clear();
   }
 }
 
@@ -1070,4 +1295,14 @@ class _RelayBudget {
   DateTime windowStart;
   int count = 0;
   _RelayBudget(this.windowStart);
+}
+
+/// One open sync offer round with one peer: the ids we put on the link, the
+/// ids it asked for, and the chunk/reply counts that say whether the exchange
+/// completed. [chunksSent] counts only chunks actually written.
+class _SyncRound {
+  final Set<String> offered = {};
+  final Set<String> requested = {};
+  int chunksSent = 0;
+  int repliesSeen = 0;
 }

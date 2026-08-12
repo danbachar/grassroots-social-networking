@@ -158,6 +158,30 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS idx_pev_route ON packet_events(exp, packet_id, t);
             CREATE INDEX IF NOT EXISTS idx_pev_event ON packet_events(exp, event);
+            -- One row per PACKET, rolled up at build time. The same numbers
+            -- are a GROUP BY over packet_events, and that is how they were
+            -- read at first — 198 s per request on the collector's disk, past
+            -- the proxy's patience, so every list load 502'd. Aggregating a
+            -- million rows is a build-time job, not a per-request one.
+            CREATE TABLE IF NOT EXISTS packet_summary (
+                exp        TEXT    NOT NULL,
+                packet_id  TEXT    NOT NULL,
+                t0         INTEGER,
+                t1         INTEGER,
+                kind       TEXT,
+                origin     TEXT,
+                message_id TEXT,
+                recipient  TEXT,
+                nodes      INTEGER,
+                relays     INTEGER,
+                delivers   INTEGER,
+                acked      INTEGER,
+                conveys    INTEGER,
+                drops      INTEGER,
+                ttl_min    INTEGER,
+                PRIMARY KEY (exp, packet_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_psum ON packet_summary(exp, nodes DESC, t0);
             CREATE TABLE IF NOT EXISTS packet_index_meta (
                 exp      TEXT PRIMARY KEY,
                 built_at TEXT NOT NULL,
@@ -314,7 +338,6 @@ class Store:
         here may fetchall.
         """
         like = exp + "%"
-        rows: List[tuple] = []
 
         # Pass A — `message` records. These are the only ones that know a
         # packet's KIND (data vs ack) and its messageId; a relay's record knows
@@ -323,7 +346,36 @@ class Store:
         msg_to_packets: Dict[str, List[str]] = {}
         pending_recv: List[tuple] = []
         conn = sqlite3.connect(self._conn_path, timeout=60)
+        # Written on THIS connection, in batches, and never accumulated: a
+        # multi-million-row experiment produced ~1.5M sightings, and holding
+        # them as Python tuples to insert at the end was ~1 GB — which the
+        # collector does not have, so the process was OOM-killed mid-request
+        # and the caller saw a 502.
+        wconn = sqlite3.connect(self._conn_path, timeout=120)
+        wconn.execute("PRAGMA busy_timeout=120000")
+        pending: List[tuple] = []
+        total = 0
+
+        def emit(row: tuple) -> None:
+            nonlocal total
+            pending.append(row)
+            total += 1
+            if len(pending) >= 20000:
+                flush()
+
+        def flush() -> None:
+            if not pending:
+                return
+            wconn.executemany(
+                "INSERT INTO packet_events VALUES (" + ",".join("?" * 16) + ")",
+                pending)
+            wconn.commit()
+            pending.clear()
+
         try:
+            wconn.execute("DELETE FROM packet_events WHERE exp = ?", (exp,))
+            wconn.execute("DELETE FROM packet_summary WHERE exp = ?", (exp,))
+            wconn.commit()
             cur = conn.execute(
                 "SELECT device_id, t, body FROM records "
                 " WHERE upload_id LIKE ? AND type = 'message'", (like,))
@@ -343,28 +395,28 @@ class Store:
                         if mid:
                             msg_to_packets[str(mid)] = ids
                         for pid in ids:
-                            rows.append((exp, pid, t, device_id, "mint", None, None,
-                                         None, None, None, None, None, mid,
-                                         r.get("peer"), "data", None))
+                            emit((exp, pid, t, device_id, "mint", None, None,
+                                  None, None, None, None, None, mid,
+                                  r.get("peer"), "data", None))
                     elif d == "ackTx":
                         pid = r.get("packetId")
                         if pid:
-                            rows.append((exp, str(pid), t, device_id, "mint", None,
-                                         None, None, None, None, None, None, mid,
-                                         r.get("peer"), "ack", None))
+                            emit((exp, str(pid), t, device_id, "mint", None,
+                                  None, None, None, None, None, None, mid,
+                                  r.get("peer"), "ack", None))
                     elif d == "ackRx":
                         pid = r.get("packetId")
                         if pid:
-                            rows.append((exp, str(pid), t, device_id, "ackRx",
-                                         r.get("fromPeer"), None, None, None, None,
-                                         None, None, mid, None, "ack", None))
+                            emit((exp, str(pid), t, device_id, "ackRx",
+                                  r.get("fromPeer"), None, None, None, None,
+                                  None, None, mid, None, "ack", None))
                     elif d == "recv" and mid:
                         pending_recv.append((device_id, t, str(mid), r.get("fromPeer"),
                                              r.get("relayHops")))
             for device_id, t, mid, from_peer, hops in pending_recv:
                 for pid in msg_to_packets.get(mid, ()):
-                    rows.append((exp, pid, t, device_id, "deliver", from_peer, None,
-                                 None, None, hops, None, None, mid, None, "data", None))
+                    emit((exp, pid, t, device_id, "deliver", from_peer, None,
+                          None, None, hops, None, None, mid, None, "data", None))
 
             # Pass B — everything a node records about someone else's packet.
             cur = conn.execute(
@@ -387,75 +439,78 @@ class Store:
                     ev = r.get("event")
                     if rtype == "relay":
                         name = {"aired": "aired", "dup": "dup"}.get(ev, "relay")
-                        rows.append((exp, pid, t, device_id, name, r.get("fromPeer"),
-                                     None, r.get("ttlIn"), r.get("ttlOut"), r.get("hop"),
-                                     r.get("dwellMs"), 1 if r.get("carried") else 0,
-                                     None, None, None, None))
+                        emit((exp, pid, t, device_id, name, r.get("fromPeer"),
+                              None, r.get("ttlIn"), r.get("ttlOut"), r.get("hop"),
+                              r.get("dwellMs"), 1 if r.get("carried") else 0,
+                              None, None, None, None))
                     elif rtype == "custody":
-                        rows.append((exp, pid, t, device_id, ev or "custody", None,
-                                     r.get("toDevice"), None, None, None, None, None,
-                                     None, r.get("recipient"), None, r.get("reason")))
+                        emit((exp, pid, t, device_id, ev or "custody", None,
+                              r.get("toDevice"), None, None, None, None, None,
+                              None, r.get("recipient"), None, r.get("reason")))
                     elif rtype == "packetDup":
-                        rows.append((exp, pid, t, device_id, "packetDup", None, None,
-                                     None, None, None, None, None, None, None, None,
-                                     r.get("transport")))
+                        emit((exp, pid, t, device_id, "packetDup", None, None,
+                              None, None, None, None, None, None, None, None,
+                              r.get("transport")))
                     else:                                        # drop
-                        rows.append((exp, pid, t, device_id, "drop", r.get("fromPeer"),
-                                     None, None, None, None, None, None,
-                                     r.get("messageId"), None, None,
-                                     f"{r.get('where')}/{r.get('reason')}"))
-        finally:
-            conn.close()
-
-        with self._lock:
-            self._conn.execute("DELETE FROM packet_events WHERE exp = ?", (exp,))
-            self._conn.executemany(
-                "INSERT INTO packet_events VALUES (" + ",".join("?" * 16) + ")", rows)
-            packets = self._conn.execute(
-                "SELECT COUNT(DISTINCT packet_id) FROM packet_events WHERE exp = ?",
+                        emit((exp, pid, t, device_id, "drop", r.get("fromPeer"),
+                              None, None, None, None, None, None,
+                              r.get("messageId"), None, None,
+                              f"{r.get('where')}/{r.get('reason')}"))
+            flush()
+            # `nodes` counts DISTINCT devices, which is the honest measure of
+            # reach: a packet sighted twice on one node travelled no further
+            # than one sighted once.
+            wconn.execute(
+                """
+                INSERT INTO packet_summary
+                SELECT exp, packet_id, MIN(t), MAX(t), MAX(kind),
+                       MAX(CASE WHEN event='mint' THEN device_id END),
+                       MAX(CASE WHEN event='mint' THEN message_id END),
+                       MAX(CASE WHEN event='mint' THEN recipient END),
+                       COUNT(DISTINCT device_id),
+                       SUM(event='relay'), SUM(event='deliver'),
+                       SUM(event='ackRx'), SUM(event='convey'),
+                       SUM(event='drop'),
+                       MIN(CASE WHEN event='relay' THEN ttl_out END)
+                  FROM packet_events WHERE exp = ? GROUP BY packet_id
+                """, (exp,))
+            packets = wconn.execute(
+                "SELECT COUNT(*) FROM packet_summary WHERE exp = ?",
                 (exp,)).fetchone()[0]
-            self._conn.execute(
+            wconn.execute(
                 "INSERT INTO packet_index_meta (exp, built_at, events, packets) "
                 "VALUES (?,?,?,?) ON CONFLICT(exp) DO UPDATE SET "
                 "built_at=excluded.built_at, events=excluded.events, "
                 "packets=excluded.packets",
-                (exp, _utc_now_iso(), len(rows), packets))
-            self._conn.commit()
-        return {"exp": exp, "events": len(rows), "packets": packets,
+                (exp, _utc_now_iso(), total, packets))
+            wconn.commit()
+        except BaseException:
+            # A half-written index reads as a complete one and silently answers
+            # "this packet was never seen again". Leave nothing behind instead.
+            try:
+                wconn.execute("DELETE FROM packet_events WHERE exp = ?", (exp,))
+                wconn.execute("DELETE FROM packet_summary WHERE exp = ?", (exp,))
+                wconn.commit()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+            wconn.close()
+        return {"exp": exp, "events": total, "packets": packets,
                 "builtAt": _utc_now_iso()}
 
     def packets(self, exp: str, kind: Optional[str] = None,
                 outcome: Optional[str] = None, q: Optional[str] = None,
                 min_hops: int = 0, limit: int = 300) -> List[Dict[str, Any]]:
-        """One row per packet: who minted it, how far it got, how it ended.
-
-        `nodes` counts the DISTINCT devices that saw it, which is the honest
-        measure of reach — a packet re-sighted twice on one node travelled no
-        further than one that was sighted once.
-        """
-        sql = """
-            SELECT packet_id,
-                   MIN(t)                                              AS t0,
-                   MAX(t)                                              AS t1,
-                   MAX(kind)                                           AS kind,
-                   MAX(CASE WHEN event='mint'    THEN device_id END)   AS origin,
-                   MAX(CASE WHEN event='mint'    THEN message_id END)  AS message_id,
-                   MAX(CASE WHEN event='mint'    THEN recipient END)   AS recipient,
-                   COUNT(DISTINCT device_id)                           AS nodes,
-                   SUM(event='relay')                                  AS relays,
-                   SUM(event='deliver')                                AS delivers,
-                   SUM(event='ackRx')                                  AS acked,
-                   SUM(event='convey')                                 AS conveys,
-                   SUM(event='drop')                                   AS drops,
-                   MIN(CASE WHEN event='relay' THEN ttl_out END)       AS ttl_min
-              FROM packet_events
-             WHERE exp = ?
-        """
+        """One row per packet: who minted it, how far it got, how it ended."""
+        sql = ("SELECT packet_id, t0, t1, kind, origin, message_id, recipient, "
+               "       nodes, relays, delivers, acked, conveys, drops, ttl_min "
+               "  FROM packet_summary WHERE exp = ?")
         params: List[Any] = [exp]
         if q:
             sql += " AND (packet_id LIKE ? OR message_id LIKE ?)"
             params += [f"%{q}%", f"%{q}%"]
-        sql += " GROUP BY packet_id HAVING 1=1"
         if kind in ("data", "ack"):
             sql += " AND kind = ?"
             params.append(kind)

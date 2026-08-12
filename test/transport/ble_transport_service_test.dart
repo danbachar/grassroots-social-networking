@@ -77,9 +77,17 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
     calls.add('disconnect:${request.pathId}');
   }
 
+  /// Path ids whose writes are refused, as the plugin refuses them: a throw
+  /// raised while validating the path or when the stack will not take the
+  /// buffer — always BEFORE any byte reaches the controller.
+  final Set<String> refuse = {};
+
   @override
   Future<void> send(BleSendRequest request) async {
     calls.add('send:${request.pathId}:${request.value.length}');
+    if (refuse.contains(request.pathId)) {
+      throw StateError('refused write on ${request.pathId}');
+    }
   }
 
   @override
@@ -1307,5 +1315,152 @@ void main() {
           reason: 'With no stranded reverse leg the scan stays unfiltered so '
               'new peers keep being discovered.');
     });
+  });
+
+  group('BleTransportService — retry on the pair\'s other leg', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Sender'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      addTearDown(transport.dispose);
+    });
+
+    /// A converged pair: both GATT legs ready and both attributed to one
+    /// identity, which is the only state in which a fallback is possible.
+    Future<GrassrootsIdentity> convergedPair({
+      String centralPathId = 'central:PAIR',
+      String peripheralPathId = 'peripheral:PAIR',
+      int centralMtu = 247,
+      int peripheralMtu = 247,
+    }) async {
+      final peer = await _makeIdentity('PairPeer');
+      callbacks.pushPath(BlePath(
+        pathId: centralPathId,
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: centralMtu,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: peripheralPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: peripheralMtu,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: centralPathId,
+        blePeripheralDeviceId: peripheralPathId,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      return peer;
+    }
+
+    test("a refused write falls back to the pair's OTHER leg", () async {
+      await convergedPair();
+      // The flood prefers our peripheral leg, and the peripheral leg is the
+      // one with no queue behind it — so it is the one that refuses first.
+      hostApi.refuse.add('peripheral:PAIR');
+
+      final aired = await transport.broadcast(Uint8List(40));
+
+      expect(aired, 1,
+          reason: 'The neighbour was reached — on the other leg, but reached.');
+      expect(hostApi.calls, [
+        'send:peripheral:PAIR:40',
+        'send:central:PAIR:40',
+      ], reason: 'Refused on the preferred leg, then written on the other. '
+          'The order matters: the fallback is a consequence of the failure, '
+          'never a second copy sent alongside the first.');
+    });
+
+    test('a write that succeeds never touches the second leg', () async {
+      await convergedPair();
+      final aired = await transport.broadcast(Uint8List(40));
+      expect(aired, 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:40'],
+          reason: 'One leg per peer per flood: the same bytes on both legs is '
+              'double airtime for a copy the packetId bloom drops.');
+    });
+
+    test('both legs refusing reports the neighbour as not reached', () async {
+      await convergedPair();
+      hostApi.refuse.addAll({'peripheral:PAIR', 'central:PAIR'});
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Each leg is tried exactly once — no retry loop.');
+    });
+
+    test('sendToPeer falls back too (sync conveyance, directed sends)',
+        () async {
+      await convergedPair();
+      hostApi.refuse.add('central:PAIR');
+      expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
+      expect(hostApi.calls.last, 'send:peripheral:PAIR:40');
+    });
+
+    test('no fallback onto a leg that would truncate the packet', () async {
+      // The legs negotiate their MTUs separately, and on iOS the notify limit
+      // is a per-central property. A 200-byte packet fits the peripheral leg
+      // and not the central one; retrying there would put an unparseable
+      // write on the air and count it as a success.
+      await convergedPair(centralMtu: 23, peripheralMtu: 247);
+      hostApi.refuse.add('peripheral:PAIR');
+      expect(await transport.broadcast(Uint8List(200)), 0);
+      expect(hostApi.calls, ['send:peripheral:PAIR:200'],
+          reason: 'The undersized leg is not attempted at all.');
+    });
+
+    test('an unidentified path gets no fallback', () async {
+      // Two ready legs, no ANNOUNCE on either: they cannot be shown to belong
+      // to the same peer, and a "fallback" onto a stranger's leg would send
+      // this packet to someone the flood did not choose.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:UNKNOWN-A',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: 247,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:UNKNOWN-B',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      hostApi.refuse.addAll({'central:UNKNOWN-A', 'peripheral:UNKNOWN-B'});
+
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Both unidentified legs are flood targets in their own '
+              'right, but neither is the other one\'s fallback.');
+    });
+
   });
 }

@@ -772,6 +772,19 @@ class FieldPlanPresets {
             expId: 'scf-nocap-1', role: 1, relayBudgetDisabled: true),
         'SCF nocap — sender (1 rep, ~17 min)': storeCarryForward(
             expId: 'scf-nocap-1', role: 2, relayBudgetDisabled: true),
+        // Post-TTL build check on however many phones are to hand, under its
+        // own id so it can never merge into the measured A/B. Uncapped,
+        // because that is the arm the A/B settled on and the one whose
+        // `sync/staleOffer` storm (16,697 on one phone) the per-peer declines
+        // are meant to end. Three things to read off it: staleOffer collapses,
+        // carried deliveries report a non-zero hop count now that conveyance
+        // pays TTL, and `message re-delivery` is zero under age-only dedup.
+        // Delivery RATE is not comparable with scf-cap-1/scf-nocap-1 — fewer
+        // senders is a different mesh, not a better one.
+        'SCF re-arm check — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-rearm-1', role: 1, relayBudgetDisabled: true),
+        'SCF re-arm check — sender (1 rep, ~17 min)': storeCarryForward(
+            expId: 'scf-rearm-1', role: 2, relayBudgetDisabled: true),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

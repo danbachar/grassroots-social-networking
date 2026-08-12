@@ -203,6 +203,18 @@ class FieldStep {
   /// ignored. Delivery accounting comes from the wire ledger alone.
   final String? rawLeg;
 
+  /// DEBUG raw-throughput mode: how far the blob overshoots or undershoots the
+  /// ATT ceiling, in bytes. The blob is written at `MTU - 3 + rawSizeDelta`,
+  /// so 0 writes exactly at the ceiling, +1 one byte past it, -8 the margin
+  /// the fragment budget currently holds back.
+  ///
+  /// This is the arm variable of the ATT-ceiling probe: the receiver records
+  /// the length that actually ARRIVED, so a write that the stack truncates is
+  /// distinguishable from one it refuses outright, and both are
+  /// distinguishable from one that lands whole. Ignored unless [rawLeg] is
+  /// set.
+  final int rawSizeDelta;
+
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
   /// repeat trial at the same position — nothing to walk to). A step at a new
@@ -220,6 +232,7 @@ class FieldStep {
     this.sendLanes = 1,
     this.sendTo = 'all',
     this.rawLeg,
+    this.rawSizeDelta = 0,
     this.bleOn,
     this.resetSessions,
     this.resetDtnBuffer,
@@ -243,6 +256,7 @@ class FieldStep {
         if (sendLanes != 1) 'sendLanes': sendLanes,
         if (sendTo != 'all') 'sendTo': sendTo,
         if (rawLeg != null) 'rawLeg': rawLeg,
+        if (rawSizeDelta != 0) 'rawSizeDelta': rawSizeDelta,
         if (bleOn != null) 'bleOn': bleOn,
         if (resetSessions != null) 'resetSessions': resetSessions,
         if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
@@ -259,6 +273,7 @@ class FieldStep {
         sendLanes: json['sendLanes'] as int? ?? 1,
         sendTo: json['sendTo'] as String? ?? 'all',
         rawLeg: json['rawLeg'] as String?,
+        rawSizeDelta: json['rawSizeDelta'] as int? ?? 0,
         bleOn: json['bleOn'] as bool?,
         resetSessions: json['resetSessions'] as bool?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool?,
@@ -277,6 +292,7 @@ class FieldStep {
       other.sendLanes == sendLanes &&
       other.sendTo == sendTo &&
       other.rawLeg == rawLeg &&
+      other.rawSizeDelta == rawSizeDelta &&
       other.bleOn == bleOn &&
       other.resetSessions == resetSessions &&
       other.resetDtnBuffer == resetDtnBuffer;
@@ -284,8 +300,8 @@ class FieldStep {
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, sendLanes, sendTo, rawLeg, bleOn, resetSessions,
-          resetDtnBuffer);
+          saturate, sendLanes, sendTo, rawLeg, rawSizeDelta, bleOn,
+          resetSessions, resetDtnBuffer);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and

@@ -2477,8 +2477,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           bleUsableChanges: _grassroots?.bleUsableChanges,
           sendRaw: _grassroots == null
               ? null
-              : (peer, {required leg, required seq}) =>
-                  _grassroots!.sendRawBlob(peer, leg: leg, seq: seq),
+              : (peer, {required leg, required seq, sizeDelta = 0}) =>
+                  _grassroots!.sendRawBlob(peer,
+                      leg: leg, seq: seq, sizeDelta: sizeDelta),
           onSetBle: _grassroots == null
               ? null
               : (on) => _grassroots!.setBleActiveForTestbed(on),

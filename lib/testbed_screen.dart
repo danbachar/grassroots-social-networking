@@ -62,7 +62,7 @@ class TestbedScreen extends StatefulWidget {
   /// runner's bt-on/bt-off stamps come from this, never from a poll.
   final Stream<bool>? bleUsableChanges;
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
   final bool Function(Uint8List peer)? linkSettled;
 

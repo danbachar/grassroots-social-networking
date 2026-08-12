@@ -1835,9 +1835,14 @@ class GrassrootsNetwork {
   /// dropped before the peer's parser) to [peer] over [leg]. Returns the blob
   /// size or null when the leg is not available.
   Future<int?> sendRawBlob(Uint8List peer,
-          {required String leg, required int seq}) async =>
+          {required String leg,
+          required int seq,
+          int sizeDelta = 0}) async =>
       _bleService?.sendRawBlob(
-          peerHex: _pubkeyToHex(peer), leg: leg, seq: seq);
+          peerHex: _pubkeyToHex(peer),
+          leg: leg,
+          seq: seq,
+          sizeDelta: sizeDelta);
 
   /// Bytes on the air over BLE since the transport last came up, tx and rx
   /// together. Counted at the GATT send/receive choke points, so this only

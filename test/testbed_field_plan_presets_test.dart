@@ -488,6 +488,50 @@ void main() {
           reason: 'rawLeg must survive the JSON round-trip');
     });
 
+    test('rawLink: default sweep writes at the ATT ceiling and nowhere else',
+        () {
+      final p = FieldPlanPresets.rawLink(legs: const ['notify']);
+      expect(p.steps.single.rawSizeDelta, 0,
+          reason: 'the plain throughput run writes at MTU-3 exactly');
+      expect(p.steps.single.label, 'leg=notify',
+          reason: 'no delta tag when there is no sweep');
+    });
+
+    test('rawLink: a size sweep crosses legs and signs the label', () {
+      final p = FieldPlanPresets.rawLink(
+        legs: const ['notify', 'write'],
+        sizeDeltas: const [-8, 0, 1],
+      );
+      expect(p.steps.map((s) => s.rawSizeDelta), [-8, 0, 1, -8, 0, 1],
+          reason: 'every delta is run on every leg');
+      expect(p.steps.map((s) => s.label), [
+        'leg=notify d=-8',
+        'leg=notify',
+        'leg=notify d=+1',
+        'leg=write d=-8',
+        'leg=write',
+        'leg=write d=+1',
+      ]);
+      expect(FieldPlan.fromJson(p.toJson()), p,
+          reason: 'rawSizeDelta must survive the JSON round-trip — a dropped '
+              'arm variable makes a saved plan silently differ from the one '
+              'built in memory');
+    });
+
+    test('the ATT ceiling probe straddles the ceiling on the notify leg', () {
+      final p = FieldPlanPresets
+          .presets['Raw link: ATT ceiling probe (−8/−4/0/+1/+4 B)']!;
+      expect(p.expId, 'att-ceiling-1',
+          reason: 'its own id — this is not a throughput run');
+      expect(p.steps.map((s) => s.rawSizeDelta), [-8, -4, 0, 1, 4]);
+      expect(p.steps.every((s) => s.rawLeg == 'notify'), isTrue,
+          reason: 'notify is the leg floods actually use');
+      // -8 is where the fragment budget sits today and 0 is the ceiling it
+      // could move to; +1 is the first byte that should not survive.
+      expect(p.steps.map((s) => s.rawSizeDelta), contains(0));
+      expect(p.steps.map((s) => s.rawSizeDelta), contains(1));
+    });
+
     test('powerBaseline: complementary roles under identical labels', () {
       final p1 = FieldPlanPresets.powerBaseline(role: 1, reps: 2);
       final p2 = FieldPlanPresets.powerBaseline(role: 2, reps: 2);

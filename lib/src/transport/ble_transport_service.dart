@@ -1037,6 +1037,7 @@ class BleTransportService extends TransportService {
     required String peerHex,
     required String leg,
     required int seq,
+    int sizeDelta = 0,
   }) async {
     final path = pickRawPath(
       ready: _readyPaths,
@@ -1046,7 +1047,24 @@ class BleTransportService extends TransportService {
       seq: seq,
     );
     if (path == null) return null;
-    final size = (path.mtu - 3).clamp(1, 512);
+    // `mtu - 3` is the ATT ceiling: one byte of opcode plus two of attribute
+    // handle come out of every write. [sizeDelta] deliberately overshoots or
+    // undershoots it — the ATT-ceiling probe's arm variable — so 0 writes at
+    // the ceiling and +1 one byte past it. Recorded with the negotiated MTU
+    // rather than the requested one, because that is the number the fragment
+    // budget is actually betting on.
+    final size = (path.mtu - 3 + sizeDelta).clamp(1, 512);
+    if (_tracing) {
+      unawaited(trace!.log({
+        'type': 'wire',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'rawTx',
+        'mtu': path.mtu,
+        'sizeDelta': sizeDelta,
+        'len': size,
+        'leg': leg,
+      }));
+    }
     final blob = Uint8List(size);
     blob[0] = rawPacketType;
     // Fill so the radio cannot run-length anything (paranoia; BLE does not
@@ -1839,7 +1857,22 @@ class BleTransportService extends TransportService {
     if (_tracing) _wireLedger.onRx(payload.value);
     // Raw-throughput blobs (DEBUG/TESTBED): counted above, dropped here —
     // they are deliberately not packets and must never reach the parser.
-    if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) return;
+    if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) {
+      // The LENGTH THAT ARRIVED is the whole point of the ATT-ceiling probe.
+      // A write the stack truncates shows up here shorter than it was sent, a
+      // write it refuses never shows up at all, and a write that lands whole
+      // matches — three outcomes the byte totals alone cannot separate.
+      if (_tracing) {
+        unawaited(trace!.log({
+          'type': 'wire',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'rawRx',
+          'len': payload.value.length,
+          'path': payload.pathId,
+        }));
+      }
+      return;
+    }
     // Drop payloads unless the plugin currently marks the path ready. This
     // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
     // not-sendable paths from populating PeerState BLE role fields. NOTE the

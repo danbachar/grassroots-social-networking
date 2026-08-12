@@ -20,12 +20,21 @@ class FragmentHandler {
   /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
   ///   54 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
   ///   = 100 bytes.
-  /// So chunk ≤ 244 − 100 = 144; we use 136 for margin (236-byte packet).
+  /// So chunk ≤ 244 − 100 = 144; we use 136, holding 8 bytes back.
+  ///
+  /// That 8 is a CHOSEN margin, not a measured one. What it buys is the one
+  /// number here that is not a constant: 247 is the MTU the transport
+  /// *requests*, not necessarily the one a given pair negotiates. A chunk cut
+  /// to exactly 144 truncates silently against any peer that settles below
+  /// 247, and 8 bytes covers down to a 239-byte MTU. Whether such a peer
+  /// exists on real hardware is measurable and, until the ATT-ceiling probe
+  /// runs (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]),
+  /// unmeasured. Reclaiming it is worth ~6% more payload per fragment.
   static const int _bleFloorMtu = 247;
   static const int _packetFixedOverhead =
       GrassrootsPacket.headerSize + 25 + 21; // = 100
   static const int maxFragmentPayload =
-      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 132
+      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 136
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
   /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a

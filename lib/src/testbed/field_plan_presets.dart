@@ -142,10 +142,18 @@ class FieldPlanPresets {
   /// no ACK, no buffering: this measures the naked GATT pipe, and the gap to
   /// the protocol numbers is the measured cost of the stack. The receiver
   /// counts bytes in its wire ledger and drops the blobs before the parser.
+  /// `+4` / `-4` / `0` — a signed tag for a step label.
+  static String _signed(int v) => v > 0 ? '+$v' : '$v';
+
   static FieldPlan rawLink({
     String expId = 'raw-link-1',
     int dwellSec = 30,
     List<String> legs = const ['notify', 'write', 'stripe'],
+    // Byte offsets from the ATT ceiling (`MTU - 3`) to write at. The default
+    // single 0 is the plain throughput run: write exactly at the ceiling.
+    // A multi-value sweep turns the plan into the ATT-ceiling probe — the
+    // measurement the fragment budget's 8-byte margin has never had.
+    List<int> sizeDeltas = const [0],
     int repeat = 1,
     bool resetSessions = false,
     // Default ON, unlike every other warm-link plan: the plugin's per-path
@@ -159,15 +167,23 @@ class FieldPlanPresets {
   }) {
     final trials = repeat < 1 ? 1 : repeat;
     final arms = legs.isEmpty ? const ['notify'] : legs;
+    final deltas = sizeDeltas.isEmpty ? const [0] : sizeDeltas;
     final steps = <FieldStep>[];
     for (final leg in arms) {
-      for (var i = 1; i <= trials; i++) {
-        steps.add(FieldStep(
-          label: trials > 1 ? 'leg=$leg t$i' : 'leg=$leg',
-          dwellSec: dwellSec,
-          rawLeg: leg,
-          autoAdvance: steps.isNotEmpty,
-        ));
+      for (final delta in deltas) {
+        for (var i = 1; i <= trials; i++) {
+          // The delta belongs in the label as well as the step, because the
+          // label is what the analysis segments on and what the operator
+          // reads on the phone mid-run.
+          final tag = delta == 0 ? 'leg=$leg' : 'leg=$leg d=${_signed(delta)}';
+          steps.add(FieldStep(
+            label: trials > 1 ? '$tag t$i' : tag,
+            dwellSec: dwellSec,
+            rawLeg: leg,
+            rawSizeDelta: delta,
+            autoAdvance: steps.isNotEmpty,
+          ));
+        }
       }
     }
     return FieldPlan(
@@ -800,6 +816,19 @@ class FieldPlanPresets {
             payloadSizes: const [defaultSendBytes, 264, 1200])),
         'Throughput: ceiling sweep (1/4/16/64 lanes)': manualized(throughputCeiling()),
         'Raw link throughput (notify/write/stripe)': manualized(rawLink()),
+        // Prices the fragment budget's 8-byte margin, which has never been
+        // measured. Each step writes a raw blob at `MTU - 3 + d` on ONE leg
+        // and the receiver records the length that arrived, so the three
+        // outcomes separate: arrives whole, arrives short (the stack
+        // truncated it), never arrives (the stack refused it). d=0 is the
+        // ceiling, d=-8 is where the fragment budget sits today, and d=+1 is
+        // the first byte that should not survive. Notify only — it is the leg
+        // floods actually use, and one leg keeps the sweep to ~2.5 min.
+        'Raw link: ATT ceiling probe (−8/−4/0/+1/+4 B)': manualized(rawLink(
+          expId: 'att-ceiling-1',
+          legs: const ['notify'],
+          sizeDeltas: const [-8, -4, 0, 1, 4],
+        )),
         // Full ladder, ~2h41. Every quantity measured on BOTH devices.
         'Power baseline P1 (full, ~2h41)': manualized(powerBaseline(role: 1)),
         'Power baseline P2 (full, ~2h41)': manualized(powerBaseline(role: 2)),

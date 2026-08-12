@@ -66,7 +66,7 @@ class SettingsScreen extends StatefulWidget {
   final void Function(void Function(String expId)? listener)?
       registerStartListener;
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;

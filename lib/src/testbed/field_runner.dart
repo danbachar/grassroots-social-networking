@@ -116,7 +116,9 @@ class FieldRunner extends ChangeNotifier {
   /// step's [FieldStep.rawLeg]. Returns the blob size, or null when that leg
   /// is not currently available.
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg,
+      required int seq,
+      int sizeDelta})? sendRaw;
 
   /// Currently identified peers (pubkeys), consulted when the plan has NO
   /// roster: every known peer becomes a send target and labels are the 8-hex
@@ -897,8 +899,8 @@ class FieldRunner extends ChangeNotifier {
       final targets = _sendTargets();
       var sentAny = false;
       for (final (_, pubkey) in targets) {
-        final size =
-            await doSendRaw(pubkey, leg: step.rawLeg!, seq: seq);
+        final size = await doSendRaw(pubkey,
+            leg: step.rawLeg!, seq: seq, sizeDelta: step.rawSizeDelta);
         if (size != null) {
           _rawBlobs++;
           _rawBytes += size;
@@ -1006,6 +1008,9 @@ class FieldRunner extends ChangeNotifier {
         'event': 'stop',
         'flow': 'raw',
         'leg': currentStep!.rawLeg,
+        // The arm variable travels with the step summary so the analysis can
+        // key sent-vs-arrived on it without re-deriving it from the label.
+        'sizeDelta': currentStep!.rawSizeDelta,
         'sent': _rawBlobs,
         'sentBytes': _rawBytes,
       });

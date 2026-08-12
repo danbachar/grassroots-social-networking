@@ -712,7 +712,7 @@ void main() {
         recorder: recorder,
         myPubkeyHex: hexOf(0),
         knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
-        sendRaw: (peer, {required leg, required seq}) async {
+        sendRaw: (peer, {required leg, required seq, sizeDelta = 0}) async {
           if (!legUp) return null;
           sent.add((leg, seq));
           await Future<void>.delayed(const Duration(milliseconds: 5));

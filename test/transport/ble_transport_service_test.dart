@@ -1467,6 +1467,51 @@ void main() {
           'never a second copy sent alongside the first.');
     });
 
+    test('a raw blob is written at the ATT ceiling plus the arm delta',
+        () async {
+      final peer = await convergedPair(peripheralMtu: 247);
+      final peerHex = peer.publicKey
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+
+      // 247 − 3 = 244 is the ceiling: one opcode byte and two handle bytes
+      // come out of every ATT write.
+      final atCeiling =
+          await transport.sendRawBlob(peerHex: peerHex, leg: 'notify', seq: 0);
+      expect(atCeiling, 244);
+
+      // The arm variable straddles it. −8 is where the fragment budget sits
+      // today; +1 is the first byte that should not survive on real hardware.
+      final under = await transport.sendRawBlob(
+          peerHex: peerHex, leg: 'notify', seq: 1, sizeDelta: -8);
+      expect(under, 236);
+      final over = await transport.sendRawBlob(
+          peerHex: peerHex, leg: 'notify', seq: 2, sizeDelta: 1);
+      expect(over, 245);
+
+      expect(hostApi.calls, [
+        'send:peripheral:PAIR:244',
+        'send:peripheral:PAIR:236',
+        'send:peripheral:PAIR:245',
+      ], reason: 'the delta must reach the wire, not just the return value');
+    });
+
+    test('a raw blob sizes off the NEGOTIATED mtu, not the requested one',
+        () async {
+      // The whole point of the probe: 247 is what the transport asks for. A
+      // pair that settles lower is exactly the case the fragment budget's
+      // margin exists to cover, so the blob has to follow the real mtu.
+      final peer = await convergedPair(peripheralMtu: 185);
+      final peerHex = peer.publicKey
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+
+      final size =
+          await transport.sendRawBlob(peerHex: peerHex, leg: 'notify', seq: 0);
+      expect(size, 182);
+      expect(hostApi.calls, ['send:peripheral:PAIR:182']);
+    });
+
     test('a write that succeeds never touches the second leg', () async {
       await convergedPair();
       final aired = await transport.broadcast(Uint8List(40));

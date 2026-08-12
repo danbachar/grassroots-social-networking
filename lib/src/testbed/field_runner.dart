@@ -71,11 +71,6 @@ class FieldRunner extends ChangeNotifier {
   /// step's undelivered backlog cannot drain into this step's window.
   final VoidCallback? onResetDtnBuffer;
 
-  /// DEBUG/TESTBED ONLY. Lift or restore the per-neighbour relay cap for the
-  /// run, from [FieldPlan.relayBudgetDisabled]. Applied once at start and
-  /// stamped as a marker, so the trace says which arm it is.
-  final void Function(bool disabled)? onSetRelayBudgetDisabled;
-
   /// Sets the BLE transport up/down for steps that script it
   /// ([FieldStep.bleOn]). Awaited before the step marker so every power
   /// sample inside the segment sees the requested state.
@@ -178,7 +173,6 @@ class FieldRunner extends ChangeNotifier {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetDtnBuffer,
-    this.onSetRelayBudgetDisabled,
     this.onSetBle,
     this.onSampleLocation,
     this.bleWireBytes,
@@ -420,12 +414,6 @@ class FieldRunner extends ChangeNotifier {
     _btOnSeen = false;
     _radioUp = false;
     await recorder.startExperiment(plan.expId);
-    if (onSetRelayBudgetDisabled != null) {
-      onSetRelayBudgetDisabled!.call(plan.relayBudgetDisabled);
-      if (plan.relayBudgetDisabled) {
-        await recorder.logMarker('relay-budget-disabled');
-      }
-    }
     if (plan.manualJoin) {
       // Anchor on the wall clock, not the tap: every phone rounds up to the
       // same 10-minute boundary, so the start skew collapses to clock-sync

@@ -344,20 +344,6 @@ class FieldPlan {
   /// the buffer surviving across steps (store-carry-forward, multi-hop).
   final bool resetDtnBuffer;
 
-  /// DEBUG/TESTBED ONLY. Run with the per-neighbour relay cap LIFTED.
-  ///
-  /// The cap is a charter requirement, so this is false everywhere except an
-  /// arm that exists to measure what the cap costs. It became worth measuring
-  /// when `relay / rateLimited` fired ~3,400 times across seven of eight
-  /// phones on scf-check-4: at that rate the ceiling is shaping delivery, and
-  /// the only honest way to size its effect is the same plan with and without
-  /// it. It rides in the plan rather than in a build flag so the trace records
-  /// which arm produced which numbers.
-  ///
-  /// TTL and the packetId bloom still bound the flood; only the per-neighbour
-  /// rate ceiling is removed.
-  final bool relayBudgetDisabled;
-
   /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
@@ -423,7 +409,6 @@ class FieldPlan {
     this.resetSessions = true,
     this.resetLinks = false,
     this.resetDtnBuffer = true,
-    this.relayBudgetDisabled = false,
     this.autoAdvanceGapSec = 5,
     this.deviceOrder,
     this.manualJoin = false,
@@ -442,7 +427,6 @@ class FieldPlan {
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
         'resetDtnBuffer': resetDtnBuffer,
-        'relayBudgetDisabled': relayBudgetDisabled,
         'autoAdvanceGapSec': autoAdvanceGapSec,
         if (deviceOrder != null) 'deviceOrder': deviceOrder,
         if (manualJoin) 'manualJoin': true,
@@ -466,8 +450,6 @@ class FieldPlan {
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
-        relayBudgetDisabled:
-            json['relayBudgetDisabled'] as bool? ?? false,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
         deviceOrder: json['deviceOrder'] as int?,
         manualJoin: json['manualJoin'] as bool? ?? false,
@@ -487,7 +469,6 @@ class FieldPlan {
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
       other.resetDtnBuffer == resetDtnBuffer &&
-      other.relayBudgetDisabled == relayBudgetDisabled &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
       other.deviceOrder == deviceOrder &&
       other.manualJoin == manualJoin &&
@@ -499,7 +480,6 @@ class FieldPlan {
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
       Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
-      relayBudgetDisabled,
       autoAdvanceGapSec, deviceOrder, manualJoin, placementSec, alignSec,
       scriptedRadio,
       sampleGps);

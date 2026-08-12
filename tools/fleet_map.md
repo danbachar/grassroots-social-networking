@@ -62,6 +62,48 @@ key are all on it) rather than inferred:
 
 All three agree with `fleet_map.json`.
 
+## The eight attached on 2026-08-12, with models read over adb
+
+Every phone in `fleet_map.json` except the Pixel 7a (node 1) was attached.
+Model and Android version come from the handsets themselves
+(`ro.product.model`, `ro.build.version.release`); the pubkeys are the map's.
+
+| serial | phone | Android | pubkey |
+|---|---|---|---|
+| `56261FDCH00B50` | Pixel 10 Pro | 16 | `f5aee069…` |
+| `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` |
+| `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` |
+| `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` |
+| `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` |
+| `00de4b24f89021e4` | Nexus 5X | 8.1 | `b7d04acb…` |
+| `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` |
+| `00d98aa1795bc454` | Nexus 5X | 8.1 | `d5aedd63…` |
+
+This settles what the slot 5–7 footnote left open in one direction: there are
+**four** Nexus 5X units, not three, and the eighth handset (`d5aedd63`) is the
+fourth of them. The *join order* of slots 5–7 is still inferred — the models
+match, but the model cannot tell three identical 5X units apart. Read the
+**You** screen before trusting a numbered role on those three.
+
+### The mDNS name is not a serial
+
+Over wireless debugging, `adb devices` prints
+`adb-<serial>-XXXXXX._adb-tls-connect._tcp` rather than the serial, and the
+`XXXXXX` is regenerated on every re-pairing. `fleet_map.json` therefore holds
+**serials only**; `sync_phone_clocks.sh` strips the mDNS wrapper before the
+lookup. Do not add an `adb-…_tcp` key to the map — it maps a phone for exactly
+as long as the current pairing lasts, and when it stops matching the device
+silently loses its pubkey rather than erroring.
+
+### Location on the Android 8.1 units
+
+All four Nexus 5X had `settings get secure location_providers_allowed`
+populated after Dan toggled location on 2026-08-12. `0253914a45ebaeb0` read
+**empty** before that toggle — the state in which the scanner is blind while
+the UI can still show location as on. Check this key on all four before every
+run; it is one adb read per phone and it is the difference between a mesh and
+a phone that only ever answers.
+
 ## Pairing a phone by hand
 
 Open the app and stay on the **You** tab: it prints the nickname, the

@@ -48,7 +48,6 @@ class SettingsScreen extends StatefulWidget {
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
   final VoidCallback? onResetDtnBuffer;
-  final void Function(bool disabled)? onSetRelayBudgetDisabled;
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
   final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
@@ -90,7 +89,6 @@ class SettingsScreen extends StatefulWidget {
     this.sendMessage,
     this.onResetSessions,
     this.onResetDtnBuffer,
-    this.onSetRelayBudgetDisabled,
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
@@ -337,8 +335,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetDtnBuffer: widget.onResetDtnBuffer,
-                      onSetRelayBudgetDisabled:
-                          widget.onSetRelayBudgetDisabled,
                       onCryptoBench: widget.onCryptoBench,
                       bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,

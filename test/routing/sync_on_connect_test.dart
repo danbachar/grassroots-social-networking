@@ -383,8 +383,8 @@ void main() {
       expect(
         decodeSyncIds(router.buildSyncOffers(neighbourPubkey).single),
         contains(p.packetId),
-        reason: 'the relay budget can stop a conveyance mid-request; a peer '
-            'that already has it declines on the next round at a cost of one id',
+        reason: 'a conveyance can still be lost on the air; a peer that '
+            'already has it declines on the next round at a cost of one id',
       );
     });
 

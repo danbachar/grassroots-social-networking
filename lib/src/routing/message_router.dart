@@ -66,36 +66,6 @@ class MessageRouter {
   /// ever pushed blindly on connect (see [buildSyncOffers]).
   final DtnStore _dtnStore = DtnStore();
 
-  /// Per-neighbor relay budget (managed-flooding abuse cap). A single inbound
-  /// neighbor may have at most [_maxRelaysPerWindow] packets relayed on its
-  /// behalf per [_relayWindow]; excess is dropped.
-  ///
-  /// Keyed by the neighbour's PEER IDENTITY (pubkey hex) where the inbound path
-  /// is authenticated, falling back to the raw path id only while it is not.
-  /// Keying by path id alone leaked budget two ways: a converged pair holds two
-  /// GATT legs, so a neighbour got one full budget per leg, and the OS rotates
-  /// the radio MAC roughly every 30 s, which minted a fresh key — and a fresh
-  /// 512-packet allowance — several times per window. The cap is meant to bound
-  /// a *neighbour*, and a neighbour is an identity.
-  static const Duration _relayWindow = Duration(seconds: 10);
-  static const int _maxRelaysPerWindow = 512;
-  final Map<String, _RelayBudget> _relayBudgets = {};
-
-  /// DEBUG/TESTBED ONLY. Lift the per-neighbour relay cap for a measurement.
-  ///
-  /// The cap is a charter requirement (CLAUDE.md: "per-neighbor relay rate
-  /// are all capped — an unbounded flood/cache is an abuse and battery
-  /// sink"), so this defaults to false and production never touches it. It
-  /// exists because the cap became load-bearing in a measured run — `relay /
-  /// rateLimited` fired ~3,400 times across seven of eight phones on
-  /// scf-check-4 — and the only way to know what it cost is to run the same
-  /// plan with it lifted and diff the delivery.
-  ///
-  /// Lifting it does NOT make flooding unbounded: TTL still bounds hop count
-  /// and the packetId bloom still relays each packet at most once. It removes
-  /// only the per-neighbour rate ceiling.
-  bool relayBudgetDisabled = false;
-
   /// Called when a message is received. [transport] is the transport the packet
   /// actually arrived on — authoritative, taken from the receive path rather
   /// than inferred from peer state.
@@ -367,33 +337,21 @@ class MessageRouter {
     if (!forUs) {
       // Open managed flooding: forward the sealed, sender-anonymous packet
       // toward its recipient, unverified and without decrypting. Only the first
-      // sighting is relayed; TTL bounds the hop count; a per-neighbor budget
-      // caps flooding abuse.
-      // Consume EXACTLY ONE budget unit per relayed packet. _allowRelayFrom
-      // both tests and increments, so it must be called once and the result
-      // reused: evaluating it in two arms of this chain charged every relayed
-      // packet twice and silently halved the effective cap to 256.
+      // sighting is relayed and TTL bounds the hop count — those two are the
+      // whole bound on the flood.
       // A node refuses a relay whose count has ALREADY reached 0; anything
       // above that is accepted, decremented, and forwarded once. So a packet
       // with one hop left is still passed on — it goes out at 0, which is
       // useful precisely because the destination is exempt from this check:
       // that last broadcast can still be accepted by a neighbour who is the
       // recipient. It simply cannot be relayed again after that.
-      final relayAllowed =
-          firstSeen && packet.ttl > 0 && _allowRelayFrom(bleDeviceId);
+      final relayAllowed = firstSeen && packet.ttl > 0;
 
       if (firstSeen && packet.ttl <= 0) {
         // The flood dies here: hop budget exhausted on a first sighting.
         // Previously fully silent — the one place a multi-hop delivery
         // failure leaves evidence on the node that killed it.
         _traceDrop('relay', 'ttlExpired', {
-          'packetId': packet.packetId,
-          'fromPeer': _peerHexForBleDevice(bleDeviceId),
-        });
-      } else if (firstSeen && !relayAllowed) {
-        // Refused by the per-neighbour budget: not relayed AND not carried
-        // (carry lives inside the relay branch, deliberately).
-        _traceDrop('relay', 'rateLimited', {
           'packetId': packet.packetId,
           'fromPeer': _peerHexForBleDevice(bleDeviceId),
         });
@@ -884,30 +842,6 @@ class MessageRouter {
     return _peersState.getPeerByPubkey(r)?.isReachable ?? false;
   }
 
-  /// Per-neighbor flooding cap. Returns false when the inbound neighbor has had
-  /// too many packets relayed on its behalf this window.
-  ///
-  /// SIDE-EFFECTING: a call that returns true consumes one unit of the
-  /// neighbour's budget. Call it once per relay decision and reuse the result —
-  /// never twice for the same packet.
-  bool _allowRelayFrom(String? inboundPeerId) {
-    if (relayBudgetDisabled) return true; // DEBUG/TESTBED: cap lifted
-    if (inboundPeerId == null) return true; // unattributable (e.g. UDP)
-    // Charge the identity, not the path: both legs of a converged pair and
-    // every MAC rotation of the same neighbour share one budget.
-    final budgetKey = _peerHexForBleDevice(inboundPeerId) ?? inboundPeerId;
-    final now = DateTime.now();
-    final budget =
-        _relayBudgets.putIfAbsent(budgetKey, () => _RelayBudget(now));
-    if (now.difference(budget.windowStart) > _relayWindow) {
-      budget.windowStart = now;
-      budget.count = 0;
-    }
-    if (budget.count >= _maxRelaysPerWindow) return false;
-    budget.count++;
-    return true;
-  }
-
   static bool _pubkeysEqual(Uint8List a, Uint8List b) {
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
@@ -1142,8 +1076,9 @@ class MessageRouter {
   /// other way is a lost message.
   ///
   /// A REQUESTED id is not declined either, even though it was almost
-  /// certainly conveyed — the relay budget can cut a conveyance short
-  /// mid-request. Re-offering a packet the peer already has costs one id.
+  /// certainly conveyed — the conveyance can still be lost, and a write that
+  /// fails on both legs takes the packet with it. Re-offering a packet the
+  /// peer already has costs one id.
   void _settleSyncRound(String peerHex) {
     final round = _openRound.remove(peerHex);
     if (round == null) return;
@@ -1199,9 +1134,8 @@ class MessageRouter {
   }
 
   /// A neighbor requested packets from our offer: convey each one we still
-  /// carry, directed over that link. Conveyance counts against the
-  /// requester's per-neighbor relay budget — sync must not be a way around
-  /// the flooding cap. Ids expired/evicted since the offer are skipped.
+  /// carry, directed over that link. Ids expired/evicted since the offer are
+  /// skipped.
   void _handleSyncRequest(Uint8List payload, SyncLink link) {
     final List<String> requested;
     try {
@@ -1231,15 +1165,6 @@ class MessageRouter {
         // is healed only by a future contact.
         _traceDrop('sync', 'staleOffer', {'packetId': id});
         continue;
-      }
-      if (!_allowRelayFrom(link.bleDeviceId)) {
-        // Budget exhausted mid-conveyance: everything after this point in
-        // the request silently waits for the next sync round.
-        _traceDrop('sync', 'budgetExhausted', {
-          'remaining': requested.length - i,
-          'peer': _pubkeyToHex(link.peerPubkey),
-        });
-        break;
       }
       // A conveyance IS a hop: the packet moves from this node's radio to
       // another's exactly as a flood does, so it pays TTL on the same terms.
@@ -1284,17 +1209,9 @@ class MessageRouter {
     _seenPackets.clear();
     _deliveredMessages.clear();
     _dtnStore.clear();
-    _relayBudgets.clear();
     _declinedByPeer.clear();
     _openRound.clear();
   }
-}
-
-/// Per-neighbor relay budget window (managed-flooding abuse cap).
-class _RelayBudget {
-  DateTime windowStart;
-  int count = 0;
-  _RelayBudget(this.windowStart);
 }
 
 /// One open sync offer round with one peer: the ids we put on the link, the

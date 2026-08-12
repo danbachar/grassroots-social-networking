@@ -1977,15 +1977,6 @@ class GrassrootsNetwork {
     _dtnPacketIds.clear();
   }
 
-  /// DEBUG/TESTBED ONLY. Lift or restore the per-neighbour relay cap. See
-  /// [MessageRouter.relayBudgetDisabled]: TTL and the packetId bloom still
-  /// bound the flood, only the rate ceiling moves.
-  void setRelayBudgetDisabled(bool disabled) {
-    debugPrint('[testbed] Per-neighbour relay budget '
-        '${disabled ? 'DISABLED' : 'enabled'}');
-    _messageRouter.relayBudgetDisabled = disabled;
-  }
-
   void resetAllSessions() {
     debugPrint('[testbed] Dropping all Noise sessions');
     _noiseSessions.resetAll();

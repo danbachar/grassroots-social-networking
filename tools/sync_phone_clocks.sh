@@ -54,10 +54,22 @@ if command -v sntp >/dev/null 2>&1; then
 fi
 
 CHECK_ONLY="$CHECK_ONLY" JSON_OUT="$JSON_OUT" python3 - "$serials" <<'PY'
-import json, os, pathlib, subprocess, sys, time
+import json, os, pathlib, re, subprocess, sys, time
 
 check_only = os.environ["CHECK_ONLY"] == "1"
 json_out = os.environ.get("JSON_OUT") or ""
+
+# Wireless debugging does not name a phone by its serial: adb prints the mDNS
+# service instead, `adb-<serial>-XXXXXX._adb-tls-connect._tcp`, and the XXXXXX
+# is regenerated every time the phone is re-paired. Keying the fleet map by
+# that string means the entry dies at the next pairing — silently, since an
+# unmapped device just loses its pubkey. The real serial is inside it, so
+# identity is taken from there and the map holds serials only.
+_MDNS = re.compile(r"^adb-(.+)-[^-]+\._adb-tls-connect\._tcp$")
+
+def stable_id(serial):
+    m = _MDNS.match(serial)
+    return m.group(1) if m else serial
 
 def sh(serial, *cmd, timeout=10):
     return subprocess.run(["adb", "-s", serial, "shell", *cmd],
@@ -134,16 +146,17 @@ if json_out:
         "measuredAtMs": int(time.time() * 1000),
         "checkOnly": check_only,
         "devices": [
-            {"serial": serial, "model": model,
+            {"serial": stable_id(serial), "model": model,
              "offsetBeforeS": round(before, 4),
              "offsetS": round(after, 4),
              "errS": round(err, 4),
-             **({"pubkey": fleet[serial]} if serial in fleet else {})}
+             **({"pubkey": fleet[stable_id(serial)]}
+                if stable_id(serial) in fleet else {})}
             for serial, model, before, after, err, _ in rows
         ],
     }
     pathlib.Path(json_out).write_text(json.dumps(payload, indent=2))
-    unmapped = [r[0] for r in rows if r[0] not in fleet]
+    unmapped = [stable_id(r[0]) for r in rows if stable_id(r[0]) not in fleet]
     print(f"wrote {json_out}")
     if unmapped:
         print(f"  no pubkey for {len(unmapped)} device(s): add them to "

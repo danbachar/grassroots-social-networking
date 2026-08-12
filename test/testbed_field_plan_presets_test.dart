@@ -84,32 +84,6 @@ void main() {
           reason: 'the override has to survive the JSON the phones load');
     });
 
-    test('the relay cap is ON unless a plan explicitly lifts it', () {
-      // The cap is a charter requirement, so the default must never drift to
-      // off; lifting it is an arm you opt into, and it has to survive the
-      // JSON the phones actually load or the run silently keeps the cap.
-      expect(FieldPlanPresets.storeCarryForward(role: 2).relayBudgetDisabled,
-          isFalse,
-          reason: 'the builder default stays capped; lifting is per-plan');
-      // The shipped nocap arm runs UNCAPPED, deliberately; its twin does not.
-      expect(
-          FieldPlanPresets
-              .presets['SCF nocap — sender (1 rep, ~17 min)']!
-              .relayBudgetDisabled,
-          isTrue);
-      expect(
-          FieldPlanPresets
-              .presets['SCF cap — sender (1 rep, ~17 min)']!
-              .relayBudgetDisabled,
-          isFalse);
-      final lifted = FieldPlanPresets.storeCarryForward(
-          role: 2, relayBudgetDisabled: true);
-      expect(lifted.relayBudgetDisabled, isTrue);
-      expect(lifted.toJson()['relayBudgetDisabled'], isTrue);
-      expect(FieldPlan.fromJson(lifted.toJson()).relayBudgetDisabled, isTrue);
-      expect(FieldPlan.fromJson(lifted.toJson()), lifted);
-    });
-
     test('anchored to a 5-minute grid, with the runner working the radio', () {
       // The dark window has to open on every phone at the same instant, and
       // nobody is standing at the desk to toggle six radios at that instant.
@@ -143,40 +117,15 @@ void main() {
           .map((s) => s.dwellSec).toSet(), {60});
     });
 
-    test('the A/B pair differs ONLY in the relay cap', () {
-      // The whole point of a pair is that one variable moves. If anything
-      // else differs the two traces are not comparable and the run is wasted.
-      final capped = FieldPlanPresets.presets['SCF cap — sender (1 rep, ~17 min)']!;
-      final nocap = FieldPlanPresets.presets['SCF nocap — sender (1 rep, ~17 min)']!;
-      expect(capped.relayBudgetDisabled, isFalse);
-      expect(nocap.relayBudgetDisabled, isTrue);
-      expect(capped.expId, isNot(nocap.expId),
-          reason: 'separate ids or the two runs merge into one file');
-      expect(capped.steps.map((s) => s.label).toList(),
-          nocap.steps.map((s) => s.label).toList());
-      expect(capped.steps.map((s) => s.dwellSec).toList(),
-          nocap.steps.map((s) => s.dwellSec).toList());
-      expect(capped.steps.map((s) => s.saturate).toList(),
-          nocap.steps.map((s) => s.saturate).toList());
-      expect(capped.alignSec, nocap.alignSec);
-      expect(capped.scriptedRadio, nocap.scriptedRadio);
-      // Exactly one traveller preset per arm, and it is the one that goes dark.
-      for (final arm in ['cap', 'nocap']) {
-        final t = FieldPlanPresets.presets['SCF $arm — TRAVELLER (1 rep, ~17 min)']!;
-        expect(t.steps.firstWhere((s) => s.label.startsWith('dark')).bleOn,
-            isFalse);
-      }
-    });
-
     test('both dropdown entries exist and differ in who goes dark', () {
       final measured =
           FieldPlanPresets.presets.keys.where((k) => k.startsWith('SCF desk'));
       final checks = FieldPlanPresets.presets.keys
-          .where((k) => k.startsWith('SCF cap') || k.startsWith('SCF nocap'));
+          .where((k) => k.startsWith('SCF re-arm check'));
       expect(measured, hasLength(2));
-      expect(checks, hasLength(4),
-          reason: 'the A/B pair ships beside the measured run: a traveller '
-              'and a sender for each arm');
+      expect(checks, hasLength(2),
+          reason: 'the shakedown ships beside the measured run: a traveller '
+              'and a sender');
       final traveller =
           FieldPlanPresets.presets['SCF desk — TRAVELLER (this phone goes dark)']!;
       final sender =

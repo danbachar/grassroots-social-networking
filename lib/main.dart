@@ -2465,9 +2465,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
-          onSetRelayBudgetDisabled: _grassroots == null
-              ? null
-              : (disabled) => _grassroots!.setRelayBudgetDisabled(disabled),
           onCryptoBench:
               _grassroots == null ? null : () => _grassroots!.runCryptoBench(),
           bleWireBytes:

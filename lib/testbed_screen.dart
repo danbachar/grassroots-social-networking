@@ -46,7 +46,6 @@ class TestbedScreen extends StatefulWidget {
   final VoidCallback? onResetSessions;
   final Future<void> Function()? onResetLinks;
   final VoidCallback? onResetDtnBuffer;
-  final void Function(bool disabled)? onSetRelayBudgetDisabled;
 
   /// Runs the on-device crypto bench (failed-AEAD and handshake cost).
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
@@ -105,7 +104,6 @@ class TestbedScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetDtnBuffer,
-    this.onSetRelayBudgetDisabled,
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
@@ -399,7 +397,6 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
       onResetDtnBuffer: widget.onResetDtnBuffer,
-      onSetRelayBudgetDisabled: widget.onSetRelayBudgetDisabled,
       sendRaw: widget.sendRaw,
       onSetBle: widget.onSetBle,
       onSampleLocation: _sampleLocation,

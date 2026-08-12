@@ -640,7 +640,6 @@ class FieldPlanPresets {
     int lowSends = 10,
     int mediumSends = 60,
     int repeat = 1,
-    bool relayBudgetDisabled = false,
   }) {
     final traveller = role == 1;
     final steps = <FieldStep>[];
@@ -710,7 +709,6 @@ class FieldPlanPresets {
       alignSec: 300,
       placementSec: 60,
       scriptedRadio: true,
-      relayBudgetDisabled: relayBudgetDisabled,
       sampleGps: false,
       steps: steps,
     );
@@ -768,39 +766,22 @@ class FieldPlanPresets {
         // min to prove the traveller really goes dark and comes back, the
         // backlog moves, and the analysis reads it — before committing 2h45m.
         // Its own id keeps the check out of the measured data.
-        // A/B PAIR on the per-neighbour relay cap. Identical plans under two
-        // ids, so the only difference between the traces is whether the cap
-        // fires. It is worth measuring because the cap bit hard on
-        // scf-check-4 — `relay/rateLimited` ~3,400 times across seven of
-        // eight phones, and `sync/budgetExhausted` at the top of the drop
-        // table — which is the cap shaping delivery rather than bounding
-        // abuse. Lifting it leaves TTL and the packetId bloom in place; only
-        // the per-neighbour rate ceiling goes.
+        // Shakedown on the full fleet, under its own id so it can never
+        // merge into the measured run. Three things to read off it:
+        // `sync/staleOffer` collapses, carried deliveries report a non-zero
+        // hop count now that conveyance pays TTL, and `message re-delivery`
+        // is zero under age-only dedup.
         //
-        // Run them BACK TO BACK on the same fleet with the same traveller,
-        // capped first as the baseline, so any drift over the session is
-        // attributable by order rather than confounded with the arm.
-        'SCF cap — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-cap-1', role: 1, relayBudgetDisabled: false),
-        'SCF cap — sender (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-cap-1', role: 2, relayBudgetDisabled: false),
-        'SCF nocap — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-nocap-1', role: 1, relayBudgetDisabled: true),
-        'SCF nocap — sender (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-nocap-1', role: 2, relayBudgetDisabled: true),
-        // Post-TTL build check on however many phones are to hand, under its
-        // own id so it can never merge into the measured A/B. Uncapped,
-        // because that is the arm the A/B settled on and the one whose
-        // `sync/staleOffer` storm (16,697 on one phone) the per-peer declines
-        // are meant to end. Three things to read off it: staleOffer collapses,
-        // carried deliveries report a non-zero hop count now that conveyance
-        // pays TTL, and `message re-delivery` is zero under age-only dedup.
-        // Delivery RATE is not comparable with scf-cap-1/scf-nocap-1 — fewer
-        // senders is a different mesh, not a better one.
-        'SCF re-arm check — TRAVELLER (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-rearm-1', role: 1, relayBudgetDisabled: true),
-        'SCF re-arm check — sender (1 rep, ~17 min)': storeCarryForward(
-            expId: 'scf-rearm-1', role: 2, relayBudgetDisabled: true),
+        // scf-rearm-1 is already recorded and the recorder APPENDS, so this
+        // is -2: re-using the id would merge two runs into one file and one
+        // upload. Its numbers are not comparable with scf-rearm-1 anyway —
+        // that run had the per-neighbour relay cap in the build (lifted for
+        // the arm), this one has no cap at all, and it ran on three phones
+        // rather than eight.
+        'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
+            storeCarryForward(expId: 'scf-rearm-2', role: 1),
+        'SCF re-arm check — sender (1 rep, ~17 min)':
+            storeCarryForward(expId: 'scf-rearm-2', role: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

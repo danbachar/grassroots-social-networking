@@ -592,12 +592,10 @@ void main() {
       expect(p.steps.every((st) => st.resetSessions == null), isTrue);
     });
 
-    test('manual by construction: no GPS, wall-clock anchor, order stamped',
-        () {
+    test('manual by construction: no GPS, wall-clock anchor', () {
       final p = FieldPlanPresets.meshScale(role: 4);
       expect(p.manualJoin, isTrue);
       expect(p.sampleGps, isFalse);
-      expect(p.deviceOrder, 4);
       expect(p.resetDtnBuffer, isFalse,
           reason: 'buffer persistence across steps IS part of the subject');
       expect(FieldPlan.fromJson(p.toJson()), p);
@@ -720,7 +718,6 @@ void main() {
       expect(p.sampleGps, isFalse);
       expect(p.expId, 'mesh-preflight',
           reason: 'a rehearsal must never land in a real run\'s file');
-      expect(p.deviceOrder, 1);
       // 4 devices -> sizes 3 and 4, two stable reps each.
       expect(p.steps.map((s) => s.label),
           ['n=3 t1', 'n=3 t2', 'n=4 t1', 'n=4 t2']);

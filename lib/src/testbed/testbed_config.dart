@@ -348,17 +348,6 @@ class FieldPlan {
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
 
-  /// This phone's join order in a multi-device plan (`role` in the mesh-scale
-  /// preset), stamped into every step marker. Null for plans where order is
-  /// meaningless.
-  ///
-  /// Without it the trace records WHICH step ran but not which slot this
-  /// device was configured to fill, so a misconfigured phone is
-  /// indistinguishable from one that failed to join: the 7-device smoke run's
-  /// `n=3` steps had only two devices in the mesh and the reason could only
-  /// be inferred from when links first appeared.
-  final int? deviceOrder;
-
   /// Manual-join mode: system Bluetooth is toggled BY THE OPERATOR in the
   /// phone's settings, never by the app. The run is anchored to a shared
   /// wall-clock instant (the next 10-minute boundary at least [placementSec]
@@ -410,7 +399,6 @@ class FieldPlan {
     this.resetLinks = false,
     this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
-    this.deviceOrder,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
@@ -428,7 +416,6 @@ class FieldPlan {
         if (resetLinks) 'resetLinks': resetLinks,
         'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
-        if (deviceOrder != null) 'deviceOrder': deviceOrder,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
@@ -451,7 +438,6 @@ class FieldPlan {
         resetLinks: json['resetLinks'] as bool? ?? false,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
-        deviceOrder: json['deviceOrder'] as int?,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
@@ -470,7 +456,6 @@ class FieldPlan {
       other.resetLinks == resetLinks &&
       other.resetDtnBuffer == resetDtnBuffer &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
-      other.deviceOrder == deviceOrder &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
@@ -480,7 +465,7 @@ class FieldPlan {
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
       Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
-      autoAdvanceGapSec, deviceOrder, manualJoin, placementSec, alignSec,
+      autoAdvanceGapSec, manualJoin, placementSec, alignSec,
       scriptedRadio,
       sampleGps);
 }

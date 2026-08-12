@@ -1150,10 +1150,9 @@ void main() {
   });
 
   group('remote start', () {
-    FieldPlan plan({String id = 'mesh-scale-1', int? order}) => FieldPlan(
+    FieldPlan plan({String id = 'mesh-scale-1'}) => FieldPlan(
           expId: id,
           settleSec: 5,
-          deviceOrder: order,
           steps: const [FieldStep(label: 'n=3', dwellSec: 60, bleOn: false)],
         );
 
@@ -1208,14 +1207,21 @@ void main() {
       // like one configured right that failed to join: both just have no
       // links. `order` says which slot it was told to fill, `joined` says
       // whether it believed it belonged in the mesh for this step.
+      //
+      // The order comes from THIS PHONE'S NICKNAME, never from the plan: a
+      // plan is shared by the whole fleet and cannot know which phone is
+      // which. It used to ride in the plan, where the presets set it to the
+      // role — so every sender in a store-carry-forward run stamped the same
+      // number.
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(
           recorder: recorder,
+          myNickname: '4',
           onSetBle: (on) async {},
           upload: () async => 'ok',
         );
-        runner.armForRemoteStart(plan(order: 4));
+        runner.armForRemoteStart(plan());
         async.flushMicrotasks();
         unawaited(runner.remoteStart('mesh-scale-1'));
         async.flushMicrotasks();
@@ -1227,13 +1233,15 @@ void main() {
       });
     });
 
-    test('a plan with no join order stamps no order field', () {
-      // Distance/power plans have no notion of order; the marker must not
-      // invent one.
+    test('a nickname that is not a plain number stamps no order field', () {
+      // Strict on purpose: "pixel-2" is NOT node 2, and a phone that cannot
+      // say which slot it fills must stamp nothing rather than a guess that
+      // the analysis would then join geometry on.
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(
           recorder: recorder,
+          myNickname: 'pixel-2',
           onSetBle: (on) async {},
           upload: () async => 'ok',
         );
@@ -1360,7 +1368,6 @@ void main() {
     FieldPlan geoPlan() => const FieldPlan(
           expId: 'mesh-scale-1',
           settleSec: 1,
-          deviceOrder: 2,
           steps: [
             FieldStep(label: 'distribute', dwellSec: 10, bleOn: false),
             FieldStep(label: 'n=3 t1', dwellSec: 10, bleOn: true,

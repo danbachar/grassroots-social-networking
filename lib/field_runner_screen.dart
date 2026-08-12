@@ -132,7 +132,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           foregroundColor: Colors.white,
           title: Text('${plan.expId} — step '
               '${(runner.stepIndex + 1).clamp(1, total)}/$total'
-              '${plan.deviceOrder == null ? '' : ' · #${plan.deviceOrder}'}'),
+              '${runner.joinOrder == null ? '' : ' · #${runner.joinOrder}'}'),
           actions: [
             if (runner.isRunning)
               IconButton(
@@ -217,9 +217,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         // never filled. This is the screen you are looking at while placing
         // the phones, so the order is stated here, big, not left to the
         // preset name in a list somewhere behind you.
-        if (runner.armedPlan!.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 16),
-          _orderBadge(runner.armedPlan!.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 12),
         Text('waiting for the start signal\n"${runner.armedPlan!.expId}"',
@@ -367,9 +367,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                 color: Colors.white,
                 fontSize: 88,
                 fontWeight: FontWeight.w800)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 14),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 14),
         if (runner.radioAction != null)
@@ -435,9 +435,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           Text('at ${_hhmmss(windowAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 16),
         Text(

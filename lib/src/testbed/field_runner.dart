@@ -154,6 +154,25 @@ class FieldRunner extends ChangeNotifier {
   /// them alone cannot.
   final int Function()? sessionTableCount;
 
+  /// THIS phone's join order, read from its own nickname.
+  ///
+  /// The join order is the nickname and nothing else. It used to ride in the
+  /// plan as `deviceOrder`, which the presets set to the plan ROLE — so the
+  /// traveller of a store-carry-forward run stamped and displayed `#1`
+  /// whatever its nickname was, and the sender `#2`, seven times over. The
+  /// marker's `order` and `nick` then disagreed on every phone but one, and
+  /// `order` is what the analysis joins geometry on.
+  ///
+  /// A plan is shared by the whole fleet, so it cannot know which phone is
+  /// which; the nickname is per-device and is the one thing that can. Strict
+  /// parse, deliberately: a nickname like "pixel-2" is NOT node 2, and a
+  /// phone whose nickname is not a plain positive integer has no join order
+  /// at all rather than a guessed one.
+  int? get joinOrder {
+    final n = int.tryParse(myNickname?.trim() ?? '');
+    return (n != null && n > 0) ? n : null;
+  }
+
   /// Epoch-ms clock, injectable so the wall-clock schedule is testable
   /// under fakeAsync. Production default is the real clock.
   final int Function() nowMs;
@@ -437,7 +456,7 @@ class FieldRunner extends ChangeNotifier {
       // query shows whether all phones computed the same instant.
       await recorder.logMarker('placement', extra: {
         'targetMs': anchor,
-        if (plan.deviceOrder != null) 'order': plan.deviceOrder,
+        if (joinOrder != null) 'order': joinOrder,
         if (myNickname != null && myNickname!.isNotEmpty) 'nick': myNickname,
       });
       _startRadioObserver();
@@ -477,7 +496,7 @@ class FieldRunner extends ChangeNotifier {
       _radioUp = up;
       if (up) _btOnSeen = true;
       await recorder.logMarker(up ? 'bt-on' : 'bt-off', extra: {
-        if (_plan?.deviceOrder != null) 'order': _plan!.deviceOrder,
+        if (joinOrder != null) 'order': joinOrder,
       });
       _notify();
     }
@@ -608,7 +627,7 @@ class FieldRunner extends ChangeNotifier {
     // phone from one that was configured right and failed to join — from the
     // marker alone, without inferring it from when links first appear.
     await recorder.logMarker(step.label, extra: {
-      if (_plan!.deviceOrder != null) 'order': _plan!.deviceOrder,
+      if (joinOrder != null) 'order': joinOrder,
       if (step.bleOn != null) 'joined': step.bleOn,
       if (sessionPeerCount != null) 'sessions': sessionPeerCount!(),
       if (sessionTableCount != null)

@@ -427,7 +427,6 @@ class FieldPlanPresets {
       // packet held while the mesh was too sparse may deliver once density
       // rises, and clearing between steps would erase exactly that effect.
       resetDtnBuffer: false,
-      deviceOrder: role,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
@@ -501,7 +500,6 @@ class FieldPlanPresets {
       // Leftover sends would otherwise drain into the next rep's window via
       // the sync exchange and blur its usable stage.
       resetDtnBuffer: true,
-      deviceOrder: role,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
@@ -586,7 +584,6 @@ class FieldPlanPresets {
       resetSessions: false,
       resetLinks: false,
       resetDtnBuffer: false,
-      deviceOrder: role,
       manualJoin: true,
       alignSec: alignSec,
       placementSec: placementSec,
@@ -698,7 +695,6 @@ class FieldPlanPresets {
       resetSessions: false,
       resetLinks: false,
       resetDtnBuffer: false,
-      deviceOrder: role,
       // Wall-clock anchored so every phone opens the dark window at the same
       // instant — a stagger would let a sender push while the traveller was
       // still up, and those messages would deliver instead of being carried.
@@ -744,7 +740,6 @@ class FieldPlanPresets {
       resetLinks: p.resetLinks,
       resetDtnBuffer: p.resetDtnBuffer,
       autoAdvanceGapSec: p.autoAdvanceGapSec,
-      deviceOrder: p.deviceOrder,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
@@ -772,16 +767,18 @@ class FieldPlanPresets {
         // hop count now that conveyance pays TTL, and `message re-delivery`
         // is zero under age-only dedup.
         //
-        // scf-rearm-1 is already recorded and the recorder APPENDS, so this
-        // is -2: re-using the id would merge two runs into one file and one
-        // upload. Its numbers are not comparable with scf-rearm-1 anyway —
-        // that run had the per-neighbour relay cap in the build (lifted for
-        // the arm), this one has no cap at all, and it ran on three phones
-        // rather than eight.
+        // A FRESH id each attempt, because the recorder APPENDS: re-using one
+        // merges two runs into a single file and a single upload. -1 is
+        // already recorded; -2 was launched on 2026-08-12 and killed ~16 s
+        // after its anchor (the presets were stamping the plan ROLE as the
+        // join order), so a stub of it exists on every phone and its id is
+        // burnt. Numbers here are not comparable with scf-rearm-1 anyway —
+        // that run had the per-neighbour relay cap in the build, this one has
+        // no cap at all, and it ran on three phones rather than eight.
         'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-2', role: 1),
+            storeCarryForward(expId: 'scf-rearm-3', role: 1),
         'SCF re-arm check — sender (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-2', role: 2),
+            storeCarryForward(expId: 'scf-rearm-3', role: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

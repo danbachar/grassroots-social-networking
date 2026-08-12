@@ -19,9 +19,18 @@ class DtnStore {
   /// Max distinct recipients held at once.
   final int maxRecipients;
 
-  /// Max cached packets across ALL recipients (globally-oldest evicted
-  /// first). 8192 packets ≈ 2 MB at typical sealed sizes.
-  final int maxTotal;
+  /// Max cached BYTES across ALL recipients (globally-oldest evicted first).
+  ///
+  /// The size bound is bytes, not a packet count. A count says nothing about
+  /// memory unless every packet is the same size, and they are not: a
+  /// fragmented message is several packets of whatever the MTU left over.
+  /// Bytes are the thing actually being bounded, so bytes are what the bound
+  /// is written in.
+  ///
+  /// This counts sealed PAYLOAD bytes, which is what [totalBytes] reports and
+  /// what the `buf` trace record carries — not the Dart object overhead
+  /// around each entry, so real process memory sits above this figure.
+  final int maxBytes;
 
   /// Packets older than this are dropped.
   final Duration maxAge;
@@ -38,7 +47,7 @@ class DtnStore {
 
   DtnStore({
     this.maxRecipients = 256,
-    this.maxTotal = 8192,
+    this.maxBytes = 512 * 1024 * 1024, // 512 MiB
     this.maxAge = const Duration(hours: 6),
   });
 
@@ -71,10 +80,10 @@ class DtnStore {
     list.add(_Entry(packet, at));
     _totalBytes += packet.payload.length;
 
-    // Bound the store as a whole: evict the globally-oldest packet. Each
-    // per-recipient list is append-ordered, so the oldest entry overall is
-    // the oldest list head.
-    while (totalCount > maxTotal) {
+    // Bound the store as a whole: evict the globally-oldest packet until the
+    // buffer is inside its byte ceiling. Each per-recipient list is
+    // append-ordered, so the oldest entry overall is the oldest list head.
+    while (_totalBytes > maxBytes) {
       String? evictKey;
       DateTime? oldestHead;
       for (final entry in _byRecipient.entries) {

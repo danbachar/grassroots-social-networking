@@ -32,7 +32,9 @@ void main() {
   });
 
   test('store-wide cap eviction reports evictedTotal, oldest first', () {
-    final store = DtnStore(maxTotal: 2);
+    // The bound is BYTES: 10 + 20 fits, the 30-byte packet does not, so the
+    // globally-oldest goes and the ledger lands exactly on the ceiling.
+    final store = DtnStore(maxBytes: 50);
     final drops = <(String, String)>[];
     store.onDrop =
         (reason, recipient, packet) => drops.add((reason, packet.packetId));

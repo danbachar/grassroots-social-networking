@@ -413,19 +413,34 @@ class GrassrootsNetwork {
   /// single-packet message, N for fragments) so the ACK can drop them from
   /// the buffer.
   ///
-  /// BOUNDED: entries leave on the recipient's ACK, so anything never ACKed
-  /// would accumulate forever. Evicting the oldest only costs the ability to
-  /// drop it from the buffer early — the DTN store still ages it out.
+  /// BOUNDED BY THE BUFFER: an entry leaves when its packets leave, for ANY
+  /// reason — the recipient's ACK, age expiry, or an eviction. The store
+  /// reports the non-ACK exits through [MessageRouter.onBufferedPacketDropped]
+  /// and [_forgetBufferedPacket] applies them here, so the index holds exactly
+  /// the messages with packets still in the store.
   ///
-  /// Sized to the DTN store's own packet ceiling ([MessageRouter.dtnCapacity]),
-  /// because an entry stops being useful exactly when its last packet leaves
-  /// the buffer, and at most that many packets can be live at once. The old
-  /// bound of 1000 (borrowed from `MessagesState.maxMessages`, an unrelated
-  /// UI-history depth) was 8x under the buffer and filled in ~50 s at the
-  /// measured saturation rate: the 7-device smoke run evicted 178,138 entries,
-  /// which silently turned ACK-driven buffer release off and left packets to
-  /// age out instead.
+  /// It did not always. The index drained on ACK alone while the buffer
+  /// drained on ACK, expiry AND eviction, so every non-ACK exit left a dead
+  /// entry behind. Measured on scf-rearm-3: the buffer shed 12,723 packets by
+  /// eviction against 1,958 released by ACK — six sheds per ACK — and two
+  /// phones sat pinned at the cap with 8,307 index evictions between them.
+  /// Once the index is full of dead entries the FIFO throws out LIVE ones, so
+  /// a later ACK cannot release its packets and they linger to age expiry,
+  /// which keeps the buffer full. That is the same failure an earlier bound of
+  /// 1000 caused (178,138 evictions on a 7-device run); raising the number
+  /// only made it slower to arrive, because the number was never the problem.
   final Map<String, List<String>> _dtnPacketIds = {};
+
+  /// packetId → the messageId that sealed it. The store reports exits by
+  /// packetId and the index is keyed by messageId, so without this the prune
+  /// would be a scan of every entry per dropped packet.
+  final Map<String, String> _dtnMessageOfPacket = {};
+
+  /// Backstop only — reaching it means [_forgetBufferedPacket] is not being
+  /// called, since the index cannot otherwise outgrow the buffer. It fires an
+  /// `ackIndex / evicted` drop record, which is the alarm for exactly that
+  /// regression; in a healthy run the count is zero.
+  static const int _maxAckIndexEntries = 200000;
 
 
   // ===== Public callbacks =====
@@ -1482,6 +1497,9 @@ class GrassrootsNetwork {
         _dtnPacketIds[messageId] = [
           for (final p in sealedPackets) p.packetId,
         ];
+        for (final p in sealedPackets) {
+          _dtnMessageOfPacket[p.packetId] = messageId;
+        }
         // THE fragment join: relay/packetDup/custody/decrypt records carry
         // only per-fragment packetIds, and for a fragmented message those are
         // random — unjoinable to the messageId without this record.
@@ -1490,9 +1508,11 @@ class GrassrootsNetwork {
           'packetIds': [for (final p in sealedPackets) p.packetId],
           'fragments': sealedPackets.length,
         });
-        while (_dtnPacketIds.length > _messageRouter.dtnCapacity) {
+        while (_dtnPacketIds.length > _maxAckIndexEntries) {
           final evicted = _dtnPacketIds.keys.first;
-          _dtnPacketIds.remove(evicted);
+          for (final id in _dtnPacketIds.remove(evicted) ?? const <String>[]) {
+            _dtnMessageOfPacket.remove(id);
+          }
           // A later ACK for this message can no longer release its packets
           // early — they linger to age expiry. Silent before.
           _traceDrop('ackIndex', 'evicted', {'messageId': evicted});
@@ -1716,7 +1736,23 @@ class GrassrootsNetwork {
   /// of every sealed packet belonging to [messageId].
   void _dropFromDtnBufferFor(String messageId) {
     final ids = _dtnPacketIds.remove(messageId);
+    for (final id in ids ?? const <String>[]) {
+      _dtnMessageOfPacket.remove(id);
+    }
     _messageRouter.dropFromDtnBuffer(ids ?? [messageId]);
+  }
+
+  /// A packet left the DTN buffer without an ACK. Forget it, and forget the
+  /// whole message once its LAST packet is gone — a fragmented message keeps
+  /// its entry while any fragment is still buffered, so an ACK can still
+  /// release the rest.
+  void _forgetBufferedPacket(String packetId) {
+    final messageId = _dtnMessageOfPacket.remove(packetId);
+    if (messageId == null) return;
+    final ids = _dtnPacketIds[messageId];
+    if (ids == null) return;
+    ids.remove(packetId);
+    if (ids.isEmpty) _dtnPacketIds.remove(messageId);
   }
 
   /// DEBUG/TESTBED ONLY. Notified on every end-to-end ACK so the field
@@ -1975,6 +2011,7 @@ class GrassrootsNetwork {
     debugPrint('[testbed] Clearing DTN memory buffer');
     _messageRouter.clearDtnBuffer();
     _dtnPacketIds.clear();
+    _dtnMessageOfPacket.clear();
   }
 
   void resetAllSessions() {
@@ -3640,6 +3677,10 @@ class GrassrootsNetwork {
     };
 
     // ACK received (UDP delivery confirmation)
+    // The store sheds packets without an ACK (expiry, eviction); the index
+    // has to hear about it or it fills with dead entries.
+    _messageRouter.onBufferedPacketDropped = _forgetBufferedPacket;
+
     _messageRouter.onAckReceived = (messageId) {
       debugPrint('ACK received for message $messageId');
       // Duplicate-ACK guard for the TRACE (the reducer already refuses the
@@ -4917,6 +4958,7 @@ class GrassrootsNetwork {
     _issuedNonceUses.clear();
     _invitedContacts.clear();
     _dtnPacketIds.clear();
+    _dtnMessageOfPacket.clear();
 
     _messageRouter.dispose();
     _signalingService.dispose();

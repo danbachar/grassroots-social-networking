@@ -105,8 +105,9 @@ void main() {
       expect(store.packetById(uuid.v4()), isNull);
     });
 
-    test('store-wide total cap evicts the globally-oldest packet', () {
-      final store = DtnStore(maxTotal: 3);
+    test('store-wide byte cap evicts the globally-oldest packet', () {
+      // Payloads are 3 bytes each, so 9 bytes holds exactly three packets.
+      final store = DtnStore(maxBytes: 9);
       final t0 = DateTime(2026, 1, 1);
       final first = sealed('a');
       store.store('ra', first, now: t0);
@@ -159,12 +160,31 @@ void main() {
 
     tearDown(() => router.dispose());
 
-    test('dtnCapacity exposes the store-wide packet ceiling', () {
-      // GrassrootsNetwork sizes its messageId -> packetIds ACK index from
-      // this. The two bounds must not drift: an index entry is dead the
-      // moment its last packet leaves the buffer, so a smaller index silently
-      // disables ACK-driven release and leaves packets to age out instead.
-      expect(router.dtnCapacity, DtnStore().maxTotal);
+    test('a non-ACK buffer exit is reported so the ACK index can forget it',
+        () {
+      // GrassrootsNetwork's messageId -> packetIds index is keyed by message
+      // while the store evicts by packet, and the index used to drain on ACK
+      // ALONE. Every expiry and eviction then left a dead entry behind until
+      // the index filled and started throwing out LIVE ones — which is what
+      // turns ACK-driven release off. The store must report every non-ACK
+      // exit, and it must do so whether or not tracing is on.
+      final seen = <String>[];
+      router.onBufferedPacketDropped = seen.add;
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 5,
+        recipientPubkey: Uint8List(32),
+        payload: Uint8List.fromList([1, 2, 3]),
+      );
+      router.storeInDtnBuffer(Uint8List(32), p);
+      router.clearDtnBuffer();
+      expect(seen, isEmpty,
+          reason: 'a wholesale clear is not a per-packet exit');
+
+      router.storeInDtnBuffer(Uint8List(32), p);
+      router.dropFromDtnBuffer([p.packetId]);
+      expect(seen, isEmpty,
+          reason: 'an ACK release is reported by the caller, not here');
     });
 
     GrassrootsPacket thirdPartySealed({int ttl = 5}) => GrassrootsPacket(

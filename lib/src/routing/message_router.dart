@@ -203,6 +203,10 @@ class MessageRouter {
     // silent: a custody `store` with no `end` was ambiguous between "still
     // held" and "gone". Now every exit is a custody `end` with a reason.
     _dtnStore.onDrop = (reason, recipientHex, packet) {
+      // Tell the sender's index first, and unconditionally: this is a
+      // correctness path, not a tracing one, so it must not sit behind the
+      // `trace.active` return below.
+      onBufferedPacketDropped?.call(packet.packetId);
       if (!(trace?.active ?? false)) return;
       unawaited(trace!.log({
         'type': 'custody',
@@ -243,11 +247,13 @@ class MessageRouter {
   int get dtnBufferedRecipients => _dtnStore.recipientCount;
   int get dtnBufferedBytes => _dtnStore.totalBytes;
 
-  /// Store-wide packet ceiling. Anything indexed against the buffer (notably
-  /// the sender's messageId → packetIds map) must be sized from this: an index
-  /// entry is dead the moment its last packet leaves the store, and no more
-  /// than this many packets can be live at once.
-  int get dtnCapacity => _dtnStore.maxTotal;
+  /// A buffered packet left the store WITHOUT an ACK (age expiry or an
+  /// eviction). The sender's messageId → packetIds index subscribes to this
+  /// so it can forget the entry: an index entry is dead the moment its last
+  /// packet leaves the store, and an index that only ever drained on ACK
+  /// filled with dead entries and then evicted LIVE ones — which is exactly
+  /// what turns ACK-driven buffer release off.
+  void Function(String packetId)? onBufferedPacketDropped;
 
   // ===== Unified Packet Processing =====
 

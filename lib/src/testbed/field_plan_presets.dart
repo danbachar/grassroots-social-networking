@@ -791,10 +791,16 @@ class FieldPlanPresets {
         // changes came out of. Nothing here is comparable with -1: that run
         // had the per-neighbour relay cap in the build and this one has no
         // cap at all.
+        //
+        // -6 is a straight repeat of -5 — same plan, no flood, offers are
+        // id lists — on a rebooted six-phone fleet, this time with the build
+        // that drops a discovered address the moment a central dial fails.
+        // The question it answers is narrow: is the GATT exhaustion storm
+        // gone, or was the dead address only part of it?
         'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-5', role: 1),
+            storeCarryForward(expId: 'scf-rearm-6', role: 1),
         'SCF re-arm check — sender (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-5', role: 2),
+            storeCarryForward(expId: 'scf-rearm-6', role: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

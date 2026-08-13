@@ -1032,7 +1032,10 @@ class MessageRouter {
   List<Uint8List> buildSyncOffers(Uint8List peerPubkey) {
     final peerHex = _pubkeyToHex(peerPubkey);
     _settleSyncRound(peerHex);
-    final ids = _dtnStore.carriedPacketIds();
+    // Direct delivery outranks relay: lead with packets addressed to this
+    // peer so they ride the first offer chunk and are conveyed before a large
+    // relay backlog can starve them inside a short, unstable BLE window.
+    final ids = _dtnStore.carriedPacketIdsFor(peerHex);
     // Prune first, and unconditionally: an id that left the buffer (ACKed,
     // expired, evicted) can never be offered again, so keeping its decline
     // only grows the set. This is what keeps the declines bounded by the

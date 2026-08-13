@@ -96,6 +96,32 @@ void main() {
       expect(store.carriedPacketIds(), hasLength(2));
     });
 
+    test('carriedPacketIdsFor leads with the peer own packets, then relay', () {
+      final store = DtnStore();
+      // Two relay packets buffered before the target's own packet, so a flat
+      // enumeration would put the direct delivery LAST.
+      final r1 = sealed('a'), r2 = sealed('b');
+      final mine = sealed('c'), mine2 = sealed('c');
+      store.store('relay1', r1);
+      store.store('relay2', r2);
+      store.store('peer', mine);
+      store.store('peer', mine2);
+      final ids = store.carriedPacketIdsFor('peer');
+      // The peer own packets come first, in FIFO order, ahead of the backlog.
+      expect(ids.take(2), orderedEquals([mine.packetId, mine2.packetId]),
+          reason: 'direct-delivery packets must lead the offer');
+      // Nothing is dropped: the relay backlog still follows.
+      expect(ids, hasLength(4));
+      expect(ids.skip(2), containsAll([r1.packetId, r2.packetId]));
+    });
+
+    test('carriedPacketIdsFor for an unheld recipient is just the backlog', () {
+      final store = DtnStore();
+      final r1 = sealed('a');
+      store.store('relay1', r1);
+      expect(store.carriedPacketIdsFor('nobody'), orderedEquals([r1.packetId]));
+    });
+
     test('packetById finds without removing; unknown id is null', () {
       final store = DtnStore();
       final a = sealed('a');

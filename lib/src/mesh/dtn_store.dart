@@ -137,6 +137,30 @@ class DtnStore {
     ];
   }
 
+  /// The same carried packetIds, but with those held FOR [recipientHex]
+  /// emitted FIRST — the direct-delivery set for the peer we are offering to,
+  /// ahead of the mesh-relay backlog (packets addressed to everyone else).
+  ///
+  /// Ordering is load-bearing, not cosmetic. The offer is chunked and a
+  /// neighbour requests per chunk, so whatever leads the list is requested
+  /// and conveyed first. When the buffer is large and the BLE window short
+  /// and unstable, a flat ordering interleaves a peer's own packets (its
+  /// pending message, its friend request/acceptance — all addressed to it)
+  /// behind hundreds of relay packets for other recipients, and the link
+  /// drops before they are reached: the direct delivery is starved by the
+  /// relay it should outrank. Leading with the direct set puts it in the
+  /// first chunk, so it lands before anything else can crowd it out.
+  List<String> carriedPacketIdsFor(String recipientHex, {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    return [
+      for (final e in _byRecipient[recipientHex] ?? const <_Entry>[])
+        e.packet.packetId,
+      for (final entry in _byRecipient.entries)
+        if (entry.key != recipientHex)
+          for (final e in entry.value) e.packet.packetId,
+    ];
+  }
+
   /// Look up a carried packet by [packetId] without removing it — used to
   /// convey a copy to a neighbor that requested it from our sync offer.
   /// Returns null if expired/evicted since the offer.

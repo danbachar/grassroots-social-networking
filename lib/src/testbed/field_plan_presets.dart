@@ -797,10 +797,18 @@ class FieldPlanPresets {
         // that drops a discovered address the moment a central dial fails.
         // The question it answers is narrow: is the GATT exhaustion storm
         // gone, or was the dead address only part of it?
+        //
+        // -7 changes three things at once, so it gets its own id: the fleet
+        // runs CLOSED (friends-only, ghost excluded by the scan filter), the
+        // build offers direct-recipient packets before the relay backlog
+        // (buildSyncOffers/carriedPacketIdsFor), and node 4 is a degraded unit
+        // whose GATT discovery wedges — so the 4<->6 edge is absent and node 4
+        // may contribute little. Read: does closed-mode SCF still deliver via
+        // the hub with one node down and no ghost in the trace.
         'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-6', role: 1),
+            storeCarryForward(expId: 'scf-rearm-7', role: 1),
         'SCF re-arm check — sender (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-6', role: 2),
+            storeCarryForward(expId: 'scf-rearm-7', role: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

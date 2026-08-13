@@ -792,9 +792,9 @@ class FieldPlanPresets {
         // had the per-neighbour relay cap in the build and this one has no
         // cap at all.
         'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-4', role: 1),
+            storeCarryForward(expId: 'scf-rearm-5', role: 1),
         'SCF re-arm check — sender (1 rep, ~17 min)':
-            storeCarryForward(expId: 'scf-rearm-4', role: 2),
+            storeCarryForward(expId: 'scf-rearm-5', role: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

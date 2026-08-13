@@ -1810,7 +1810,22 @@ class BleTransportService extends TransportService {
       case ble.BlePathState.stale:
         if (path.state == ble.BlePathState.failed &&
             path.role == ble.BleRole.central) {
-          store.dispatch(BleDeviceConnectionFailedAction(path.pathId));
+          // One strike and the address is gone. A peer's resolvable private
+          // address rotates every ~15 min, so an address that just refused a
+          // dial is usually one the peer no longer answers on — but we keep
+          // seeing it in the discovery map and redialing it about once a
+          // second, and every failed connectGatt holds one of Android's ~32
+          // native GATT slots for its full ~30s timeout. Twenty seconds of
+          // dialing one dead address fills the table, after which EVERY
+          // connect — including to peers that would have worked — returns
+          // GATT_ERROR(133) at once (measured on the fleet: up to 280
+          // exhaustion events per minute with zero successful connects).
+          // Dropping the address means it cannot be redialed until the peer
+          // advertises again, which it does under whatever address it
+          // currently answers on. Being wrong about a transient failure costs
+          // one dial opportunity: a live peer is re-added by its next
+          // advertisement about a second later.
+          store.dispatch(BleDeviceRemovedAction(path.pathId));
         }
         // Mirror the connect emit at the `ready` case: surface a disconnect
         // to the upper layer only on a true transition out of `ready`.

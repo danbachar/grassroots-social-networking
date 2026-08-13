@@ -8,6 +8,7 @@ import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart'
     show
+        BleDeviceDiscoveredAction,
         BleDeviceRemovedAction,
         FriendEstablishedAction,
         PeerAnnounceReceivedAction;
@@ -407,6 +408,64 @@ void main() {
 
       expect(
           hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(2));
+    });
+
+    test('a failed central dial drops the discovered address', () async {
+      const remoteId = 'DEADADDR';
+      const pathId = 'central:$remoteId';
+      const serviceUuid = '84c40316-0871-e5ad-8888-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true);
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT_ERROR(133)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), false,
+          reason: 'An address that refused a dial must leave the discovery '
+              'map, so it cannot be redialed once a second into a full GATT '
+              'table until the peer advertises again.');
+    });
+
+    test('a failed peripheral path does NOT drop a discovered address',
+        () async {
+      // Planted under the peripheral pathId so the two keys coincide: if the
+      // eviction were not gated on the central role it would fire here.
+      const pathId = 'peripheral:INBOUND';
+      store.dispatch(BleDeviceDiscoveredAction(
+        deviceId: pathId,
+        rssi: -55,
+        serviceUuid: '84c40316-0871-e5ad-9999-000000000000',
+      ));
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.peripheral,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+        error: 'Connection timed out.',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'Only our own dial exhausts GATT slots. A failure on an '
+              'inbound leg says nothing about whether that address is dialable.');
     });
 
     test(

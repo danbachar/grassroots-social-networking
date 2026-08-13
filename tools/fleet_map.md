@@ -14,35 +14,42 @@ them either. Hence this file — serials are stable, join orders are not.
 }
 ```
 
-## The fleet as of 2026-08-12
+## The fleet as of 2026-08-13 — RENUMBERED, and one phone short
 
-Nicknames stated by Dan on 2026-08-12; models and Android versions read off
-the handsets over adb (`ro.product.model`, `ro.build.version.release`). All
-eight were attached, all in **open mode**.
+The Pixel 2 dropped off adb (wireless debugging pairing lost) and is out of the
+fleet until it is re-paired or cabled. The remaining seven were renumbered 1-7
+contiguously with the traveller as 1, so there is no gap where it was.
 
-| join | serial | phone | Android | pubkey |
-|---|---|---|---|---|
-| 1 | `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` |
-| 2 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `f5aee069…` |
-| 3 | `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` |
-| 4 | `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` |
-| 5–8 | `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` |
-| 5–8 | `00de4b24f89021e4` | Nexus 5X | 8.1 | `b7d04acb…` |
-| 5–8 | `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` |
-| 5–8 | `00d98aa1795bc454` | Nexus 5X | 8.1 | `d5aedd63…` |
+| join | serial | phone | Android | pubkey | was |
+|---|---|---|---|---|---|
+| 1 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `f5aee069…` | 2 |
+| 2 | `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` | 1 |
+| 3 | `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` | 4 |
+| 4 | `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` | 5 |
+| 5 | `00de4b24f89021e4` | Nexus 5X | 8.1 | `b7d04acb…` | 6 |
+| 6 | `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` | 7 |
+| 7 | `00d98aa1795bc454` | Nexus 5X | 8.1 | `d5aedd63…` | 8 |
+| — | `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` | 3, OFF ADB |
 
-**The four Nexus 5X hold 5, 6, 7 and 8 — but which is which is unread.** The
-models are identical and the join order lives only in the app, so nothing
-here can tell them apart. Read the **You** screen on each before trusting a
-numbered role on any of them. An earlier version of this file guessed at
-`18130c0f`=5, `b7d04acb`=6, `44a266c4`=7, `d5aedd63`=8; that was inference
-from serial format, never confirmed, and it is not evidence.
+**Node 1 is the TRAVELLER** — the phone that goes dark in a store-carry-forward
+run. It moved to the Pixel 10 Pro because it is the only handset in the fleet
+with no GATT exhaustion and no Bluetooth stack crashes; the Pixel 2 that held
+the role had seven stack crashes in one day.
 
-**This renumbering superseded the 2026-08-08 assignment.** The Huawei was 4
-and is now 1; the S10e had the non-numeric nickname `User_929a022c` and is
-now 4. Any analysis that maps a join order onto a phone must use the numbering
-that was live when the run was recorded — for runs before 2026-08-12, the old
-one. The pubkey is the only identifier that never moves.
+**As of writing, 2-7 are confirmed renamed** (each read off its own You screen
+after saving, with the pubkey verified first). **The Pixel 10 is still `2`** —
+it is locked behind its post-boot PIN, so its app data is credential-encrypted
+and the launcher activity does not resolve. It needs one physical unlock before
+the rename to `1` can be made.
+
+A peer's Nearby list LAGS a rename — during the renumber several phones showed
+two peers claiming one number. The authoritative value is the phone's own You
+screen, never a neighbour's list of it.
+
+**Every trace recorded before 2026-08-13 uses the OLD numbering**, and
+scf-rearm-1..5 additionally ran with eight phones. Join order is only meaningful
+alongside the numbering that was live when the run was recorded; the pubkey is
+the only identifier that never moves.
 
 ### The ninth handset
 

@@ -377,10 +377,6 @@ void main() {
       bobRouter.onMessageReceived = (_, __, ___, ____) {
         messageReceived = true;
       };
-      GrassrootsPacket? relayed;
-      bobRouter.onRelay = (packet, {String? excludeBlePeerId}) {
-        relayed = packet;
-      };
 
       await bobRouter.processPacket(
         sealed,
@@ -390,10 +386,12 @@ void main() {
       );
 
       expect(messageReceived, isFalse);
-      // Relayed toward the (unreachable) recipient with a decremented TTL.
-      expect(relayed, isNotNull);
-      expect(relayed!.recipientPubkey, equals(otherPub));
-      expect(relayed!.ttl, equals(sealed.ttl - 1));
+      // Taken into custody for the recipient with a decremented TTL. Nothing
+      // is pushed: it leaves only when a neighbour asks for it by packetId.
+      final held = bobRouter.dtnBufferFor(otherPub);
+      expect(held, hasLength(1));
+      expect(held.single.recipientPubkey, equals(otherPub));
+      expect(held.single.ttl, equals(sealed.ttl - 1));
     });
   });
 

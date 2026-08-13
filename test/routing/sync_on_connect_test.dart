@@ -226,7 +226,6 @@ void main() {
     /// the DTN store (recipient unreachable in the empty peers state).
     Future<GrassrootsPacket> storeViaRelay() async {
       final p = thirdPartySealed();
-      router.onRelay = (_, {String? excludeBlePeerId}) {};
       await router.processPacket(
         p,
         transport: PeerTransport.bleDirect,
@@ -482,8 +481,6 @@ void main() {
     test('a spent packet in TRANSIT is dropped on arrival', () async {
       // Nothing can be done with it: it cannot be forwarded, and carrying it
       // one buffer further would only make the next node refuse it too.
-      var relayed = false;
-      router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
       final spent = GrassrootsPacket(
         type: PacketType.secure,
         ttl: 0,
@@ -492,7 +489,7 @@ void main() {
       );
       await router.processPacket(spent,
           transport: PeerTransport.bleDirect, bleDeviceId: 'inbound-leg');
-      expect(relayed, isFalse);
+      expect(router.dtnBufferedCount, 0);
       expect(router.dtnBufferedCount, 0,
           reason: 'a packet with no budget is not worth carrying either');
     });
@@ -544,53 +541,45 @@ void main() {
     });
 
     test('arriving at 2 forwards at 1 — a hop still remains', () async {
-      final relayed = <GrassrootsPacket>[];
-      router.onRelay = (p, {String? excludeBlePeerId}) => relayed.add(p);
       await router.processPacket(
         thirdPartySealed(ttl: 2),
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'inbound-leg',
       );
-      expect(relayed.single.ttl, 1);
+      expect(router.dtnBufferedPackets.single.ttl, 1);
     });
 
     test('arriving at 1 is forwarded once, at 0', () async {
       // The last hop is still worth taking: the destination is exempt from the
       // refusal, so a neighbour who is the recipient still accepts it.
-      final relayed = <GrassrootsPacket>[];
-      router.onRelay = (p, {String? excludeBlePeerId}) => relayed.add(p);
       await router.processPacket(
         thirdPartySealed(ttl: 1),
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'inbound-leg',
       );
-      expect(relayed.single.ttl, 0);
+      expect(router.dtnBufferedPackets.single.ttl, 0);
       expect(router.dtnBufferedCount, 1,
           reason: 'exhaustion does not delete it — it stays in custody and is '
               're-offered whenever a link to the recipient forms');
     });
 
     test('a relay already at 0 is refused', () async {
-      var relayed = false;
-      router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
       await router.processPacket(
         thirdPartySealed(ttl: 0),
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'inbound-leg',
       );
-      expect(relayed, isFalse);
+      expect(router.dtnBufferedCount, 0);
       expect(router.dtnBufferedCount, 0);
     });
 
     test('arriving at 3 still forwards, at 2', () async {
-      final relayed = <GrassrootsPacket>[];
-      router.onRelay = (p, {String? excludeBlePeerId}) => relayed.add(p);
       await router.processPacket(
         thirdPartySealed(ttl: 3),
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'inbound-leg',
       );
-      expect(relayed.single.ttl, 2);
+      expect(router.dtnBufferedPackets.single.ttl, 2);
     });
 
     test('conveyance sends the held packet unchanged', () async {
@@ -615,7 +604,6 @@ void main() {
     test('an unforwardable packet never enters the buffer at all', () async {
       // The gate is at ARRIVAL: a packet that cannot be forwarded is dropped
       // rather than stored, which is why conveyance needs no gate of its own.
-      router.onRelay = (_, {String? excludeBlePeerId}) {};
       await router.processPacket(
         thirdPartySealed(ttl: 0),
         transport: PeerTransport.bleDirect,
@@ -646,13 +634,11 @@ void main() {
     });
 
     test('sync packets are never relayed and never delivered', () async {
-      var relayed = false;
-      router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
       router.onMessageReceived =
           (_, __, ___, ____) => fail('sync must not deliver');
 
       await deliverSyncFrame(ContentType.syncOffer, [uuid.v4()], 'neighbor-1');
-      expect(relayed, isFalse);
+      expect(router.dtnBufferedCount, 0);
     });
 
     test('sync over UDP is ignored — the buffer is BLE-only',

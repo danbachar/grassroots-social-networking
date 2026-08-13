@@ -710,49 +710,67 @@ void main() {
     // Managed flooding (relay) + DTN
     // =========================================================================
 
-    group('processPacket - managed flooding (relay)', () {
-      test('relays a sealed packet not addressed to us with ttl>1', () async {
-        GrassrootsPacket? relayed;
-        String? excluded;
-        router.onRelay = (packet, {String? excludeBlePeerId}) {
-          relayed = packet;
-          excluded = excludeBlePeerId;
-        };
-        // We hold no session, so even if it were addressed to us we couldn't
-        // open it — but it isn't ours, so it must be forwarded blindly.
+    // =========================================================================
+    // Custody (no flood) + DTN
+    // =========================================================================
+
+    group('processPacket - transit packets are taken into custody', () {
+      test('a transit packet with ttl left is buffered, decremented once, and '
+          'pushed at nobody', () async {
+        // There is no flood. A packet that is not ours is taken into custody
+        // and leaves only when a neighbour asks for it by packetId in a sync
+        // exchange, so the observable effect of an arrival is a buffer entry,
+        // not a transmission.
         router.onMessageReceived = (_, __, ___, ____) =>
             fail('a packet not addressed to us must not be delivered');
+        var conveyed = 0;
+        router.onSyncSend = (_, __) => conveyed++;
 
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
           type: PacketType.secure,
           ttl: 5,
           recipientPubkey: thirdParty,
-          payload: Uint8List.fromList([9, 9, 9]),
+          payload: Uint8List.fromList([9]),
         );
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect,
+            bleDeviceId: 'inbound-leg',
+            rssi: -60);
 
-        await router.processPacket(
-          p,
-          transport: PeerTransport.bleDirect,
-          bleDeviceId: 'inbound-leg',
-          rssi: -60,
-        );
-
-        expect(relayed, isNotNull);
-        // TTL decremented for the next hop.
-        expect(relayed!.ttl, equals(4));
-        expect(relayed!.packetId, equals(p.packetId));
-        // The inbound BLE leg is excluded from the rebroadcast.
-        expect(excluded, equals('inbound-leg'));
+        final held = router.dtnBufferFor(thirdParty);
+        expect(held, hasLength(1));
+        expect(held.single.packetId, p.packetId);
+        expect(held.single.ttl, 4,
+            reason: 'ONE decrement per arrival, paid on the way in');
+        expect(conveyed, 0, reason: 'nothing is pushed; a peer must ask');
       });
 
-      test('does not relay a packet whose ttl has already reached 0', () async {
-        // The refusal is for a count that is ALREADY spent. A packet arriving
-        // at 1 still gets its last hop (see below); one arriving at 0 does
-        // not, because there is nothing left to subtract.
-        bool relayed = false;
-        router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
+      test('it is buffered even when the recipient is reachable right now',
+          () async {
+        // The flooding design stored only when the recipient was out of
+        // reach, because the flood covered the reachable case. With nothing
+        // pushing, a packet this node did not keep is one it can never offer
+        // onward — so it keeps every transit packet with TTL left.
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: otherPubkey,
+          nickname: 'Reachable',
+          rssi: -40,
+          bleCentralDeviceId: 'central:reachable',
+        ));
+        final p = GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 5,
+          recipientPubkey: otherPubkey,
+          payload: Uint8List.fromList([4]),
+        );
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
+        expect(router.dtnBufferFor(otherPubkey).map((c) => c.packetId),
+            contains(p.packetId));
+      });
 
+      test('a packet whose ttl has already reached 0 dies here', () async {
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
           type: PacketType.secure,
@@ -760,64 +778,47 @@ void main() {
           recipientPubkey: thirdParty,
           payload: Uint8List.fromList([1]),
         );
-
-        await router.processPacket(
-          p,
-          transport: PeerTransport.bleDirect,
-          bleDeviceId: 'inbound-leg',
-          rssi: -60,
-        );
-
-        expect(relayed, isFalse);
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
+        expect(router.dtnBufferFor(thirdParty), isEmpty,
+            reason: 'nothing unforwardable belongs in the buffer');
       });
 
-      test('relays a packet at ttl 1 once, at 0', () async {
-        // That final broadcast is worth making: the destination is exempt from
-        // the refusal, so a neighbour who is the recipient still accepts it.
-        final relayed = <GrassrootsPacket>[];
-        router.onRelay = (p, {String? excludeBlePeerId}) => relayed.add(p);
-
+      test('a packet at ttl 1 is taken into custody at 0', () async {
+        // Worth keeping: the node it is addressed to is exempt from the
+        // refusal, so a conveyance to the recipient still delivers at 0.
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
-        await router.processPacket(
-          GrassrootsPacket(
-            type: PacketType.secure,
-            ttl: 1,
-            recipientPubkey: thirdParty,
-            payload: Uint8List.fromList([1]),
-          ),
-          transport: PeerTransport.bleDirect,
-          bleDeviceId: 'inbound-leg',
-          rssi: -60,
+        final p = GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 1,
+          recipientPubkey: thirdParty,
+          payload: Uint8List.fromList([2]),
         );
-
-        expect(relayed.single.ttl, 0);
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
+        final held = router.dtnBufferFor(thirdParty);
+        expect(held, hasLength(1));
+        expect(held.single.ttl, 0);
       });
 
-      test('relays a packet only on first sighting (dedup prevents loops)',
-          () async {
-        int relayCount = 0;
-        router.onRelay = (_, {String? excludeBlePeerId}) => relayCount++;
-
+      test('only the first sighting is taken into custody (dedup)', () async {
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
         final p = GrassrootsPacket(
           type: PacketType.secure,
           ttl: 5,
           recipientPubkey: thirdParty,
-          payload: Uint8List.fromList([2]),
+          payload: Uint8List.fromList([1]),
         );
-
-        await router.processPacket(p,
-            transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
-        await router.processPacket(p,
-            transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
-
-        expect(relayCount, equals(1));
+        for (var i = 0; i < 3; i++) {
+          await router.processPacket(p,
+              transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
+        }
+        expect(router.dtnBufferFor(thirdParty), hasLength(1));
       });
+
 
       test('packets are kept per recipient and leave on dropFromDtnBuffer',
           () async {
-        router.onRelay = (packet, {String? excludeBlePeerId}) {};
-
         final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 7));
         final p = GrassrootsPacket(
           type: PacketType.secure,
@@ -826,8 +827,8 @@ void main() {
           payload: Uint8List.fromList([3]),
         );
 
-        // Recipient is not a reachable peer -> first sighting relays AND the
-        // sealed packet enters the buffer, retrievable per recipient.
+        // First sighting takes the sealed packet into custody, retrievable
+        // per recipient.
         await router.processPacket(p,
             transport: PeerTransport.bleDirect, bleDeviceId: 'leg', rssi: -60);
         expect(router.dtnBufferFor(thirdParty).map((c) => c.packetId),
@@ -900,7 +901,7 @@ void main() {
         protocolHandler: protocolHandler,
         fragmentHandler: fragmentHandler,
         trace: trace,
-      )..onRelay = (packet, {String? excludeBlePeerId}) {};
+      );
 
       final stranger = Uint8List.fromList(List.generate(32, (i) => i + 11));
       final packet = GrassrootsPacket(
@@ -957,7 +958,6 @@ void main() {
 
       test('markSeen prevents relay of a pre-marked packet', () async {
         bool relayed = false;
-        router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
 
         router.markSeen('33333333-3333-3333-3333-333333333333');
 
@@ -977,7 +977,7 @@ void main() {
           rssi: -60,
         );
 
-        expect(relayed, isFalse);
+        expect(router.dtnBufferedCount, 0);
       });
 
       test('isDuplicate returns correct results', () {

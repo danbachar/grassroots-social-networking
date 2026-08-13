@@ -153,11 +153,6 @@ class MessageRouter {
   Future<(GrassrootsPacket, Uint8List)?> Function(GrassrootsPacket packet)?
       trialDecrypt;
 
-  /// Relays a packet into the BLE mesh by managed flooding — rebroadcast to all
-  /// neighbors except [excludeBlePeerId] (the inbound path). The coordinator
-  /// wires this to the BLE transport's broadcast.
-  void Function(GrassrootsPacket packet, {String? excludeBlePeerId})? onRelay;
-
   /// Sends a sync-on-connect packet (a conveyed buffered copy) back over
   /// [SyncLink] — directed at that one authenticated peer, never flooded. The
   /// coordinator routes by the link's transport.
@@ -362,28 +357,32 @@ class MessageRouter {
           'fromPeer': _peerHexForBleDevice(bleDeviceId),
         });
       } else if (relayAllowed) {
-        // ONE decrement per arrival. The hopped copy is what we forward AND
-        // what we hold: storing the packet as received would make the buffered
-        // copy a hop richer than the forwarded one, and it would then pay for
-        // this same arrival a second time when conveyed.
+        // ONE decrement per arrival. The hopped copy is what we hold, and it
+        // is what a later conveyance sends: storing the packet as received
+        // would make the buffered copy a hop richer and it would pay for this
+        // same arrival a second time on the way out.
         final hopped = packet.decrementTtl();
-        onRelay?.call(
-          hopped,
-          excludeBlePeerId:
-              transport == PeerTransport.bleDirect ? bleDeviceId : null,
-        );
 
-        // Store-carry-forward: if the recipient isn't a currently-reachable
-        // peer, cache the sealed packet and re-flood it when they reappear.
+        // NO FLOOD. A transit packet is taken into custody and leaves only
+        // when a neighbour asks for it by packetId in a sync exchange. The
+        // node does not push it at anyone.
+        //
+        // Which is why this stores UNCONDITIONALLY, where the flooding design
+        // stored only when the recipient was out of reach: back then the
+        // flood covered the reachable case and the buffer was the exception
+        // path. With nothing pushing, a packet this node did not keep is a
+        // packet it can never offer onward — it would die here — so the
+        // buffer is now the ONLY path and every transit packet with TTL left
+        // belongs in it.
         final recipientHex = _recipientHex(packet);
-        final carried = recipientHex != null && !_recipientReachable(packet);
+        final carried = recipientHex != null;
         if (carried) {
           _dtnStore.store(recipientHex, hopped);
         }
         if (trace?.active ?? false) {
-          // The relay's own view: this node forwarded someone else's sealed
-          // packet. Joining these across devices by packetId reconstructs the
-          // actual path a message took through the mesh (multi-hop evidence).
+          // The relay's own view: this node took someone else's sealed packet
+          // into custody. Joining these across devices by packetId
+          // reconstructs the actual path a message took through the mesh.
           // The envelope is sender-anonymous, so we can only report the
           // neighbour we received FROM — which is exactly the topology edge.
           unawaited(trace!.log({
@@ -854,11 +853,7 @@ class MessageRouter {
     return r == null ? null : _pubkeyToHex(r);
   }
 
-  bool _recipientReachable(GrassrootsPacket packet) {
-    final r = packet.recipientPubkey;
-    if (r == null) return false;
-    return _peersState.getPeerByPubkey(r)?.isReachable ?? false;
-  }
+
 
   static bool _pubkeysEqual(Uint8List a, Uint8List b) {
     if (a.length != b.length) return false;
@@ -958,6 +953,15 @@ class MessageRouter {
       }
     }
   }
+
+  /// Every packet currently in custody, across recipients. Test inspection
+  /// only — in production the buffer is read exclusively by the sync
+  /// offer/request exchange.
+  @visibleForTesting
+  List<GrassrootsPacket> get dtnBufferedPackets => [
+        for (final id in _dtnStore.carriedPacketIds())
+          if (_dtnStore.packetById(id) != null) _dtnStore.packetById(id)!,
+      ];
 
   /// All buffered packets held for [recipientPubkey] (own + relayed). Test
   /// inspection only — in production, buffered packets move exclusively

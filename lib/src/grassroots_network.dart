@@ -1522,21 +1522,19 @@ class GrassrootsNetwork {
         }
 
         final wireMs = DateTime.now().millisecondsSinceEpoch;
-        var reachedNeighbors = false;
-        for (final p in sealedPackets) {
-          reachedNeighbors |= await _floodViaBle(p.serialize()) > 0;
-          if (sealedPackets.length > 1) {
-            await Future.delayed(FragmentHandler.fragmentDelay);
-          }
-        }
-
-        // Buffered either way; on-air reach only affects status.
+        // NOTHING GOES ON THE AIR HERE. The sealed packets are in the buffer;
+        // they leave only when a neighbour asks for them by packetId in a
+        // sync exchange, which the next announce cycle (~10 s) offers them
+        // in. The originator is simply the first node holding them.
+        //
+        // So the message is QUEUED, not aired — `aired: false` is the honest
+        // status, and it flips when the recipient's ACK comes home.
         _markSent(
           messageId: messageId,
           recipientPubkey: recipientPubkey,
           payload: payload,
           transport: MessageTransport.ble,
-          aired: reachedNeighbors,
+          aired: false,
           atMs: wireMs,
         );
         return true;
@@ -2202,12 +2200,10 @@ class GrassrootsNetwork {
         'peer': _pubkeyToHex(senderPubkey),
         'transport': 'ble',
       });
-      // Originator buffers it, same as ACKs: the sealed receipt rides future
-      // sync exchanges even if this flood reaches nobody. Age-expiry only.
+      // Same as ACKs: the sealed receipt goes into the buffer and rides the
+      // sync exchange out. Age-expiry only.
       _messageRouter.storeInDtnBuffer(senderPubkey, sealed);
-      if (await _floodViaBle(sealed.serialize()) > 0) {
-        return true;
-      }
+      return true;
     }
 
     // Fall back to UDP (direct point-to-point) if we have an address.
@@ -3849,30 +3845,6 @@ class GrassrootsNetwork {
     // Trial-decrypt a sealed, sender-anonymous packet against active sessions.
     _messageRouter.trialDecrypt = (packet) => _noiseSessions.trialDecrypt(packet);
 
-    // Relay (managed flooding) — rebroadcast a sealed packet to all BLE
-    // neighbors except the inbound path. The router only relays over the BLE
-    // mesh; UDP stays direct.
-    _messageRouter.onRelay = (packet, {String? excludeBlePeerId}) {
-      // The relay record documents the DECISION; whether the flood reached
-      // anyone is only known after the writes. Kept unawaited so the receive
-      // path is never backpressured by GATT writes — the outcome lands as a
-      // separate tiny record joined on packetId. aired:0 means the hop the
-      // relay record claims never actually made it to the air.
-      unawaited(_floodViaBle(
-        packet.serialize(),
-        excludeBlePeerId: excludeBlePeerId,
-      ).then((aired) {
-        if (!(trace?.active ?? false)) return;
-        unawaited(trace!.log({
-          'type': 'relay',
-          't': DateTime.now().millisecondsSinceEpoch,
-          'event': 'aired',
-          'packetId': packet.packetId,
-          'aired': aired,
-        }));
-      }));
-    };
-
     // Sync-on-connect: directed (never flooded) send of an offer/request/
     // conveyed buffered packet to one specific neighbor.
     _messageRouter.onSyncSend = (packet, link) {
@@ -4137,13 +4109,10 @@ class GrassrootsNetwork {
           });
         }
       } else {
-        // The ACK is epidemic traffic like everything else, and we are its
-        // the originator buffers it too: if no neighbor hears this flood,
-        // the sealed ACK
-        // still rides every future sync exchange. Nothing ACKs an ACK, so
-        // the entry leaves the buffer only by age expiry.
+        // The ACK is recipient-addressed traffic like everything else: it goes
+        // into the buffer and rides the sync exchange out. Nothing ACKs an
+        // ACK, so the entry leaves the buffer only by age expiry.
         _messageRouter.storeInDtnBuffer(senderPubkey, sealed);
-        await _floodViaBle(bytes);
       }
     };
 

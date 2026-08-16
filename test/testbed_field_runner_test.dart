@@ -7,27 +7,39 @@ import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/field_runner.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 import 'package:grassroots_networking/src/trace/experiment_recorder.dart';
-import 'package:uuid/uuid.dart';
 
 /// In-memory recorder: overrides the disk-backed methods the runner calls so
 /// fakeAsync stays in full control of the virtual clock (real file I/O never
 /// resolves under fakeAsync). Records the sequence of experiment events.
 class _FakeRecorder extends ExperimentRecorder {
   final List<String> events = [];
+  final List<String> archived = [];
   bool _active = false;
   @override
   bool get active => _active;
 
+  String? _expId;
+  @override
+  String? get experimentId => _expId;
+
   @override
   Future<void> startExperiment(String id) async {
     _active = true;
+    _expId = id;
     events.add('start:$id');
   }
 
   @override
   Future<void> stopExperiment() async {
     _active = false;
+    _expId = null;
     events.add('stop');
+  }
+
+  @override
+  Future<String?> archiveAbortedExperiment(String id) async {
+    archived.add(id);
+    return 'exp_$id-aborted-1.jsonl';
   }
 
   /// Label and extras are recorded separately: `events` stays the plain
@@ -109,6 +121,38 @@ void main() {
         'marker:end',
         'stop',
       ]);
+      runner.dispose();
+    });
+  });
+
+  test('a role-free diluting plan refuses to launch without a numeric '
+      'nickname', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final runner = FieldRunner(recorder: recorder, myNickname: 'Alice');
+      runner.start(FieldPlanPresets.dilutingWarmupSweep());
+      async.flushMicrotasks();
+      expect(runner.isRunning, isFalse);
+      expect(runner.abortReason, contains('not a join order'));
+      expect(recorder.events, isEmpty,
+          reason: 'nothing may be recorded for a run that never started');
+      runner.dispose();
+    });
+  });
+
+  test('a role-free diluting plan resolves membership from the nickname', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final runner = FieldRunner(recorder: recorder, myNickname: '4');
+      runner.start(FieldPlanPresets.dilutingWarmupSweep());
+      async.flushMicrotasks();
+      expect(runner.isRunning, isTrue);
+      // The resolved plan is what the runner holds: phone #4 is off through
+      // the N=2 and N=3 phases and on from N=4.
+      final steps = runner.plan!.steps;
+      expect(steps.every((s) => s.bleOn != null), isTrue);
+      expect(steps.where((s) => s.bleOn == true).map((s) => s.cliqueN).toSet(),
+          {4, 5, 6, 7});
       runner.dispose();
     });
   });
@@ -240,10 +284,12 @@ void main() {
       async.elapse(const Duration(seconds: 10));
       expect(sent, hasLength(3));
       expect(runner.sentCount, 3);
-      const uuid = Uuid();
+      // Ids are v4, like production: unique, and never repeated across runs.
+      // They used to be derived from the step and seq, which made two runs of
+      // one plan mint identical ids — the receiver's bloom then dropped the
+      // second run's messages as duplicates.
+      expect(sent.map((e) => e.$1).toSet(), hasLength(3));
       for (var seq = 0; seq < 3; seq++) {
-        expect(sent[seq].$1,
-            uuid.v5(workloadUuidNamespace, 'field|cp|A|B|0|$seq'));
         expect(sent[seq].$2, '64'); // dst = roster B (base 100 = 0x64)
       }
       async.elapse(const Duration(seconds: 5)); // settle
@@ -522,6 +568,46 @@ void main() {
     });
   });
 
+  test('a scheduled send goes to every peer: the rate is per destination', () {
+    // 10 sends over the dwell with six peers up is 60 messages, with one peer
+    // it is 10. The count is what each destination receives, and it must not
+    // be quietly divided by how many peers happen to be identified.
+    int sentWith(int peerCount) {
+      var n = 0;
+      fakeAsync((async) {
+        final peers = [
+          for (var i = 0; i < peerCount; i++)
+            Uint8List.fromList(List.generate(32, (j) => (i * 7 + j) & 0xff)),
+        ];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          myPubkeyHex: hexOf(0),
+          knownPeers: () => peers,
+          send: (r, p, {String? messageId}) async {
+            n++;
+            return messageId;
+          },
+        );
+        runner.start(const FieldPlan(
+          expId: 'rate',
+          settleSec: 1,
+          resetSessions: false,
+          steps: [FieldStep(label: 'r', dwellSec: 10, sendCount: 10)],
+        ));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 12));
+        runner.dispose();
+        async.flushTimers();
+      });
+      return n;
+    }
+
+    expect(sentWith(1), 10);
+    expect(sentWith(6), 60, reason: '10 per destination, six destinations');
+  });
+
   test('sendTo addresses one peer by prefix; a miss sends nothing', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
@@ -616,13 +702,7 @@ void main() {
       async.elapse(const Duration(seconds: 10));
 
       expect(sent, hasLength(2));
-      const uuid = Uuid();
-      final src = hexOf(0).substring(0, 8);
-      final dst = hexOf(100).substring(0, 8);
-      for (var seq = 0; seq < 2; seq++) {
-        expect(sent[seq],
-            uuid.v5(workloadUuidNamespace, 'field|cp|$src|$dst|0|$seq'));
-      }
+      expect(sent.toSet(), hasLength(2), reason: 'v4 ids never repeat');
       async.elapse(const Duration(seconds: 5));
       runner.dispose();
     });
@@ -664,7 +744,7 @@ void main() {
         recorder: recorder,
         myPubkeyHex: hexOf(0),
         knownPeers: () => [Uint8List.fromList(List.generate(32, (i) => 100 + i))],
-        sendRaw: (peer, {required leg, required seq}) async {
+        sendRaw: (peer, {required leg, required seq, sizeDelta = 0}) async {
           if (!legUp) return null;
           sent.add((leg, seq));
           await Future<void>.delayed(const Duration(milliseconds: 5));
@@ -1101,75 +1181,35 @@ void main() {
     });
   });
 
-  group('remote start', () {
-    FieldPlan plan({String id = 'mesh-scale-1', int? order}) => FieldPlan(
+  group('step marker order stamping', () {
+    FieldPlan plan({String id = 'mesh-scale-1'}) => FieldPlan(
           expId: id,
           settleSec: 5,
-          deviceOrder: order,
           steps: const [FieldStep(label: 'n=3', dwellSec: 60, bleOn: false)],
         );
-
-    test('arming brings the radio UP so the signal can be heard', () {
-      // A late joiner's first step turns BLE off, but it must be ON to hear
-      // the start at all — a previous run that ended dark would otherwise
-      // leave the phone permanently deaf, sitting armed while the rest ran.
-      fakeAsync((async) {
-        final ble = <bool>[];
-        final runner = FieldRunner(
-          recorder: _FakeRecorder(),
-          onSetBle: (on) async => ble.add(on),
-        );
-        runner.armForRemoteStart(plan());
-        async.flushMicrotasks();
-
-        expect(ble, [true]);
-        expect(runner.armedPlan?.expId, 'mesh-scale-1');
-        expect(runner.isRunning, isFalse, reason: 'armed is not running');
-      });
-    });
-
-    test('a matching signal starts the run and passes the first step', () {
-      fakeAsync((async) {
-        final recorder = _FakeRecorder();
-        final ble = <bool>[];
-        final runner = FieldRunner(
-          recorder: recorder,
-          onSetBle: (on) async => ble.add(on),
-          upload: () async => 'ok',
-        );
-        runner.armForRemoteStart(plan());
-        async.flushMicrotasks();
-
-        unawaited(runner.remoteStart('mesh-scale-1'));
-        async.flushMicrotasks();
-
-        expect(runner.isRunning, isTrue);
-        expect(runner.phase, FieldPhase.dwelling,
-            reason: 'no tap is coming — the signal IS the tap');
-        expect(runner.remotelyStarted, isTrue);
-        expect(runner.armedPlan, isNull, reason: 'consumed');
-        // Armed brought the radio up; the first step then took it down,
-        // which is how a late joiner listens, hears, and goes dark.
-        expect(ble, [true, false]);
-        expect(recorder.events, contains('marker:n=3'));
-      });
-    });
 
     test('the step marker stamps this phone\'s join order and intent', () {
       // Without these, a phone configured for the wrong slot looks exactly
       // like one configured right that failed to join: both just have no
       // links. `order` says which slot it was told to fill, `joined` says
       // whether it believed it belonged in the mesh for this step.
+      //
+      // The order comes from THIS PHONE'S NICKNAME, never from the plan: a
+      // plan is shared by the whole fleet and cannot know which phone is
+      // which. It used to ride in the plan, where the presets set it to the
+      // role — so every sender in a store-carry-forward run stamped the same
+      // number.
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(
           recorder: recorder,
+          myNickname: '4',
           onSetBle: (on) async {},
           upload: () async => 'ok',
         );
-        runner.armForRemoteStart(plan(order: 4));
+        runner.start(plan());
         async.flushMicrotasks();
-        unawaited(runner.remoteStart('mesh-scale-1'));
+        runner.inPosition();
         async.flushMicrotasks();
 
         final extra =
@@ -1179,69 +1219,27 @@ void main() {
       });
     });
 
-    test('a plan with no join order stamps no order field', () {
-      // Distance/power plans have no notion of order; the marker must not
-      // invent one.
+    test('a nickname that is not a plain number stamps no order field', () {
+      // Strict on purpose: "pixel-2" is NOT node 2, and a phone that cannot
+      // say which slot it fills must stamp nothing rather than a guess that
+      // the analysis would then join geometry on.
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(
           recorder: recorder,
+          myNickname: 'pixel-2',
           onSetBle: (on) async {},
           upload: () async => 'ok',
         );
-        runner.armForRemoteStart(plan());
+        runner.start(plan());
         async.flushMicrotasks();
-        unawaited(runner.remoteStart('mesh-scale-1'));
+        runner.inPosition();
         async.flushMicrotasks();
 
         final extra =
             recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
         expect(extra.containsKey('order'), isFalse);
         expect(extra['joined'], isFalse);
-      });
-    });
-
-    test('a signal for a DIFFERENT experiment is ignored', () {
-      fakeAsync((async) {
-        final runner = FieldRunner(
-          recorder: _FakeRecorder(),
-          onSetBle: (_) async {},
-        );
-        runner.armForRemoteStart(plan(id: 'mesh-scale-1'));
-        async.flushMicrotasks();
-
-        unawaited(runner.remoteStart('some-other-run'));
-        async.flushMicrotasks();
-
-        expect(runner.isRunning, isFalse);
-        expect(runner.armedPlan, isNotNull,
-            reason: 'still waiting for its own signal');
-      });
-    });
-
-    test('an unarmed runner ignores the signal entirely', () {
-      fakeAsync((async) {
-        final runner = FieldRunner(recorder: _FakeRecorder());
-        unawaited(runner.remoteStart('mesh-scale-1'));
-        async.flushMicrotasks();
-        expect(runner.isRunning, isFalse);
-      });
-    });
-
-    test('disarm releases it', () {
-      fakeAsync((async) {
-        final runner = FieldRunner(
-          recorder: _FakeRecorder(),
-          onSetBle: (_) async {},
-        );
-        runner.armForRemoteStart(plan());
-        async.flushMicrotasks();
-        runner.disarm();
-        expect(runner.armedPlan, isNull);
-
-        unawaited(runner.remoteStart('mesh-scale-1'));
-        async.flushMicrotasks();
-        expect(runner.isRunning, isFalse);
       });
     });
   });
@@ -1308,109 +1306,6 @@ void main() {
     });
   });
 
-  group('placement location fix', () {
-    FieldPlan geoPlan() => const FieldPlan(
-          expId: 'mesh-scale-1',
-          settleSec: 1,
-          deviceOrder: 2,
-          steps: [
-            FieldStep(label: 'distribute', dwellSec: 10, bleOn: false),
-            FieldStep(label: 'n=3 t1', dwellSec: 10, bleOn: true,
-                autoAdvance: true),
-            FieldStep(label: 'n=3 t2', dwellSec: 10, bleOn: true,
-                autoAdvance: true),
-          ],
-        );
-
-    test('one fix at placement, not on the walk-out and not per step', () {
-      // The walk-out step is when the phone is still being carried, and an
-      // auto-advanced step means it has not moved. A fix on either would be
-      // a wrong position or a needless radio wake.
-      fakeAsync((async) {
-        var calls = 0;
-        final recorder = _FakeRecorder();
-        final runner = FieldRunner(
-          recorder: recorder,
-          onSetBle: (on) async {},
-          upload: () async => 'ok',
-          onSampleLocation: () async {
-            calls++;
-            return {'lat': 48.265, 'lon': 11.671, 'accM': 4.0};
-          },
-        );
-        runner.start(geoPlan());
-        async.flushMicrotasks();
-
-        runner.inPosition();          // operator taps to begin the walk-out
-        async.flushMicrotasks();
-        expect(calls, 0, reason: 'the phone is still being carried');
-
-        // dwell 10s then a 5s auto-advance gap: n=3 t1 opens at t=15s.
-        async.elapse(const Duration(seconds: 16));
-        async.flushMicrotasks();
-        expect(calls, 1, reason: 'first measured step: it is now placed');
-        expect(runner.locationFixes, 1);
-
-        async.elapse(const Duration(seconds: 15));  // auto-advance into n=3 t2
-        async.flushMicrotasks();
-        expect(calls, 1, reason: 'a timer firing is not a placement');
-
-        expect(
-            recorder.events.where((e) => e.startsWith('log:location')).length, 1);
-        // The screen must be able to say a fix landed, and how good it is.
-        expect(runner.locationStatus, contains('position fixed'));
-        expect(runner.locationStatus, contains('4 m'));
-      });
-    });
-
-    test('a failed fix says so on screen instead of looking normal', () {
-      // Eight phones silently recording no position is the failure this is
-      // meant to make visible while there is still time to fix it.
-      fakeAsync((async) {
-        final runner = FieldRunner(
-          recorder: _FakeRecorder(),
-          onSetBle: (on) async {},
-          upload: () async => 'ok',
-          onSampleLocation: () async => null,
-        );
-        expect(runner.hasLocation, isTrue);
-        expect(runner.locationStatus, contains('when this phone is placed'));
-
-        runner.start(geoPlan());
-        async.flushMicrotasks();
-        runner.inPosition();
-        async.flushMicrotasks();
-        async.elapse(const Duration(seconds: 16));
-        async.flushMicrotasks();
-
-        expect(runner.locationStatus, contains('NO FIX'));
-      });
-    });
-
-    test('a null fix never blocks the run', () {
-      // No permission, services off, no sky view -- the step must still run.
-      fakeAsync((async) {
-        final recorder = _FakeRecorder();
-        final runner = FieldRunner(
-          recorder: recorder,
-          onSetBle: (on) async {},
-          upload: () async => 'ok',
-          onSampleLocation: () async => null,
-        );
-        runner.start(geoPlan());
-        async.flushMicrotasks();
-        runner.inPosition();
-        async.flushMicrotasks();
-        async.elapse(const Duration(seconds: 16));
-        async.flushMicrotasks();
-
-        expect(runner.isRunning, isTrue);
-        expect(recorder.events, contains('marker:n=3 t1'));
-        expect(recorder.events.where((e) => e.startsWith('log:location')), isEmpty);
-      });
-    });
-  });
-
   group('manual-join wall-clock schedule', () {
     // Base sits 100s past a 10-minute boundary, so the anchor maths is
     // checkable by hand: tap+300s = B0+400s -> next boundary = B0+600s,
@@ -1443,6 +1338,181 @@ void main() {
             reason: 'every phone must round to the SAME instant');
         expect(runner.startTargetMs! - base,
             greaterThanOrEqualTo(runner.plan!.placementSec * 1000));
+        runner.dispose();
+      });
+    });
+
+    test('an aborted run is set aside so the next arm cannot append to it', () {
+      // startExperiment APPENDS to an existing file of the same id. Without
+      // the rename, an abort followed by a re-arm interleaves the dead run
+      // with the real one in a single upload — which is exactly what reached
+      // the server on 2026-08-08 and had to be cut out in analysis.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        unawaited(runner.abort());
+        async.flushMicrotasks();
+
+        expect(recorder.events, contains('marker:aborted'));
+        expect(recorder.archived, ['mesh-manual-t'],
+            reason: 'the abandoned file must be moved aside, by its own id');
+        runner.dispose();
+      });
+    });
+
+    test('two runs under one experiment id get DIFFERENT run ids', () {
+      // Testbed ids are deterministic so a trace can be re-derived offline.
+      // Without a per-run term that determinism made two runs mint identical
+      // ids for every message, and any join on messageId silently merged them.
+      // The run id is the seed term that separates them; assert it differs.
+      // (Production is unaffected — real messages get a random v4 id.)
+      int runIdFor(int base) {
+        late int id;
+        fakeAsync((async) {
+          final recorder = _FakeRecorder();
+          final runner = FieldRunner(
+            recorder: recorder,
+            nowMs: () => base + async.elapsed.inMilliseconds,
+            upload: () async => 'ok',
+          );
+          runner.start(manualPlan(order: 1));
+          async.flushMicrotasks();
+          async.elapse(const Duration(milliseconds: 500001));
+          async.flushMicrotasks();
+          id = recorder.markerExtras
+              .firstWhere((e) => e.$1 == 'n=3').$2['run']! as int;
+          runner.dispose();
+        });
+        return id;
+      }
+
+      final first = runIdFor(base);
+      final second = runIdFor(base + const Duration(hours: 1).inMilliseconds);
+      expect(first, isNot(second),
+          reason: 'a later run must not re-mint the earlier run\'s ids');
+    });
+
+    test('a scripted-radio plan never prompts the operator for the radio', () {
+      // Seen on hardware 2026-08-10: a hands-free desk plan told the operator
+      // "TURN BLUETOOTH OFF" during a dark window the runner was already
+      // opening. There is nothing for them to do, and the system Bluetooth
+      // adapter stays on regardless — only the app's transport goes down.
+      fakeAsync((async) {
+        // The radio reads UP throughout, so a dark step genuinely disagrees
+        // with the observed state — which is exactly when the prompt fired.
+        final scf = FieldPlanPresets.storeCarryForward(role: 1);
+        expect(scf.scriptedRadio, isTrue);
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          bleUsable: () => true,
+          onSetBle: (on) async {},
+          upload: () async => 'ok',
+        );
+        runner.start(scf);
+        async.flushMicrotasks();
+        // Walk the whole plan: warm, dark and return of every arm.
+        for (var i = 0; i < 40; i++) {
+          async.elapse(const Duration(seconds: 30));
+          async.flushMicrotasks();
+          expect(runner.radioAction, isNull,
+              reason: 'the runner owns the radio here, not the operator '
+                  '(step ${runner.currentStep?.label})');
+        }
+        runner.dispose();
+      });
+    });
+
+    test('the step marker records the run id, so ids stay derivable', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        async.elapse(const Duration(milliseconds: 500001));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
+        expect(extra['run'], b0 + 600000,
+            reason: 'the run id is the shared anchor, so every phone agrees');
+        runner.dispose();
+      });
+    });
+
+    test('step markers carry BOTH session counts', () {
+      // `sessions` is Redux-filtered and dips when a quiet peer is delisted
+      // while its session lives; `sessionTable` is the table itself. Field
+      // analysis needs both to tell a lost session from a delisted peer.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          sessionPeerCount: () => 2,
+          sessionTableCount: () => 5,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+        async.elapse(const Duration(milliseconds: 500001));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'n=3').$2;
+        expect(extra['sessions'], 2);
+        expect(extra['sessionTable'], 5);
+        runner.dispose();
+      });
+    });
+
+    test('the placement marker carries the nickname beside the order', () {
+      // The order is typed per run and the nickname is set once on the
+      // phone: recording both is what makes a mistyped order detectable
+      // instead of silently remapping a device onto another node's geometry.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          myNickname: '2',
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 2));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'placement').$2;
+        expect(extra['nick'], '2');
+        expect(extra['order'], 2);
+        runner.dispose();
+      });
+    });
+
+    test('no nickname stamps no nick field', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          upload: () async => 'ok',
+        );
+        runner.start(manualPlan(order: 1));
+        async.flushMicrotasks();
+
+        final extra =
+            recorder.markerExtras.firstWhere((e) => e.$1 == 'placement').$2;
+        expect(extra.containsKey('nick'), isFalse);
         runner.dispose();
       });
     });
@@ -1483,27 +1553,6 @@ void main() {
             .firstWhere((e) => e.$1 == 'placement')
             .$2;
         expect(pl['targetMs'], b0 + 600000);
-        runner.dispose();
-      });
-    });
-
-    test('no GPS fix is ever taken in manual mode', () {
-      fakeAsync((async) {
-        var fixes = 0;
-        final runner = FieldRunner(
-          recorder: _FakeRecorder(),
-          nowMs: () => base + async.elapsed.inMilliseconds,
-          onSampleLocation: () async {
-            fixes++;
-            return {'lat': 1.0, 'lon': 2.0, 'accM': 3.0};
-          },
-          upload: () async => 'ok',
-        );
-        runner.start(manualPlan(order: 1));
-        async.flushMicrotasks();
-        async.elapse(const Duration(seconds: 800));
-        async.flushMicrotasks();
-        expect(fixes, 0, reason: 'the layout is measured by hand');
         runner.dispose();
       });
     });
@@ -1652,7 +1701,6 @@ void main() {
     test('manual plan round-trips through JSON', () {
       final p = manualPlan();
       expect(p.manualJoin, isTrue);
-      expect(p.sampleGps, isFalse);
       expect(FieldPlan.fromJson(p.toJson()), p);
     });
   });

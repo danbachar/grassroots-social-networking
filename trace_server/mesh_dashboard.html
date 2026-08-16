@@ -405,6 +405,71 @@
       </details>
     </section>
 
+    <section class="panel" id="routePanel">
+      <p class="eyebrow">The route one packet took</p>
+      <p class="note" id="routeIntro">A packet&rsquo;s id survives relaying &mdash; it <em>is</em> the dedup
+         key &mdash; so every node that saw the same packet recorded the same id, and a relay
+         record names the neighbour it came from. That makes a real path, not a guess from timing.</p>
+      <div class="row" style="margin:12px 0">
+        <button id="pktBuild">Build the route index</button>
+        <span class="mono" id="pktIndexState" style="font-size:12.5px;color:var(--ink-2)"></span>
+      </div>
+      <div class="row" id="pktFilters" style="margin-bottom:12px">
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">KIND
+          <select id="pktKind">
+            <option value="">any</option>
+            <option value="data">message</option>
+            <option value="ack">ack</option>
+          </select>
+        </label>
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">OUTCOME
+          <select id="pktOutcome">
+            <option value="">any</option>
+            <option value="multihop">relayed at least once</option>
+            <option value="delivered">reached the recipient</option>
+            <option value="undelivered">never arrived</option>
+          </select>
+        </label>
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">SEEN&nbsp;BY&nbsp;&ge;
+          <select id="pktMinHops">
+            <option value="0">1 node</option>
+            <option value="1">2 nodes</option>
+            <option value="2">3 nodes</option>
+            <option value="3">4 nodes</option>
+          </select>
+        </label>
+        <input id="pktQuery" type="text" placeholder="packet or message id"
+               spellcheck="false" style="flex:1 1 180px;min-width:140px;padding:7px 9px;
+               border-radius:7px;border:1px solid var(--line);background:var(--surface-2);
+               color:var(--ink-1);font-family:ui-monospace,Menlo,monospace;font-size:12.5px">
+        <button id="pktSearch" class="primary">Find packets</button>
+      </div>
+      <!-- Capped and scrolled: 300 matches is a 13,000px panel otherwise, and
+           the route drawing below it becomes unreachable. -->
+      <div class="scroll-x" style="max-height:360px;overflow-y:auto">
+        <table class="datatable" id="pktTable"></table>
+      </div>
+
+      <div id="routeView" class="hidden" style="margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+        <div class="row" style="align-items:flex-start;gap:24px">
+          <svg id="routeSvg" viewBox="0 0 460 400" style="flex:1 1 340px;max-width:520px"
+               role="img" aria-label="The path this packet took through the mesh"></svg>
+          <div style="flex:1 1 300px;min-width:260px">
+            <p class="eyebrow" style="margin-bottom:8px">Every sighting, in order</p>
+            <div class="scroll-x" style="max-height:340px;overflow-y:auto">
+              <table class="datatable" id="routeHops"></table>
+            </div>
+            <p class="note" id="routeNote"></p>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="swatch"></i>a hop, from the neighbour that handed it over</span>
+          <span><i class="swatch dash"></i>carried, then conveyed on a later meeting</span>
+          <span>ring = minted here &middot; double ring = delivered here</span>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <p class="eyebrow">Every step in this run</p>
       <div class="scroll-x"><table class="datatable" id="stepsTable"></table></div>
@@ -510,6 +575,10 @@
         : null;
       return { idx: i, file: f.name, order, exp, steps, events, bounds,
                batteryFloor, fix, rawFixes: (f.locations || []).length,
+               // The upload envelope's deviceId IS the node's public key, so
+               // when the recording came from the server this is known rather
+               // than deduced. Files dropped from disk carry no envelope.
+               self: f.deviceId || null,
                peers: new Set(events.map(e => e.peer)) };
     });
 
@@ -519,6 +588,7 @@
     const all = new Set();
     for (const p of phones) for (const k of p.peers) if (!k.startsWith("mac:")) all.add(k);
     for (const p of phones) {
+      if (p.self) continue;                       // already known, exactly
       const missing = [...all].filter(k => !p.peers.has(k));
       p.self = missing.length === 1 ? missing[0] : null;
     }
@@ -526,7 +596,15 @@
     for (const p of phones) if (p.self && p.order != null) keyToOrder.set(p.self, p.order);
     for (const p of phones) p.label = p.order != null ? "#" + p.order
                                     : p.self ? p.self.slice(0, 8) : p.file.slice(0, 12);
-    return { phones, keyToOrder };
+    // Every phone's view of every link, merged: a custody `convey` names the
+    // BLE device it was sent on, not a pubkey, so a route cannot say WHO was
+    // handed the packet without this. One phone alone is not enough — the
+    // mapping it needs may only appear in another phone's links.
+    const deviceToPeer = new Map();
+    for (const f of files) for (const l of f.links) {
+      if (l.path && l.peer) deviceToPeer.set(l.path.split(":").slice(1).join(":"), l.peer);
+    }
+    return { phones, keyToOrder, deviceToPeer };
   }
 
   // A run is one recording session. Files accumulate across sessions under the
@@ -644,9 +722,10 @@
   }
 
   // ------------------------------------------------------------------ render
-  const ST = { phones: [], keyToOrder: new Map(), runs: [], run: null, t: 0,
+  const ST = { phones: [], keyToOrder: new Map(), deviceToPeer: new Map(),
+               runs: [], run: null, t: 0,
                series: [], playing: false, timer: null, pos: {}, posMetres: false,
-               dist: {} };
+               dist: {}, serverExp: null, pkts: [], route: null };
 
   const $ = id => document.getElementById(id);
   const SVGNS = "http://www.w3.org/2000/svg";
@@ -1156,6 +1235,8 @@
 
   function selectRun(i) {
     ST.run = ST.runs[i];
+    ST.route = null;
+    $("routeView").classList.add("hidden");
     ST.series = realisedSeries(ST.run);
     loadPositions();
     if (!distExpId() || ST.lastRunExp === distExpId()) {
@@ -1377,7 +1458,11 @@
       }));
     }
     $("parseStatus").classList.add("hidden");
+    // Files loaded from disk carry no server identity, so a route index cannot
+    // be asked for. Clearing this is what makes the route panel say so.
+    ST.serverExp = null;
     ingest(parsed);
+    refreshPacketIndex();
   }
 
   // Both sources — parsed files and the server's topology endpoint — hand over
@@ -1385,6 +1470,7 @@
   function ingest(parsed) {
     const built = buildPhones(parsed);
     ST.phones = built.phones; ST.keyToOrder = built.keyToOrder;
+    ST.deviceToPeer = built.deviceToPeer;
     ST.runs = buildRuns(ST.phones);
     if (!ST.runs.length) {
       $("loadErr").textContent =
@@ -1409,6 +1495,308 @@
     e.preventDefault(); drop.classList.remove("hot");
     load(e.dataTransfer.files);
   });
+
+  // ------------------------------------------------------------ packet routes
+  // What a route can and cannot show, stated once so the drawing never implies
+  // more than the trace holds:
+  //   * A hop with a `fromPeer` is a MEASURED edge — the receiving node named
+  //     the neighbour that handed the packet over.
+  //   * A hop whose `fromPeer` is null happened over a link that was not yet
+  //     authenticated. The sighting is real, the edge is unknown; it is drawn
+  //     as an unattached arrival, never guessed from who else held it.
+  //   * The sync exchange is invisible on the wire: a conveyance appears as
+  //     the holder's `convey` and the receiver's later sighting, with nothing
+  //     joining them. Those two are drawn as a carry, dashed.
+  const EV_LABEL = {
+    mint: "minted here", aired: "put on the air", relay: "relayed on",
+    dup: "arrived again (already relayed)", packetDup: "arrived again (dropped)",
+    store: "held for the recipient", convey: "handed over on a sync",
+    end: "left the buffer", deliver: "DELIVERED to the recipient",
+    ackRx: "ack came back", drop: "dropped",
+  };
+
+  const orderOfPeer = k => (k == null ? null : ST.keyToOrder.get(k) ?? null);
+  // The trace's device_id IS the node's public key, so it resolves the same way.
+  // A BLE device id is not: it is the link path, and the two forms in the trace
+  // differ by the leading role — a link record's `path` is what deviceToPeer is
+  // keyed by (role stripped), while a custody `convey` records the id whole.
+  // Matching only one form silently dropped every conveyance from the drawing.
+  const peerOfBle = (d) => {
+    if (d == null) return null;
+    return ST.deviceToPeer.get(d)
+        ?? ST.deviceToPeer.get(d.split(":").slice(1).join(":"))
+        ?? null;
+  };
+  const orderOfBle = d => orderOfPeer(peerOfBle(d));
+  const nodeName = (k) => {
+    const o = orderOfPeer(k);
+    return o != null ? "#" + o : k ? k.slice(0, 6) : "?";
+  };
+
+  function routeNodeCount() {
+    return Math.max(ST.run ? ST.run.phones.length : 0, 1);
+  }
+
+  async function refreshPacketIndex() {
+    if (!ST.serverExp) {
+      $("pktIndexState").textContent =
+        "Routes need the server's copy of the run — open an experiment instead of loading files.";
+      $("pktBuild").disabled = true;
+      $("pktFilters").classList.add("hidden");
+      return;
+    }
+    try {
+      const r = await api("/v1/packets?limit=1&exp=" + encodeURIComponent(ST.serverExp));
+      if (!r.index) {
+        $("pktIndexState").textContent = "Not indexed yet — one full pass over this run.";
+        $("pktFilters").classList.add("hidden");
+        $("pktTable").innerHTML = "";
+      } else {
+        $("pktIndexState").textContent =
+          `${fmtCount(r.index.packets)} packets, ${fmtCount(r.index.events)} sightings ` +
+          `(indexed ${new Date(r.index.builtAt).toLocaleString()})`;
+        $("pktFilters").classList.remove("hidden");
+        $("pktBuild").textContent = "Rebuild the route index";
+      }
+    } catch (err) {
+      $("pktIndexState").textContent = err.message;
+    }
+  }
+
+  async function buildPacketIndex() {
+    $("pktBuild").disabled = true;
+    $("pktIndexState").textContent = "Indexing — a full pass over the run, this takes a while…";
+    try {
+      const r = await api("/v1/packets/index?exp=" + encodeURIComponent(ST.serverExp),
+                          { method: "POST" });
+      $("pktIndexState").textContent =
+        `${fmtCount(r.packets)} packets, ${fmtCount(r.events)} sightings.`;
+      $("pktFilters").classList.remove("hidden");
+      $("pktBuild").textContent = "Rebuild the route index";
+      await loadPackets();
+    } catch (err) {
+      $("pktIndexState").textContent = err.message;
+    } finally {
+      $("pktBuild").disabled = false;
+    }
+  }
+
+  async function loadPackets() {
+    const qs = new URLSearchParams({ exp: ST.serverExp, limit: "300" });
+    for (const [k, id] of [["kind", "pktKind"], ["outcome", "pktOutcome"],
+                           ["minHops", "pktMinHops"], ["q", "pktQuery"]]) {
+      const v = $(id).value.trim();
+      if (v) qs.set(k, v);
+    }
+    $("pktTable").innerHTML = "<tr><td class='axis-text'>Searching…</td></tr>";
+    try {
+      const r = await api("/v1/packets?" + qs.toString());
+      ST.pkts = r.packets;
+      renderPacketTable();
+    } catch (err) {
+      $("pktTable").innerHTML = `<tr><td class="err">${err.message}</td></tr>`;
+    }
+  }
+
+  function renderPacketTable() {
+    const t = $("pktTable");
+    if (!ST.pkts.length) {
+      t.innerHTML = "<tr><td class='axis-text'>No packet matches those filters.</td></tr>";
+      return;
+    }
+    const head = ["packet", "kind", "from", "to", "seen by", "relays", "carried",
+                  "outcome", "when"];
+    const rows = ST.pkts.map(p => {
+      const rel = ST.run ? fmtDur(p.t0 - ST.run.t0) : "";
+      return `<tr data-pid="${p.packetId}" style="cursor:pointer">
+        <td class="mono">${p.packetId.slice(0, 8)}</td>
+        <td>${p.kind === "ack" ? "ack" : "message"}</td>
+        <td class="n">${nodeName(p.origin)}</td>
+        <td class="n">${nodeName(p.recipient)}</td>
+        <td class="n">${p.nodes}</td>
+        <td class="n">${p.relays}</td>
+        <td class="n">${p.conveys}</td>
+        <td>${p.delivered ? '<span class="pill ok">✓ arrived</span>'
+                          : '<span class="pill bad">never arrived</span>'}</td>
+        <td class="n">${rel}</td></tr>`;
+    });
+    t.innerHTML = `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead>` +
+                  `<tbody>${rows.join("")}</tbody>`;
+    for (const tr of t.querySelectorAll("tbody tr")) {
+      tr.addEventListener("click", () => openRoute(tr.dataset.pid));
+    }
+  }
+
+  async function openRoute(pid) {
+    try {
+      ST.route = await api(`/v1/route?exp=${encodeURIComponent(ST.serverExp)}&pid=${encodeURIComponent(pid)}`);
+      ST.route.summary = ST.pkts.find(p => p.packetId === pid) || null;
+      $("routeView").classList.remove("hidden");
+      renderRoute();
+      $("routeView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (err) {
+      $("routeNote").textContent = err.message;
+    }
+  }
+
+  function renderRoute() {
+    const r = ST.route, svg = $("routeSvg");
+    svg.innerHTML = "";
+    const evs = r.events;
+    const layout = $("layoutSelect").value;
+    const count = routeNodeCount();
+    const orders = (ST.run ? ST.run.phones : []).map(p => p.order).filter(o => o != null)
+                   .sort((a, b) => a - b);
+    const pos = new Map();
+    for (const o of orders) pos.set(o, nodePos(o, count, layout));
+
+    const defs = el("defs");
+    for (const [id, colour] of [["rArrow", "var(--accent)"], ["rArrowDim", "var(--ink-3)"]]) {
+      const m = el("marker", { id, viewBox: "0 0 10 10", refX: "9", refY: "5",
+                               markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse" });
+      m.appendChild(el("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: colour }));
+      defs.appendChild(m);
+    }
+    svg.appendChild(defs);
+
+    // Faint node ring first, so a node the packet never touched is still
+    // visible — "did not reach #5" is a result, and it needs #5 on the page.
+    for (const o of orders) {
+      const P = pos.get(o);
+      svg.appendChild(el("circle", { cx: P[0], cy: P[1], r: 21, fill: "var(--node-off)",
+                                     "fill-opacity": .35 }));
+    }
+
+    const t0 = evs.length ? evs[0].t : 0;
+    const seen = new Set();      // orders the packet actually reached
+    const pairSeq = new Map();   // parallel hops between the same pair fan out
+    let hopNo = 0;
+
+    for (const e of evs) {
+      const to = orderOfPeer(e.device);
+      if (to != null) seen.add(to);
+      let from = null, dashed = false;
+      if (e.event === "convey") {
+        // Drawn FROM the holder TO the peer it was handed to: the receiving
+        // node logs nothing that names this exchange, so this record is the
+        // only evidence the packet moved, and its direction is not in doubt.
+        from = to;
+        const dest = orderOfBle(e.toDevice);
+        if (dest == null) continue;
+        drawHop(from, dest, ++hopNo, true, e);
+        seen.add(dest);
+        continue;
+      }
+      from = orderOfPeer(e.fromPeer);
+      if (from == null || to == null) continue;
+      if (e.event === "relay" || e.event === "deliver" || e.event === "dup") {
+        drawHop(from, to, ++hopNo, dashed, e);
+      }
+    }
+
+    function drawHop(a, b, n, dashed, e) {
+      const A = pos.get(a), B = pos.get(b);
+      if (!A || !B) return;
+      const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+      const i = (pairSeq.get(key) || 0); pairSeq.set(key, i + 1);
+      const dx = B[0] - A[0], dy = B[1] - A[1];
+      const len = Math.hypot(dx, dy) || 1;
+      // Shorten to the node edge so the head lands on the circle, not in it.
+      const ux = dx / len, uy = dy / len, R = 24;
+      // Bow parallel hops apart rather than stacking them into one line.
+      const bow = (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 22;
+      const mx = (A[0] + B[0]) / 2 - uy * bow, my = (A[1] + B[1]) / 2 + ux * bow;
+      const path = `M ${A[0] + ux * R} ${A[1] + uy * R} Q ${mx} ${my} ${B[0] - ux * R} ${B[1] - uy * R}`;
+      svg.appendChild(el("path", {
+        d: path, fill: "none",
+        stroke: e.event === "dup" ? "var(--ink-3)" : "var(--accent)",
+        "stroke-width": e.event === "deliver" ? 3.5 : 2.2,
+        "stroke-opacity": e.event === "dup" ? .5 : .9,
+        "stroke-dasharray": dashed ? "7 5" : "none",
+        "marker-end": `url(#${e.event === "dup" ? "rArrowDim" : "rArrow"})`,
+      }));
+      svg.appendChild(el("text", {
+        x: mx, y: my - 4, "text-anchor": "middle", class: "axis-text",
+      }, String(n)));
+    }
+
+    // Endpoints on top of the arrows.
+    const mint = evs.find(e => e.event === "mint");
+    const delivered = evs.filter(e => e.event === "deliver").map(e => orderOfPeer(e.device));
+    for (const o of orders) {
+      const P = pos.get(o);
+      const touched = seen.has(o);
+      svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 21,
+        fill: touched ? "var(--accent)" : "var(--node-off)",
+        "fill-opacity": touched ? .95 : .35,
+        stroke: "var(--surface-1)", "stroke-width": 2,
+      }));
+      if (delivered.includes(o)) svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 26, fill: "none",
+        stroke: "var(--accent)", "stroke-width": 2,
+      }));
+      if (mint && orderOfPeer(mint.device) === o) svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 26, fill: "none", stroke: "var(--ink-2)",
+        "stroke-width": 1.5, "stroke-dasharray": "3 3",
+      }));
+      svg.appendChild(el("text", {
+        x: P[0], y: P[1] + 5, "text-anchor": "middle",
+        fill: touched ? "#fff" : "var(--ink-2)",
+        style: "font:600 15px ui-monospace,Menlo,monospace",
+      }, String(o)));
+    }
+
+    // The sightings, in order — the table is the evidence; the drawing is a
+    // summary of it.
+    const head = ["+time", "node", "what", "from", "ttl", "note"];
+    const body = evs.map(e => {
+      const ttl = e.ttlIn != null ? `${e.ttlIn}→${e.ttlOut}` : "";
+      const note = [
+        e.carried ? "kept a copy" : "",
+        e.dwellMs != null ? `held ${e.dwellMs} ms` : "",
+        e.toDevice ? "to " + nodeName(peerOfBle(e.toDevice)) : "",
+        e.reason || "",
+      ].filter(Boolean).join(" · ");
+      return `<tr data-t="${e.t}" style="cursor:pointer">
+        <td class="n">${((e.t - t0) / 1000).toFixed(2)}s</td>
+        <td class="n">${nodeName(e.device)}</td>
+        <td>${EV_LABEL[e.event] || e.event}</td>
+        <td class="n">${e.fromPeer ? nodeName(e.fromPeer)
+                        : ["relay", "deliver", "dup"].includes(e.event) ? "unknown" : "—"}</td>
+        <td class="n">${ttl}</td>
+        <td class="axis-text">${note}</td></tr>`;
+    });
+    $("routeHops").innerHTML =
+      `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body.join("")}</tbody>`;
+    for (const tr of $("routeHops").querySelectorAll("tbody tr")) {
+      tr.addEventListener("click", () => setT(+tr.dataset.t));   // scrub there
+    }
+
+    const s = r.summary;
+    const unknown = evs.filter(e => !e.fromPeer && ["relay", "deliver", "dup"].includes(e.event)).length;
+    const blindConvey = evs.filter(e => e.event === "convey" && orderOfBle(e.toDevice) == null).length;
+    const span = evs.length ? (evs[evs.length - 1].t - t0) / 1000 : 0;
+    $("routeNote").innerHTML =
+      `<span class="mono">${r.packetId}</span><br>` +
+      (s ? `${s.kind === "ack" ? "An ack" : "A message"} from ${nodeName(s.origin)} ` +
+           `to ${nodeName(s.recipient)}. ` : "") +
+      `${evs.length} sighting(s) across ${new Set(evs.map(e => e.device)).size} node(s), ` +
+      `spanning ${span.toFixed(1)} s.` +
+      (unknown ? ` ${unknown} arrival(s) came over a link that was not yet authenticated, ` +
+                 `so the trace does not name who handed those over — they are listed but not drawn.`
+               : "") +
+      (blindConvey ? ` ${blindConvey} conveyance(s) went to a BLE link no phone ever named a ` +
+                     `peer for, so the destination is unknown — listed, not drawn.` : "") +
+      ` Click a row to scrub the topology view to that instant.`;
+  }
+
+  $("pktBuild").addEventListener("click", buildPacketIndex);
+  $("pktSearch").addEventListener("click", loadPackets);
+  $("pktQuery").addEventListener("keydown", e => { if (e.key === "Enter") loadPackets(); });
+  for (const id of ["pktKind", "pktOutcome", "pktMinHops"]) {
+    $(id).addEventListener("change", loadPackets);
+  }
 
   // ------------------------------------------------------- server-side source
   // The server already holds every upload, and link+marker records are a few
@@ -1467,13 +1855,15 @@
     try {
       const data = await api("/v1/topology?exp=" + encodeURIComponent(expId));
       const files = data.devices.map(d => ({
-        name: d.deviceId.slice(0, 8), markers: d.markers, links: d.links,
-        locations: d.locations || []
+        name: d.deviceId.slice(0, 8), deviceId: d.deviceId,
+        markers: d.markers, links: d.links, locations: d.locations || []
       }));
       $("parseStatus").classList.add("hidden");
       $("parseBar").value = 0;
       if (!files.length) throw new Error("That experiment has no link or marker records.");
+      ST.serverExp = expId;
       ingest(files);
+      refreshPacketIndex();
     } catch (err) {
       $("parseStatus").classList.add("hidden");
       $("parseBar").value = 0;

@@ -52,8 +52,8 @@ next to ``t0``/``t1`` makes the difference visible.
 ``airB_per_msg`` is every sealed byte both devices put on the air during the
 step (data + acks + custody sync) divided by the messages delivered, and
 ``air_overhead`` is that over the payload size. This is what the payload arm
-measures: a payload above one sealed packet (132 B) fragments, and each
-fragment re-pays the full 104-byte header.
+measures: a payload above one sealed packet (136 B) fragments, and each
+fragment re-pays the full 100-byte header.
 
 Usage:
     python3 analyze.py data/traces.db --out analysis
@@ -65,6 +65,7 @@ Dependencies: pandas, numpy, matplotlib (see analysis_requirements.txt).
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import re
@@ -96,7 +97,7 @@ LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
 # FragmentHandler.fragmentThreshold: payloads above this are split, and each
 # fragment gets a RANDOM packetId — so relay records can no longer be joined
 # to the messageId and hop counts for such messages are not trustworthy.
-FRAGMENT_THRESHOLD_B = 132
+FRAGMENT_THRESHOLD_B = 136  # 247 - 3 - (54 hdr + 25 noise + 21 frame) - 8
 # Runner markers that annotate a boundary or an event but are not steps. Every
 # OTHER marker opens a step segment — a throughput step ("saturate", "p=264B")
 # has no position at all, and dropping it would make the whole experiment
@@ -125,6 +126,120 @@ def _exp_from_upload_id(upload_id: str) -> str:
     if name.endswith(".jsonl"):
         name = name[: -len(".jsonl")]
     return name or "unknown"
+
+
+def _drop_pre_arm(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the arm that counted, when a device was armed more than once.
+
+    A phone can be armed, aborted and armed again (field day 2026-08-08: one
+    tapped ~10 min early caught the earlier wall-clock boundary, ran alone for
+    7 s against peers whose recorders were not up, and was aborted). The
+    abandoned arm stamps ordinary step labels — `n=3 t1` is indistinguishable
+    from the real one — so it reads as an extra rep unless it is cut here.
+
+    Which arm counted is READ, not guessed: the runner stamps `end` when a run
+    finishes and `aborted` when it is abandoned. Per device the records are
+    split at its `placement` markers, and the block kept is the last one
+    containing an `end` — or the last block if none does (nothing completed,
+    so the latest arm is the live one). Keeping a block rather than a floor is
+    what stops a stray re-arm at the tail from deleting a COMPLETED run.
+
+    The cut is then id-aware. Message ids are UUIDv5 over
+    `field|expId|src|dst|step|seq` with no per-run term, so an abandoned arm
+    mints ids identical to the real run's. Cutting only the re-armed device
+    leaves its peers' `recv` rows behind, and those join the real run's later
+    `sent` for the same id — which manufactures negative latencies and trips
+    the "every latency is biased LOW" verdict. Those ids are unusable either
+    way: the receiver's packet bloom saw them during the abandoned arm, so the
+    real run's copies were dropped as duplicates and never delivered. They
+    leave on every device.
+
+    The recording is not modified: the abandoned arm stays in the trace, it
+    simply stops being read as part of the run.
+    """
+    if df.empty or "_device" not in df.columns:
+        return df
+    marks = df[df._type == "marker"]
+    if marks.empty:
+        # main() forces `marker` into any --types set precisely so this
+        # cannot silently pass an unguarded frame through.
+        print("  WARNING: no marker records loaded — re-arm guard INACTIVE")
+        return df
+    labels = _col(marks, "label")
+    placements = marks[labels == "placement"]
+    if placements.empty:
+        return df
+
+    keep = pd.Series(True, index=df.index)
+    abandoned = pd.Series(False, index=df.index)
+    cuts = []
+    completed_elsewhere = []
+    for dev, pl in placements.groupby("_device"):
+        arms = sorted(pl._t.tolist())
+        if len(arms) < 2:
+            continue
+        dev_marks = marks[marks._device == dev]
+        ends = sorted(dev_marks[_col(dev_marks, "label") == "end"]._t.tolist())
+        chosen = len(arms) - 1
+        for i, lo in enumerate(arms):
+            hi = arms[i + 1] if i + 1 < len(arms) else math.inf
+            if any(lo <= e < hi for e in ends):
+                chosen = i
+        mine = df._device == dev
+        for i, lo in enumerate(arms):
+            if i == chosen:
+                continue
+            hi = arms[i + 1] if i + 1 < len(arms) else math.inf
+            block = mine & (df._t >= lo) & (df._t < hi)
+            n = int(block.sum())
+            if not n:
+                continue
+            keep &= ~block
+            # Whether THIS block finished decides whether its ids are dead.
+            if any(lo <= e < hi for e in ends):
+                completed_elsewhere.append((str(dev)[:8], n))
+            else:
+                abandoned |= block
+            cuts.append((str(dev)[:8], len(arms), n))
+    if not cuts:
+        return df
+
+    # Ids from an ABANDONED arm are dead everywhere: the receiver's bloom saw
+    # them, so the surviving run's copies were dropped as duplicates. Ids from
+    # a COMPLETED earlier run are NOT dead — message ids carry no per-run term,
+    # so two runs under one experiment id mint the SAME ids, and tainting them
+    # would delete the surviving run's own traffic. That mistake cost 65k
+    # records on 2026-08-10 before it was caught.
+    tainted: set[str] = set()
+    dropped = df[abandoned]
+    for col in ("messageId", "packetId"):
+        if col in dropped.columns:
+            tainted |= {str(v) for v in dropped[col].dropna()}
+    extra = 0
+    if tainted:
+        hit = pd.Series(False, index=df.index)
+        for col in ("messageId", "packetId"):
+            if col in df.columns:
+                hit |= df[col].astype(str).isin(tainted)
+        hit &= keep
+        extra = int(hit.sum())
+        keep &= ~hit
+
+    for dev, arms, n in cuts:
+        print(f"  re-arm: {dev} armed {arms}x, {n} record(s) outside the arm "
+              f"that counted ignored")
+    if completed_elsewhere:
+        devs = sorted({d for d, _ in completed_elsewhere})
+        tot = sum(n for _, n in completed_elsewhere)
+        print(f"  !! {len(devs)} device(s) recorded MORE THAN ONE COMPLETE run "
+              f"under this experiment id ({tot} record(s) in the earlier "
+              f"run(s), ignored). Only the last is analysed. Message ids carry "
+              f"no per-run term, so the runs share ids — split the ids and "
+              f"re-record rather than trusting a merge.")
+    if extra:
+        print(f"  re-arm: {extra} further record(s) on other devices carried "
+              f"ids minted by a dropped arm — dead on arrival, also ignored")
+    return df[keep]
 
 
 def load_db(path: Path, exp: str | None = None,
@@ -468,6 +583,16 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             # Round trip: the ACK made it back to the sender too.
             row["msg_delivered"] = int(len(lat))
             row["delivery_rate"] = round(len(lat) / sent_n, 3)
+            # Most complete arrival evidence: a message ARRIVED if the receiver
+            # logged `recv` OR an ACK came back (an ACK is proof of receipt).
+            # `recv` alone misses arrivals whose recv record was never written
+            # but whose ACK returned; `delivered` alone misses arrivals whose
+            # ACK was lost on the return path. The union recovers both, so it is
+            # the honest reachability numerator when either log has holes.
+            arrived_n = int((seg_msgs["receivedAt"].notna()
+                             | seg_msgs["latencyMs"].notna()).sum())
+            row["msg_arrived"] = arrived_n
+            row["arrival_rate"] = round(arrived_n / sent_n, 3)
             row["rtt_median_ms"] = round(lat.median()) if len(lat) else None
             row["rtt_p90_ms"] = round(lat.quantile(0.9)) if len(lat) else None
             applat = pd.to_numeric(seg_msgs.get("appLatencyMs"),
@@ -493,7 +618,8 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
                                    if len(lat) and payload_b else None)
         else:
             row.update({"msg_sent": 0, "msg_recv": 0, "recv_rate": None,
-                        "msg_delivered": 0,
+                        "msg_delivered": 0, "msg_arrived": 0,
+                        "arrival_rate": None,
                         "delivery_rate": None, "rtt_median_ms": None,
                         "rtt_p90_ms": None, "applat_median_ms": None,
                         "active_s": None, "msg_per_s": None,
@@ -610,11 +736,39 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
     sent = sent.sort_values("_t").drop_duplicates(subset="messageId",
                                                   keep="first")
 
+    # Hops as plain dicts holding only the four fields the walk reads, built
+    # from column arrays. `relays.iterrows()` mints a pandas Series per row —
+    # on a field trace that is millions of Series, each carrying the whole
+    # merged column set, and the dict holds them all at once: gigabytes to
+    # store what is really four scalars a row.
     relay_by_id: dict[str, list] = defaultdict(list)
-    for _, r in relays.iterrows():
-        if r.get("event") == "dup":
-            continue
-        relay_by_id[str(r.get("packetId"))].append(r)
+    if not relays.empty:
+        def _arr(name):
+            return (relays[name].to_numpy() if name in relays.columns
+                    else np.full(len(relays), None, dtype=object))
+        r_pkt, r_ev = _arr("packetId"), _arr("event")
+        r_from, r_carried = _arr("fromPeer"), _arr("carried")
+        r_t, r_dev = _arr("_t"), _arr("_device")
+        for i in range(len(relays)):
+            if r_ev[i] == "dup":
+                continue
+            relay_by_id[str(r_pkt[i])].append({
+                "_t": r_t[i], "_device": r_dev[i],
+                "fromPeer": r_from[i], "carried": r_carried[i],
+            })
+
+    # Deliveries indexed by messageId, ONCE. Filtering `recv` per sent message
+    # instead is O(sent x recv): a boolean mask over an object column, rebuilt
+    # for every send. At field scale (millions of message records) that is
+    # days of CPU — it only looked fine on desk-sized traces, where both sides
+    # are a few hundred rows. Only the first delivery per id is ever read, so
+    # the index keeps exactly that, in the frame's own order.
+
+    recv_first: dict[str, pd.Series] = {}
+    if not recv.empty and "messageId" in recv.columns:
+        for _, r in recv.drop_duplicates(subset="messageId",
+                                         keep="first").iterrows():
+            recv_first[str(r.get("messageId"))] = r
 
     # Devices seen in this run, so an edge can be labelled by role.
     def label(dev: str) -> str:
@@ -623,9 +777,9 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
     rows = []
     for _, s_row in sent.iterrows():
         mid = str(s_row.get("messageId"))
-        hops = sorted(relay_by_id.get(mid, []), key=lambda r: r._t)
-        got = recv[_col(recv, "messageId") == mid]
-        delivered = len(got) > 0
+        hops = sorted(relay_by_id.get(mid, []), key=lambda r: r["_t"])
+        got = recv_first.get(mid)
+        delivered = got is not None
 
         # Edge-based chain: every hop names the peer it received FROM, so the
         # parent of each forwarder is known rather than guessed. Walk forward
@@ -639,7 +793,7 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
                 break
             by_parent[str(parent)].append(h)
         if delivered:
-            last = got.iloc[0].get("fromPeer")
+            last = got.get("fromPeer")
             if last is None or (isinstance(last, float) and pd.isna(last)):
                 edges_known = False
 
@@ -649,17 +803,17 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
             seen_hops = 0
             while by_parent.get(cursor):
                 nxt = by_parent[cursor].pop(0)
-                path_devs.append(nxt._device)
-                cursor = str(nxt._device)
+                path_devs.append(nxt["_device"])
+                cursor = str(nxt["_device"])
                 seen_hops += 1
             # A hop nobody claims as a child means the chain forked or a
             # forwarder's parent was outside the experiment: fall back.
             if seen_hops != len(hops):
                 edges_known = False
         if not edges_known:
-            path_devs = [s_row._device] + [h._device for h in hops]
+            path_devs = [s_row._device] + [h["_device"] for h in hops]
         if delivered:
-            path_devs.append(got.iloc[0]._device)
+            path_devs.append(got._device)
 
         rows.append({
             "messageId": mid,
@@ -675,18 +829,19 @@ def mesh_paths(df: pd.DataFrame, roles: dict[str, str]) -> pd.DataFrame:
             "fragmented": bool(
                 (s_row.get("payloadSize") or 0) > FRAGMENT_THRESHOLD_B),
             "delivered": delivered,
-            "deliveredAt": int(got.iloc[0]._t) if delivered else None,
-            "latencyMs": int(got.iloc[0]._t - s_row._t) if delivered else None,
+            "deliveredAt": int(got._t) if delivered else None,
+            "latencyMs": int(got._t - s_row._t) if delivered else None,
             # The receiver's own view of distance travelled (TTL drop).
-            "recvRelayHops": (int(got.iloc[0].get("relayHops"))
-                              if delivered and pd.notna(got.iloc[0].get("relayHops"))
+            "recvRelayHops": (int(got.get("relayHops"))
+                              if delivered and pd.notna(got.get("relayHops"))
                               else None),
             "carried": any(bool(h.get("carried")) for h in hops),
         })
     return pd.DataFrame(rows)
 
 
-def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
+def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame,
+                 clocks: dict | None = None) -> str:
     """Hop-count distribution, relay/custody evidence, duplication factor."""
     if paths.empty:
         return ""
@@ -703,6 +858,52 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
     # stamping `sent` after the wire write (the receiver logged the arrival
     # before the sender's own stamp ran). That bias shrinks every latency,
     # not just the ones it pushes below zero.
+    # Measured clock offsets, from tools/sync_phone_clocks.sh --json. This is
+    # the ONLY sound source for them. The marker-derived number below cannot
+    # be one: in a manual-join run every phone stamps its step markers at the
+    # same SCHEDULED epoch, so a phone whose clock is 22 s slow writes exactly
+    # the same timestamp as everyone else and simply reaches it 22 s late. The
+    # markers measure how well the phones agree on the SCHEDULE, not on the
+    # time — and in a tap-anchored run they measure the spread of the taps.
+    # Both were previously printed as "device clocks", which on 2026-08-08
+    # reported a 0.017 s spread for a fleet holding a 22 s offset, and on the
+    # tap-anchored run before it labelled a phone that started 10 min early as
+    # a -640 s clock error.
+    if clocks:
+        measured = []
+        for d in clocks.get("devices", []):
+            pk = str(d.get("pubkey") or "").lower()
+            if not pk:
+                continue
+            hit = [dev for dev in df._device.dropna().unique()
+                   if str(dev).lower().startswith(pk)]
+            for dev in hit:
+                measured.append((str(dev), float(d.get("offsetS") or 0.0),
+                                 float(d.get("errS") or 0.0),
+                                 str(d.get("model") or "")))
+        if measured:
+            roles_m = device_roles(df)
+            lines.append("measured clock offsets (tools/sync_phone_clocks.sh, "
+                         f"synced {clocks.get('measuredAtMs')}):")
+            for dev, off, err, model in sorted(measured, key=lambda m: -abs(m[1])):
+                lines.append(f"  {label_for(dev, roles_m)} {model} "
+                             f"{off:+.3f}s ±{err:.3f}s")
+            unmapped = [d.get("serial") for d in clocks.get("devices", [])
+                        if not d.get("pubkey")]
+            if unmapped:
+                lines.append(f"  {len(unmapped)} synced device(s) have no "
+                             f"pubkey in tools/fleet_map.json and are not "
+                             f"shown: {', '.join(str(u) for u in unmapped)}")
+        else:
+            lines.append("!! --clocks given but no device matched this "
+                         "experiment (fill tools/fleet_map.json with "
+                         "serial -> pubkey)")
+    else:
+        lines.append("!! clock offsets NOT measured for this run — pass "
+                     "--clocks from tools/sync_phone_clocks.sh --json. Every "
+                     "cross-device latency below is uncorrected and carries "
+                     "whatever offset the phones held.")
+
     marks = df[(df._type == "marker")]
     lbl = marks.get("label")
     lbl = lbl if lbl is not None else pd.Series(dtype=object)
@@ -724,8 +925,10 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
         parts = " ".join(
             f"{label_for(d, roles)} {v / 1000:+.3f}s"
             for d, v in sorted(offsets.items()))
-        lines.append(f"device clocks (from shared step markers): {parts} "
-                     f"— max spread {spread / 1000:.3f}s")
+        lines.append(f"step scheduling spread (NOT clock offset): {parts} "
+                     f"— max spread {spread / 1000:.3f}s. This is how closely "
+                     f"the phones agreed on WHEN each step opens; a constant "
+                     f"clock offset is invisible to it.")
     neg = paths[paths.latencyMs.notna() & (paths.latencyMs < 0)].copy()
     if len(neg):
         lines.append(f"!! {len(neg)} impossible orderings "
@@ -736,12 +939,20 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
             off = -grp.latencyMs.min() / 1000
             lines.append(f"!!   {pair}: {len(grp)} msg, worst {off:.1f}s")
         worst = -neg.latencyMs.min() / 1000
-        if spread is not None:
+        if clocks:
             lines.append(
-                f"!! the marker-measured clock spread is {spread / 1000:.3f}s"
-                f"; whatever part of {worst:.1f}s it cannot cover is the "
-                "sender's own sent stamp lagging the wire write — every "
-                "latency in this run is biased LOW by up to that lag")
+                f"!! worst impossible ordering is {worst:.1f}s. Compare it "
+                "against the MEASURED offsets above: a pair whose offsets "
+                "differ by about that much is a clock artifact, and anything "
+                "left over is the sender's own sent stamp lagging the wire "
+                "write. Both shrink latency, neither is corrected here.")
+        elif spread is not None:
+            lines.append(
+                f"!! {worst:.1f}s of impossible ordering, and the clocks were "
+                "NOT measured for this run — the scheduling spread above "
+                f"({spread / 1000:.3f}s) cannot bound it, because scheduled "
+                "markers cannot see a clock offset. Do not attribute this to "
+                "sent-stamp lag without --clocks.")
         else:
             lines.append(
                 "!! no shared step markers in this run: cannot separate "
@@ -801,14 +1012,215 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame) -> str:
     msg_dups = df[(df._type == "message") & (_col(df, "dir") == "dup")]
     if len(fresh):
         lines.append(
-            f"packet redundancy: {len(pkt_dups)} redundant packet arrival(s) "
-            f"for {len(fresh)} delivered message(s) "
-            f"= {1 + len(pkt_dups) / len(fresh):.2f} copies on the air per "
-            "message (1.00 = every packet arrived exactly once)")
+            f"redundant arrivals for us: {len(pkt_dups)} for {len(fresh)} "
+            f"delivered message(s) = {1 + len(pkt_dups) / len(fresh):.2f} per "
+            "message. NOT a duplication factor: the numerator counts outer "
+            "PACKETS addressed to us (a duplicate ack is one, and acks are "
+            "not deliveries) and it sees nothing of the transit traffic a "
+            "relay drops. Use the packets-per-delivery figure below for cost")
         lines.append(
             f"message re-delivery: {len(msg_dups)} (must be 0 — a duplicate "
             "of an already-delivered message triggers nothing)")
+
+    # The honest cost figure: everything the fleet PUT ON THE AIR against the
+    # packets that actually reached the node they were addressed to. Both
+    # sides are packets, so the ratio means something — unlike a packet
+    # numerator over a message denominator. Transmissions come from the wire
+    # ledger, which counts per link (a broadcast over N links is N packets,
+    # which is what the radio actually paid for).
+    tx_sealed = collections.Counter()
+    rx_all = collections.Counter()
+    for _, w in df[df._type == "wire"].iterrows():
+        for name, n in _dict(w.get("txPackets")).items():
+            tx_sealed[name] += int(n)
+        for name, n in _dict(w.get("rxPackets")).items():
+            rx_all[name] += int(n)
+    sealed_tx = sum(n for name, n in tx_sealed.items()
+                    if name == "secure" or name.startswith("secure:"))
+    # Reached its final destination = accepted by the node it was addressed
+    # to, first time: a data packet delivered (recv) or an ack that got home
+    # (ackRx). Anything else on the air was transit, a duplicate, or a sync
+    # offer nobody wanted.
+    acks_home = len(df[(df._type == "message") & (_col(df, "dir") == "ackRx")])
+    arrived = len(fresh) + acks_home
+    if sealed_tx and arrived:
+        # Sync frames can NEVER appear in the denominator: an offer/request is
+        # dispatched to the sync handlers and produces no `recv` and no ack,
+        # so counting it against deliveries is not a like-for-like ratio. Keep
+        # it out of the cost figure and report it as what it is — the share of
+        # the air spent on reconciliation rather than on carrying anything.
+        sync_tx = sum(n for name, n in tx_sealed.items()
+                      if name.startswith("secure:sync"))
+        payload_tx = sealed_tx - sync_tx
+        parts = ", ".join(f"{k} {v}" for k, v in
+                          sorted(tx_sealed.items(), key=lambda kv: -kv[1])
+                          if k == "secure" or k.startswith("secure:"))
+        lines.append(
+            f"packets per delivery: {payload_tx} carrying packet(s) on the "
+            f"air (data + ack, including every relayed and conveyed copy) "
+            f"for {arrived} that reached their destination ({len(fresh)} "
+            f"data + {acks_home} ack) = {payload_tx / arrived:.1f} "
+            f"transmissions per delivered packet")
+        if sync_tx:
+            lines.append(
+                f"sync overhead: {sync_tx} sync packet(s) = "
+                f"{100 * sync_tx / sealed_tx:.0f}% of all sealed air, and "
+                f"{sync_tx / arrived:.1f} per delivered packet. These carry "
+                f"no payload and by construction never appear as a delivery — "
+                f"they are the price of reconciling buffers, not of moving "
+                f"messages")
+        lines.append(f"  sealed tx by kind: [{parts}]")
+
+    # EVERY packet on the air, whatever it carries. ANNOUNCE and sync compete
+    # for the same radio as payload, so a congestion figure that leaves them
+    # out understates what the medium is actually carrying. Three stages, each
+    # a strict subset of the one before:
+    #   aired    — writes the radio paid for (a broadcast over N links is N)
+    #   received — the same packets arriving at SOME node, transit included
+    #   arrived  — accepted by the node they were addressed to, first time
+    # aired - received is what the air itself swallowed; received - arrived is
+    # what the mesh carried for someone else or threw away as a duplicate.
+    tx_total = sum(tx_sealed.values())
+    rx_total = sum(rx_all.values())
+    if tx_total:
+        tx_kinds = ", ".join(f"{k} {v}" for k, v in tx_sealed.most_common())
+        rx_kinds = ", ".join(f"{k} {v}" for k, v in rx_all.most_common())
+        lines.append(
+            f"packets on the air: {tx_total} aired -> {rx_total} received "
+            f"({100 * rx_total / tx_total:.0f}%) -> {arrived} reached their "
+            f"destination ({100 * arrived / tx_total:.1f}% of what was aired)")
+        lines.append(f"  aired by kind:    [{tx_kinds}]")
+        lines.append(f"  received by kind: [{rx_kinds}]")
+
+        # DATA PLANE vs CONTROL PLANE. Mixing them hides which one is
+        # expensive: control traffic scales with neighbours and buffer churn,
+        # data traffic with what the user actually sent, and only the second
+        # is what the mesh exists to move.
+        data_tx = tx_sealed.get("secure", 0) + sum(
+            v for k, v in tx_sealed.items() if k.startswith("secure:data"))
+        ack_tx = sum(v for k, v in tx_sealed.items()
+                     if k.startswith("secure:ack"))
+        ann_tx = tx_sealed.get("announce", 0)
+        hs_tx = tx_sealed.get("handshake", 0)
+        ctrl_tx = sync_tx + ack_tx + ann_tx + hs_tx
+        ann_rx = rx_all.get("announce", 0)
+        lines.append(
+            f"  DATA plane:    {data_tx} aired -> {len(fresh)} delivered"
+            + (f" = {data_tx / len(fresh):.1f} per delivery" if len(fresh)
+               else ""))
+        lines.append(
+            f"  CONTROL plane: {ctrl_tx} aired "
+            f"({100 * ctrl_tx / tx_total:.0f}% of the air) — sync {sync_tx}, "
+            f"ack {ack_tx}, announce {ann_tx}, handshake {hs_tx}")
+        lines.append(
+            f"    of which delivered: ack {acks_home} home, announce {ann_rx} "
+            f"received. Sync arrivals are NOT separable: the receive side "
+            f"classifies by the outer type byte alone, so a received sync "
+            f"packet is indistinguishable from a data one and sits inside "
+            f"rx `secure`. Splitting it would need the packetId (which "
+            f"survives relaying unchanged) joined back to the originator's "
+            f"own record of what it sealed")
+    joined = packet_join(df)
+    if joined:
+        lines.append(joined)
     return "\n".join(lines) + "\n"
+
+
+def packet_join(df: pd.DataFrame) -> str:
+    """Follow individual packets by id, from the sender that minted them to
+    every node that saw them.
+
+    The packetId survives relaying unchanged --- `decrementTtl` carries it
+    through, because it IS the dedup key --- so the id the originator wrote is
+    the id every hop reads. That makes an offline join possible where the wire
+    itself is deliberately uninformative: a relay cannot tell a data packet
+    from an ack, but the originator recorded which it sealed, and the analysis
+    can put the two together afterwards.
+
+    What this can and cannot see, stated plainly:
+      * data  — `message/sealed` lists the packetIds of every message sent
+      * ack   — `ackTx` names the packetId of every ack sent
+      * sync  — INVISIBLE. Sync frames are traced on neither side: the sender
+                logs no per-frame record and the receiver logs nothing for a
+                packet it neither delivers nor relays. Sync is also TTL 1, so
+                it never appears in a `relay` record either. Any figure below
+                therefore describes data and ack traffic only, and the sync
+                share has to come from the wire ledger's tx counts.
+    """
+    msgs = df[df._type == "message"]
+    if msgs.empty:
+        return ""
+    kind: dict[str, str] = {}
+    origin: dict[str, str] = {}
+    msg_to_packets: dict[str, list[str]] = {}
+    for _, r in msgs[_col(msgs, "dir") == "sealed"].iterrows():
+        ids = r.get("packetIds")
+        ids = list(ids) if isinstance(ids, (list, tuple)) else []
+        msg_to_packets[str(r.get("messageId"))] = [str(i) for i in ids]
+        for i in ids:
+            kind[str(i)] = "data"
+            origin[str(i)] = str(r.get("_device"))
+    for _, r in msgs[_col(msgs, "dir") == "ackTx"].iterrows():
+        kind[str(r.get("packetId"))] = "ack"
+        origin[str(r.get("packetId"))] = str(r.get("_device"))
+    if not kind:
+        return ""
+
+    # Where a packet was SEEN. Each of these is a node reporting an arrival:
+    # forwarded on (relay), stored or conveyed for someone (custody), dropped
+    # as a duplicate (packetDup), or accepted as an ack (ackRx).
+    #
+    # Only ANOTHER node's record counts. The originator stores every packet it
+    # sends in its own DTN buffer, so counting custody records without this
+    # filter reports 100% "seen" for free and measures nothing.
+    seen: dict[str, set[str]] = collections.defaultdict(set)
+    for t in ("relay", "custody", "packetDup"):
+        sub = df[df._type == t]
+        if sub.empty:
+            continue
+        for pid, dev in zip(_col(sub, "packetId"), sub["_device"]):
+            if pd.isna(pid):
+                continue
+            if origin.get(str(pid)) == str(dev):
+                continue
+            seen[str(pid)].add(t)
+    for _, r in msgs[_col(msgs, "dir") == "ackRx"].iterrows():
+        seen[str(r.get("packetId"))].add("arrived")
+    # A delivered message names its messageId; the sender's own `sealed`
+    # record is what maps that back to the packets it was cut into.
+    for _, r in msgs[_col(msgs, "dir") == "recv"].iterrows():
+        for pid in msg_to_packets.get(str(r.get("messageId")), []):
+            if origin.get(pid) != str(r.get("_device")):
+                seen[pid].add("arrived")
+
+    lines = ["", "Packet join (by packetId, which survives relaying)"]
+    lines.append("-" * 60)
+    for k in ("data", "ack"):
+        ids = {i for i, v in kind.items() if v == k}
+        if not ids:
+            continue
+        obs = {i for i in ids if seen.get(i)}
+        home = {i for i in ids if "arrived" in seen.get(i, ())}
+        relayed = {i for i in ids if "relay" in seen.get(i, ())}
+        carried = {i for i in ids if "custody" in seen.get(i, ())}
+        lines.append(
+            f"  {k:5}: {len(ids)} minted -> {len(obs)} seen by ANOTHER node "
+            f"({100 * len(obs) / len(ids):.0f}%) -> {len(home)} reached the "
+            f"node they were addressed to ({100 * len(home) / len(ids):.0f}%)"
+            f"; {len(relayed)} were forwarded by a relay, {len(carried)} "
+            f"entered a buffer")
+        lost = ids - obs
+        if lost:
+            lines.append(
+                f"         {len(lost)} left no trace on any OTHER node — "
+                f"never relayed, never buffered elsewhere, never delivered: "
+                f"as far as the fleet is concerned they never left the "
+                f"sender")
+    lines.append(
+        "  sync: not joinable — sync frames are traced on neither side and "
+        "are TTL 1, so they never appear as a relay either. Their cost is "
+        "visible only as tx `secure:sync` above.")
+    return "\n".join(lines)
 
 
 def ladder_table(steps: pd.DataFrame) -> pd.DataFrame:
@@ -1721,6 +2133,86 @@ def plot_wire(df: pd.DataFrame, out: Path):
     plt.close(fig)
 
 
+_LOAD_SWEEP_LABEL = re.compile(r"^N=(\d+)\s+L=(\S+)\s+t(\d+)$")
+
+
+def load_sweep_points(steps: pd.DataFrame) -> pd.DataFrame:
+    """Per-step (clique size N, offered load, arrival) for a load-sweep run.
+
+    Recognises the diluting-clique / load-sweep labels `N=<n> L=<level> t<rep>`
+    (level is a percent like `30%` or a name like `low`/`sat`). The offered
+    load is the ACHIEVED rate each node originated in the step — messages sent
+    / N / dwell seconds, in msg/s — so the x-axis is a measured rate rather
+    than a nominal knob and stays comparable across clique sizes. Arrival is
+    recv-OR-ACK (see steps_table). Empty when the run is not a load sweep.
+    """
+    rows = []
+    for _, r in steps.iterrows():
+        m = _LOAD_SWEEP_LABEL.match(str(r.get("label", "")))
+        if not m:
+            continue
+        sent = r.get("msg_sent") or 0
+        arr = r.get("arrival_rate")
+        if not sent or arr is None or pd.isna(arr):
+            continue
+        n = int(m.group(1))
+        dwell = max((r["t1"] - r["t0"]) / 1000.0, 1e-9)
+        rows.append({"N": n, "level": m.group(2),
+                     "rate_msg_s": sent / n / dwell,
+                     "arrival_pct": 100.0 * float(arr)})
+    return pd.DataFrame(rows)
+
+
+# Clique size is encoded by MARKER SHAPE (+ line style), not colour, so the
+# same N reads identically across panels and survives greyscale / CVD.
+_SWEEP_MARKER = {2: "o", 3: "s", 4: "^", 5: "x", 6: "+", 7: "*", 8: "D"}
+_SWEEP_LINE = {2: "-", 3: "--", 4: "-.", 5: ":",
+               6: (0, (3, 1, 1, 1)), 7: (0, (5, 1)), 8: (0, (1, 1))}
+
+
+def plot_load_sweep(ax, pts: pd.DataFrame, title: str) -> None:
+    """Draw arrival-vs-offered-load curves, one line per clique size N, onto
+    [ax]. Each point is the mean over the repeat trials at that (N, level) with
+    a +/- sd bar; x is the mean achieved msg/s per node. N is distinguished by
+    marker shape and line style rather than colour."""
+    ns = sorted(pts.N.unique())
+    for n in ns:
+        g = pts[pts.N == n].groupby("level")
+        agg = sorted(
+            ((grp.rate_msg_s.mean(), grp.arrival_pct.mean(),
+              grp.arrival_pct.std(ddof=0)) for _, grp in g),
+            key=lambda p: p[0])
+        xs = [a[0] for a in agg]
+        ys = [a[1] for a in agg]
+        es = [a[2] for a in agg]
+        ax.errorbar(xs, ys, yerr=es, marker=_SWEEP_MARKER.get(n, "o"),
+                    ms=8, lw=1.5, capsize=3, color="#222222",
+                    markeredgewidth=1.6,
+                    linestyle=_SWEEP_LINE.get(n, "-"), label=f"N={n}")
+    ax.set_xscale("log")
+    ax.set_xlabel("offered load per node (msg/s)")
+    ax.set_ylabel("delivery — arrived (recv or ACK), %")
+    ax.set_ylim(0, 100)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(title="clique size", ncol=2, fontsize=9)
+    ax.set_title(title)
+
+
+def write_load_sweep(steps: pd.DataFrame, out: Path, exp: str) -> bool:
+    """Emit the single-run load-sweep delivery graph, or return False when the
+    run's labels are not a load sweep."""
+    pts = load_sweep_points(steps)
+    if pts.empty:
+        return False
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plot_load_sweep(ax, pts, f"{exp} — arrival vs offered load, per clique size "
+                             "(mean ± sd over repeats)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -1731,6 +2223,11 @@ def main() -> int:
     ap.add_argument("--exp", default=None,
                     help="only analyze this experiment name (filtered in SQL, "
                          "so other experiments are never read)")
+    ap.add_argument("--clocks", default=None, metavar="PATH",
+                    help="clock offsets measured by "
+                         "tools/sync_phone_clocks.sh --json. The only sound "
+                         "source: markers are stamped on a schedule, so they "
+                         "cannot reveal a constant offset.")
     ap.add_argument("--types", default=None,
                     help="comma-separated record types to load, e.g. "
                          "'power,marker' for a power ladder. Cuts memory by "
@@ -1739,14 +2236,30 @@ def main() -> int:
                          "Omit to load everything.")
     args = ap.parse_args()
 
+    clocks = None
+    if args.clocks:
+        try:
+            clocks = json.loads(Path(args.clocks).read_text())
+        except (OSError, ValueError) as e:
+            print(f"cannot read --clocks {args.clocks}: {e}", file=sys.stderr)
+            return 1
+
+    types = ({t.strip() for t in args.types.split(",") if t.strip()}
+             if args.types else None)
+    if types and "marker" not in types:
+        # The re-arm guard finds an abandoned arm from `placement` markers.
+        # Without them it cannot see one, and an unguarded frame reads the
+        # abandoned arm's sends as part of the run — silently, because the
+        # guard has nothing to warn about. Markers are ~1000 rows.
+        print("  --types has no 'marker': adding it (the re-arm guard needs it)")
+        types = types | {"marker"}
+
     frames = []
     for raw in args.inputs:
         p = Path(raw)
         if not p.exists():
             print(f"no such file: {p}", file=sys.stderr)
             return 1
-        types = ({t.strip() for t in args.types.split(",") if t.strip()}
-                 if args.types else None)
         frames.append(load_db(p, exp=args.exp, types=types)
                       if p.suffix == ".db" else load_jsonl([p]))
     df = pd.concat(frames, ignore_index=True)
@@ -1756,6 +2269,7 @@ def main() -> int:
 
     out_root = Path(args.out)
     for exp, edf in df.groupby("_exp"):
+        edf = _drop_pre_arm(edf)
         if args.exp and exp != args.exp:
             continue
         out = out_root / exp
@@ -1767,7 +2281,7 @@ def main() -> int:
         summary = summarize(edf, latency)
         if not paths.empty:
             paths.to_csv(out / "mesh_paths.csv", index=False)
-            summary += mesh_summary(paths, edf)
+            summary += mesh_summary(paths, edf, clocks)
         (out / "summary.txt").write_text(summary)
         if not latency.empty:
             latency.to_csv(out / "latency.csv", index=False)
@@ -1819,6 +2333,7 @@ def main() -> int:
             if fit:
                 (out / "pathloss.txt").write_text(fit)
             plot_range(steps, out / "range.png")
+            write_load_sweep(steps, out / "load_sweep_delivery.png", exp)
         scale = mesh_scale(edf, segs)
         if not scale.empty:
             scale.to_csv(out / "mesh_scale.csv", index=False)

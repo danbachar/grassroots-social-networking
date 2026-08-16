@@ -59,6 +59,45 @@ def analyse_exp(conn, exp: str):
     if g:
         dist = {k: float(v) for k, v in json.loads(g[0]).items()}
 
+    # A device armed more than once abandoned an arm (an abort, or a tap that
+    # caught an earlier wall-clock boundary). Which arm counted is READ from
+    # the terminators the runner already stamps: split the device's records at
+    # its `placement` markers and keep the last block containing an `end`, or
+    # the last block if none does. Keeping a BLOCK, not a floor, is what stops
+    # a stray re-arm at the tail from deleting a run that completed.
+    arms: dict[str, list[int]] = {}
+    ends: dict[str, list[int]] = {}
+    for dev, ty, t, b in rows:
+        if ty != "marker":
+            continue
+        label = json.loads(b).get("label")
+        if label == "placement":
+            arms.setdefault(dev, []).append(t)
+        elif label == "end":
+            ends.setdefault(dev, []).append(t)
+    windows: dict[str, tuple[int, float]] = {}
+    for dev, ts in arms.items():
+        if len(ts) < 2:
+            continue
+        ts = sorted(ts)
+        chosen = len(ts) - 1
+        for i, lo in enumerate(ts):
+            hi = ts[i + 1] if i + 1 < len(ts) else math.inf
+            if any(lo <= e < hi for e in ends.get(dev, [])):
+                chosen = i
+        windows[dev] = (ts[chosen],
+                        ts[chosen + 1] if chosen + 1 < len(ts) else math.inf)
+    if windows:
+        before = len(rows)
+        rows = [r for r in rows
+                if r[0] not in windows
+                or windows[r[0]][0] <= r[2] < windows[r[0]][1]]
+        for dev, (lo, _) in windows.items():
+            print(f"!! {dev[:8]} armed {len(arms[dev])}x; records outside the "
+                  f"arm that counted are ignored (the abandoned arm stays in "
+                  f"the trace)")
+        print(f"!! {before - len(rows)} record(s) ignored in total")
+
     # device -> order, and pubkey -> order (device_id IS the pubkey hex)
     order: dict[str, int] = {}
     marks: dict[str, list] = {}
@@ -78,6 +117,16 @@ def analyse_exp(conn, exp: str):
     by_n: dict[int, list[float]] = {}
     by_d: dict[float, list[float]] = {}
     print(f"=== {exp} ===")
+    dupes = {o for o in order.values() if list(order.values()).count(o) > 1}
+    if dupes:
+        print(f"!! {len(dupes)} join order(s) claimed by more than one device: "
+              + ", ".join(f"#{o}" for o in sorted(dupes))
+              + " — BOTH tables below are affected. The geometry rows "
+                "collide, so a distance naming one of these numbers is "
+                "attributed to whichever row owns it; and the join order IS "
+                "the mesh size (N = the joiner's own order), so the duplicated "
+                "number files its samples under the wrong N and reports the "
+                "wrong count of peers that never formed.")
     print(f"{'join':>5} {'N':>3} {'peer':>5} {'dist':>7} {'join\u0394':>8} {'pair\u0394':>8}")
     def emit_join(dev, o, w0, blk_end, ms, tag=""):
         # bt-on is stamped by the transport-state transition itself (the

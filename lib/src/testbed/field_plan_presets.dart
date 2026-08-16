@@ -47,7 +47,7 @@ class FieldPlanPresets {
   ///
   /// [payloadSizes] is the PAYLOAD ARM: one saturating step per size, so the
   /// per-message cost of fragmentation is a measured result instead of a
-  /// hidden constant. [defaultSendBytes] (132 B) is exactly one sealed packet;
+  /// hidden constant. [defaultSendBytes] (136 B) is exactly one sealed packet;
   /// 264 B is exactly two; 1200 B is ten. Every step runs from the same spot,
   /// so only the very first waits for the tap — a whole arm is hands-free
   /// after one press. Labels carry the size (`p=264B`) so the analyzer
@@ -142,10 +142,18 @@ class FieldPlanPresets {
   /// no ACK, no buffering: this measures the naked GATT pipe, and the gap to
   /// the protocol numbers is the measured cost of the stack. The receiver
   /// counts bytes in its wire ledger and drops the blobs before the parser.
+  /// `+4` / `-4` / `0` — a signed tag for a step label.
+  static String _signed(int v) => v > 0 ? '+$v' : '$v';
+
   static FieldPlan rawLink({
     String expId = 'raw-link-1',
     int dwellSec = 30,
     List<String> legs = const ['notify', 'write', 'stripe'],
+    // Byte offsets from the ATT ceiling (`MTU - 3`) to write at. The default
+    // single 0 is the plain throughput run: write exactly at the ceiling.
+    // A multi-value sweep turns the plan into the ATT-ceiling probe — the
+    // measurement the fragment budget's 8-byte margin has never had.
+    List<int> sizeDeltas = const [0],
     int repeat = 1,
     bool resetSessions = false,
     // Default ON, unlike every other warm-link plan: the plugin's per-path
@@ -159,15 +167,23 @@ class FieldPlanPresets {
   }) {
     final trials = repeat < 1 ? 1 : repeat;
     final arms = legs.isEmpty ? const ['notify'] : legs;
+    final deltas = sizeDeltas.isEmpty ? const [0] : sizeDeltas;
     final steps = <FieldStep>[];
     for (final leg in arms) {
-      for (var i = 1; i <= trials; i++) {
-        steps.add(FieldStep(
-          label: trials > 1 ? 'leg=$leg t$i' : 'leg=$leg',
-          dwellSec: dwellSec,
-          rawLeg: leg,
-          autoAdvance: steps.isNotEmpty,
-        ));
+      for (final delta in deltas) {
+        for (var i = 1; i <= trials; i++) {
+          // The delta belongs in the label as well as the step, because the
+          // label is what the analysis segments on and what the operator
+          // reads on the phone mid-run.
+          final tag = delta == 0 ? 'leg=$leg' : 'leg=$leg d=${_signed(delta)}';
+          steps.add(FieldStep(
+            label: trials > 1 ? '$tag t$i' : tag,
+            dwellSec: dwellSec,
+            rawLeg: leg,
+            rawSizeDelta: delta,
+            autoAdvance: steps.isNotEmpty,
+          ));
+        }
       }
     }
     return FieldPlan(
@@ -411,11 +427,9 @@ class FieldPlanPresets {
       // packet held while the mesh was too sparse may deliver once density
       // rises, and clearing between steps would erase exactly that effect.
       resetDtnBuffer: false,
-      deviceOrder: role,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
-      sampleGps: false,
       steps: steps,
     );
   }
@@ -485,11 +499,140 @@ class FieldPlanPresets {
       // Leftover sends would otherwise drain into the next rep's window via
       // the sync exchange and blur its usable stage.
       resetDtnBuffer: true,
-      deviceOrder: role,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
-      sampleGps: false,
+      steps: steps,
+    );
+  }
+
+  /// TIER 3 — store-carry-forward under load, on a desk.
+  ///
+  /// One phone is the TRAVELLER: its radio goes down, everyone else keeps
+  /// messaging it, and then it comes back. What is measured is what survives
+  /// the absence — how much of the backlog is delivered on reunion and how
+  /// long each message was carried. Nothing here needs distance, so it runs on
+  /// a desk: the variable is OFFERED LOAD, not geometry.
+  ///
+  /// Three arms, run back to back:
+  ///   low     — a trickle; the buffer holds tens of packets
+  ///   medium  — steady traffic
+  ///   high    — the field-day setting (saturate, ONE lane, one sealed packet
+  ///             per message), so a desk result is comparable to
+  ///             mesh-scale-30m-2. The packet header lost its unused 4-byte
+  ///             timestamp after that run, so the payload is 136 B where the
+  ///             field day sent 132 B — the packet on the wire is 236 B in
+  ///             both, which is what contention actually sees.
+  ///
+  /// Each arm is three steps. `warm` lets sessions form (SEALING NEEDS A
+  /// SESSION — a recipient never paired with is held unsealed and is a
+  /// different measurement). `dark` drops the traveller's radio while the
+  /// senders push. `return` brings it back and sends NOTHING, so every
+  /// delivery in that window came out of a buffer rather than off the wire.
+  ///
+  /// The DTN buffer is deliberately NOT reset between the steps of an arm —
+  /// carrying the backlog across the dark step IS the experiment — but it is
+  /// reset at each arm's `warm` step so one arm's leftovers cannot be counted
+  /// as the next arm's delivery.
+  /// [travellerPrefix] concentrates the load on the absent phone. Leave it
+  /// empty and the senders address EVERYONE, which is both easier to set up
+  /// (no pubkey to type on six phones) and closer to the field day: every
+  /// phone messaging every other, with one member away. The absent peer's
+  /// share is the part that has to be carried, and it is identified in the
+  /// trace by recipient, not by how the load was aimed.
+  static FieldPlan storeCarryForward({
+    String expId = 'scf-desk-1',
+    required int role,
+    String travellerPrefix = '',
+    int warmSec = 60,
+    int darkSec = 120,
+    int returnSec = 120,
+    int lowSends = 10,
+    int mediumSends = 60,
+    int repeat = 1,
+  }) {
+    final traveller = role == 1;
+    final steps = <FieldStep>[];
+    final trials = repeat < 1 ? 1 : repeat;
+    for (final arm in const ['low', 'medium', 'high']) {
+      for (var t = 1; t <= trials; t++) {
+        final tag = trials > 1 ? '$arm t$t' : arm;
+        steps.add(FieldStep(
+          label: 'warm $tag',
+          dwellSec: warmSec,
+          bleOn: true,
+          // Clear the buffer where it is safe to: the arm's first step, before
+          // anything it will measure has been sent. The plan-level flag cannot
+          // express this (it fires on every step, which would wipe the backlog
+          // at `return`), so without this an arm inherits the previous arm's
+          // undelivered packets and scores them as its own deliveries.
+          // Sessions and links are untouched, so the arm still starts warm.
+          resetDtnBuffer: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
+        steps.add(FieldStep(
+          label: 'dark $tag',
+          dwellSec: darkSec,
+          // The traveller is unreachable; everyone else keeps sending TO it,
+          // addressed by prefix so the load lands on the absent peer rather
+          // than being shared out among the phones that are present.
+          bleOn: traveller ? false : true,
+          sendTo: (traveller || travellerPrefix.isEmpty)
+              ? 'all'
+              : travellerPrefix,
+          saturate: !traveller && arm == 'high',
+          sendLanes: 1,
+          sendCount: traveller
+              ? 0
+              : switch (arm) {
+                  'low' => lowSends,
+                  'medium' => mediumSends,
+                  _ => 0,
+                },
+          autoAdvance: true,
+        ));
+        steps.add(FieldStep(
+          label: 'return $tag',
+          dwellSec: returnSec,
+          bleOn: true,
+          // Nobody sends: every delivery inside this window came from a
+          // buffer, which is the whole measurement.
+          autoAdvance: true,
+        ));
+      }
+    }
+    // A trailing DISCARDED step, so the last arm is measured on the same terms
+    // as the others. What closes an arm's delivery window is the buffer reset
+    // at the NEXT warm step: arms before the last get `return` plus the
+    // auto-advance gap and are then wiped. The last arm had no following warm,
+    // so its window ran to the `end` marker and on into the settle — a longer
+    // drain, under quieter air, for the one arm that also carries the heaviest
+    // load. This step is that missing warm: same shape, same reset, and its
+    // label is excluded from the per-arm tables.
+    steps.add(FieldStep(
+      label: 'drain',
+      dwellSec: warmSec,
+      bleOn: true,
+      resetDtnBuffer: true,
+      autoAdvance: true,
+    ));
+    return FieldPlan(
+      expId: expId,
+      settleSec: 60,
+      autoAdvanceGapSec: 10,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: false,
+      // Wall-clock anchored so every phone opens the dark window at the same
+      // instant — a stagger would let a sender push while the traveller was
+      // still up, and those messages would deliver instead of being carried.
+      // A 5-minute grid is enough to tap six phones without a second pair of
+      // hands, and `scriptedRadio` keeps the toggling with the runner: nobody
+      // is standing over the desk to work the radio at the boundary.
+      manualJoin: true,
+      alignSec: 300,
+      placementSec: 60,
+      scriptedRadio: true,
       steps: steps,
     );
   }
@@ -505,8 +648,87 @@ class FieldPlanPresets {
         resetLinks: true,
       );
 
+  /// Diluting mesh with a DEDICATED WARM-UP after every join and a QUIET
+  /// ACK-drain window after every send — the unified methodology for desk and
+  /// field. ROLE-FREE: every phone loads this identical plan; each step
+  /// carries [FieldStep.cliqueN] and the runner derives THIS phone's radio
+  /// schedule from its own nickname at launch (on iff nickname <= cliqueN),
+  /// so there is no per-role entry to pick wrongly. Radios start OFF
+  /// everywhere; [scriptedRadio] turns each on only when its device joins.
+  ///
+  /// Per clique size N = 2..7:
+  ///   1. the joining device's radio comes up,
+  ///   2. settle — [firstWarmupSec] (60 s) at N=2 while the pair forms, else
+  ///      [warmupSec] (30 s) for the one new link — a no-send step so the
+  ///      grown clique converges BEFORE it is measured,
+  ///   3. for each load level {light 10%, medium 50%, heavy = saturate}, run
+  ///      [reps] trials, each [sendSec] s of all-to-all send followed by
+  ///      [quietSec] s of silence so late ACKs land in the send step's window
+  ///      (delivery is attributed by send step, not arrival).
+  ///
+  /// The quiet window is the plan's [autoAdvanceGapSec], so it sits after
+  /// every step; the per-N settle is a real no-send step on top of it. An
+  /// un-joined phone schedules nothing (the runner gates sends on the derived
+  /// bleOn). ~3.3 h for the full N=2..7 sweep.
+  static FieldPlan dilutingWarmupSweep({
+    String expId = 'dilute-5-warmup-quiet-drain',
+    int reps = 10,
+    int sendSec = 30,
+    int quietSec = 30,
+    int warmupSec = 30,
+    int firstWarmupSec = 60,
+    double nominalSatPerDest = 20.0,
+  }) {
+    const levels = [
+      ('light', 0.10),
+      ('medium', 0.50),
+      ('heavy', 1.0), // heavy = saturate
+    ];
+    final steps = <FieldStep>[];
+    for (final n in const [2, 3, 4, 5, 6, 7]) {
+      // Warm-up: the joining device's radio just came on; no sends while the
+      // clique converges. First join (N=2) gets longer — both radios are new.
+      steps.add(FieldStep(
+        label: 'N=$n settle',
+        dwellSec: n == 2 ? firstWarmupSec : warmupSec,
+        cliqueN: n,
+        sendCount: 0,
+        autoAdvance: steps.isNotEmpty,
+      ));
+      for (final (name, frac) in levels) {
+        final heavy = name == 'heavy';
+        final count = (frac * nominalSatPerDest * sendSec).round();
+        for (var t = 1; t <= reps; t++) {
+          steps.add(FieldStep(
+            label: 'N=$n L=$name t$t',
+            dwellSec: sendSec,
+            cliqueN: n,
+            sendTo: 'all',
+            saturate: heavy,
+            sendLanes: 1,
+            sendCount: heavy ? 0 : count,
+            autoAdvance: true,
+          ));
+        }
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      settleSec: 30,
+      autoAdvanceGapSec: quietSec,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: false,
+      manualJoin: true,
+      alignSec: 300,
+      placementSec: 120,
+      scriptedRadio: true,
+      steps: steps,
+    );
+  }
+
   /// Rebuild [p] under the manual running logic: operator-toggled system
-  /// Bluetooth, wall-clock-anchored start, no GPS. This is the ONE flow every
+  /// Bluetooth, wall-clock-anchored start. This is the ONE flow every
   /// experiment runs under; walk-driven plans no longer exist. The lone
   /// exception is the bounce-stress diagnostic, whose subject IS the
   /// app-level toggle.
@@ -524,16 +746,90 @@ class FieldPlanPresets {
       resetLinks: p.resetLinks,
       resetDtnBuffer: p.resetDtnBuffer,
       autoAdvanceGapSec: p.autoAdvanceGapSec,
-      deviceOrder: p.deviceOrder,
       manualJoin: true,
       placementSec: placementSec,
       alignSec: alignSec,
-      sampleGps: false,
     );
   }
 
   /// Named presets for the dropdown (label → ready-to-run plan).
   static Map<String, FieldPlan> get presets => {
+        // Two entries because the traveller runs a different script from
+        // everyone else; picking the right one IS the per-phone setup, which
+        // is what makes this launchable from the dropdown with no typing.
+        // 10 reps per arm. One rep per arm is a single draw from a spread
+        // that the power ladder already showed is where the uncertainty
+        // lives; ten gives a distribution instead of an anecdote. Windows
+        // stay fixed at 60/120/120 s so every arm gets the same wall-clock
+        // exposure and the arms differ ONLY in offered load. ~2h45m.
+        // A one-rep shakedown of the SAME plan shape, under its own id: ~17
+        // min to prove the traveller really goes dark and comes back, the
+        // backlog moves, and the analysis reads it — before committing 2h45m.
+        // Its own id keeps the check out of the measured data.
+        // Shakedown on the full fleet, under its own id so it can never
+        // merge into the measured run. Three things to read off it:
+        // `sync/staleOffer` collapses, carried deliveries report a non-zero
+        // hop count now that conveyance pays TTL, and `message re-delivery`
+        // is zero under age-only dedup.
+        //
+        // A FRESH id each attempt, because the recorder APPENDS: re-using one
+        // merges two runs into a single file and a single upload. -1 is
+        // recorded (3 phones, and only one of them recorded anything useful);
+        // -2 was launched and killed ~16 s after its anchor when the presets
+        // turned out to be stamping the plan ROLE as the join order; -3 is
+        // recorded on all 8 and is what the TTL-attribution and drain-step
+        // changes came out of. Nothing here is comparable with -1: that run
+        // had the per-neighbour relay cap in the build and this one has no
+        // cap at all.
+        //
+        // -6 is a straight repeat of -5 — same plan, no flood, offers are
+        // id lists — on a rebooted six-phone fleet, this time with the build
+        // that drops a discovered address the moment a central dial fails.
+        // The question it answers is narrow: is the GATT exhaustion storm
+        // gone, or was the dead address only part of it?
+        //
+        // -7 changes three things at once, so it gets its own id: the fleet
+        // runs CLOSED (friends-only, ghost excluded by the scan filter), the
+        // build offers direct-recipient packets before the relay backlog
+        // (buildSyncOffers/carriedPacketIdsFor), and node 4 is a degraded unit
+        // whose GATT discovery wedges — so the 4<->6 edge is absent and node 4
+        // may contribute little. Read: does closed-mode SCF still deliver via
+        // the hub with one node down and no ghost in the trace.
+        // -11 is ARM C with the filter advertising what a node has SEEN, not
+        // what it still HOLDS. -10 (age-bounded seen set) balanced the load and
+        // lifted delivery 1%->6%, but redundancy stayed ~12.76x: a held-filter
+        // re-pushes the backlog to a node that already delivered and dropped a
+        // message ("I hold nothing, send everything"). -11 advertises the seen
+        // set instead ("do not resend me these"), so a responder conveys only
+        // what the peer has never seen. Read redundancy against -10 (should
+        // fall toward ~1) and offer airtime against -7 (the saving should hold;
+        // the seen filter is larger than the held one but still windowed).
+        // -12 is ARM C again — same GCS seen-set filter as -11 — with the
+        // direct-deliver fast path added: a message to a peer we are connected
+        // to now goes out on the raw leg the moment it is sealed, without
+        // waiting for that peer's next sync offer. -11 proved the seen filter
+        // drops redundancy toward 1x; the open question -12 answers is whether
+        // firing directly on connect lifts delivery (which -11 left load-bound)
+        // without bringing redundancy back up — the fast-path copy and the
+        // later sync copy must dedup on the receiver's packetId bloom, not
+        // double-count. Read delivery against -11 (should rise) and redundancy
+        // against -11 (should stay ~1x).
+        'SCF re-arm check — TRAVELLER (1 rep, ~17 min)':
+            storeCarryForward(expId: 'scf-rearm-12-direct-deliver-connected', role: 1),
+        'SCF re-arm check — sender (1 rep, ~17 min)':
+            storeCarryForward(expId: 'scf-rearm-12-direct-deliver-connected', role: 2),
+        // Unified per-N warmup + quiet ACK-drain sweep (desk or field), one
+        // SHARED entry for every phone: the join order is the nickname, and
+        // the runner derives each phone's schedule from it at launch. Radios
+        // off at start; each turns on at its join. N=2..7, 3 levels, 10 reps.
+        'Warmup sweep N=2..7 (shared plan, ~3h20)': dilutingWarmupSweep(),
+        // A FRESH id per campaign: the recorder appends, so reusing an id
+        // merges runs into one file and one upload. The shakedown runs live
+        // under scf-desk-1; this is the measured one.
+        'SCF desk — TRAVELLER (this phone goes dark)':
+            storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
+        'SCF desk — sender (everyone else)':
+            storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),
         'Link-cycle check (5×1 min)': manualized(cycleCheck()),
         'Throughput (saturate 60s)': manualized(throughput()),
@@ -542,6 +838,19 @@ class FieldPlanPresets {
             payloadSizes: const [defaultSendBytes, 264, 1200])),
         'Throughput: ceiling sweep (1/4/16/64 lanes)': manualized(throughputCeiling()),
         'Raw link throughput (notify/write/stripe)': manualized(rawLink()),
+        // Prices the fragment budget's 8-byte margin, which has never been
+        // measured. Each step writes a raw blob at `MTU - 3 + d` on ONE leg
+        // and the receiver records the length that arrived, so the three
+        // outcomes separate: arrives whole, arrives short (the stack
+        // truncated it), never arrives (the stack refused it). d=0 is the
+        // ceiling, d=-8 is where the fragment budget sits today, and d=+1 is
+        // the first byte that should not survive. Notify only — it is the leg
+        // floods actually use, and one leg keeps the sweep to ~2.5 min.
+        'Raw link: ATT ceiling probe (−8/−4/0/+1/+4 B)': manualized(rawLink(
+          expId: 'att-ceiling-1',
+          legs: const ['notify'],
+          sizeDeltas: const [-8, -4, 0, 1, 4],
+        )),
         // Full ladder, ~2h41. Every quantity measured on BOTH devices.
         'Power baseline P1 (full, ~2h41)': manualized(powerBaseline(role: 1)),
         'Power baseline P2 (full, ~2h41)': manualized(powerBaseline(role: 2)),
@@ -627,6 +936,7 @@ class FieldPlanPresets {
 enum FieldPlanKind {
   meshScale,
   joinTime,
+  storeCarryForward,
   homeSoak,
   throughput,
   throughputCeiling,
@@ -638,6 +948,8 @@ extension FieldPlanKindLabel on FieldPlanKind {
   String get label => switch (this) {
         FieldPlanKind.meshScale => 'Mesh: scale N devices (all send)',
         FieldPlanKind.joinTime => 'Establishment: frontier join (quiet mesh)',
+        FieldPlanKind.storeCarryForward =>
+          'Store-carry-forward vs load (desk)',
         FieldPlanKind.homeSoak => 'Home soak (stationary)',
         FieldPlanKind.throughput => 'Throughput (saturate)',
         FieldPlanKind.throughputCeiling => 'Throughput: ceiling sweep',
@@ -656,6 +968,7 @@ class FieldPlanWizard {
         // joining, not by tearing down what is already established.
         FieldPlanKind.meshScale => (false, false),
         FieldPlanKind.joinTime => (false, false),
+        FieldPlanKind.storeCarryForward => (false, false),
         FieldPlanKind.homeSoak => (true, false),
         FieldPlanKind.throughput => (false, false),
         FieldPlanKind.throughputCeiling => (false, false),
@@ -683,6 +996,10 @@ class FieldPlanWizard {
     int meshRole = 1,
     bool saturate = true,
     bool manualJoin = false,
+
+    /// Store-carry-forward: the pubkey prefix of the traveller (join order 1),
+    /// so senders address the absent phone rather than each other.
+    String travellerPrefix = '',
   }) {
     final id = expId.trim().isEmpty ? 'exp' : expId.trim();
     final (defSessions, defLinks) = resetDefaults(kind);
@@ -755,6 +1072,16 @@ class FieldPlanWizard {
           role: meshRole,
           maxDevices: maxDevices,
           joinDwellSec: dwellSec,
+          repeat: repeat,
+        );
+      case FieldPlanKind.storeCarryForward:
+        return FieldPlanPresets.storeCarryForward(
+          expId: id,
+          role: meshRole,
+          travellerPrefix: travellerPrefix,
+          darkSec: dwellSec,
+          returnSec: dwellSec,
+          mediumSends: sends,
           repeat: repeat,
         );
     }

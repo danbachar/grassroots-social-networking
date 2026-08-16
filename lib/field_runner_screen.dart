@@ -14,42 +14,10 @@ class FieldRunnerScreen extends StatefulWidget {
   final FieldRunner runner;
   final FieldPlan plan;
 
-  /// DEBUG/TESTBED. Signals every peer to start; returns how many were
-  /// reached. Present only when the runner was armed for a remote start.
-  final Future<int> Function(String expId)? onBroadcastStart;
-
-  /// Peers this phone holds a Noise SESSION with — one hop, not the mesh.
-  ///
-  /// Sessions, not live links: the start signal travels on sessions, and a
-  /// session is keyed by peer identity so it survives the link churn a
-  /// joining phone causes. Counting live links instead made this collapse to
-  /// 1-2 mid-join while the flood was entirely healthy.
-  ///
-  /// It does not have to reach the roster size before pressing — phones
-  /// further out are reached by relay. It has to be non-zero and settled.
-  final int Function()? neighbourCount;
-
-  /// Phones in the connected component containing this one, learned from the
-  /// armed-time neighbour gossip. This is the number that answers "will the
-  /// start signal reach everyone", which a one-hop count cannot.
-  final int Function()? meshComponentSize;
-
-  /// Gossip this phone's neighbours to its peers. Driven on a timer while
-  /// armed, and never while a run is under way.
-  final Future<int> Function()? onGossipNeighbours;
-
-  /// Drop the gossiped view when the run begins.
-  final VoidCallback? onClearMeshView;
-
   const FieldRunnerScreen({
     super.key,
     required this.runner,
     required this.plan,
-    this.onBroadcastStart,
-    this.neighbourCount,
-    this.meshComponentSize,
-    this.onGossipNeighbours,
-    this.onClearMeshView,
   });
 
   @override
@@ -57,33 +25,17 @@ class FieldRunnerScreen extends StatefulWidget {
 }
 
 class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
-  Timer? _armedTick;
-  int _tickCount = 0;
-
   @override
   void initState() {
     super.initState();
     widget.runner.addListener(_onRunner);
-    // Nothing notifies while merely armed, but the peer count is changing as
-    // the mesh converges — and that is exactly what you are waiting on.
-    _armedTick = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (!mounted || widget.runner.armedPlan == null) return;
-      // Gossip every other tick: often enough that the count settles while
-      // you walk back from placing the last phone, rare enough to be
-      // invisible next to ANNOUNCE traffic.
-      if ((_tickCount++).isEven) unawaited(widget.onGossipNeighbours?.call());
-      setState(() {});
-    });
-    // An ARMED runner is deliberately not started: it is waiting for a
-    // peer's signal (or for this phone to be the one that sends it).
-    if (!widget.runner.isRunning && widget.runner.armedPlan == null) {
+    if (!widget.runner.isRunning) {
       widget.runner.start(widget.plan);
     }
   }
 
   @override
   void dispose() {
-    _armedTick?.cancel();
     widget.runner.removeListener(_onRunner);
     super.dispose();
   }
@@ -132,7 +84,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           foregroundColor: Colors.white,
           title: Text('${plan.expId} — step '
               '${(runner.stepIndex + 1).clamp(1, total)}/$total'
-              '${plan.deviceOrder == null ? '' : ' · #${plan.deviceOrder}'}'),
+              '${runner.joinOrder == null ? '' : ' · #${runner.joinOrder}'}'),
           actions: [
             if (runner.isRunning)
               IconButton(
@@ -153,7 +105,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight - 48),
                 child: switch (runner.phase) {
-                  _ when runner.armedPlan != null => _armed(runner),
                   _ when runner.finishing => _finishing(runner),
                   _ when runner.resetting => _resetting(step),
                   FieldPhase.placement => _placement(runner),
@@ -170,8 +121,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                           'TURN BLUETOOTH '
                               '${runner.radioAction == 'on' ? 'ON' : 'OFF'} — '
                               'the window has already started',
-                        if (runner.locationStatus.isNotEmpty)
-                          runner.locationStatus,
                       ].join('\n'),
                       Colors.orangeAccent),
                   FieldPhase.settling => _countdown(
@@ -194,122 +143,20 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     );
   }
 
-  /// Waiting for a peer's start signal. Every phone sits here; ONE is
-  /// tapped and signals the rest, so devices spread over hundreds of metres
-  /// begin together instead of however far apart their taps landed.
-  Widget _armed(FieldRunner runner) {
-    final broadcast = widget.onBroadcastStart;
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        const Icon(Icons.podcasts_rounded, color: Colors.tealAccent, size: 88),
-        const SizedBox(height: 20),
-        const Text('ARMED',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-                color: Colors.tealAccent,
-                fontSize: 44,
-                fontWeight: FontWeight.w800)),
-        // The join order decides when this phone enters the mesh, and a phone
-        // handed to the wrong spot silently costs a whole mesh size: the
-        // 7-device smoke run's n=3 steps had two devices because one slot was
-        // never filled. This is the screen you are looking at while placing
-        // the phones, so the order is stated here, big, not left to the
-        // preset name in a list somewhere behind you.
-        if (runner.armedPlan!.deviceOrder != null) ...[
-          const SizedBox(height: 16),
-          _orderBadge(runner.armedPlan!.deviceOrder!),
-        ],
-        const SizedBox(height: 12),
-        Text('waiting for the start signal\n"${runner.armedPlan!.expId}"',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white70, fontSize: 19),
-            ),
-        const SizedBox(height: 10),
-        const Text(
-            'Place every phone first, then press START ALL on exactly one.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white38, fontSize: 15)),
-        if (widget.neighbourCount != null) ...[
-          const SizedBox(height: 14),
-          Builder(builder: (_) {
-            final n = widget.neighbourCount!();
-            // One hop. Phones further out are reached by relay, so this does
-            // not need to equal the roster — it needs to be non-zero and to
-            // have stopped climbing.
-            // The mesh figure is the one that answers "will the signal
-            // reach everyone" — the neighbour count is only this phone's
-            // one-hop view and is shown as supporting detail.
-            final mesh = widget.meshComponentSize?.call();
-            return Column(children: [
-              if (mesh != null)
-                Text('$mesh phone(s) in the mesh',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                        color: mesh <= 1
-                            ? Colors.orangeAccent
-                            : Colors.tealAccent,
-                        fontSize: 30,
-                        fontWeight: FontWeight.w800)),
-              const SizedBox(height: 4),
-              Text(
-                  n == 0
-                      ? 'no sessions yet — wait for the mesh to form'
-                      : '$n session peer(s) of this phone',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: n == 0 ? Colors.orangeAccent : Colors.white54,
-                      fontSize: 15)),
-              const SizedBox(height: 4),
-              const Text('press START ALL once this stops climbing',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white30, fontSize: 13)),
-            ]);
-          }),
-        ],
-        const SizedBox(height: 34),
-        if (broadcast != null)
-          SizedBox(
-            height: 88,
-            child: FilledButton(
-              onPressed: () async {
-                final expId = runner.armedPlan!.expId;
-                final n = await broadcast(expId);
-                if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text(n == 0
-                        ? 'No peer reached — is anyone else armed and in range?'
-                        : 'Signalled $n peer(s)')));
-                // This phone starts too: it is part of the mesh, not a
-                // remote control.
-                widget.onClearMeshView?.call();
-                await runner.remoteStart(expId);
-              },
-              child: const Text('START ALL',
-                  style: TextStyle(
-                      fontSize: 30, fontWeight: FontWeight.w800)),
-            ),
-          ),
-        const SizedBox(height: 14),
-        SizedBox(
-          height: 60,
-          child: OutlinedButton(
-            onPressed: () {
-              runner.disarm();
-              Navigator.of(context).pop();
-            },
-            child: const Text('Cancel', style: TextStyle(fontSize: 20)),
-          ),
-        ),
-      ],
-    );
-  }
-
+  /// The shared anchor, rendered in UTC.
+  ///
+  /// This string is the fleet's alignment CHECK — every phone must show the
+  /// same one — and the anchor itself is an epoch instant, identical on every
+  /// phone regardless of timezone. Rendering it in LOCAL time made the check
+  /// test the timezone instead: on 2026-08-08 a phone whose zone was two
+  /// hours out displayed a start time two hours off while computing exactly
+  /// the same anchor, which read as a broken clock and cost a restart. In
+  /// UTC, phones that agree show identical text and phones that disagree
+  /// really do disagree.
   static String _hhmmss(int epochMs) {
-    final d = DateTime.fromMillisecondsSinceEpoch(epochMs);
+    final d = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
+    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}Z';
   }
 
   /// "BLUETOOTH ON in 12:30 (at 14:52:30)" for a phone that joins later.
@@ -357,9 +204,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                 color: Colors.white,
                 fontSize: 88,
                 fontWeight: FontWeight.w800)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 14),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 14),
         if (runner.radioAction != null)
@@ -425,9 +272,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           Text('at ${_hhmmss(windowAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 16),
         Text(
@@ -648,20 +495,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           Text('starts in ${runner.remainingSec}s',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white70, fontSize: 22)),
-        ],
-        // Say what the tap will do about position, because the answer differs
-        // by step and is otherwise only discoverable from the data afterwards.
-        if (runner.hasLocation) ...[
-          const SizedBox(height: 10),
-          Text(
-              step.label == 'distribute'
-                  ? 'no GPS fix yet — this tap starts the walk-out.\n'
-                      'The fix is taken where you put the phone down.'
-                  : runner.locationFixes == 0
-                      ? 'a GPS fix is taken when this step begins'
-                      : 'tapping re-fixes this phone\'s position',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white38, fontSize: 15)),
         ],
         const SizedBox(height: 48),
         SizedBox(

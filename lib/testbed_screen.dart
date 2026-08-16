@@ -3,7 +3,6 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:redux/redux.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -25,6 +24,12 @@ class TestbedScreen extends StatefulWidget {
   /// This device's hex public key (for building/verifying the roster). Null if
   /// the network isn't up yet.
   final String? myPubkeyHex;
+
+  /// This device's ANNOUNCE nickname. When it is a plain integer it IS
+  /// the join order — the number is set once, on the phone, and shown on
+  /// its own screen, so deriving the order from it removes the per-run
+  /// retyping that put two devices on one node number.
+  final String? myNickname;
 
   /// Trace logger for the experiment recording sink. Null hides the
   /// experiment section (network not up yet).
@@ -55,7 +60,7 @@ class TestbedScreen extends StatefulWidget {
   /// runner's bt-on/bt-off stamps come from this, never from a poll.
   final Stream<bool>? bleUsableChanges;
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
   final bool Function(Uint8List peer)? linkSettled;
 
@@ -63,30 +68,17 @@ class TestbedScreen extends StatefulWidget {
   final void Function(void Function(String messageId)? listener)?
       registerAckListener;
 
-  /// DEBUG/TESTBED. Tell every peer holding a session with us to start
-  /// [expId]; returns how many were signalled.
-  final Future<int> Function(String expId)? onBroadcastStart;
-
-  /// DEBUG/TESTBED. Registers the listener a peer's start signal reaches.
-  final void Function(void Function(String expId)? listener)?
-      registerStartListener;
-
-  /// DEBUG/TESTBED. Armed-time mesh gossip: tell peers who we can see.
-  final Future<int> Function()? onGossipNeighbours;
-
   /// DEBUG/TESTBED. Peers this phone holds a session with.
   final int Function()? sessionPeerCount;
 
-  /// DEBUG/TESTBED. Phones in the connected component containing this one.
-  final int Function()? meshComponentSize;
-
-  /// DEBUG/TESTBED. Forget the gossiped view (called when a run starts).
-  final VoidCallback? onClearMeshView;
+  /// Sessions in the Noise table (see FieldRunner.sessionTableCount).
+  final int Function()? sessionTableCount;
 
   const TestbedScreen({
     super.key,
     required this.store,
     this.myPubkeyHex,
+    this.myNickname,
     this.experimentRecorder,
     this.onStartBulk,
     this.onStopBulk,
@@ -102,12 +94,8 @@ class TestbedScreen extends StatefulWidget {
     this.onSetBle,
     this.linkSettled,
     this.registerAckListener,
-    this.onBroadcastStart,
-    this.registerStartListener,
-    this.onGossipNeighbours,
     this.sessionPeerCount,
-    this.meshComponentSize,
-    this.onClearMeshView,
+    this.sessionTableCount,
   });
 
   @override
@@ -250,74 +238,6 @@ class _TestbedScreenState extends State<TestbedScreen> {
     _snack('Marker: $label');
   }
 
-  /// Accept no position vaguer than this. At 30 m spacing a fix claiming
-  /// +/-2 km is not a weak measurement, it is a different measurement: an
-  /// un-locked receiver falls back to cell towers and returns a point up to
-  /// a kilometre away. Two of eight phones did exactly that in the 30 m
-  /// field run and put 2.1 km pair distances into a 30 m graph.
-  static const double _maxFixAccuracyM = 30;
-
-  /// One GPS fix, for drawing a field run's topology to true scale.
-  ///
-  /// Takes the BEST of several attempts inside a budget rather than the
-  /// first thing offered, because the first fix after a cold start is
-  /// habitually the cell-tower one. Returns null rather than throwing on
-  /// every failure path — no permission, services off, nothing accurate
-  /// enough in time. A run must never be blocked or degraded because a
-  /// position could not be read.
-  ///
-  /// The caller does not await this, so the budget can be generous without
-  /// delaying a measurement window.
-  Future<Map<String, Object?>?> _sampleLocation() async {
-    try {
-      if (!await Geolocator.isLocationServiceEnabled()) return null;
-      var perm = await Geolocator.checkPermission();
-      if (perm == LocationPermission.denied) {
-        perm = await Geolocator.requestPermission();
-      }
-      if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) {
-        return null;
-      }
-
-      Position? best;
-      final deadline = DateTime.now().add(const Duration(seconds: 120));
-      while (DateTime.now().isBefore(deadline)) {
-        try {
-          final p = await Geolocator.getCurrentPosition(
-            locationSettings: const LocationSettings(
-              accuracy: LocationAccuracy.best,
-              timeLimit: Duration(seconds: 30),
-            ),
-          );
-          if (best == null || p.accuracy < best.accuracy) best = p;
-        } catch (_) {
-          // A timed-out attempt is not fatal: the receiver may still be
-          // acquiring, and the next attempt inside the budget often locks.
-        }
-        // Good enough to place a phone within a 30 m layout — stop early
-        // rather than keep the radio up for a better number nobody needs.
-        if (best != null && best.accuracy <= 10) break;
-        await Future<void>.delayed(const Duration(seconds: 5));
-      }
-
-      if (best == null || best.accuracy > _maxFixAccuracyM) {
-        debugPrint('[exp] no usable GPS fix'
-            '${best == null ? "" : " (best was ±${best.accuracy.round()} m)"}');
-        return null;
-      }
-      return {
-        'lat': best.latitude,
-        'lon': best.longitude,
-        'accM': best.accuracy,
-        'altM': best.altitude,
-        'fixAt': best.timestamp.millisecondsSinceEpoch,
-      };
-    } catch (_) {
-      return null;
-    }
-  }
-
   Future<void> _uploadExperimentFiles() async {
     final recorder = widget.experimentRecorder;
     if (recorder == null) return;
@@ -377,16 +297,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
       // the marker. The hook existed but was never handed to the runner —
       // the home preflight's markers all read sessions:null.
       sessionPeerCount: widget.sessionPeerCount,
+      sessionTableCount: widget.sessionTableCount,
       onStartBulk: widget.onStartBulk,
       onStopBulk: widget.onStopBulk,
       myPubkeyHex: widget.myPubkeyHex,
+      myNickname: widget.myNickname,
       send: widget.sendMessage,
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
       onResetDtnBuffer: widget.onResetDtnBuffer,
       sendRaw: widget.sendRaw,
       onSetBle: widget.onSetBle,
-      onSampleLocation: _sampleLocation,
       bleWireBytes: widget.bleWireBytes,
       bleUsable: widget.bleUsable,
       bleUsableChanges: widget.bleUsableChanges,
@@ -423,26 +344,11 @@ class _TestbedScreenState extends State<TestbedScreen> {
   }
 
   /// Open the runner screen for [plan], wiring the listeners it needs and
-  /// tearing them down when the screen closes. [armed] waits for a peer's
-  /// start signal instead of a tap.
-  void _openRunner(FieldPlan plan, {required bool armed}) {
+  /// tearing them down when the screen closes.
+  void _openRunner(FieldPlan plan) {
     final recorder = widget.experimentRecorder;
     if (recorder == null) return;
-    if (armed && plan.manualJoin) {
-      // Arming turns the radio ON and waits for a flooded start signal —
-      // both wrong for a manual-join plan, whose late phones must keep
-      // Bluetooth OFF and whose start is a wall-clock instant. Every phone
-      // is simply tapped.
-      _snack('Manual-join plans start by tap — no signal. '
-          'Press Run on every phone.');
-      return;
-    }
     final runner = _makeRunner(recorder);
-    if (armed) {
-      runner.armForRemoteStart(plan);
-      widget.registerStartListener
-          ?.call((expId) => unawaited(runner.remoteStart(expId)));
-    }
     // Saturating steps refill their window on each end-to-end ACK.
     widget.registerAckListener?.call(runner.onAck);
     Navigator.of(context)
@@ -451,36 +357,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
           builder: (_) => FieldRunnerScreen(
             runner: runner,
             plan: plan,
-            onBroadcastStart: widget.onBroadcastStart,
-            // Sessions, not live links: that is what the start signal
-            // travels on, and it is what survives the churn a joining phone
-            // causes. A live-link count drops to near zero mid-join while
-            // the flood is perfectly healthy.
-            neighbourCount: widget.sessionPeerCount,
-            meshComponentSize: widget.meshComponentSize,
-            onGossipNeighbours: widget.onGossipNeighbours,
-            onClearMeshView: widget.onClearMeshView,
           ),
         ))
         .then((_) {
       widget.registerAckListener?.call(null);
-      widget.registerStartListener?.call(null);
       runner.dispose();
     });
   }
 
-  /// Arm for a peer's start signal. Every phone arms; ONE is then tapped and
-  /// signals the rest, so devices spread over hundreds of metres begin
-  /// within the flood's latency of each other rather than however long it
-  /// takes to walk between them.
-  void _armPlan() {
-    final plan = _parsePlan();
-    if (plan != null) _openRunner(plan, armed: true);
-  }
-
   void _launchPlan() {
     final plan = _parsePlan();
-    if (plan != null) _openRunner(plan, armed: false);
+    if (plan != null) _openRunner(plan);
   }
 
   Future<void> _shareExperimentFiles() async {
@@ -735,16 +622,6 @@ class _TestbedScreenState extends State<TestbedScreen> {
           icon: const Icon(Icons.play_circle_fill),
           label: const Text('Launch here'),
         ),
-        // Multi-device runs: every phone arms, then ONE is tapped and
-        // signals the rest over the mesh. Tapping phones in sequence would
-        // otherwise skew their timelines by however long the walk between
-        // them takes, smearing the mesh composition at every step boundary.
-        if (widget.onBroadcastStart != null)
-          OutlinedButton.icon(
-            onPressed: _armPlan,
-            icon: const Icon(Icons.podcasts_rounded),
-            label: const Text('Arm (wait for signal)'),
-          ),
       ]),
     ];
   }
@@ -758,7 +635,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
   Future<void> _openPlanWizard() async {
     final result = await showDialog<_WizardResult>(
       context: context,
-      builder: (_) => const _PlanWizardDialog(),
+      builder: (_) => _PlanWizardDialog(myNickname: widget.myNickname),
     );
     if (result == null) return;
     if (result.plan != null) {
@@ -929,7 +806,10 @@ class _WizardResult {
 /// static record-only request) and pops it back to the caller. Pure plan
 /// construction lives in [FieldPlanWizard]; this is only the form.
 class _PlanWizardDialog extends StatefulWidget {
-  const _PlanWizardDialog();
+  const _PlanWizardDialog({this.myNickname});
+
+  /// This device's ANNOUNCE nickname, used to seed the join order.
+  final String? myNickname;
 
   @override
   State<_PlanWizardDialog> createState() => _PlanWizardDialogState();
@@ -961,10 +841,24 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   /// who sends during light/heavy.
   int _powerRole = 1;
   // Mesh scaling: total devices taking part, and this phone's join order.
+  /// Store-carry-forward: which phone the senders address while it is dark.
+  final TextEditingController _travellerPrefix = TextEditingController();
   final TextEditingController _maxDevices =
       TextEditingController(text: '8');
-  final TextEditingController _meshRole = TextEditingController(text: '1');
+  /// Join order, seeded from the nickname: on this fleet the nickname IS the
+  /// node number, so the operator no longer retypes it per run. Falls back to
+  /// 1 for a non-numeric nickname, and stays editable either way.
+  late final TextEditingController _meshRole =
+      TextEditingController(text: _nicknameOrder()?.toString() ?? '1');
   bool _meshSaturate = true;
+
+  /// The nickname read as a join order, or null when it is not a plain
+  /// positive integer. Deliberately strict: a nickname like "pixel-2" must
+  /// NOT silently become node 2.
+  int? _nicknameOrder() {
+    final n = int.tryParse(widget.myNickname?.trim() ?? '');
+    return (n != null && n > 0) ? n : null;
+  }
 
   /// Manual Bluetooth join (operator toggles settings-BT; wall-clock
   /// anchored start). Default ON — it is the current field procedure, and
@@ -1011,6 +905,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       FieldPlanKind.meshScale => 'mesh-scale-1',
       // The spacing belongs in the id: the sweep is run per distance.
       FieldPlanKind.joinTime => 'join-time-30m',
+      FieldPlanKind.storeCarryForward => 'scf-desk-1',
       FieldPlanKind.homeSoak => 'home-soak-1',
       FieldPlanKind.throughput => 'throughput-1',
       FieldPlanKind.throughputCeiling => 'throughput-ceiling-1',
@@ -1236,6 +1131,31 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
               style: TextStyle(fontSize: 12, color: Colors.grey)),
           ),
         ];
+      case FieldPlanKind.storeCarryForward:
+        return [
+          _num(_meshRole, "This phone's role (1 = the TRAVELLER that goes dark)"),
+          const SizedBox(height: 12),
+          _num(_travellerPrefix,
+              "Traveller's pubkey prefix — optional, blank = message everyone"),
+          const SizedBox(height: 12),
+          _num(_dwellSec, 'Dark window and return window each (s)'),
+          const SizedBox(height: 12),
+          _num(_sends, 'Medium-arm messages over the dark window'),
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text(
+              'Set the role and leave the rest: the role is seeded from this '
+              'phone\'s nickname, and a blank prefix means everyone messages '
+              'everyone with one member away — the field-day shape. '
+              'Desk test — distance is not the variable, offered load is. '
+              'Three arms run back to back: low, medium, then HIGH, which is '
+              'the field-day setting exactly (saturate, one lane, 132 B). '
+              'Phone 1 drops its radio for the dark window while everyone '
+              'else messages it; on return nobody sends, so every delivery in '
+              'that window came out of a buffer. Start all phones together.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          ),
+        ];
       case FieldPlanKind.joinTime:
         return [
           _num(_meshRole, "This phone's join order (the block-k phone is the frontier)"),
@@ -1307,6 +1227,9 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
       FieldPlanKind.meshScale => (120, 10, 60),
       // dwell = the frontier's join window per rep; repeat = cold joins per N.
       FieldPlanKind.joinTime => (60, 5, 0),
+      // dwell = the dark AND the return window; sends = the MEDIUM arm's
+      // count (low is a trickle, high saturates and ignores it).
+      FieldPlanKind.storeCarryForward => (120, 1, 60),
       FieldPlanKind.homeSoak => (60, 1, 40),
       FieldPlanKind.throughput => (60, 1, 0),
       FieldPlanKind.throughputCeiling => (60, 1, 0),
@@ -1350,6 +1273,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         powerRole: _powerRole,
         maxDevices: int.tryParse(_maxDevices.text.trim()) ?? 8,
         meshRole: int.tryParse(_meshRole.text.trim()) ?? 1,
+        travellerPrefix: _travellerPrefix.text.trim(),
         saturate: _meshSaturate,
         manualJoin: _meshManual,
         rawLegs: [

@@ -2,9 +2,9 @@
 
 // Decode a GrassrootsPacket from a byte array.
 //
-// Wire format (lib/src/models/packet.dart, header = 58 bytes):
-//   type(1) + ttl(1) + timestamp u32 BE(4) + recipient pubkey(32, zeros =
-//   broadcast) + packetId UUID(16) + payloadLength u32 BE(4) + payload
+// Wire format (lib/src/models/packet.dart, header = 54 bytes):
+//   type(1) + ttl(1) + recipient pubkey(32, zeros = broadcast) +
+//   packetId UUID(16) + payloadLength u32 BE(4) + payload
 //
 // The outer envelope deliberately carries NO sender and NO signature —
 // sender identity and authentication live inside the Noise-sealed payload
@@ -20,7 +20,7 @@ const PACKET_TYPES = {
   0x03: 'SECURE',
 };
 
-const HEADER_SIZE = 58;
+const HEADER_SIZE = 54;
 const SIGNATURE_SIZE = 64;
 
 function toHex(bytes) {
@@ -115,11 +115,6 @@ function decodePacket(bytes) {
   // TTL (1 byte)
   const ttl = bytes[offset++];
 
-  // Timestamp (4 bytes, big-endian, seconds)
-  const timestamp = readUint32BE(bytes, offset);
-  offset += 4;
-  const date = new Date(timestamp * 1000);
-
   // Recipient pubkey (32 bytes, all-zeros = broadcast). No sender on the
   // wire — relays must not learn who originated a packet.
   const recipientPubkey = bytes.slice(offset, offset + 32);
@@ -141,7 +136,6 @@ function decodePacket(bytes) {
   console.log('=== GrassrootsPacket ===');
   console.log(`Type:        ${typeName} (0x${typeValue.toString(16).padStart(2, '0')})`);
   console.log(`TTL:         ${ttl}`);
-  console.log(`Timestamp:   ${timestamp} (${date.toISOString()})`);
   console.log(`Recipient:   ${isBroadcast ? '(broadcast)' : toHex(recipientPubkey)}`);
   console.log(`Packet ID:   ${packetId}`);
   console.log(`Payload len: ${payloadLength}`);

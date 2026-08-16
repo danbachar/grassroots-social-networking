@@ -1,12 +1,179 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 
 void main() {
+  group('storeCarryForward', () {
+    test('the traveller goes dark and never sends; senders address IT', () {
+      final traveller =
+          FieldPlanPresets.storeCarryForward(role: 1, travellerPrefix: 'abcd1234');
+      final sender =
+          FieldPlanPresets.storeCarryForward(role: 2, travellerPrefix: 'abcd1234');
+
+      final dark = traveller.steps.where((s) => s.label.startsWith('dark'));
+      expect(dark, isNotEmpty);
+      for (final s in dark) {
+        expect(s.bleOn, isFalse, reason: 'the traveller is the one that leaves');
+        expect(s.sendCount, 0);
+        expect(s.saturate, isFalse);
+      }
+
+      for (final s in sender.steps.where((s) => s.label.startsWith('dark'))) {
+        expect(s.bleOn, isTrue);
+        expect(s.sendTo, 'abcd1234',
+            reason: 'a prefix concentrates the load on the absent phone');
+      }
+
+      // Empty prefix is the desk default: address everyone, one member away.
+      final broad = FieldPlanPresets.storeCarryForward(role: 2);
+      for (final s in broad.steps.where((s) => s.label.startsWith('dark'))) {
+        expect(s.sendTo, 'all');
+      }
+    });
+
+    test('the high arm is the field-day setting exactly', () {
+      // mesh-scale-30m-2 ran saturate + ONE lane at 132 B; the desk arm has to
+      // match it or the two results are not comparable.
+      final sender = FieldPlanPresets.storeCarryForward(role: 2);
+      final high =
+          sender.steps.firstWhere((s) => s.label == 'dark high');
+      expect(high.saturate, isTrue);
+      expect(high.sendLanes, 1);
+      expect(high.sendBytes, defaultSendBytes);
+
+      final low = sender.steps.firstWhere((s) => s.label == 'dark low');
+      final medium = sender.steps.firstWhere((s) => s.label == 'dark medium');
+      expect(low.saturate, isFalse);
+      expect(medium.saturate, isFalse);
+      expect(low.sendCount, lessThan(medium.sendCount),
+          reason: 'the arms must actually differ in offered load');
+    });
+
+    test('nobody sends during the return window', () {
+      // Otherwise a delivery there could have come off the wire instead of
+      // out of a buffer, and the measurement means nothing.
+      for (final role in [1, 2, 3]) {
+        final plan = FieldPlanPresets.storeCarryForward(role: role);
+        for (final s in plan.steps.where((s) => s.label.startsWith('return'))) {
+          expect(s.sendCount, 0);
+          expect(s.saturate, isFalse);
+          expect(s.bleOn, isTrue, reason: 'the traveller must come back');
+        }
+      }
+    });
+
+    test('each arm clears the buffer at warm, and nowhere else', () {
+      // Carrying the backlog across dark->return IS the experiment, so the
+      // plan-level flag must stay off; but an arm that inherits the previous
+      // arm's undelivered packets scores them as its own deliveries. The only
+      // safe boundary is the arm's first step.
+      final plan = FieldPlanPresets.storeCarryForward(role: 2);
+      expect(plan.resetDtnBuffer, isFalse,
+          reason: 'plan-level would fire on every step, wiping the backlog');
+      for (final s in plan.steps) {
+        // The trailing drain step is the last arm's missing warm, so it
+        // clears on exactly the same terms.
+        final clears = s.label.startsWith('warm') || s.label == 'drain';
+        expect(s.resetDtnBuffer, clears ? isTrue : isNull,
+            reason: 'only warm and the trailing drain clear: ${s.label}');
+      }
+      // Sessions and links are deliberately NOT reset — the arm starts warm.
+      expect(plan.resetSessions, isFalse);
+      expect(plan.resetLinks, isFalse);
+      expect(FieldPlan.fromJson(plan.toJson()), plan,
+          reason: 'the override has to survive the JSON the phones load');
+    });
+
+    test('anchored to a 5-minute grid, with the runner working the radio', () {
+      // The dark window has to open on every phone at the same instant, and
+      // nobody is standing at the desk to toggle six radios at that instant.
+      // Those are separate needs: manualJoin gives the shared anchor,
+      // scriptedRadio keeps the toggling with the runner.
+      final plan = FieldPlanPresets.storeCarryForward(role: 1);
+      expect(plan.manualJoin, isTrue);
+      expect(plan.alignSec, 300);
+      expect(plan.scriptedRadio, isTrue,
+          reason: 'hands-free is the point of a desk run');
+      expect(plan.toJson()['scriptedRadio'], isTrue,
+          reason: 'it has to survive the JSON the phones actually load');
+      expect(FieldPlan.fromJson(plan.toJson()).scriptedRadio, isTrue);
+    });
+
+    test('the dropdown entries run 10 reps of every arm, windows unchanged', () {
+      // The arms must differ only in offered load, so each keeps the same
+      // wall-clock exposure; and one rep per arm is an anecdote, not a
+      // distribution.
+      final plan =
+          FieldPlanPresets.presets['SCF desk — sender (everyone else)']!;
+      expect(plan.steps, hasLength(3 * 10 * 3 + 1),
+          reason: 'the arms plus one trailing discarded drain step');
+      for (final arm in ['low', 'medium', 'high']) {
+        expect(plan.steps.where((s) => s.label == 'dark $arm t1'), hasLength(1));
+        expect(plan.steps.where((s) => s.label == 'dark $arm t10'), hasLength(1));
+      }
+      final darks = plan.steps.where((s) => s.label.startsWith('dark'));
+      expect(darks.map((s) => s.dwellSec).toSet(), {120},
+          reason: 'every arm gets the same window');
+      expect(plan.steps.where((s) => s.label.startsWith('warm'))
+          .map((s) => s.dwellSec).toSet(), {60});
+    });
+
+    test('both dropdown entries exist and differ in who goes dark', () {
+      final measured =
+          FieldPlanPresets.presets.keys.where((k) => k.startsWith('SCF desk'));
+      final checks = FieldPlanPresets.presets.keys
+          .where((k) => k.startsWith('SCF re-arm check'));
+      expect(measured, hasLength(2));
+      expect(checks, hasLength(2),
+          reason: 'the shakedown ships beside the measured run: a traveller '
+              'and a sender');
+      final traveller =
+          FieldPlanPresets.presets['SCF desk — TRAVELLER (this phone goes dark)']!;
+      final sender =
+          FieldPlanPresets.presets['SCF desk — sender (everyone else)']!;
+      expect(traveller.steps.firstWhere((s) => s.label == 'dark low t1').bleOn,
+          isFalse);
+      expect(sender.steps.firstWhere((s) => s.label == 'dark low t1').bleOn,
+          isTrue);
+    });
+
+    test('a trailing drain step closes the last arm like any other', () {
+      // An arm's delivery window is closed by the buffer reset at the NEXT
+      // warm step. Without a trailing step the last arm alone ran to the end
+      // marker and on through the settle window — a longer drain, in quieter
+      // air, for the arm carrying the heaviest load. The drain step is that
+      // missing warm.
+      for (final role in [1, 2]) {
+        final plan = FieldPlanPresets.storeCarryForward(role: role);
+        final drain = plan.steps.last;
+        final warm = plan.steps.firstWhere((s) => s.label == 'warm high');
+        expect(drain.label, 'drain');
+        expect(drain.dwellSec, warm.dwellSec);
+        expect(drain.resetDtnBuffer, isTrue,
+            reason: 'the reset is what actually closes the window');
+        expect(drain.sendCount, 0);
+        expect(drain.saturate, isFalse);
+        expect(drain.bleOn, isTrue,
+            reason: 'the traveller is back for it, exactly as at a warm step');
+      }
+    });
+
+    test('all three arms are present, warm-dark-return each', () {
+      final plan = FieldPlanPresets.storeCarryForward(role: 2);
+      expect(plan.steps.map((s) => s.label).toList(), [
+        'warm low', 'dark low', 'return low',
+        'warm medium', 'dark medium', 'return medium',
+        'warm high', 'dark high', 'return high',
+        'drain',
+      ]);
+      // Carrying the backlog across the dark step IS the experiment.
+      expect(plan.resetDtnBuffer, isFalse);
+    });
+  });
+
   group('FieldPlanPresets', () {
     test('home soak: one long rosterless dwell with sends', () {
       final p = FieldPlanPresets.homeSoak(dwellMin: 40, sends: 40);
@@ -240,6 +407,50 @@ void main() {
           reason: 'rawLeg must survive the JSON round-trip');
     });
 
+    test('rawLink: default sweep writes at the ATT ceiling and nowhere else',
+        () {
+      final p = FieldPlanPresets.rawLink(legs: const ['notify']);
+      expect(p.steps.single.rawSizeDelta, 0,
+          reason: 'the plain throughput run writes at MTU-3 exactly');
+      expect(p.steps.single.label, 'leg=notify',
+          reason: 'no delta tag when there is no sweep');
+    });
+
+    test('rawLink: a size sweep crosses legs and signs the label', () {
+      final p = FieldPlanPresets.rawLink(
+        legs: const ['notify', 'write'],
+        sizeDeltas: const [-8, 0, 1],
+      );
+      expect(p.steps.map((s) => s.rawSizeDelta), [-8, 0, 1, -8, 0, 1],
+          reason: 'every delta is run on every leg');
+      expect(p.steps.map((s) => s.label), [
+        'leg=notify d=-8',
+        'leg=notify',
+        'leg=notify d=+1',
+        'leg=write d=-8',
+        'leg=write',
+        'leg=write d=+1',
+      ]);
+      expect(FieldPlan.fromJson(p.toJson()), p,
+          reason: 'rawSizeDelta must survive the JSON round-trip — a dropped '
+              'arm variable makes a saved plan silently differ from the one '
+              'built in memory');
+    });
+
+    test('the ATT ceiling probe straddles the ceiling on the notify leg', () {
+      final p = FieldPlanPresets
+          .presets['Raw link: ATT ceiling probe (−8/−4/0/+1/+4 B)']!;
+      expect(p.expId, 'att-ceiling-1',
+          reason: 'its own id — this is not a throughput run');
+      expect(p.steps.map((s) => s.rawSizeDelta), [-8, -4, 0, 1, 4]);
+      expect(p.steps.every((s) => s.rawLeg == 'notify'), isTrue,
+          reason: 'notify is the leg floods actually use');
+      // -8 is where the fragment budget sits today and 0 is the ceiling it
+      // could move to; +1 is the first byte that should not survive.
+      expect(p.steps.map((s) => s.rawSizeDelta), contains(0));
+      expect(p.steps.map((s) => s.rawSizeDelta), contains(1));
+    });
+
     test('powerBaseline: complementary roles under identical labels', () {
       final p1 = FieldPlanPresets.powerBaseline(role: 1, reps: 2);
       final p2 = FieldPlanPresets.powerBaseline(role: 2, reps: 2);
@@ -351,12 +562,9 @@ void main() {
       expect(p.steps.every((st) => st.resetSessions == null), isTrue);
     });
 
-    test('manual by construction: no GPS, wall-clock anchor, order stamped',
-        () {
+    test('manual by construction: wall-clock anchor', () {
       final p = FieldPlanPresets.meshScale(role: 4);
       expect(p.manualJoin, isTrue);
-      expect(p.sampleGps, isFalse);
-      expect(p.deviceOrder, 4);
       expect(p.resetDtnBuffer, isFalse,
           reason: 'buffer persistence across steps IS part of the subject');
       expect(FieldPlan.fromJson(p.toJson()), p);
@@ -473,13 +681,11 @@ void main() {
     FieldPlan row(int r) => FieldPlanPresets.presets[
         'PREFLIGHT 4 devices, manual join (~7 min) — this phone is #$r']!;
 
-    test('rehearses the real procedure: manual, no GPS, own id', () {
+    test('rehearses the real procedure: manual, own id', () {
       final p = row(1);
       expect(p.manualJoin, isTrue);
-      expect(p.sampleGps, isFalse);
       expect(p.expId, 'mesh-preflight',
           reason: 'a rehearsal must never land in a real run\'s file');
-      expect(p.deviceOrder, 1);
       // 4 devices -> sizes 3 and 4, two stable reps each.
       expect(p.steps.map((s) => s.label),
           ['n=3 t1', 'n=3 t2', 'n=4 t1', 'n=4 t2']);
@@ -509,4 +715,54 @@ void main() {
   });
 
 
+
+  group('dilutingWarmupSweep (role-free diluting clique)', () {
+    test('every step carries cliqueN and none bakes a role into bleOn', () {
+      final plan = FieldPlanPresets.dilutingWarmupSweep();
+      expect(plan.steps, isNotEmpty);
+      for (final s in plan.steps) {
+        expect(s.cliqueN, isNotNull, reason: s.label);
+        expect(s.bleOn, isNull,
+            reason: 'membership must come from the nickname at launch, '
+                'not from a per-role preset: ${s.label}');
+      }
+      // N=2..7, per N: 1 settle + 3 levels x 10 reps.
+      expect(plan.steps.length, 6 * (1 + 3 * 10));
+      expect(plan.autoAdvanceGapSec, 30, reason: 'the quiet ACK-drain window');
+    });
+
+    test('resolvedFor derives the radio schedule from the join order', () {
+      final plan = FieldPlanPresets.dilutingWarmupSweep().resolvedFor(3);
+      for (final s in plan.steps) {
+        expect(s.bleOn, s.cliqueN! >= 3,
+            reason: 'phone #3 is on exactly from N=3: ${s.label}');
+      }
+      // Phone #1 is on everywhere; phone #7 only in the last phase.
+      final first = FieldPlanPresets.dilutingWarmupSweep().resolvedFor(1);
+      expect(first.steps.every((s) => s.bleOn == true), isTrue);
+      final last = FieldPlanPresets.dilutingWarmupSweep().resolvedFor(7);
+      expect(last.steps.where((s) => s.bleOn == true).map((s) => s.cliqueN).toSet(),
+          {7});
+    });
+
+    test('cliqueN survives the JSON round-trip', () {
+      final plan = FieldPlanPresets.dilutingWarmupSweep();
+      final back = FieldPlan.fromJson(plan.toJson());
+      expect(back, plan);
+      expect(back.steps.first.cliqueN, 2);
+    });
+
+    test('a plan without cliqueN resolves to itself', () {
+      final plan = FieldPlanPresets.homeSoak();
+      expect(identical(plan.resolvedFor(4), plan), isTrue);
+    });
+
+    test('exactly one shared dropdown entry, no per-role variants', () {
+      final names = FieldPlanPresets.presets.keys
+          .where((n) => n.contains('Warmup sweep'))
+          .toList();
+      expect(names, hasLength(1));
+      expect(names.single, contains('shared plan'));
+    });
+  });
 }

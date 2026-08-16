@@ -44,6 +44,14 @@ class FieldRunner extends ChangeNotifier {
   /// label (send source) and its send targets (every other roster row).
   final String? myPubkeyHex;
 
+  /// This device's ANNOUNCE nickname, stamped into the placement marker.
+  /// The join order is OPERATOR INPUT typed before every run; the nickname
+  /// is set once and shown on screen. Recording both makes a mistyped order
+  /// contradict itself in the trace instead of silently mapping a phone onto
+  /// another phone's geometry row — which is how a field day ends with two
+  /// devices claiming one node and none claiming its neighbour.
+  final String? myNickname;
+
   /// Message send hook (the coordinator's `send`). A send to a sessionless
   /// peer triggers the lazy handshake — which is exactly the point after a
   /// per-step session reset.
@@ -67,14 +75,6 @@ class FieldRunner extends ChangeNotifier {
   /// ([FieldStep.bleOn]). Awaited before the step marker so every power
   /// sample inside the segment sees the requested state.
   final Future<void> Function(bool on)? onSetBle;
-
-  /// Takes ONE GPS fix, returning `{lat, lon, accM}` or null if location is
-  /// unavailable or refused. Called only when the phone was actually placed
-  /// (see [inPosition]), never on a timer, so it costs one radio wake per
-  /// run rather than showing up in the power measurements. A null result is
-  /// not an error: the run continues without a position, and the topology
-  /// viewer falls back to a schematic layout.
-  final Future<Map<String, Object?>?> Function()? onSampleLocation;
 
   /// Monotonic tx+rx bytes on the BLE transport. Counted at the GATT choke
   /// points, so it only moves while a peer is connected — see
@@ -103,7 +103,9 @@ class FieldRunner extends ChangeNotifier {
   /// step's [FieldStep.rawLeg]. Returns the blob size, or null when that leg
   /// is not currently available.
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg,
+      required int seq,
+      int sizeDelta})? sendRaw;
 
   /// Currently identified peers (pubkeys), consulted when the plan has NO
   /// roster: every known peer becomes a send target and labels are the 8-hex
@@ -134,6 +136,35 @@ class FieldRunner extends ChangeNotifier {
   /// on the marker instead of an inference from link records.
   final int Function()? sessionPeerCount;
 
+  /// Sessions held in the Noise table itself, stamped as `sessionTable`.
+  ///
+  /// [sessionPeerCount] counts only sessions whose peer is still listed in
+  /// Redux, and a quiet non-friend peer is pruned from that list while its
+  /// session lives on — so `sessions` is a LOWER BOUND that dips when links
+  /// go quiet, which is precisely when a field run is most interesting. The
+  /// pair of numbers separates a lost session from a delisted peer; one of
+  /// them alone cannot.
+  final int Function()? sessionTableCount;
+
+  /// THIS phone's join order, read from its own nickname.
+  ///
+  /// The join order is the nickname and nothing else. It used to ride in the
+  /// plan as `deviceOrder`, which the presets set to the plan ROLE — so the
+  /// traveller of a store-carry-forward run stamped and displayed `#1`
+  /// whatever its nickname was, and the sender `#2`, seven times over. The
+  /// marker's `order` and `nick` then disagreed on every phone but one, and
+  /// `order` is what the analysis joins geometry on.
+  ///
+  /// A plan is shared by the whole fleet, so it cannot know which phone is
+  /// which; the nickname is per-device and is the one thing that can. Strict
+  /// parse, deliberately: a nickname like "pixel-2" is NOT node 2, and a
+  /// phone whose nickname is not a plain positive integer has no join order
+  /// at all rather than a guessed one.
+  int? get joinOrder {
+    final n = int.tryParse(myNickname?.trim() ?? '');
+    return (n != null && n > 0) ? n : null;
+  }
+
   /// Epoch-ms clock, injectable so the wall-clock schedule is testable
   /// under fakeAsync. Production default is the real clock.
   final int Function() nowMs;
@@ -144,15 +175,16 @@ class FieldRunner extends ChangeNotifier {
     required this.recorder,
     this.nowMs = _realNowMs,
     this.sessionPeerCount,
+    this.sessionTableCount,
     this.onStartBulk,
     this.onStopBulk,
     this.myPubkeyHex,
+    this.myNickname,
     this.send,
     this.onResetSessions,
     this.onResetLinks,
     this.onResetDtnBuffer,
     this.onSetBle,
-    this.onSampleLocation,
     this.bleWireBytes,
     this.bleUsable,
     this.bleUsableChanges,
@@ -165,6 +197,21 @@ class FieldRunner extends ChangeNotifier {
   });
 
   FieldPlan? _plan;
+
+  /// Identifies THIS run among runs sharing an experiment id.
+  ///
+  /// Stamped on every step marker so an analysis can segment two runs that
+  /// were recorded under one id — the recorder appends, so that happens
+  /// whenever an id is reused. It does NOT seed message ids: those are v4,
+  /// the same as production. Deterministic ids used to repeat across runs of
+  /// the same plan, and the receiver's packetId bloom then dropped the second
+  /// run's messages as duplicates — a testbed-only id scheme that changed
+  /// delivery behaviour and corrupted the measurement it was there to serve.
+  ///
+  /// The value is the shared anchor for a wall-clock run and the start instant
+  /// otherwise.
+  int? _runId;
+
   FieldPhase _phase = FieldPhase.finished;
   int _stepIndex = 0;
   int _remainingSec = 0;
@@ -267,7 +314,13 @@ class FieldRunner extends ChangeNotifier {
   /// single source for every screen prompt, so an off-step's TURN OFF and a
   /// join-step's TURN ON cannot drift apart.
   String? get radioAction {
+    // A scripted-radio plan works the radio itself, so prompting the operator
+    // asks for something they cannot do and did not need to: the instruction
+    // appears in the gap between the step wanting the radio down and
+    // `bleUsableChanges` reporting it down, and reads as a failure. The prompt
+    // belongs only to plans where a human genuinely owns the toggle.
     if (!manualJoin || !_running) return null;
+    if (_plan?.scriptedRadio ?? false) return null;
     final want = currentStep?.bleOn;
     if (want == null) return null;
     if (want && !_radioUp) return 'on';
@@ -275,67 +328,40 @@ class FieldRunner extends ChangeNotifier {
     return null;
   }
 
-  /// DEBUG/TESTBED. Wait for a peer's run-start signal instead of a tap.
-  ///
-  /// A field run puts phones hundreds of metres apart. Tapping each is
-  /// impractical, and tapping them in sequence skews their timelines by the
-  /// walk itself, which smears the mesh composition at every step boundary.
-  /// Arming holds the plan; the coordinator's signal handler calls
-  /// [remoteStart], which begins the run AND passes the first step
-  /// immediately — the phone is already where it is going to be.
-  ///
-  /// The armed id is checked against the signal's, so a stray or stale
-  /// broadcast cannot launch a run nobody asked for, and an unarmed device
-  /// ignores the signal entirely.
-  void armForRemoteStart(FieldPlan plan) {
-    if (_running) return;
-    _armed = plan;
-    // The signal arrives over BLE, so the radio must be UP to hear it — even
-    // on a device whose first step will immediately turn it off again
-    // (roles 4+ are not in the mesh at n=3). A previous run that ended with
-    // the radio down would otherwise leave this phone permanently deaf to
-    // the start, and it would sit armed forever while the others ran.
-    unawaited(onSetBle?.call(true) ?? Future<void>.value());
-    notifyListeners();
-  }
-
-  void disarm() {
-    _armed = null;
-    notifyListeners();
-  }
-
-  /// The plan waiting for a peer's signal, or null.
-  FieldPlan? get armedPlan => _armed;
-  FieldPlan? _armed;
-
-  /// A peer signalled a start. Runs only when armed for this exact
-  /// experiment. Returns whether it took effect.
-  Future<bool> remoteStart(String expId) async {
-    final plan = _armed;
-    if (plan == null || _running) return false;
-    if (plan.expId != expId) {
-      debugPrint('[testbed] ignoring start for "$expId" — armed for '
-          '"${plan.expId}"');
-      return false;
-    }
-    _armed = null;
-    _remotelyStarted = true;
-    await start(plan);
-    // No tap is coming: the signal IS the tap, and every phone is already
-    // in position.
-    await inPosition();
-    return true;
-  }
-
-  /// Whether this run was begun by a peer's signal rather than a tap —
-  /// shown on screen so an unexpected launch is never a mystery.
-  bool get remotelyStarted => _remotelyStarted;
-  bool _remotelyStarted = false;
-
   /// Begin the plan: starts the experiment recording and enters the first
   /// step's positioning phase. No-op while already running.
+  /// Set by [dispose]. A run's countdown is a periodic timer, and a step
+  /// boundary can land after the widget that owns this runner is gone — the
+  /// timer then drives `_finish` into `notifyListeners()` on a disposed
+  /// ChangeNotifier, which throws. It surfaced as a test that passed or
+  /// failed depending on which won the race.
+  bool _disposed = false;
+
+  /// Every notify goes through here: after dispose there is nobody to tell,
+  /// and telling them is an error rather than a no-op.
+  void _notify() {
+    if (_disposed) return;
+    notifyListeners();
+  }
+
   Future<void> start(FieldPlan plan) async {
     if (_running || plan.steps.isEmpty) return;
+    // Role-free diluting plan: derive THIS phone's schedule from its nickname
+    // before anything is recorded. The nickname is the only place the join
+    // order lives — there is no per-role preset to pick wrongly (the field
+    // run lost its whole N=2 phase to exactly that mistake). A nickname that
+    // is not a number cannot join anywhere, so refuse loudly instead of
+    // running a phone that would silently sit out every phase.
+    if (plan.steps.any((s) => s.cliqueN != null)) {
+      final order = joinOrder;
+      if (order == null) {
+        _abortReason = 'nickname "${myNickname ?? ''}" is not a join order — '
+            'set it to this phone\'s number (1..N) and relaunch';
+        _notify();
+        return;
+      }
+      plan = plan.resolvedFor(order);
+    }
     // A discharge plan ends on state of charge, not on the clock: its step
     // dwell is deliberately longer than the battery can last, and this is
     // what actually stops it.
@@ -345,7 +371,6 @@ class FieldRunner extends ChangeNotifier {
     _uploadResult = null;
     _abortReason = null;
     _batteryFloorLevel = null;
-    _armed = null;
     _finishing = false;
     _finishingWhat = '';
     _uploadChunks = 0;
@@ -353,6 +378,7 @@ class FieldRunner extends ChangeNotifier {
     _running = true;
     _anchorMs = null;
     _stepStartMs = null;
+    _runId = nowMs();
     _btOnSeen = false;
     _radioUp = false;
     await recorder.startExperiment(plan.expId);
@@ -365,6 +391,9 @@ class FieldRunner extends ChangeNotifier {
       final minStart = nowMs() + plan.placementSec * 1000;
       final anchor = ((minStart + alignMs - 1) ~/ alignMs) * alignMs;
       _anchorMs = anchor;
+      // Every phone computes the same anchor, so it also gives every phone the
+      // same run id — ids stay comparable across the fleet, as they must be.
+      _runId = anchor;
       final starts = <int>[];
       var t = anchor;
       for (final st in plan.steps) {
@@ -376,12 +405,13 @@ class FieldRunner extends ChangeNotifier {
       // query shows whether all phones computed the same instant.
       await recorder.logMarker('placement', extra: {
         'targetMs': anchor,
-        if (plan.deviceOrder != null) 'order': plan.deviceOrder,
+        if (joinOrder != null) 'order': joinOrder,
+        if (myNickname != null && myNickname!.isNotEmpty) 'nick': myNickname,
       });
       _startRadioObserver();
       _phase = FieldPhase.placement;
-      _countdownToMs(anchor, () => inPosition(manual: false));
-      notifyListeners();
+      _countdownToMs(anchor, () => inPosition());
+      _notify();
       return;
     }
     _enterPositioning();
@@ -415,9 +445,9 @@ class FieldRunner extends ChangeNotifier {
       _radioUp = up;
       if (up) _btOnSeen = true;
       await recorder.logMarker(up ? 'bt-on' : 'bt-off', extra: {
-        if (_plan?.deviceOrder != null) 'order': _plan!.deviceOrder,
+        if (joinOrder != null) 'order': joinOrder,
       });
-      notifyListeners();
+      _notify();
     }
 
     // Initial state, stamped from a direct read at observer start.
@@ -451,22 +481,17 @@ class FieldRunner extends ChangeNotifier {
       // The gap counts down to the next step's ABSOLUTE start. This gap is
       // also the join window: the phone whose first joined step is next
       // shows TURN ON BLUETOOTH for exactly this long.
-      _countdownToMs(_stepStartMs![_stepIndex], () => inPosition(manual: false));
+      _countdownToMs(_stepStartMs![_stepIndex], () => inPosition());
     } else if (currentStep?.autoAdvance ?? false) {
-      // A timer firing is not the operator putting the phone down, so it
-      // must not be mistaken for one when deciding to take a GPS fix.
-      _startCountdown(_plan!.autoAdvanceGapSec, () => inPosition(manual: false));
+      _startCountdown(_plan!.autoAdvanceGapSec, () => inPosition());
     }
-    notifyListeners();
+    _notify();
   }
 
   /// The experimenter reached the current step's position: drop sessions
   /// (when the plan asks), stamp the ground-truth marker, hold the dwell,
   /// and run the step's sends spread through it.
-  /// [manual] distinguishes the operator tapping IN POSITION from the
-  /// auto-advance timer firing. Only the former means the phone was just
-  /// placed or moved, which is the only time a GPS fix is worth taking.
-  Future<void> inPosition({bool manual = true}) async {
+  Future<void> inPosition() async {
     final step = currentStep;
     if (!_running ||
         (_phase != FieldPhase.positioning && _phase != FieldPhase.placement) ||
@@ -479,19 +504,24 @@ class FieldRunner extends ChangeNotifier {
     _absFire = null;
     // Manual-join mode never touches the radio: system Bluetooth belongs to
     // the operator, and bleOn is intent for the marker, not a command.
-    if (step.bleOn != null && onSetBle != null && !manualJoin) {
+    // Wall-clock anchored AND hands-free: `scriptedRadio` says the plan, not
+    // an operator, works the radio, so the anchor and the toggling stop being
+    // one decision.
+    if (step.bleOn != null &&
+        onSetBle != null &&
+        (!manualJoin || _plan!.scriptedRadio)) {
       _resetting = true;
-      notifyListeners();
+      _notify();
       await onSetBle!.call(step.bleOn!);
       _resetting = false;
-      notifyListeners();
+      _notify();
     }
     if (_plan!.resetLinks && onResetLinks != null) {
       _resetting = true;
-      notifyListeners();
+      _notify();
       await onResetLinks!.call(); // BLE bounce; wait for the transport back up
       _resetting = false;
-      notifyListeners();
+      _notify();
       await recorder.logMarker('links-reset');
     }
     if ((step.resetSessions ?? _plan!.resetSessions) &&
@@ -499,50 +529,23 @@ class FieldRunner extends ChangeNotifier {
       onResetSessions!.call();
       await recorder.logMarker('sessions-reset');
     }
-    if (_plan!.resetDtnBuffer && onResetDtnBuffer != null) {
+    if ((step.resetDtnBuffer ?? _plan!.resetDtnBuffer) &&
+        onResetDtnBuffer != null) {
       onResetDtnBuffer!.call();
       await recorder.logMarker('custody-reset');
     }
-    // ONE fix, at placement. The first measured step is the moment the phone
-    // is finally where it belongs (the `distribute` walk-out is when it is
-    // still being carried), and a manual tap after that means it was moved.
-    // Never on an auto-advanced step: the phone has not moved, and a GPS
-    // radio waking 60 times would show up in the power numbers.
-    // Never on the walk-out: a manual tap THERE starts the walk, it does not
-    // end it. Otherwise: the first measured step (just placed), or any later
-    // manual tap (moved).
-    final placed = step.label != 'distribute' && (manual || _locationFixes == 0);
-    if (onSampleLocation != null && placed && _plan!.sampleGps) {
-      _locationFixes++;
-      _locationFixing = true;
-      notifyListeners();
-      // NOT awaited. A good fix can take a minute of acquisition, and the
-      // step must not wait for it — the position is metadata about where the
-      // phone is, not a precondition for measuring.
-      unawaited(onSampleLocation!.call().then((fix) async {
-        _locationFixing = false;
-        _lastFix = fix;
-        notifyListeners();
-        if (fix != null) {
-          await recorder.log({
-            'type': 'location',
-            't': DateTime.now().millisecondsSinceEpoch,
-            'step': step.label,
-            ...fix,
-          });
-        }
-      }));
-    }
-
     // The step marker carries this phone's CONFIGURED intent, not just the
     // step name: which join slot it was assigned and whether it believed it
     // was in the mesh for this step. Analysis can then tell a misconfigured
     // phone from one that was configured right and failed to join — from the
     // marker alone, without inferring it from when links first appear.
     await recorder.logMarker(step.label, extra: {
-      if (_plan!.deviceOrder != null) 'order': _plan!.deviceOrder,
+      if (joinOrder != null) 'order': joinOrder,
       if (step.bleOn != null) 'joined': step.bleOn,
       if (sessionPeerCount != null) 'sessions': sessionPeerCount!(),
+      if (sessionTableCount != null)
+        'sessionTable': sessionTableCount!(),
+      if (_runId != null) 'run': _runId,
     });
     if (step.bulk) onStartBulk?.call();
     _phase = FieldPhase.dwelling;
@@ -557,7 +560,7 @@ class FieldRunner extends ChangeNotifier {
     } else {
       _startCountdown(step.dwellSec, _endDwell);
     }
-    notifyListeners();
+    _notify();
   }
 
   /// Countdown to an ABSOLUTE instant: the display ticks once a second, the
@@ -570,7 +573,7 @@ class FieldRunner extends ChangeNotifier {
     void show() {
       final rem = targetMs - nowMs();
       _remainingSec = rem <= 0 ? 0 : (rem + 999) ~/ 1000;
-      notifyListeners();
+      _notify();
     }
 
     show();
@@ -693,9 +696,14 @@ class FieldRunner extends ChangeNotifier {
   /// spread the sends across the REMAINING dwell — data never races a
   /// re-forming link, and an out-of-range step sends nothing. Without the
   /// predicate: legacy fixed offsets from dwell start. Targets resolve at
-  /// fire time; ids are the offline-reproducible UUIDv5 set
-  /// `field|expId|src|dst|stepIndex|seq`.
+  /// fire time; message ids are v4, matching production.
   void _scheduleSends(FieldStep step) {
+    // A step whose radio THIS phone holds down sends nothing — in a resolved
+    // diluting plan every step carries the full send config and membership
+    // lives in the derived [FieldStep.bleOn], so an un-joined phone must not
+    // schedule sends that would only fail into the trace. Explicit false
+    // only: bleOn == null means the plan does not script the radio.
+    if (step.bleOn == false) return;
     // Raw mode first: it uses [sendRaw], not [send] — gating it behind the
     // message-send hook silently disabled it (caught by test).
     if (step.rawLeg != null) {
@@ -732,7 +740,7 @@ class FieldRunner extends ChangeNotifier {
       for (var seq = 0; seq < step.sendCount; seq++) {
         _queueSend(step, seq, (seq * windowSec) ~/ step.sendCount);
       }
-      notifyListeners();
+      _notify();
     });
     _sendTimers.add(poll);
   }
@@ -757,7 +765,7 @@ class FieldRunner extends ChangeNotifier {
       for (var i = 0; i < lanes; i++) {
         unawaited(_pushLane(step));
       }
-      notifyListeners();
+      _notify();
     }
 
     if (settled == null) {
@@ -789,7 +797,7 @@ class FieldRunner extends ChangeNotifier {
     void begin() {
       unawaited(recorder.logMarker('raw-start'));
       unawaited(_pushRaw(step));
-      notifyListeners();
+      _notify();
     }
 
     if (settled == null) {
@@ -817,8 +825,8 @@ class FieldRunner extends ChangeNotifier {
       final targets = _sendTargets();
       var sentAny = false;
       for (final (_, pubkey) in targets) {
-        final size =
-            await doSendRaw(pubkey, leg: step.rawLeg!, seq: seq);
+        final size = await doSendRaw(pubkey,
+            leg: step.rawLeg!, seq: seq, sizeDelta: step.rawSizeDelta);
         if (size != null) {
           _rawBlobs++;
           _rawBytes += size;
@@ -858,8 +866,7 @@ class FieldRunner extends ChangeNotifier {
     if (!_running || _phase != FieldPhase.dwelling) return;
     final seq = _satSeq++;
     for (final (dstLabel, pubkey) in _sendTargets()) {
-      final messageId = _uuid.v5(workloadUuidNamespace,
-          'field|${plan.expId}|$_srcLabel|$dstLabel|$_stepIndex|$seq');
+      final messageId = _uuid.v4();
       final payload = Uint8List(step.sendBytes);
       for (var i = 0; i < payload.length; i++) {
         payload[i] = (seq + i) & 0xff;
@@ -883,16 +890,17 @@ class FieldRunner extends ChangeNotifier {
     // An ACK only COUNTS here. It never triggers a send: clocking sends on
     // ACKs would cap the rate at lanes/RTT and make the experiment measure
     // its own window instead of the link.
-    notifyListeners();
+    _notify();
   }
 
   void _queueSend(FieldStep step, int seq, int offsetSec) {
-    final plan = _plan!;
-    final stepIdx = _stepIndex;
     _sendTimers.add(Timer(Duration(seconds: offsetSec), () {
-      for (final (dstLabel, pubkey) in _sendTargets()) {
-        final messageId = _uuid.v5(workloadUuidNamespace,
-            'field|${plan.expId}|$_srcLabel|$dstLabel|$stepIdx|$seq');
+      // One scheduled send is one message to EVERY target. The step's send
+      // count is therefore a rate PER DESTINATION: at 1/s with seven peers a
+      // device puts seven messages a second on the air, which is the load
+      // model these experiments mean by "rate".
+      for (final (_, pubkey) in _sendTargets()) {
+        final messageId = _uuid.v4();
         final payload = Uint8List(step.sendBytes);
         for (var i = 0; i < payload.length; i++) {
           payload[i] = (seq + i) & 0xff;
@@ -903,7 +911,7 @@ class FieldRunner extends ChangeNotifier {
         _sentCount++;
         unawaited(send!(pubkey, payload, messageId: messageId));
       }
-      notifyListeners();
+      _notify();
     }));
   }
 
@@ -926,6 +934,9 @@ class FieldRunner extends ChangeNotifier {
         'event': 'stop',
         'flow': 'raw',
         'leg': currentStep!.rawLeg,
+        // The arm variable travels with the step summary so the analysis can
+        // key sent-vs-arrived on it without re-deriving it from the label.
+        'sizeDelta': currentStep!.rawSizeDelta,
         'sent': _rawBlobs,
         'sentBytes': _rawBytes,
       });
@@ -965,7 +976,7 @@ class FieldRunner extends ChangeNotifier {
     await recorder.logMarker('end');
     _phase = FieldPhase.settling;
     _startCountdown(plan.settleSec, _finish);
-    notifyListeners();
+    _notify();
   }
 
   /// The battery reached the floor where Android's saver engages. This is a
@@ -994,34 +1005,6 @@ class FieldRunner extends ChangeNotifier {
 
   /// State of charge at which a discharge run ended, or null if it did not
   /// end that way. The screen shows it instead of a plain completion.
-  /// How many GPS fixes this run has taken — the guard that keeps placement
-  /// sampling from becoming a stream.
-  int get locationFixes => _locationFixes;
-  int _locationFixes = 0;
-
-  /// One line about this phone's position, for the runner screen. Whether a
-  /// fix was taken is otherwise invisible until the data is on a server,
-  /// which is far too late to notice that eight phones recorded nothing.
-  String get locationStatus {
-    if (onSampleLocation == null) return '';
-    if (_locationFixing) return 'getting a GPS fix…';
-    if (_lastFix == null) {
-      return _locationFixes == 0
-          ? 'position: taken when this phone is placed'
-          : 'position: NO FIX — check location permission';
-    }
-    final acc = _lastFix!['accM'];
-    return 'position fixed'
-        '${acc is num ? ' ±${acc.round()} m' : ''}';
-  }
-
-  /// Whether this runner was wired to sample position at all.
-  bool get hasLocation => onSampleLocation != null;
-
-  Map<String, Object?>? get lastFix => _lastFix;
-  Map<String, Object?>? _lastFix;
-  bool _locationFixing = false;
-
   int? get batteryFloorLevel => _batteryFloorLevel;
   int? _batteryFloorLevel;
 
@@ -1049,7 +1032,7 @@ class FieldRunner extends ChangeNotifier {
     recorder.onBatteryFloor = null;
     _finishing = true;
     _finishingWhat = 'writing the recording to disk';
-    notifyListeners();
+    _notify();
     await recorder.stopExperiment();
     if (!_running) return; // forceFinish won the race
     onWindowElapsed?.call();
@@ -1057,7 +1040,7 @@ class FieldRunner extends ChangeNotifier {
     if (doUpload != null) {
       _finishingWhat = 'uploading';
       _uploadFraction = 0;
-      notifyListeners();
+      _notify();
       // Progress in bytes read, not chunks: the chunk total is not knowable
       // in advance because the file is streamed. The bar is honest from the
       // first chunk; the chunk count beside it shows work actually landing.
@@ -1066,7 +1049,7 @@ class FieldRunner extends ChangeNotifier {
         _uploadFraction = fraction;
         _finishingWhat = 'uploading — chunk $chunks, '
             '${(fraction * 100).clamp(0, 100).toStringAsFixed(0)}%';
-        notifyListeners();
+        _notify();
       };
       try {
         _uploadResult = await doUpload();
@@ -1082,7 +1065,7 @@ class FieldRunner extends ChangeNotifier {
     _finishing = false;
     _phase = FieldPhase.finished;
     _running = false;
-    notifyListeners();
+    _notify();
   }
 
   /// Stop waiting for the wrap-up and mark the run finished.
@@ -1119,7 +1102,7 @@ class FieldRunner extends ChangeNotifier {
     _finishing = false;
     _phase = FieldPhase.finished;
     _running = false;
-    notifyListeners();
+    _notify();
   }
 
   /// Abandon the run: marker the abort, stop bulk + recording. Files stay.
@@ -1142,10 +1125,17 @@ class FieldRunner extends ChangeNotifier {
     }
     recorder.onBatteryFloor = null;
     await recorder.logMarker('aborted');
+    // Captured BEFORE the stop clears it: the abandoned file has to be set
+    // aside under its own id, or the next arm appends the real run to it.
+    final abandoned = recorder.experimentId;
     await recorder.stopExperiment();
+    if (abandoned != null) {
+      final moved = await recorder.archiveAbortedExperiment(abandoned);
+      if (moved != null) debugPrint('[field] aborted run set aside: $moved');
+    }
     _phase = FieldPhase.finished;
     _running = false;
-    notifyListeners();
+    _notify();
   }
 
   void _startCountdown(int seconds, Future<void> Function() onDone) {
@@ -1164,12 +1154,13 @@ class FieldRunner extends ChangeNotifier {
         _tick = null;
         unawaited(onDone());
       }
-      notifyListeners();
+      _notify();
     });
   }
 
   @override
   void dispose() {
+    _disposed = true;
     _cancelSends();
     _bleWatchdog?.cancel();
     _bleWatchdog = null;

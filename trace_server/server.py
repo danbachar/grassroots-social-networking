@@ -103,6 +103,7 @@ class Store:
 
     def __init__(self, db_path: Path):
         self._lock = threading.Lock()
+        self._conn_path = str(db_path)     # for the index build's own connection
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.executescript(
@@ -131,6 +132,62 @@ class Store:
             CREATE INDEX IF NOT EXISTS idx_records_type   ON records(type);
             CREATE INDEX IF NOT EXISTS idx_records_t      ON records(t);
             CREATE INDEX IF NOT EXISTS idx_records_upload ON records(upload_id);
+            -- One row per SIGHTING of a packet: the route index. Derived
+            -- entirely from `records` and rebuildable from it, so it is a
+            -- cache, not data — but a necessary one. Reconstructing a route
+            -- by scanning `records` for one id is a full scan of tens of
+            -- millions of rows per packet; here it is an index seek.
+            CREATE TABLE IF NOT EXISTS packet_events (
+                exp        TEXT    NOT NULL,
+                packet_id  TEXT    NOT NULL,
+                t          INTEGER,
+                device_id  TEXT    NOT NULL,  -- node that recorded it (= its pubkey)
+                event      TEXT    NOT NULL,  -- mint|aired|relay|dup|packetDup|
+                                              -- store|convey|end|deliver|ackRx|drop
+                from_peer  TEXT,              -- neighbour that handed it over
+                to_device  TEXT,              -- BLE device a convey was sent on
+                ttl_in     INTEGER,
+                ttl_out    INTEGER,
+                hop        INTEGER,
+                dwell_ms   INTEGER,
+                carried    INTEGER,
+                message_id TEXT,
+                recipient  TEXT,
+                kind       TEXT,              -- data|ack, known at the originator
+                reason     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pev_route ON packet_events(exp, packet_id, t);
+            CREATE INDEX IF NOT EXISTS idx_pev_event ON packet_events(exp, event);
+            -- One row per PACKET, rolled up at build time. The same numbers
+            -- are a GROUP BY over packet_events, and that is how they were
+            -- read at first — 198 s per request on the collector's disk, past
+            -- the proxy's patience, so every list load 502'd. Aggregating a
+            -- million rows is a build-time job, not a per-request one.
+            CREATE TABLE IF NOT EXISTS packet_summary (
+                exp        TEXT    NOT NULL,
+                packet_id  TEXT    NOT NULL,
+                t0         INTEGER,
+                t1         INTEGER,
+                kind       TEXT,
+                origin     TEXT,
+                message_id TEXT,
+                recipient  TEXT,
+                nodes      INTEGER,
+                relays     INTEGER,
+                delivers   INTEGER,
+                acked      INTEGER,
+                conveys    INTEGER,
+                drops      INTEGER,
+                ttl_min    INTEGER,
+                PRIMARY KEY (exp, packet_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_psum ON packet_summary(exp, nodes DESC, t0);
+            CREATE TABLE IF NOT EXISTS packet_index_meta (
+                exp      TEXT PRIMARY KEY,
+                built_at TEXT NOT NULL,
+                events   INTEGER NOT NULL,
+                packets  INTEGER NOT NULL
+            );
             -- Hand-measured pairwise distances for an experiment's layout.
             -- Kept server-side, not in a browser: the measurement is a fact
             -- about the deployment, and it must not be lost with a cache or
@@ -245,6 +302,255 @@ class Store:
                 {"deviceId": k, "markers": v["markers"], "links": v["links"],
                  "locations": v["locations"]}
                 for k, v in devices.items()
+            ],
+        }
+
+    # ----------------------------------------------------------------- routes
+    # A packet's route is reconstructable offline even though the wire is
+    # deliberately uninformative — the outer envelope names no sender, and a
+    # relay cannot tell a data packet from an ack. What makes the join work is
+    # that the packetId survives relaying unchanged (it IS the dedup key), so
+    # the id the originator minted is the id every hop records. Each node
+    # reports its own sighting; `fromPeer` on a relay/deliver record names the
+    # neighbour that handed the packet over, which is a real directed edge, not
+    # an inference from timing.
+    #
+    # Two things are structurally invisible and the UI must say so rather than
+    # guess: sync frames (traced on neither side, TTL 1, so a conveyance shows
+    # only as the holder's `convey` and the receiver's later sighting), and any
+    # hop over a link that was not yet authenticated (`fromPeer` is then null).
+
+    def packet_index_state(self, exp: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT built_at, events, packets FROM packet_index_meta WHERE exp = ?",
+                (exp,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"exp": exp, "builtAt": row[0], "events": row[1], "packets": row[2]}
+
+    def build_packet_index(self, exp: str) -> Dict[str, Any]:
+        """Scan one experiment's records once and materialise every sighting.
+
+        Read on a private connection and streamed: the source can be tens of
+        millions of rows and the server has under 2 GB of memory, so nothing
+        here may fetchall.
+        """
+        like = exp + "%"
+
+        # Pass A — `message` records. These are the only ones that know a
+        # packet's KIND (data vs ack) and its messageId; a relay's record knows
+        # neither. Deliveries name a messageId only, so they are held back and
+        # expanded once the sender's `sealed` record has supplied the mapping.
+        msg_to_packets: Dict[str, List[str]] = {}
+        pending_recv: List[tuple] = []
+        conn = sqlite3.connect(self._conn_path, timeout=60)
+        # Written on THIS connection, in batches, and never accumulated: a
+        # multi-million-row experiment produced ~1.5M sightings, and holding
+        # them as Python tuples to insert at the end was ~1 GB — which the
+        # collector does not have, so the process was OOM-killed mid-request
+        # and the caller saw a 502.
+        wconn = sqlite3.connect(self._conn_path, timeout=120)
+        wconn.execute("PRAGMA busy_timeout=120000")
+        pending: List[tuple] = []
+        total = 0
+
+        def emit(row: tuple) -> None:
+            nonlocal total
+            pending.append(row)
+            total += 1
+            if len(pending) >= 20000:
+                flush()
+
+        def flush() -> None:
+            if not pending:
+                return
+            wconn.executemany(
+                "INSERT INTO packet_events VALUES (" + ",".join("?" * 16) + ")",
+                pending)
+            wconn.commit()
+            pending.clear()
+
+        try:
+            wconn.execute("DELETE FROM packet_events WHERE exp = ?", (exp,))
+            wconn.execute("DELETE FROM packet_summary WHERE exp = ?", (exp,))
+            wconn.commit()
+            cur = conn.execute(
+                "SELECT device_id, t, body FROM records "
+                " WHERE upload_id LIKE ? AND type = 'message'", (like,))
+            while True:
+                batch = cur.fetchmany(20000)
+                if not batch:
+                    break
+                for device_id, t, body in batch:
+                    try:
+                        r = json.loads(body)
+                    except json.JSONDecodeError:
+                        continue
+                    d = r.get("dir")
+                    mid = r.get("messageId")
+                    if d == "sealed":
+                        ids = [str(i) for i in (r.get("packetIds") or [])]
+                        if mid:
+                            msg_to_packets[str(mid)] = ids
+                        for pid in ids:
+                            emit((exp, pid, t, device_id, "mint", None, None,
+                                  None, None, None, None, None, mid,
+                                  r.get("peer"), "data", None))
+                    elif d == "ackTx":
+                        pid = r.get("packetId")
+                        if pid:
+                            emit((exp, str(pid), t, device_id, "mint", None,
+                                  None, None, None, None, None, None, mid,
+                                  r.get("peer"), "ack", None))
+                    elif d == "ackRx":
+                        pid = r.get("packetId")
+                        if pid:
+                            emit((exp, str(pid), t, device_id, "ackRx",
+                                  r.get("fromPeer"), None, None, None, None,
+                                  None, None, mid, None, "ack", None))
+                    elif d == "recv" and mid:
+                        pending_recv.append((device_id, t, str(mid), r.get("fromPeer"),
+                                             r.get("relayHops")))
+            for device_id, t, mid, from_peer, hops in pending_recv:
+                for pid in msg_to_packets.get(mid, ()):
+                    emit((exp, pid, t, device_id, "deliver", from_peer, None,
+                          None, None, hops, None, None, mid, None, "data", None))
+
+            # Pass B — everything a node records about someone else's packet.
+            cur = conn.execute(
+                "SELECT device_id, type, t, body FROM records "
+                " WHERE upload_id LIKE ? AND type IN ('relay','custody','packetDup','drop')",
+                (like,))
+            while True:
+                batch = cur.fetchmany(20000)
+                if not batch:
+                    break
+                for device_id, rtype, t, body in batch:
+                    try:
+                        r = json.loads(body)
+                    except json.JSONDecodeError:
+                        continue
+                    pid = r.get("packetId")
+                    if not pid:
+                        continue           # a drop with no id joins to nothing
+                    pid = str(pid)
+                    ev = r.get("event")
+                    if rtype == "relay":
+                        name = {"aired": "aired", "dup": "dup"}.get(ev, "relay")
+                        emit((exp, pid, t, device_id, name, r.get("fromPeer"),
+                              None, r.get("ttlIn"), r.get("ttlOut"), r.get("hop"),
+                              r.get("dwellMs"), 1 if r.get("carried") else 0,
+                              None, None, None, None))
+                    elif rtype == "custody":
+                        emit((exp, pid, t, device_id, ev or "custody", None,
+                              r.get("toDevice"), None, None, None, None, None,
+                              None, r.get("recipient"), None, r.get("reason")))
+                    elif rtype == "packetDup":
+                        emit((exp, pid, t, device_id, "packetDup", None, None,
+                              None, None, None, None, None, None, None, None,
+                              r.get("transport")))
+                    else:                                        # drop
+                        emit((exp, pid, t, device_id, "drop", r.get("fromPeer"),
+                              None, None, None, None, None, None,
+                              r.get("messageId"), None, None,
+                              f"{r.get('where')}/{r.get('reason')}"))
+            flush()
+            # `nodes` counts DISTINCT devices, which is the honest measure of
+            # reach: a packet sighted twice on one node travelled no further
+            # than one sighted once.
+            wconn.execute(
+                """
+                INSERT INTO packet_summary
+                SELECT exp, packet_id, MIN(t), MAX(t), MAX(kind),
+                       MAX(CASE WHEN event='mint' THEN device_id END),
+                       MAX(CASE WHEN event='mint' THEN message_id END),
+                       MAX(CASE WHEN event='mint' THEN recipient END),
+                       COUNT(DISTINCT device_id),
+                       SUM(event='relay'), SUM(event='deliver'),
+                       SUM(event='ackRx'), SUM(event='convey'),
+                       SUM(event='drop'),
+                       MIN(CASE WHEN event='relay' THEN ttl_out END)
+                  FROM packet_events WHERE exp = ? GROUP BY packet_id
+                """, (exp,))
+            packets = wconn.execute(
+                "SELECT COUNT(*) FROM packet_summary WHERE exp = ?",
+                (exp,)).fetchone()[0]
+            wconn.execute(
+                "INSERT INTO packet_index_meta (exp, built_at, events, packets) "
+                "VALUES (?,?,?,?) ON CONFLICT(exp) DO UPDATE SET "
+                "built_at=excluded.built_at, events=excluded.events, "
+                "packets=excluded.packets",
+                (exp, _utc_now_iso(), total, packets))
+            wconn.commit()
+        except BaseException:
+            # A half-written index reads as a complete one and silently answers
+            # "this packet was never seen again". Leave nothing behind instead.
+            try:
+                wconn.execute("DELETE FROM packet_events WHERE exp = ?", (exp,))
+                wconn.execute("DELETE FROM packet_summary WHERE exp = ?", (exp,))
+                wconn.commit()
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+            wconn.close()
+        return {"exp": exp, "events": total, "packets": packets,
+                "builtAt": _utc_now_iso()}
+
+    def packets(self, exp: str, kind: Optional[str] = None,
+                outcome: Optional[str] = None, q: Optional[str] = None,
+                min_hops: int = 0, limit: int = 300) -> List[Dict[str, Any]]:
+        """One row per packet: who minted it, how far it got, how it ended."""
+        sql = ("SELECT packet_id, t0, t1, kind, origin, message_id, recipient, "
+               "       nodes, relays, delivers, acked, conveys, drops, ttl_min "
+               "  FROM packet_summary WHERE exp = ?")
+        params: List[Any] = [exp]
+        if q:
+            sql += " AND (packet_id LIKE ? OR message_id LIKE ?)"
+            params += [f"%{q}%", f"%{q}%"]
+        if kind in ("data", "ack"):
+            sql += " AND kind = ?"
+            params.append(kind)
+        if outcome == "delivered":
+            sql += " AND (delivers > 0 OR acked > 0)"
+        elif outcome == "undelivered":
+            sql += " AND delivers = 0 AND acked = 0"
+        elif outcome == "multihop":
+            sql += " AND relays > 0"
+        if min_hops:
+            sql += " AND nodes >= ?"
+            params.append(min_hops + 1)
+        sql += " ORDER BY nodes DESC, t0 ASC LIMIT ?"
+        params.append(max(1, min(limit, 2000)))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [
+            {"packetId": r[0], "t0": r[1], "t1": r[2], "kind": r[3], "origin": r[4],
+             "messageId": r[5], "recipient": r[6], "nodes": r[7], "relays": r[8],
+             "delivered": bool(r[9]) or bool(r[10]), "conveys": r[11],
+             "drops": r[12], "ttlMin": r[13]}
+            for r in rows
+        ]
+
+    def route(self, exp: str, packet_id: str) -> Dict[str, Any]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t, device_id, event, from_peer, to_device, ttl_in, ttl_out, "
+                "       hop, dwell_ms, carried, message_id, recipient, kind, reason "
+                "  FROM packet_events WHERE exp = ? AND packet_id = ? ORDER BY t",
+                (exp, packet_id),
+            ).fetchall()
+        return {
+            "exp": exp, "packetId": packet_id,
+            "events": [
+                {"t": r[0], "device": r[1], "event": r[2], "fromPeer": r[3],
+                 "toDevice": r[4], "ttlIn": r[5], "ttlOut": r[6], "hop": r[7],
+                 "dwellMs": r[8], "carried": bool(r[9]), "messageId": r[10],
+                 "recipient": r[11], "kind": r[12], "reason": r[13]}
+                for r in rows
             ],
         }
 
@@ -405,6 +711,47 @@ class GeometryIn(BaseModel):
     # NOT stored as zero, because "we did not measure this" and "these two
     # phones were in the same place" are different facts.
     pairs: Dict[str, float]
+
+
+@app.get("/v1/packets")
+def packets(exp: str, kind: Optional[str] = None, outcome: Optional[str] = None,
+            q: Optional[str] = None, minHops: int = 0, limit: int = 300,
+            authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """Packets of one experiment, summarised — the pick-list for a route view.
+
+    Returns `index: null` when the route index has not been built for this
+    experiment yet; the caller then POSTs to /v1/packets/index. The build is
+    explicit rather than lazy because it is a full scan of the experiment,
+    which is minutes on a multi-million-record run — not something to trigger
+    by accident from a dropdown.
+    """
+    _check_auth(authorization)
+    if not exp:
+        raise HTTPException(status_code=400, detail="exp is required")
+    state = STORE.packet_index_state(exp)
+    if not state:
+        return {"exp": exp, "index": None, "packets": []}
+    return {"exp": exp, "index": state,
+            "packets": STORE.packets(exp, kind=kind, outcome=outcome, q=q,
+                                     min_hops=minHops, limit=limit)}
+
+
+@app.post("/v1/packets/index")
+def build_packet_index(exp: str,
+                       authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _check_auth(authorization)
+    if not exp:
+        raise HTTPException(status_code=400, detail="exp is required")
+    return STORE.build_packet_index(exp)
+
+
+@app.get("/v1/route")
+def route(exp: str, pid: str,
+          authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _check_auth(authorization)
+    if not exp or not pid:
+        raise HTTPException(status_code=400, detail="exp and pid are required")
+    return STORE.route(exp, pid)
 
 
 @app.get("/v1/geometry")

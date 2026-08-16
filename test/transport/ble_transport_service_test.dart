@@ -8,6 +8,7 @@ import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart'
     show
+        BleDeviceDiscoveredAction,
         BleDeviceRemovedAction,
         FriendEstablishedAction,
         PeerAnnounceReceivedAction;
@@ -77,9 +78,17 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
     calls.add('disconnect:${request.pathId}');
   }
 
+  /// Path ids whose writes are refused, as the plugin refuses them: a throw
+  /// raised while validating the path or when the stack will not take the
+  /// buffer — always BEFORE any byte reaches the controller.
+  final Set<String> refuse = {};
+
   @override
   Future<void> send(BleSendRequest request) async {
     calls.add('send:${request.pathId}:${request.value.length}');
+    if (refuse.contains(request.pathId)) {
+      throw StateError('refused write on ${request.pathId}');
+    }
   }
 
   @override
@@ -358,8 +367,8 @@ void main() {
     });
 
     test(
-        'a fresh advertisement after a failed dial immediately triggers '
-        'another dial (no backoff)', () async {
+        'a fresh advertisement inside the cooldown after a failed dial does '
+        'not redial', () async {
       const remoteId = 'AABBCC';
       const pathId = 'central:$remoteId';
       const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
@@ -386,9 +395,10 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      // The next ad must re-fire the dial — there is no rate-limit window
-      // beyond the in-flight cap and the standard isConnecting / isConnected
-      // gates. The application layer owns retry pacing.
+      // The next ad inside the cooldown must NOT re-fire the dial: a failed
+      // connectGatt holds a native GATT slot for its full timeout, so
+      // redialing on every scan tick (the scanner runs allowDuplicates)
+      // exhausts the table. The address is retried once the cooldown elapses.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: remoteId,
         serviceUuids: [serviceUuid],
@@ -398,7 +408,85 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       expect(
-          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(2));
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
+    test('a failed central dial keeps the address but cools down the redial',
+        () async {
+      const remoteId = 'DEADADDR';
+      const pathId = 'central:$remoteId';
+      const serviceUuid = '84c40316-0871-e5ad-8888-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true);
+      final dialsAfterFirst =
+          hostApi.calls.where((c) => c == 'connect:$remoteId').length;
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT_ERROR(133)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The address is NOT evicted — the peer keeps advertising it and it stays
+      // dialable; eviction only churned the discovery entry without stopping
+      // the redials (the scanner runs allowDuplicates).
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'A failed dial cools the address down, it does not evict it.');
+
+      // A fresh advertisement inside the cooldown must NOT redial — that is the
+      // rate limit that keeps a failing address off the GATT slot table.
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      final dialsAfterCooldownAd =
+          hostApi.calls.where((c) => c == 'connect:$remoteId').length;
+      expect(dialsAfterCooldownAd, dialsAfterFirst,
+          reason: 'Within the cooldown, a re-advertisement of the same address '
+              'is not redialed.');
+    });
+
+    test('a failed peripheral path does NOT drop a discovered address',
+        () async {
+      // Planted under the peripheral pathId so the two keys coincide: the
+      // dial-failure cooldown is gated on the central role, so an inbound
+      // peripheral failure must not touch this address.
+      const pathId = 'peripheral:INBOUND';
+      store.dispatch(BleDeviceDiscoveredAction(
+        deviceId: pathId,
+        rssi: -55,
+        serviceUuid: '84c40316-0871-e5ad-9999-000000000000',
+      ));
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.peripheral,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+        error: 'Connection timed out.',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'Only our own dial exhausts GATT slots. A failure on an '
+              'inbound leg says nothing about whether that address is dialable.');
     });
 
     test(
@@ -964,6 +1052,78 @@ void main() {
       expect(hostApi.calls.where((c) => c == 'connect:$friendRemoteId'),
           hasLength(1));
     });
+
+    test('closed trust scans ONLY for its friends\' derived UUIDs', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      expect(hostApi.scanRequests, hasLength(1));
+      final request = hostApi.scanRequests.single;
+      // The prefix stays — it is what makes the filter a Grassroots filter —
+      // but the scan now carries the friend's candidate UUIDs, so a stranger's
+      // advertisement is dropped by the scanner and never reaches us.
+      expect(request.serviceUuidPrefix,
+          equals(GrassrootsIdentity.grassrootsUuidPrefix));
+      expect(
+        request.serviceUuids.map((u) => u!.toLowerCase()).toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
+
+    test('closed trust with no friends does not scan at all', () async {
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // An unfiltered prefix scan here would surface exactly the strangers
+      // closed trust exists to ignore, so we scan nothing.
+      expect(hostApi.scanRequests, isEmpty);
+      expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty);
+      expect(hostApi.calls, contains('stopScan'));
+      // Advertising continues regardless: a friend added later must still be
+      // able to find US, and being findable is not the same as meeting.
+      expect(hostApi.calls.where((c) => c.startsWith('startAdvertising:')),
+          hasLength(1));
+    });
+
+    test('open trust never filters the scan to friends', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // Filtering to friends is the behaviour open trust exists to refuse.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(hostApi.scanRequests.single.serviceUuids, isEmpty);
+    });
+
+    test('closing trust at runtime re-filters the live scan at once', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      await transport.start();
+      hostApi.scanRequests.clear();
+
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      await transport.applyTrustModeChange();
+
+      // Waiting for the scan watchdog would leave the node meeting strangers
+      // for up to a silence window after the user asked it to stop.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(
+        hostApi.scanRequests.single.serviceUuids
+            .map((u) => u!.toLowerCase())
+            .toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
   });
 
   group('BleTransportService — symmetric connection invariants', () {
@@ -1307,5 +1467,197 @@ void main() {
           reason: 'With no stranded reverse leg the scan stays unfiltered so '
               'new peers keep being discovered.');
     });
+  });
+
+  group('BleTransportService — retry on the pair\'s other leg', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Sender'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      addTearDown(transport.dispose);
+    });
+
+    /// A converged pair: both GATT legs ready and both attributed to one
+    /// identity, which is the only state in which a fallback is possible.
+    Future<GrassrootsIdentity> convergedPair({
+      String centralPathId = 'central:PAIR',
+      String peripheralPathId = 'peripheral:PAIR',
+      int centralMtu = 247,
+      int peripheralMtu = 247,
+    }) async {
+      final peer = await _makeIdentity('PairPeer');
+      callbacks.pushPath(BlePath(
+        pathId: centralPathId,
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: centralMtu,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: peripheralPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: peripheralMtu,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: centralPathId,
+        blePeripheralDeviceId: peripheralPathId,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      return peer;
+    }
+
+    test("a refused write falls back to the pair's OTHER leg", () async {
+      await convergedPair();
+      // The flood prefers our peripheral leg, and the peripheral leg is the
+      // one with no queue behind it — so it is the one that refuses first.
+      hostApi.refuse.add('peripheral:PAIR');
+
+      final aired = await transport.broadcast(Uint8List(40));
+
+      expect(aired, 1,
+          reason: 'The neighbour was reached — on the other leg, but reached.');
+      expect(hostApi.calls, [
+        'send:peripheral:PAIR:40',
+        'send:central:PAIR:40',
+      ], reason: 'Refused on the preferred leg, then written on the other. '
+          'The order matters: the fallback is a consequence of the failure, '
+          'never a second copy sent alongside the first.');
+    });
+
+    test('a raw blob is written at the ATT ceiling plus the arm delta',
+        () async {
+      final peer = await convergedPair(peripheralMtu: 247);
+      final peerHex = peer.publicKey
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+
+      // 247 − 3 = 244 is the ceiling: one opcode byte and two handle bytes
+      // come out of every ATT write.
+      final atCeiling =
+          await transport.sendRawBlob(peerHex: peerHex, leg: 'notify', seq: 0);
+      expect(atCeiling, 244);
+
+      // The arm variable straddles it. −8 is where the fragment budget sits
+      // today; +1 is the first byte that should not survive on real hardware.
+      final under = await transport.sendRawBlob(
+          peerHex: peerHex, leg: 'notify', seq: 1, sizeDelta: -8);
+      expect(under, 236);
+      final over = await transport.sendRawBlob(
+          peerHex: peerHex, leg: 'notify', seq: 2, sizeDelta: 1);
+      expect(over, 245);
+
+      expect(hostApi.calls, [
+        'send:peripheral:PAIR:244',
+        'send:peripheral:PAIR:236',
+        'send:peripheral:PAIR:245',
+      ], reason: 'the delta must reach the wire, not just the return value');
+    });
+
+    test('a raw blob sizes off the NEGOTIATED mtu, not the requested one',
+        () async {
+      // The whole point of the probe: 247 is what the transport asks for. A
+      // pair that settles lower is exactly the case the fragment budget's
+      // margin exists to cover, so the blob has to follow the real mtu.
+      final peer = await convergedPair(peripheralMtu: 185);
+      final peerHex = peer.publicKey
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+
+      final size =
+          await transport.sendRawBlob(peerHex: peerHex, leg: 'notify', seq: 0);
+      expect(size, 182);
+      expect(hostApi.calls, ['send:peripheral:PAIR:182']);
+    });
+
+    test('a write that succeeds never touches the second leg', () async {
+      await convergedPair();
+      final aired = await transport.broadcast(Uint8List(40));
+      expect(aired, 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:40'],
+          reason: 'One leg per peer per flood: the same bytes on both legs is '
+              'double airtime for a copy the packetId bloom drops.');
+    });
+
+    test('both legs refusing reports the neighbour as not reached', () async {
+      await convergedPair();
+      hostApi.refuse.addAll({'peripheral:PAIR', 'central:PAIR'});
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Each leg is tried exactly once — no retry loop.');
+    });
+
+    test('sendToPeer falls back too (sync conveyance, directed sends)',
+        () async {
+      await convergedPair();
+      hostApi.refuse.add('central:PAIR');
+      expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
+      expect(hostApi.calls.last, 'send:peripheral:PAIR:40');
+    });
+
+    test('no fallback onto a leg that would truncate the packet', () async {
+      // The legs negotiate their MTUs separately, and on iOS the notify limit
+      // is a per-central property. A 200-byte packet fits the peripheral leg
+      // and not the central one; retrying there would put an unparseable
+      // write on the air and count it as a success.
+      await convergedPair(centralMtu: 23, peripheralMtu: 247);
+      hostApi.refuse.add('peripheral:PAIR');
+      expect(await transport.broadcast(Uint8List(200)), 0);
+      expect(hostApi.calls, ['send:peripheral:PAIR:200'],
+          reason: 'The undersized leg is not attempted at all.');
+    });
+
+    test('an unidentified path gets no fallback', () async {
+      // Two ready legs, no ANNOUNCE on either: they cannot be shown to belong
+      // to the same peer, and a "fallback" onto a stranger's leg would send
+      // this packet to someone the flood did not choose.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:UNKNOWN-A',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: 247,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:UNKNOWN-B',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      hostApi.refuse.addAll({'central:UNKNOWN-A', 'peripheral:UNKNOWN-B'});
+
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Both unidentified legs are flood targets in their own '
+              'right, but neither is the other one\'s fallback.');
+    });
+
   });
 }

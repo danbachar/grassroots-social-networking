@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:redux/redux.dart';
-import '../mesh/bloom_filter.dart';
+import '../mesh/seen_packets.dart';
+import '../mesh/delivered_messages.dart';
 import '../mesh/dtn_store.dart';
+import '../mesh/gcs_filter.dart';
 import '../mesh/sync_codec.dart';
 import '../trace/experiment_recorder.dart';
 import '../models/identity.dart';
@@ -21,7 +23,7 @@ import 'package:flutter/foundation.dart';
 /// Responsibilities:
 /// - ANNOUNCE self-signature verification (all other packets carry no wire
 ///   signature and authenticate end-to-end via Noise/trial-decrypt)
-/// - Packet deduplication (via BloomFilter)
+/// - Packet deduplication (via the age-bounded seen-packetId set)
 /// - ANNOUNCE decoding and Redux dispatch
 /// - MESSAGE targeting (is-for-us check)
 /// - Fragment reassembly delegation
@@ -47,8 +49,13 @@ class MessageRouter {
   final FragmentHandler fragmentHandler;
 
   /// Wire-packet dedup: "have I already seen this exact wire packet?" — gates
-  /// relay/loop prevention, keyed on the outer `packetId`.
-  final BloomFilter _seenPackets = BloomFilter();
+  /// relay/loop prevention, keyed on the outer `packetId`. Age-bounded, NOT a
+  /// rotating bloom: a wholesale clear under load forgot seen ids and let an
+  /// already-relayed packet be re-admitted, re-stored and re-circulated (12x
+  /// airtime in the GCS arm). It outlives the DTN buffer for the same reason
+  /// [DeliveredMessages] does — a copy can only reach us while a buffer holds
+  /// it. See [SeenPackets].
+  final SeenPackets _seenPackets = SeenPackets();
 
   /// Delivery dedup: "have I already delivered this logical message to the
   /// app?" — keyed on the inner frame `messageId`. This MUST be a separate set
@@ -57,20 +64,13 @@ class MessageRouter {
   /// sharing one filter would let the relay-dedup insert of `packetId` poison
   /// the delivery check and the message would be dropped as a "duplicate" on
   /// its very first receipt (ACKed but never shown).
-  final BloomFilter _deliveredMessages = BloomFilter();
+  final DeliveredMessages _deliveredMessages = DeliveredMessages();
 
   /// Store-carry-forward cache: packets held for recipients not currently in
   /// range. Conveyed ONLY through the sync exchange — a peer offers the ids it
   /// carries and the other side requests what its seen-set lacks. Nothing is
-  /// ever pushed blindly on connect (see [buildSyncOffers]).
+  /// ever pushed blindly on connect (see [buildSyncFilter]).
   final DtnStore _dtnStore = DtnStore();
-
-  /// Per-neighbor relay budget (managed-flooding abuse cap). A single inbound
-  /// neighbor may have at most [_maxRelaysPerWindow] packets relayed on its
-  /// behalf per [_relayWindow]; excess is dropped.
-  static const Duration _relayWindow = Duration(seconds: 10);
-  static const int _maxRelaysPerWindow = 512;
-  final Map<String, _RelayBudget> _relayBudgets = {};
 
   /// Called when a message is received. [transport] is the transport the packet
   /// actually arrived on — authoritative, taken from the receive path rather
@@ -83,14 +83,6 @@ class MessageRouter {
 
   /// Called when a read receipt is received
   void Function(String messageId)? onReadReceiptReceived;
-
-  /// DEBUG/TESTBED. A peer broadcast a run start for [expId]. Fired for an
-  /// authenticated sender only; acting on it is the coordinator's call.
-  void Function(String expId, Uint8List senderPubkey)? onTestbedStart;
-
-  /// DEBUG/TESTBED. A peer's gossiped neighbour list (armed-time only).
-  void Function(Uint8List senderPubkey, int seq, List<Uint8List> neighbours)?
-      onTestbedNeighbours;
 
   /// Called when a peer ANNOUNCE is processed (new or updated peer).
   /// [udpPeerId] is the transport-level peer identifier (tempKey for incoming
@@ -159,21 +151,17 @@ class MessageRouter {
   Future<(GrassrootsPacket, Uint8List)?> Function(GrassrootsPacket packet)?
       trialDecrypt;
 
-  /// Relays a packet into the BLE mesh by managed flooding — rebroadcast to all
-  /// neighbors except [excludeBlePeerId] (the inbound path). The coordinator
-  /// wires this to the BLE transport's broadcast.
-  void Function(GrassrootsPacket packet, {String? excludeBlePeerId})? onRelay;
-
   /// Sends a sync-on-connect packet (a conveyed buffered copy) back over
   /// [SyncLink] — directed at that one authenticated peer, never flooded. The
   /// coordinator routes by the link's transport.
   void Function(GrassrootsPacket packet, SyncLink link)? onSyncSend;
 
-  /// Seals a sync control frame ([ContentType.syncOffer]/[ContentType.
-  /// syncRequest]) to the link's peer and sends it back over the link. The
-  /// coordinator owns the Noise sessions, so sealing happens there.
-  void Function(ContentType type, Uint8List payload, SyncLink link)?
-      onSyncFrame;
+  /// Writes a sealed packet directly on a live BLE leg to [recipientPubkey],
+  /// or returns false when no such leg exists. Injected by the coordinator
+  /// (which owns the transport); used by [dispatchOutbound] so the ROUTER —
+  /// not the packet's creator — decides direct-write vs buffer-only.
+  Future<bool> Function(Uint8List recipientPubkey, GrassrootsPacket sealed)?
+      directSend;
 
   /// Convenience accessor for peers state
   PeersState get _peersState => store.state.peers;
@@ -209,6 +197,10 @@ class MessageRouter {
     // silent: a custody `store` with no `end` was ambiguous between "still
     // held" and "gone". Now every exit is a custody `end` with a reason.
     _dtnStore.onDrop = (reason, recipientHex, packet) {
+      // Tell the sender's index first, and unconditionally: this is a
+      // correctness path, not a tracing one, so it must not sit behind the
+      // `trace.active` return below.
+      onBufferedPacketDropped?.call(packet.packetId);
       if (!(trace?.active ?? false)) return;
       unawaited(trace!.log({
         'type': 'custody',
@@ -249,11 +241,13 @@ class MessageRouter {
   int get dtnBufferedRecipients => _dtnStore.recipientCount;
   int get dtnBufferedBytes => _dtnStore.totalBytes;
 
-  /// Store-wide packet ceiling. Anything indexed against the buffer (notably
-  /// the sender's messageId → packetIds map) must be sized from this: an index
-  /// entry is dead the moment its last packet leaves the store, and no more
-  /// than this many packets can be live at once.
-  int get dtnCapacity => _dtnStore.maxTotal;
+  /// A buffered packet left the store WITHOUT an ACK (age expiry or an
+  /// eviction). The sender's messageId → packetIds index subscribes to this
+  /// so it can forget the entry: an index entry is dead the moment its last
+  /// packet leaves the store, and an index that only ever drained on ACK
+  /// filled with dead entries and then evicted LIVE ones — which is exactly
+  /// what turns ACK-driven buffer release off.
+  void Function(String packetId)? onBufferedPacketDropped;
 
   // ===== Unified Packet Processing =====
 
@@ -279,9 +273,18 @@ class MessageRouter {
     final rxAt = DateTime.now().millisecondsSinceEpoch;
     // ANNOUNCE: neighbor-local presence, self-authenticating (its payload
     // signature is verified in decodeAnnounce). Never deduped or relayed.
+    //
+    // ANNOUNCE and the Noise handshake are the two cleartext, neighbour-local
+    // types that are fragmented to the per-leg BLE MTU on the send side (a
+    // friend ANNOUNCE with address candidates overflows the common 247 MTU).
+    // The neighbour is the endpoint, so reassemble here before dispatch; the
+    // handlers read the ORIGINAL payload with no frag header. A single-fragment
+    // set returns immediately; an incomplete one returns null and we wait.
     if (packet.type == PacketType.announce) {
+      final whole = _reassembleNeighbour(packet);
+      if (whole == null) return;
       _handleAnnounce(
-        packet,
+        whole,
         transport: transport,
         bleDeviceId: bleDeviceId,
         bleRole: bleRole,
@@ -296,8 +299,10 @@ class MessageRouter {
     // relayed.
     if (packet.type == PacketType.noiseHandshake) {
       if (!_isForUs(packet)) return;
+      final whole = _reassembleNeighbour(packet);
+      if (whole == null) return;
       await onNoiseHandshakeReceived?.call(
-        packet,
+        whole,
         transport,
         peerId: udpPeerId ?? bleDeviceId,
       );
@@ -307,9 +312,24 @@ class MessageRouter {
 
     final forUs = _isForUs(packet);
 
-    // The BloomFilter is the "seen packetId" set: it both prevents relay loops
-    // (relay each packet at most once) and gates re-processing.
-    final firstSeen = !_seenPackets.checkAndAdd(packet.packetId);
+    // Two thresholds, and they are tested against different values because
+    // they are different acts. DELIVERING is not a hop: it is judged on the
+    // TTL as it arrived, which need only be >= 0, so a packet that reaches
+    // the node it is addressed to with nothing left is still delivered.
+    // FORWARDING is a hop: it subtracts one first and needs the result above
+    // zero, since anything else would put a dead packet on the air.
+    if (packet.ttl < 0) {
+      _traceDrop('rx', 'ttlExhausted', {
+        'packetId': packet.packetId,
+        'forUs': forUs,
+      });
+      return;
+    }
+
+    // The seen-packetId set both prevents relay loops (relay each packet at
+    // most once) and gates re-processing.
+    final firstSeen =
+        !_seenPackets.checkAndAdd(packet.packetId, packet.createdAtMs);
 
     if (forUs && !firstSeen && (trace?.active ?? false)) {
       // A redundant copy of a packet addressed to us arrived (dual-leg
@@ -329,9 +349,17 @@ class MessageRouter {
     if (!forUs) {
       // Open managed flooding: forward the sealed, sender-anonymous packet
       // toward its recipient, unverified and without decrypting. Only the first
-      // sighting is relayed; TTL bounds the hop count; a per-neighbor budget
-      // caps flooding abuse.
-      if (firstSeen && packet.ttl <= 1) {
+      // sighting is relayed and TTL bounds the hop count — those two are the
+      // whole bound on the flood.
+      // A node refuses a relay whose count has ALREADY reached 0; anything
+      // above that is accepted, decremented, and forwarded once. So a packet
+      // with one hop left is still passed on — it goes out at 0, which is
+      // useful precisely because the destination is exempt from this check:
+      // that last broadcast can still be accepted by a neighbour who is the
+      // recipient. It simply cannot be relayed again after that.
+      final relayAllowed = firstSeen && packet.ttl > 0;
+
+      if (firstSeen && packet.ttl <= 0) {
         // The flood dies here: hop budget exhausted on a first sighting.
         // Previously fully silent — the one place a multi-hop delivery
         // failure leaves evidence on the node that killed it.
@@ -339,31 +367,33 @@ class MessageRouter {
           'packetId': packet.packetId,
           'fromPeer': _peerHexForBleDevice(bleDeviceId),
         });
-      } else if (firstSeen && !_allowRelayFrom(bleDeviceId)) {
-        // Refused by the per-neighbour budget: not relayed AND not carried
-        // (carry lives inside the relay branch, deliberately).
-        _traceDrop('relay', 'rateLimited', {
-          'packetId': packet.packetId,
-          'fromPeer': _peerHexForBleDevice(bleDeviceId),
-        });
-      } else if (firstSeen && packet.ttl > 1 && _allowRelayFrom(bleDeviceId)) {
-        onRelay?.call(
-          packet.decrementTtl(),
-          excludeBlePeerId:
-              transport == PeerTransport.bleDirect ? bleDeviceId : null,
-        );
+      } else if (relayAllowed) {
+        // ONE decrement per arrival. The hopped copy is what we hold, and it
+        // is what a later conveyance sends: storing the packet as received
+        // would make the buffered copy a hop richer and it would pay for this
+        // same arrival a second time on the way out.
+        final hopped = packet.decrementTtl();
 
-        // Store-carry-forward: if the recipient isn't a currently-reachable
-        // peer, cache the sealed packet and re-flood it when they reappear.
+        // NO FLOOD. A transit packet is taken into custody and leaves only
+        // when a neighbour asks for it by packetId in a sync exchange. The
+        // node does not push it at anyone.
+        //
+        // Which is why this stores UNCONDITIONALLY, where the flooding design
+        // stored only when the recipient was out of reach: back then the
+        // flood covered the reachable case and the buffer was the exception
+        // path. With nothing pushing, a packet this node did not keep is a
+        // packet it can never offer onward — it would die here — so the
+        // buffer is now the ONLY path and every transit packet with TTL left
+        // belongs in it.
         final recipientHex = _recipientHex(packet);
-        final carried = recipientHex != null && !_recipientReachable(packet);
+        final carried = recipientHex != null;
         if (carried) {
-          _dtnStore.store(recipientHex, packet);
+          _dtnStore.store(recipientHex, hopped);
         }
         if (trace?.active ?? false) {
-          // The relay's own view: this node forwarded someone else's sealed
-          // packet. Joining these across devices by packetId reconstructs the
-          // actual path a message took through the mesh (multi-hop evidence).
+          // The relay's own view: this node took someone else's sealed packet
+          // into custody. Joining these across devices by packetId
+          // reconstructs the actual path a message took through the mesh.
           // The envelope is sender-anonymous, so we can only report the
           // neighbour we received FROM — which is exactly the topology edge.
           unawaited(trace!.log({
@@ -489,49 +519,42 @@ class MessageRouter {
           observedIp: observedIp,
           observedPort: observedPort,
         );
-      case ContentType.syncOffer:
-        // Buffer reconciliation is a MESH mechanism: BLE only. UDP is
-        // direct point-to-point and moves nothing out of the buffer — it
-        // neither
-        // relays for third parties nor delivers held packets, so a sync
-        // frame arriving over it is not something we participate in. The
-        // reply link carries the authenticated peer (trial decrypt proved
-        // it), so replies never depend on a transport-level id lookup.
+      case ContentType.syncFilter:
+        // Buffer reconciliation is a MESH mechanism: BLE only. UDP is direct
+        // point-to-point and moves nothing out of the buffer — it neither
+        // relays for third parties nor delivers held packets, so a sync frame
+        // arriving over it is not something we participate in. The reply link
+        // carries the authenticated peer (trial decrypt proved it), so
+        // conveyances never depend on a transport-level id lookup.
         if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
-          _handleSyncOffer(frame.chunk, SyncLink(senderPubkey, bleDeviceId));
-        }
-      case ContentType.syncRequest:
-        if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
-          _handleSyncRequest(
-              frame.chunk, SyncLink(senderPubkey, bleDeviceId));
-        }
-      case ContentType.testbedStart:
-        // DEBUG/TESTBED. The sender is authenticated (this decrypted under
-        // their session); whether to act is the coordinator's decision — it
-        // ignores the signal unless the runner was explicitly armed.
-        final expId = String.fromCharCodes(frame.chunk);
-        if (trace?.active ?? false) {
-          unawaited(trace!.log({
-            'type': 'runner',
-            't': DateTime.now().millisecondsSinceEpoch,
-            'event': 'startRx',
-            'exp': expId,
-            'peer': _pubkeyToHex(senderPubkey),
-          }));
-        }
-        onTestbedStart?.call(expId, senderPubkey);
-      case ContentType.testbedNeighbours:
-        // DEBUG/TESTBED. Armed-time only; the coordinator drops it outright
-        // once a run is under way, so it can never share the air with a
-        // measurement.
-        try {
-          final (seq, peers) =
-              ProtocolHandler.decodeTestbedNeighbours(frame.chunk);
-          onTestbedNeighbours?.call(senderPubkey, seq, peers);
-        } on FormatException catch (e) {
-          _traceDrop('neighbourGossip', 'malformed', {'error': e.message});
+          _handleSyncFilter(frame.chunk, SyncLink(senderPubkey, bleDeviceId));
         }
     }
+  }
+
+  /// Reassemble a fragmented neighbour-local packet (ANNOUNCE / handshake).
+  /// The payload is a CLEARTEXT [SecureFrame]; [FragmentHandler.accept]
+  /// reassembles by its globally-unique messageId (a single-fragment frame
+  /// returns immediately). Returns a packet identical to [packet] but with the
+  /// reassembled ORIGINAL payload (frame stripped), or null while fragments are
+  /// outstanding. A malformed frame is traced and dropped, not crashed.
+  GrassrootsPacket? _reassembleNeighbour(GrassrootsPacket packet) {
+    final Uint8List? whole;
+    try {
+      final frame = SecureFrame.decode(packet.payload);
+      whole = fragmentHandler.accept(frame);
+    } on FormatException catch (e) {
+      debugPrint('Dropping malformed neighbour fragment ${packet.type}: $e');
+      _traceDrop('neighbourFragment', 'malformed', {
+        'packetId': packet.packetId,
+        'type': packet.type.name,
+      });
+      return null;
+    }
+    if (whole == null) return null;
+    // Same packet, reassembled payload. A single-fragment frame is the common
+    // case and this rebuild is cheap.
+    return packet.copyWith(payload: whole);
   }
 
   // ===== Handlers =====
@@ -695,7 +718,19 @@ class MessageRouter {
           'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
           'payloadSize': payload.length,
           'receivedAt': now,
+          // The copy that actually ARRIVED, so the delivery can be joined to
+          // the hand-off that produced it — the conveying node's `custody
+          // convey` or the relaying node's `relay` record, both keyed by
+          // packetId. Without it a delivery named only a messageId and the
+          // join had to detour through the sender's `sealed` record, which is
+          // on a different device and absent if that device never uploaded.
+          // For a fragmented message this is the LAST fragment to land.
+          'packetId': packet.packetId,
+          'ttl': packet.ttl,
           'relayHops': relayHops,
+          // Derived from relayHops, so it is a relabelling and NOT independent
+          // evidence: it cannot tell a carried delivery from a flooded one.
+          // Use the packetId join above for that.
           'deliveryMethod': relayHops <= 0 ? 'direct' : 'relayed',
           // The FINAL topology edge: the neighbour that handed us the packet,
           // which is the original sender only on a direct delivery. `peer`
@@ -822,27 +857,7 @@ class MessageRouter {
     return r == null ? null : _pubkeyToHex(r);
   }
 
-  bool _recipientReachable(GrassrootsPacket packet) {
-    final r = packet.recipientPubkey;
-    if (r == null) return false;
-    return _peersState.getPeerByPubkey(r)?.isReachable ?? false;
-  }
 
-  /// Per-neighbor flooding cap. Returns false when the inbound neighbor has had
-  /// too many packets relayed on its behalf this window.
-  bool _allowRelayFrom(String? inboundPeerId) {
-    if (inboundPeerId == null) return true; // unattributable (e.g. UDP)
-    final now = DateTime.now();
-    final budget =
-        _relayBudgets.putIfAbsent(inboundPeerId, () => _RelayBudget(now));
-    if (now.difference(budget.windowStart) > _relayWindow) {
-      budget.windowStart = now;
-      budget.count = 0;
-    }
-    if (budget.count >= _maxRelaysPerWindow) return false;
-    budget.count++;
-    return true;
-  }
 
   static bool _pubkeysEqual(Uint8List a, Uint8List b) {
     if (a.length != b.length) return false;
@@ -893,14 +908,15 @@ class MessageRouter {
 
   // ===== Deduplication API =====
 
-  /// Mark a packet ID as seen (e.g., for outgoing packets)
-  void markSeen(String packetId) {
-    _seenPackets.add(packetId);
+  /// Mark a packet ID as seen (e.g., for outgoing packets). [createdAtMs] is
+  /// the packet's own creation stamp — the seen set is windowed by it.
+  void markSeen(String packetId, int createdAtMs) {
+    _seenPackets.add(packetId, createdAtMs);
   }
 
   /// Check if a packet ID has been seen before
   bool isDuplicate(String packetId) {
-    return _seenPackets.mightContain(packetId);
+    return _seenPackets.contains(packetId);
   }
 
   /// Buffer a self-originated sealed packet — the sender holds its own
@@ -923,7 +939,47 @@ class MessageRouter {
     }
     // Our own sealed packets count as seen: a copy conveyed back to us by a
     // relay must not be re-relayed as a fresh sighting.
-    _seenPackets.add(sealedPacket.packetId);
+    _seenPackets.add(sealedPacket.packetId, sealedPacket.createdAtMs);
+  }
+
+  /// THE outbound path for every self-originated sealed packet — message, ACK,
+  /// read receipt, anything recipient-addressed. The creator seals and hands
+  /// the packet here; the ROUTER decides how it travels. There is no
+  /// per-content-type delivery path.
+  ///
+  /// The decision is by CONNECTIVITY, exclusive:
+  ///  - Recipient is a directly connected neighbour and the write got in →
+  ///    the packet went on the air now and is NOT buffered. Direct delivery
+  ///    is not the blind push the no-flood rule forbids: that rule is about
+  ///    RELAYED packets, where a holder cannot know what a neighbour already
+  ///    has. A just-created packet is one the recipient definitionally lacks.
+  ///  - Otherwise (no live leg, BLE down, or the write was refused) → the
+  ///    packet enters the DTN buffer and leaves via a future sync exchange —
+  ///    store-carry-forward is FOR the recipient that cannot be reached right
+  ///    now.
+  ///
+  /// Either way the packet enters our seen-set, so a copy conveyed back to us
+  /// is never re-relayed as a fresh sighting.
+  ///
+  /// Returns whether the packet went on the air now (false = buffered).
+  Future<bool> dispatchOutbound(
+      Uint8List recipientPubkey, GrassrootsPacket sealedPacket) async {
+    final send = directSend;
+    if (send != null && await send(recipientPubkey, sealedPacket)) {
+      _seenPackets.add(sealedPacket.packetId, sealedPacket.createdAtMs);
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'custody',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'direct',
+          'packetId': sealedPacket.packetId,
+          'recipient': _pubkeyToHex(recipientPubkey),
+        }));
+      }
+      return true;
+    }
+    storeInDtnBuffer(recipientPubkey, sealedPacket);
+    return false;
   }
 
   /// Drop [packetIds] from the DTN memory buffer — the recipient ACKed the
@@ -942,6 +998,15 @@ class MessageRouter {
       }
     }
   }
+
+  /// Every packet currently in custody, across recipients. Test inspection
+  /// only — in production the buffer is read exclusively by the sync
+  /// offer/request exchange.
+  @visibleForTesting
+  List<GrassrootsPacket> get dtnBufferedPackets => [
+        for (final id in _dtnStore.carriedPacketIds())
+          if (_dtnStore.packetById(id) != null) _dtnStore.packetById(id)!,
+      ];
 
   /// All buffered packets held for [recipientPubkey] (own + relayed). Test
   /// inspection only — in production, buffered packets move exclusively
@@ -970,87 +1035,157 @@ class MessageRouter {
   // sealed end-to-end and no buffer entry is ever *transferred*, only
   // replicated.
 
-  /// Build the sync offer packets advertising packetIds currently in the DTN
-  /// store (chunked to fit single BLE writes). Empty when carrying nothing —
-  /// the common case, costing zero packets.
+  /// How far this node's buffer sweep has advanced, in originator-stamped
+  /// creation-milliseconds. Each round advertises the oldest held packets at
+  /// or after the cursor (up to one filter's worth), then advances the cursor
+  /// past them; when it passes the newest held packet it wraps to 0 and
+  /// re-sweeps. One global position, not per-peer: consecutive neighbours in
+  /// the same announce round get consecutive slices, which spreads coverage
+  /// across the fleet rather than sending everyone the same slice.
+  int _syncCursorMs = 0;
+
+  /// Most packets one filter response may convey before it stops and lets the
+  /// rest ride the next round. A single filter must not be able to pull a
+  /// whole buffer in one exchange — that is the airtime the id-list offer
+  /// spent and the filter exists to avoid. The remainder is not lost: the
+  /// cursor keeps sweeping and the peer re-advertises next announce.
+  static const int _maxConveyPerFilter = 64;
+
+  /// Build the GCS filter frame advertising what this node has SEEN — the
+  /// compact "do not resend me these" the peer answers by conveying only what
+  /// this node has never seen.
   ///
-  List<Uint8List> buildSyncOffers() {
-    final ids = _dtnStore.carriedPacketIds();
-    if (ids.isEmpty) return const [];
-    return buildSyncPayloads(ids);
+  /// Advertising SEEN, not HELD, is the whole point. A held-filter re-pushes the
+  /// backlog to a node that already delivered a message and dropped it from its
+  /// buffer — it says "I hold nothing, send me everything" — which measured
+  /// 12.76 copies/msg on the air. The seen set (see [SeenPackets]) outlives the
+  /// buffer, so an emptied node still says "I have seen these," and the
+  /// responder conveys nothing it already handed on.
+  ///
+  /// This replaces the explicit id-list offer wholesale. There is no decline
+  /// state and no open-round bookkeeping: the filter carries what the ASKER has
+  /// seen, so a converged pair falls silent by construction — the peer computes
+  /// the empty difference and sends nothing. Nothing is inferred from silence,
+  /// so the incomplete-round rule the id-list offer needed is gone with it.
+  ///
+  /// The window `[fromMs, toMs]` is the load-bearing part. A filter that
+  /// covers only a slice of the buffer must not provoke the peer to re-send
+  /// everything outside that slice, so the peer answers ONLY from packets
+  /// whose creation time falls in the window (see [_handleSyncFilter]). The
+  /// window's upper bound is the creation stamp of the last packet that fit
+  /// the filter, cut on a whole-millisecond boundary by [DtnStore.windowFrom]
+  /// so it never splits a group sharing one stamp.
+  ///
+  /// Returns null when there is nothing to say — but a node holding nothing
+  /// still advertises an empty filter over all time, so a neighbour pushes it
+  /// the backlog it lacks; that is exactly the fresh/emptied node that
+  /// store-carry-forward exists to fill.
+  Uint8List? buildSyncFilter(Uint8List peerPubkey) {
+    var from = _syncCursorMs;
+    var ids = _seenPackets.windowFrom(from, limit: GcsFilter.maxElements);
+    if (ids.isEmpty) {
+      // Swept past the newest seen packet (or have seen none): wrap and try
+      // from the oldest so the sweep is continuous.
+      from = 0;
+      ids = _seenPackets.windowFrom(0, limit: GcsFilter.maxElements);
+    }
+    if (ids.isEmpty) {
+      // Genuinely seen nothing (a fresh node). Advertise "I have nothing,
+      // across all time" so a neighbour sends whatever it carries; its own
+      // rate cap bounds the round. Leave the cursor at 0.
+      _syncCursorMs = 0;
+      return encodeSyncFilter(
+          n: 0, fromMs: 0, toMs: _nowMs(), filter: Uint8List(0));
+    }
+    final toMs = ids.last.createdAtMs;
+    final built = GcsFilter.build([for (final e in ids) e.id]);
+    // Advance past this slice; wrap when it reaches the end on the next call.
+    _syncCursorMs = toMs + 1;
+    return encodeSyncFilter(
+        n: built.n, fromMs: from, toMs: toMs, filter: built.data);
   }
 
-  /// A neighbor offered the packetIds it carries: request the ones our
-  /// seen-set lacks. A bloom false positive skips a packet we actually lack —
-  /// healed by the next contact or the recipient-triggered flush.
-  void _handleSyncOffer(Uint8List payload, SyncLink link) {
-    final List<String> offered;
-    try {
-      offered = decodeSyncIds(payload);
-    } on FormatException catch (e) {
-      debugPrint('[sync] Malformed offer from ${link.bleDeviceId}: $e');
-      _traceDrop('sync', 'malformedOffer', {'peer': _pubkeyToHex(link.peerPubkey)});
-      return;
-    }
-    final wanted =
-        offered.where((id) => !_seenPackets.mightContain(id)).toList();
-    if (wanted.isEmpty) return;
-    debugPrint(
-        '[sync] Requesting ${wanted.length}/${offered.length} offered '
-        'packet(s) from ${link.bleDeviceId}');
-    for (final payload in buildSyncPayloads(wanted)) {
-      onSyncFrame?.call(ContentType.syncRequest, payload, link);
-    }
-  }
+  int _nowMs() => DateTime.now().millisecondsSinceEpoch;
 
-  /// A neighbor requested packets from our offer: convey each one we still
-  /// carry, directed over that link. Conveyance counts against the
-  /// requester's per-neighbor relay budget — sync must not be a way around
-  /// the flooding cap. Ids expired/evicted since the offer are skipped.
-  void _handleSyncRequest(Uint8List payload, SyncLink link) {
-    final List<String> requested;
+  /// A neighbour advertised what it holds as a GCS filter over a time window.
+  /// Send it every packet WE hold in that window whose id the filter proves it
+  /// lacks. The window is the neighbour's, not ours: answering outside it
+  /// would re-send packets a capped filter simply could not name.
+  void _handleSyncFilter(Uint8List payload, SyncLink link) {
+    final int n, fromMs, toMs;
+    final Uint8List filterData;
     try {
-      requested = decodeSyncIds(payload);
+      final f = decodeSyncFilter(payload);
+      n = f.n;
+      fromMs = f.fromMs;
+      toMs = f.toMs;
+      filterData = f.filter;
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed request from ${link.bleDeviceId}: $e');
-      _traceDrop('sync', 'malformedRequest', {'peer': _pubkeyToHex(link.peerPubkey)});
+      debugPrint('[sync] Malformed filter from ${link.bleDeviceId}: $e');
+      _traceDrop('sync', 'malformedFilter', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
     }
+    final List<int> values;
+    try {
+      values = GcsFilter.decode(data: filterData, n: n);
+    } on FormatException catch (e) {
+      debugPrint('[sync] Undecodable filter from ${link.bleDeviceId}: $e');
+      _traceDrop('sync', 'malformedFilter', {'peer': _pubkeyToHex(link.peerPubkey)});
+      return;
+    }
+    // Direct delivery to the connected peer outranks relay. Convey packets
+    // ADDRESSED TO this peer first, so when [_maxConveyPerFilter] cuts the
+    // round short, the peer's own packets (its pending message, an ACK owed to
+    // it) are the ones that made it out rather than being starved behind relay
+    // backlog for other recipients. The GCS window stays creation-time ordered
+    // for cross-node agreement — this only reorders WITHIN the window, and
+    // preserves that order inside each group.
+    final peerHex = _pubkeyToHex(link.peerPubkey);
+    final inWindow = _dtnStore.windowBetween(fromMs, toMs);
+    final ordered = [
+      for (final p in inWindow)
+        if (_recipientHex(p) == peerHex) p,
+      for (final p in inWindow)
+        if (_recipientHex(p) != peerHex) p,
+    ];
     var conveyed = 0;
-    for (var i = 0; i < requested.length; i++) {
-      final id = requested[i];
-      final stored = _dtnStore.packetById(id);
-      if (stored == null) {
-        // Expired/evicted since the offer: the requester never learns, and
-        // is healed only by a future contact.
-        _traceDrop('sync', 'staleOffer', {'packetId': id});
+    for (final stored in ordered) {
+      if (GcsFilter.mightContain(values, n, stored.packetId)) {
+        // The filter says the peer (probably) holds it. A false positive here
+        // withholds it for one round and self-heals as the window advances —
+        // the bounded cost of the filter's compactness.
         continue;
       }
-      if (!_allowRelayFrom(link.bleDeviceId)) {
-        // Budget exhausted mid-conveyance: everything after this point in
-        // the request silently waits for the next sync round.
-        _traceDrop('sync', 'budgetExhausted', {
-          'remaining': requested.length - i,
-          'peer': _pubkeyToHex(link.peerPubkey),
-        });
-        break;
-      }
+      // Conveyed AS HELD, exactly as the id-list path did: the buffered packet
+      // already paid its one decrement on arrival, and the node receiving it
+      // pays the next — so a conveyance is a hop and arrives at the TTL stored
+      // here. Nothing unforwardable is in the buffer to convey.
       onSyncSend?.call(stored, link);
       conveyed++;
       if (trace?.active ?? false) {
         unawaited(trace!.log({
           'type': 'custody',
-          't': DateTime.now().millisecondsSinceEpoch,
+          't': _nowMs(),
           'event': 'convey',
-          'packetId': id,
+          'packetId': stored.packetId,
           'toDevice': link.bleDeviceId,
+          'toPeer': _pubkeyToHex(link.peerPubkey),
+          'ttl': stored.ttl,
         }));
+      }
+      if (conveyed >= _maxConveyPerFilter) {
+        // Stop here; the rest ride the peer's next filter. Recorded so a
+        // truncated response is not mistaken for "the peer had everything".
+        _traceDrop('sync', 'conveyCapped', {
+          'peer': _pubkeyToHex(link.peerPubkey),
+          'window': [fromMs, toMs],
+        });
+        break;
       }
     }
     if (conveyed > 0) {
-      debugPrint(
-          '[sync] Conveyed $conveyed/${requested.length} requested '
-          'packet(s) to ${link.bleDeviceId}');
+      debugPrint('[sync] Conveyed $conveyed packet(s) to ${link.bleDeviceId} '
+          'for window [$fromMs, $toMs]');
     }
   }
 
@@ -1061,13 +1196,5 @@ class MessageRouter {
     _seenPackets.clear();
     _deliveredMessages.clear();
     _dtnStore.clear();
-    _relayBudgets.clear();
   }
-}
-
-/// Per-neighbor relay budget window (managed-flooding abuse cap).
-class _RelayBudget {
-  DateTime windowStart;
-  int count = 0;
-  _RelayBudget(this.windowStart);
 }

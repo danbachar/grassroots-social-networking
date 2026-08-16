@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../models/packet.dart';
 import '../models/secure_frame.dart';
 
 /// Splits large payloads into [SecureFrame]s and reassembles them.
@@ -17,13 +18,23 @@ class FragmentHandler {
   /// silently truncated on the wire and the receiver can't parse it. A flooded
   /// packet reaches peers with different MTUs, so we size for the floor MTU we
   /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
-  ///   58 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
-  ///   = 104 bytes.
-  /// So chunk ≤ 244 − 104 = 140; we use 132 for margin (236-byte packet).
+  ///   54 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
+  ///   = 100 bytes.
+  /// So chunk ≤ 244 − 100 = 144; we use 136, holding 8 bytes back.
+  ///
+  /// That 8 is a CHOSEN margin, not a measured one. What it buys is the one
+  /// number here that is not a constant: 247 is the MTU the transport
+  /// *requests*, not necessarily the one a given pair negotiates. A chunk cut
+  /// to exactly 144 truncates silently against any peer that settles below
+  /// 247, and 8 bytes covers down to a 239-byte MTU. Whether such a peer
+  /// exists on real hardware is measurable and, until the ATT-ceiling probe
+  /// runs (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]),
+  /// unmeasured. Reclaiming it is worth ~6% more payload per fragment.
   static const int _bleFloorMtu = 247;
-  static const int _packetFixedOverhead = 58 + 25 + 21; // = 104
+  static const int _packetFixedOverhead =
+      GrassrootsPacket.headerSize + 25 + 21; // = 100
   static const int maxFragmentPayload =
-      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 132
+      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 136
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
   /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a
@@ -66,16 +77,29 @@ class FragmentHandler {
 
   /// Build the [SecureFrame]s carrying [payload] under [messageId].
   ///
-  /// A payload at or below [fragmentThreshold] yields a single frame
-  /// (`fragCount == 1`); larger payloads are chunked at [maxFragmentPayload].
-  /// The caller seals each frame into its own [PacketType.secure] packet and
-  /// floods them [fragmentDelay] apart.
+  /// A payload at or below the chunk budget yields a single frame
+  /// (`fragCount == 1`); larger payloads are chunked at the budget. The caller
+  /// seals each frame into its own [PacketType.secure] packet and floods them
+  /// [fragmentDelay] apart.
+  ///
+  /// [chunkBudget] overrides the chunk size AND the single-vs-multi threshold.
+  /// Null (the default) is the sealed end-to-end path, sized to the floor MTU
+  /// ([maxFragmentPayload]). A caller passes an explicit budget to size
+  /// fragments to a specific target's DISCOVERED per-leg MTU — the cleartext,
+  /// neighbour-local path (ANNOUNCE / Noise handshake), where the frame is
+  /// written as `frame.encode()` in the packet payload instead of being sealed.
+  /// Reassembly is identical either way: [accept] keys on the 16-byte
+  /// [SecureFrame.messageId], which is globally unique, so no per-peer keying
+  /// is needed.
   List<SecureFrame> framesFor({
     required Uint8List payload,
     required String messageId,
     ContentType contentType = ContentType.message,
+    int? chunkBudget,
   }) {
-    if (!needsFragmentation(payload)) {
+    final budget = chunkBudget ?? maxFragmentPayload;
+
+    if (payload.length <= budget) {
       return [
         SecureFrame(
           contentType: contentType,
@@ -85,11 +109,11 @@ class FragmentHandler {
       ];
     }
 
-    final total = (payload.length / maxFragmentPayload).ceil();
+    final total = (payload.length / budget).ceil();
     final frames = <SecureFrame>[];
     for (var i = 0; i < total; i++) {
-      final start = i * maxFragmentPayload;
-      final end = (start + maxFragmentPayload).clamp(0, payload.length);
+      final start = i * budget;
+      final end = (start + budget).clamp(0, payload.length);
       frames.add(SecureFrame(
         contentType: contentType,
         messageId: messageId,

@@ -29,6 +29,7 @@ class ChatScreen extends StatefulWidget {
   final Store<AppState> store;
   final VoidCallback? onSendFriendRequest;
   final VoidCallback? onAcceptFriendRequest;
+  final VoidCallback? onCancelFriendRequest;
   final VoidCallback? onUnfriend;
   final String? myUdpAddress;
 
@@ -40,6 +41,7 @@ class ChatScreen extends StatefulWidget {
     required this.store,
     this.onSendFriendRequest,
     this.onAcceptFriendRequest,
+    this.onCancelFriendRequest,
     this.onUnfriend,
     this.myUdpAddress,
   });
@@ -246,9 +248,27 @@ class _ChatScreenState extends State<ChatScreen> {
 
   static const _uuid = Uuid();
 
+  /// Whether we hold a Noise session with this peer, read from the store.
+  ///
+  /// This is the gate on composing, NOT reachability: a session outlives the
+  /// link that formed it, so a peer who has walked out of range is still
+  /// perfectly sendable — the message seals, enters the DTN buffer and is
+  /// carried. What we cannot do is compose for a peer we have never
+  /// handshaked with, because sealing needs a session and no packet may exist
+  /// without one.
+  bool get _hasSession =>
+      widget.store.state.peers.getPeerByPubkey(widget.peer.publicKey)
+          ?.hasNoiseSession ??
+      false;
+
   void _sendMessage() {
     final text = _messageController.text.trim();
     if (text.isEmpty) return;
+
+    // No session, nothing happens — not even locally. Saving the bubble here
+    // and letting the send fail would put a message in the conversation that
+    // never became a packet and never can be one.
+    if (!_hasSession) return;
 
     _messageController.clear();
 
@@ -756,18 +776,28 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
     } else if (_hasPendingOutgoing) {
-      // Waiting for response
+      // Waiting for response — show the pending state and let the sender
+      // withdraw the outstanding request.
       actions.add(
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(Icons.hourglass_empty, size: 16),
-              SizedBox(width: 4),
-              Text('Pending', style: TextStyle(fontSize: 12)),
-            ],
+        const Center(
+          child: Padding(
+            padding: EdgeInsets.only(left: 16),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.hourglass_empty, size: 16),
+                SizedBox(width: 4),
+                Text('Pending', style: TextStyle(fontSize: 12)),
+              ],
+            ),
           ),
+        ),
+      );
+      actions.add(
+        IconButton(
+          icon: const Icon(Icons.cancel_outlined),
+          tooltip: 'Cancel friend request',
+          onPressed: widget.onCancelFriendRequest,
         ),
       );
     }
@@ -1032,14 +1062,22 @@ class _ChatScreenState extends State<ChatScreen> {
                 IconButton(
                   icon: const Icon(Icons.add_photo_alternate_outlined),
                   tooltip: 'Send a picture',
-                  onPressed: _sendingMedia ? null : _openAttachmentSheet,
+                  onPressed: (_sendingMedia || !_hasSession)
+                      ? null
+                      : _openAttachmentSheet,
                 ),
                 Expanded(
                   child: TextField(
                     controller: _messageController,
-                    decoration: const InputDecoration(
-                      hintText: 'Write a message…',
-                      contentPadding: EdgeInsets.symmetric(
+                    // History stays readable without a session; only composing
+                    // is gated. The hint says why, so a disabled composer does
+                    // not read as the app being broken.
+                    enabled: _hasSession,
+                    decoration: InputDecoration(
+                      hintText: _hasSession
+                          ? 'Write a message…'
+                          : 'No session yet — waiting for this peer',
+                      contentPadding: const EdgeInsets.symmetric(
                           horizontal: GlSpace.s4, vertical: GlSpace.s2),
                     ),
                     onSubmitted: (_) => _sendMessage(),
@@ -1052,7 +1090,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     backgroundColor: GlColors.primary,
                     foregroundColor: GlColors.textOnPrimary,
                   ),
-                  onPressed: _sendMessage,
+                  onPressed: _hasSession ? _sendMessage : null,
                 ),
               ],
             ),

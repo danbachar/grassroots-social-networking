@@ -1,7 +1,6 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/grassroots_networking.dart';
-import 'package:grassroots_networking/src/mesh/bloom_filter.dart';
 import 'package:grassroots_networking/src/models/secure_frame.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 
@@ -27,7 +26,6 @@ void main() {
 
       expect(deserialized.type, equals(packet.type));
       expect(deserialized.ttl, equals(packet.ttl));
-      expect(deserialized.timestamp, equals(packet.timestamp));
       expect(deserialized.packetId, equals(packet.packetId));
       expect(deserialized.recipientPubkey, isNull);
       expect(deserialized.payload, equals(packet.payload));
@@ -85,15 +83,43 @@ void main() {
       );
     });
 
-    test('header is 58 bytes (sender-anonymous envelope)', () {
+    test('header is 60 bytes (sender-anonymous envelope + creation time)', () {
       // No sender pubkey and no whole-packet signature on the wire: an
-      // empty-payload packet serializes to exactly the header size.
+      // empty-payload packet serializes to exactly the header size. The 4
+      // bytes over the sender-anonymous minimum are the creation time.
       final packet = GrassrootsPacket(
         type: PacketType.secure,
         payload: Uint8List(0),
       );
-      expect(GrassrootsPacket.headerSize, equals(58));
-      expect(packet.serialize().length, equals(58));
+      expect(GrassrootsPacket.headerSize, equals(60));
+      expect(packet.serialize().length, equals(60));
+    });
+
+    test('the creation time round-trips and is the ORIGINATOR\'s', () {
+      // It is the only age every node can agree on: each node's own storedAt
+      // is its receipt time, so a packet that keeps hopping would restart its
+      // clock at every hop and outlive the buffer's age cap.
+      final packet = GrassrootsPacket(
+        type: PacketType.secure,
+        payload: Uint8List.fromList([1, 2, 3]),
+        createdAtMs: 1786500000123,
+      );
+      final back = GrassrootsPacket.deserialize(packet.serialize());
+      expect(back.createdAtMs, equals(1786500000123));
+    });
+
+    test('a relay hop does NOT re-stamp the creation time', () {
+      // Re-stamping would reset the age at every relay — precisely the bug
+      // the field exists to remove.
+      final packet = GrassrootsPacket(
+        type: PacketType.secure,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1786500000123,
+      );
+      final hopped = packet.decrementTtl();
+      expect(hopped.createdAtMs, equals(1786500000123));
+      expect(GrassrootsPacket.deserialize(hopped.serialize()).createdAtMs,
+          equals(1786500000123));
     });
 
     test('relay-decremented TTL survives a serialize round-trip', () {
@@ -116,66 +142,6 @@ void main() {
       expect(roundTripped.packetId, equals(original.packetId));
       expect(roundTripped.recipientPubkey, equals(recipientPubkey));
       expect(roundTripped.payload, equals(testPayload));
-    });
-  });
-
-  group('BloomFilter', () {
-    test('returns false for items not added', () {
-      final filter = BloomFilter();
-      expect(filter.mightContain('test-item'), isFalse);
-    });
-
-    test('returns true for added items', () {
-      final filter = BloomFilter();
-      filter.add('test-item');
-      expect(filter.mightContain('test-item'), isTrue);
-    });
-
-    test('checkAndAdd returns correct values', () {
-      final filter = BloomFilter();
-
-      // First time - not present
-      expect(filter.checkAndAdd('item1'), isFalse);
-
-      // Second time - already present
-      expect(filter.checkAndAdd('item1'), isTrue);
-
-      // Different item - not present
-      expect(filter.checkAndAdd('item2'), isFalse);
-    });
-
-    test('clears correctly', () {
-      final filter = BloomFilter();
-      filter.add('test-item');
-      expect(filter.mightContain('test-item'), isTrue);
-
-      filter.clear();
-      expect(filter.mightContain('test-item'), isFalse);
-    });
-
-    test('handles many items without excessive false positives', () {
-      final filter = BloomFilter();
-
-      // Add 1000 items
-      for (var i = 0; i < 1000; i++) {
-        filter.add('item-$i');
-      }
-
-      // All added items should be found
-      for (var i = 0; i < 1000; i++) {
-        expect(filter.mightContain('item-$i'), isTrue);
-      }
-
-      // Check false positive rate on items NOT added
-      var falsePositives = 0;
-      for (var i = 1000; i < 2000; i++) {
-        if (filter.mightContain('item-$i')) {
-          falsePositives++;
-        }
-      }
-
-      // False positive rate should be low (< 5%)
-      expect(falsePositives, lessThan(50));
     });
   });
 

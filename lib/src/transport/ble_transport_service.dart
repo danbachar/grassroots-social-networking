@@ -8,6 +8,7 @@ import 'package:redux/redux.dart';
 
 import '../models/identity.dart';
 import '../models/packet.dart';
+import '../models/secure_frame.dart';
 import '../store/store.dart';
 import '../trace/experiment_recorder.dart';
 import '../trace/wire_ledger.dart';
@@ -35,6 +36,12 @@ const String _grassrootsCharacteristicUuid =
 /// the largest most Android stacks negotiate; the actual value is whatever
 /// the peer accepts and is reported back via the `BlePath.mtu` field.
 const int _requestedAndroidMtu = 247;
+
+/// The BLE default ATT MTU before any negotiation (20-byte usable payload).
+/// Used as the fragment-budget fallback when a device has no ready path or has
+/// not yet reported an MTU: sizing against it fragments small but never
+/// truncates.
+const int _defaultAttMtu = 23;
 
 /// BLE-based implementation of the transport service.
 ///
@@ -302,6 +309,22 @@ class BleTransportService extends TransportService {
     }));
   }
 
+  /// A write that failed on one leg and landed on the pair's other one. Its
+  /// own record type, not a `drop`: the failure is already traced as one, and
+  /// counting the save as a drop too would make a recovered packet look like
+  /// a lost one. How often this fires is the measure of what the second leg
+  /// is worth.
+  void _traceRetry(String where, Map<String, dynamic> extra) {
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'retry',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'where': where,
+      'transport': 'ble',
+      ...extra,
+    }));
+  }
+
   void _drainWireLedger() {
     if (!_tracing) return;
     final record = _wireLedger.drainRecord(transport: 'ble');
@@ -461,7 +484,7 @@ class BleTransportService extends TransportService {
       }
 
       if (shouldScan) {
-        _scanTargetUuids = _reverseLegScanTargets();
+        _scanTargetUuids = _scanTargets();
         if (await _startContinuousScan()) {
           anyStarted = true;
           _lastAdvertisementAt = DateTime.now();
@@ -588,7 +611,7 @@ class BleTransportService extends TransportService {
     // Silence means the scan is dead. If we have pending reverse legs, restart
     // it hardware-FILTERED for exactly those identities — a filterless restart
     // just re-enters the same Android muting that stranded us here.
-    _scanTargetUuids = _reverseLegScanTargets();
+    _scanTargetUuids = _scanTargets();
     debugPrint(
       _scanTargetUuids.isEmpty
           ? '[ble] scan-watchdog: no advertisements for '
@@ -615,6 +638,52 @@ class BleTransportService extends TransportService {
         'ok': restarted,
       }));
     }
+  }
+
+  /// Whether this device refuses to meet peers it has not friended.
+  bool get _closedTrust =>
+      store.state.settings.coldCallTrustLevel == ColdCallTrustLevel.closed;
+
+  /// Candidate service UUIDs of every accepted friend — the scan filter that
+  /// makes a closed-trust node BLIND to strangers.
+  ///
+  /// The service UUID is a pure function of the peer's public key
+  /// ([GrassrootsIdentity.deriveServiceUuidForSlot]), so we can compute what
+  /// each friend will be advertising without ever having met them this slot.
+  /// Handing that list to the OS moves the filter into the scanner — hardware
+  /// filters on Android, and the only form of scanning iOS honours in the
+  /// background — so a stranger's advertisement never reaches us at all,
+  /// rather than reaching us and being discarded a layer up.
+  ///
+  /// This is the discovery half of closed trust; the dial half already lives
+  /// in [connectToDevice]. What it deliberately does NOT do is stop us
+  /// relaying: the outer envelope carries only a recipient, so packets that
+  /// cross a friend link are still forwarded and still buffered for ANY
+  /// recipient. Closed trust narrows which LINKS traffic may travel over, not
+  /// whose traffic it is.
+  Set<String> _friendScanTargets() {
+    final targets = <String>{};
+    for (final friend in _peersState.friends) {
+      targets.addAll(GrassrootsIdentity.candidateServiceUuids(
+        friend.publicKey,
+      ));
+    }
+    return targets;
+  }
+
+  /// The UUIDs the scanner should filter on right now: the friend set when
+  /// trust is closed, plus any stuck reverse legs in either mode.
+  ///
+  /// In closed trust a stuck reverse leg is necessarily a friend already, so
+  /// the union costs nothing; in open trust the friend set is omitted, because
+  /// filtering to friends is exactly the behaviour open trust exists to
+  /// refuse — an open node must keep meeting strangers.
+  Set<String> _scanTargets() {
+    final targets = <String>{
+      if (_closedTrust) ..._friendScanTargets(),
+      ..._reverseLegScanTargets(),
+    };
+    return targets;
   }
 
   /// Candidate service UUIDs of every peer we hold a live inbound peripheral
@@ -645,6 +714,21 @@ class BleTransportService extends TransportService {
   /// scan started. `allowDuplicates` keeps already-discovered peers surfacing
   /// so RSSI refreshes and reverse-leg retries keep flowing.
   Future<bool> _startContinuousScan() async {
+    // Closed trust with nobody to look for. An unfiltered prefix scan here
+    // would surface precisely the strangers closed trust exists to ignore, so
+    // the honest thing is to not scan at all: there is no peer on the air we
+    // are willing to link with. Advertising continues, so a friend added later
+    // can still find US, and the watchdog's recompute picks them up.
+    if (_closedTrust && _scanTargetUuids.isEmpty) {
+      try {
+        await _ble.stopScan();
+      } catch (_) {}
+      debugPrint(
+        '[ble] scan: closed trust with no friends — not scanning '
+        '(an unfiltered scan would surface only strangers)',
+      );
+      return false;
+    }
     try {
       await _ble.startScan(
         serviceUuidPrefix: GrassrootsIdentity.grassrootsUuidPrefix,
@@ -655,7 +739,8 @@ class BleTransportService extends TransportService {
       if (_scanTargetUuids.isNotEmpty) {
         debugPrint(
           '[ble] scan: hardware-filtered for ${_scanTargetUuids.length} '
-          'candidate UUID(s) covering stuck reverse-leg peers',
+          'candidate UUID(s) — '
+          '${_closedTrust ? 'closed trust (friends only)' : 'stuck reverse-leg peers'}',
         );
       }
       return true;
@@ -672,10 +757,32 @@ class BleTransportService extends TransportService {
   Future<void> _applyScanTargets() async {
     if (_stopped) return;
     if (state != TransportState.active) return;
-    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
-    final targets = _reverseLegScanTargets();
+    // Reverse-leg targets are an auto-mode concern, but the closed-trust
+    // friend filter is not: it must hold in every role mode that scans, or a
+    // central-only node would quietly keep meeting strangers.
+    if (!_closedTrust &&
+        store.state.settings.bleRoleMode != BleRoleMode.auto) {
+      return;
+    }
+    final targets = _scanTargets();
     if (setEquals(targets, _scanTargetUuids)) return;
     _scanTargetUuids = targets;
+    if (await _startContinuousScan()) {
+      _lastAdvertisementAt = DateTime.now();
+    }
+  }
+
+  /// Apply a runtime trust-level change (open ⇄ closed).
+  ///
+  /// Closing must take effect at once — the whole point is to stop meeting
+  /// strangers — and opening must too, or the node would stay blind to
+  /// everyone it has not already friended. Live links are left alone: a
+  /// friend link survives either way, and a stranger link that predates the
+  /// switch is torn down by the layer that refuses to ANNOUNCE to it, not
+  /// here.
+  Future<void> applyTrustModeChange() async {
+    if (state != TransportState.active) return;
+    _scanTargetUuids = _scanTargets();
     if (await _startContinuousScan()) {
       _lastAdvertisementAt = DateTime.now();
     }
@@ -751,6 +858,55 @@ class BleTransportService extends TransportService {
     }
   }
 
+  /// Refuse nothing, but NAME a write the link cannot carry intact.
+  ///
+  /// These writes are WRITE_TYPE_NO_RESPONSE, so the stack cannot promote an
+  /// oversized payload to a GATT long write — it clamps at `MTU - 3` and the
+  /// receiver gets a prefix it cannot parse (`bleRx`/`deserialize` on the far
+  /// side, with nothing on this one). Every regular packet is sized against
+  /// the floor MTU by FragmentHandler, so anything over is a budgeting bug in
+  /// the code that built it, not a property of the peer. Logged with the
+  /// negotiated MTU because a peer that settled below the floor is a
+  /// different fault from a payload that was mis-sized.
+  ///
+  /// It is deliberately NOT dropped here: what the run needs to measure is
+  /// how often this happens and to whom, and a silent local drop would move
+  /// the evidence rather than produce it.
+  void _checkWritable(Uint8List data, ble.BlePath path, String site) {
+    final usable = path.mtu - 3;
+    if (data.length <= usable) return;
+    debugPrint('[ble-mtu] OVERSIZED $site ${data.length}B > ${usable}B usable '
+        '(mtu ${path.mtu}) on ${path.pathId} — the stack will truncate this '
+        'write and the peer cannot parse it');
+    _traceDrop(site, 'oversized', {
+      'path': path.pathId,
+      'bytes': data.length,
+      'usable': usable,
+      'mtu': path.mtu,
+    });
+  }
+
+  /// The neighbour-fragment chunk budget for [deviceId], sized to that leg's
+  /// DISCOVERED MTU: `(mtu - 3) - packetHeader - frameHeader - 8`, floored so a
+  /// pre-negotiation default MTU still makes progress. The frame header is the
+  /// cleartext [SecureFrame] carrying the fragment (ANNOUNCE / handshake).
+  ///
+  /// A packet whose payload is one such chunk serialises to at most
+  /// `mtu - 3 - 8` on the wire — the 8-byte margin absorbs a leg that settled
+  /// a little below the value we sized against, so a fragment is at worst cut
+  /// slightly small, never truncated. With no ready path (device gone, or the
+  /// MTU not yet reported) it returns the floor: fragmenting small is safe.
+  int usableFragmentBudgetFor(String deviceId) {
+    const floor = 32;
+    final path = _paths[deviceId];
+    final mtu = (path != null && _isReady(path)) ? path.mtu : _defaultAttMtu;
+    final budget = (mtu - 3) -
+        GrassrootsPacket.headerSize -
+        SecureFrame.headerSize -
+        8;
+    return budget < floor ? floor : budget;
+  }
+
   @override
   Future<bool> sendToPeer(String peerId, Uint8List data) async {
     final path = _paths[peerId];
@@ -762,15 +918,86 @@ class BleTransportService extends TransportService {
           {'path': peerId});
       return false;
     }
+    return _writeToPeer(path, data, 'bleSend');
+  }
+
+  /// Write [data] on [path], and if that write never got in, write it on the
+  /// pair's OTHER leg.
+  ///
+  /// This is the redundancy the second leg is kept for, and it is not the
+  /// double-send the one-leg-per-flood rule forbids: the fallback runs only
+  /// after a throw, and a throw means the bytes never reached the controller.
+  /// Both platforms fail *before* transmitting — Android's `sendCentral`
+  /// throws while validating the path and `sendPeripheral` when
+  /// `notifyCharacteristicChanged` refuses the buffer, iOS on `valueTooLarge`
+  /// or a full pending queue — so the packet cannot end up on the air twice.
+  ///
+  /// Until now a refused write was final: it was traced and the packet was
+  /// gone for that peer, with no retry anywhere in the stack. The peripheral
+  /// leg has no queue at all (the notify goes straight at the stack), so it is
+  /// the leg that refuses under load, and it is also the leg the flood
+  /// prefers.
+  Future<bool> _writeToPeer(
+      ble.BlePath path, Uint8List data, String site) async {
+    if (await _writeLeg(path, data, site)) return true;
+    final other = otherLegFor(
+      path: path,
+      ready: _readyPaths,
+      pubkeyFor: getPubkeyForPeerId,
+      bytes: data.length,
+    );
+    if (other == null) return false;
+    if (!await _writeLeg(other, data, '$site:otherLeg')) return false;
+    _traceRetry(site, {'path': path.pathId, 'via': other.pathId});
+    return true;
+  }
+
+  /// One write attempt on one leg. False means the bytes did not get in.
+  Future<bool> _writeLeg(
+      ble.BlePath path, Uint8List data, String site) async {
     try {
-      await _ble.send(peerId, data);
+      _checkWritable(data, path, site);
+      await _ble.send(path.pathId, data);
       if (_tracing) _wireLedger.onTx(data);
       return true;
     } catch (e) {
-      debugPrint('send() failed for $peerId: $e');
-      _traceDrop('bleSend', 'writeFailed', {'path': peerId});
+      debugPrint('send() failed for ${path.pathId}: $e');
+      _traceDrop(site, 'writeFailed', {'path': path.pathId});
       return false;
     }
+  }
+
+  /// The same peer's other GATT leg, when the pair has converged, that leg is
+  /// ready, and [bytes] fits its MTU.
+  ///
+  /// The MTU test is not paranoia: the two legs negotiate separately (and on
+  /// iOS the notify limit is a per-central property), so a packet sized for
+  /// one leg can exceed the other. Retrying onto a leg that will truncate it
+  /// puts an unparseable write on the air and reports success.
+  ///
+  /// An unidentified path has no known pair and gets no fallback: without a
+  /// pubkey there is no way to tell the pair's other leg from a stranger's.
+  @visibleForTesting
+  static ble.BlePath? otherLegFor({
+    required ble.BlePath path,
+    required Iterable<ble.BlePath> ready,
+    required Uint8List? Function(String pathId) pubkeyFor,
+    required int bytes,
+  }) {
+    final pubkey = pubkeyFor(path.pathId);
+    if (pubkey == null) return null;
+    final key = _pubkeyHex(pubkey);
+    for (final other in ready) {
+      if (other.pathId == path.pathId) continue;
+      // Same role is not the other leg — it is another connection in the same
+      // direction, which a converged pair does not have.
+      if (other.role == path.role) continue;
+      final otherKey = pubkeyFor(other.pathId);
+      if (otherKey == null || _pubkeyHex(otherKey) != key) continue;
+      if (bytes > other.mtu - 3) continue;
+      return other;
+    }
+    return null;
   }
 
   @override
@@ -788,17 +1015,10 @@ class BleTransportService extends TransportService {
     );
     var sent = 0;
     for (final path in targets) {
-      try {
-        await _ble.send(path.pathId, data);
-        if (_tracing) _wireLedger.onTx(data);
-        sent++;
-      } catch (e) {
-        debugPrint('broadcast send() failed for ${path.pathId}: $e');
-        // A flood leg that failed: the packet reached fewer neighbours than
-        // selectBroadcastTargets chose. aired counts successes; this names
-        // the leg that missed.
-        _traceDrop('bleBroadcast', 'writeFailed', {'path': path.pathId});
-      }
+      // A refused write falls back to the pair's other leg rather than
+      // dropping the packet for that neighbour: the flood chose ONE of the
+      // two legs, and the one it did not choose is still connected.
+      if (await _writeToPeer(path, data, 'bleBroadcast')) sent++;
     }
     return sent;
   }
@@ -845,6 +1065,7 @@ class BleTransportService extends TransportService {
     required String peerHex,
     required String leg,
     required int seq,
+    int sizeDelta = 0,
   }) async {
     final path = pickRawPath(
       ready: _readyPaths,
@@ -854,7 +1075,24 @@ class BleTransportService extends TransportService {
       seq: seq,
     );
     if (path == null) return null;
-    final size = (path.mtu - 3).clamp(1, 512);
+    // `mtu - 3` is the ATT ceiling: one byte of opcode plus two of attribute
+    // handle come out of every write. [sizeDelta] deliberately overshoots or
+    // undershoots it — the ATT-ceiling probe's arm variable — so 0 writes at
+    // the ceiling and +1 one byte past it. Recorded with the negotiated MTU
+    // rather than the requested one, because that is the number the fragment
+    // budget is actually betting on.
+    final size = (path.mtu - 3 + sizeDelta).clamp(1, 512);
+    if (_tracing) {
+      unawaited(trace!.log({
+        'type': 'wire',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'rawTx',
+        'mtu': path.mtu,
+        'sizeDelta': sizeDelta,
+        'len': size,
+        'leg': leg,
+      }));
+    }
     final blob = Uint8List(size);
     blob[0] = rawPacketType;
     // Fill so the radio cannot run-length anything (paranoia; BLE does not
@@ -1155,6 +1393,15 @@ class BleTransportService extends TransportService {
     if (_inFlightCentralDials() >= _maxInFlightCentralDials) {
       return false;
     }
+    // Rate-limit redials of an address that just failed: the peer's next
+    // advertisement after the cooldown re-arms it (see [_centralDialCooldown]).
+    final failedAt = _centralDialFailedAt[pathId];
+    if (failedAt != null) {
+      if (DateTime.now().difference(failedAt) < _centralDialCooldown) {
+        return false;
+      }
+      _centralDialFailedAt.remove(pathId);
+    }
 
     final remoteId = pathId.substring('central:'.length);
     try {
@@ -1250,8 +1497,23 @@ class BleTransportService extends TransportService {
         bleRole: bleRole,
       );
     } catch (e) {
-      debugPrint('Failed to deserialize packet: $e');
-      _traceDrop('bleRx', 'deserialize', {'path': fromDeviceId});
+      // The far side's counterpart to `bleSend`/`oversized`: a payload the
+      // sender's stack clamped at `MTU - 3` arrives as a parseable-looking
+      // prefix and dies here. Recording the LENGTH is what distinguishes a
+      // truncation (a length that sits suspiciously at a usable-MTU
+      // boundary, and a header whose declared size overruns what arrived)
+      // from a corrupt or foreign packet — without it, every cause looks
+      // identical in the drop table.
+      final mtu = _paths[fromDeviceId]?.mtu;
+      debugPrint('[ble-rx] deserialize failed after ${data.length}B'
+          '${mtu == null ? '' : ' (peer mtu $mtu, usable ${mtu - 3})'}'
+          ' from $fromDeviceId: $e');
+      _traceDrop('bleRx', 'deserialize', {
+        'path': fromDeviceId,
+        'bytes': data.length,
+        if (mtu != null) 'mtu': mtu,
+        if (mtu != null) 'atUsableLimit': data.length == mtu - 3,
+      });
     }
   }
 
@@ -1386,6 +1648,22 @@ class BleTransportService extends TransportService {
     }
     return count;
   }
+
+  /// After a central dial fails, that address is not redialed again until this
+  /// cooldown elapses — then its next advertisement re-arms it.
+  ///
+  /// This replaces the one-strike address eviction. The scanner runs
+  /// `allowDuplicates`, so the peer re-advertises the SAME address every scan
+  /// tick; evicting it neither stopped the redials (the next tick re-added it)
+  /// nor let a present peer settle — it churned the discovery entry (the
+  /// nearby-list flicker) and, with each redial holding a native GATT slot for
+  /// its full connect timeout, exhausted the table into a GATT-133 storm. An
+  /// advertisement is proof the peer still answers at that address, so we DO
+  /// retry the same address — but no faster than once per cooldown, and never
+  /// more than [_maxInFlightCentralDials] at once. A peer that is truly gone
+  /// stops advertising and ages out of discovery, taking its cooldown with it.
+  static const Duration _centralDialCooldown = Duration(seconds: 3);
+  final Map<String, DateTime> _centralDialFailedAt = {};
 
   /// Central-dial election: decides whether this advertisement should
   /// trigger an outbound (central) dial right now. All *validity* guards
@@ -1555,6 +1833,8 @@ class BleTransportService extends TransportService {
         // Not yet sendable — wait for `ready`.
         break;
       case ble.BlePathState.ready:
+        // A successful connect clears any dial-failure cooldown for this path.
+        _centralDialFailedAt.remove(path.pathId);
         if (previous?.state != ble.BlePathState.ready) {
           store.dispatch(BleDeviceConnectedAction(path.pathId));
           _traceLink('connected', path, role);
@@ -1585,7 +1865,22 @@ class BleTransportService extends TransportService {
       case ble.BlePathState.stale:
         if (path.state == ble.BlePathState.failed &&
             path.role == ble.BleRole.central) {
-          store.dispatch(BleDeviceConnectionFailedAction(path.pathId));
+          // Rate-limit the redial instead of evicting the address. A failed
+          // connectGatt holds one of Android's ~32 native GATT slots for its
+          // full connect timeout, so redialing a failing address once per scan
+          // tick exhausts the table into a GATT-133 storm. Evicting the address
+          // did not fix this — the scanner runs allowDuplicates, so the peer's
+          // very next advertisement re-added it — it only churned the discovery
+          // entry (the nearby-list flicker). Record the failure time instead:
+          // [connectToDevice] holds off for [_centralDialCooldown], then the
+          // peer's next advertisement retries the SAME address, which is proof
+          // it still answers there. A truly gone peer stops advertising and
+          // ages out of discovery, so nothing hammers a dead address.
+          final now = DateTime.now();
+          // Bound the map: a rotated-away address that stops failing ages out.
+          _centralDialFailedAt
+              .removeWhere((_, at) => now.difference(at) > _centralDialCooldown * 4);
+          _centralDialFailedAt[path.pathId] = now;
         }
         // Mirror the connect emit at the `ready` case: surface a disconnect
         // to the upper layer only on a true transition out of `ready`.
@@ -1632,7 +1927,22 @@ class BleTransportService extends TransportService {
     if (_tracing) _wireLedger.onRx(payload.value);
     // Raw-throughput blobs (DEBUG/TESTBED): counted above, dropped here —
     // they are deliberately not packets and must never reach the parser.
-    if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) return;
+    if (payload.value.isNotEmpty && payload.value[0] == rawPacketType) {
+      // The LENGTH THAT ARRIVED is the whole point of the ATT-ceiling probe.
+      // A write the stack truncates shows up here shorter than it was sent, a
+      // write it refuses never shows up at all, and a write that lands whole
+      // matches — three outcomes the byte totals alone cannot separate.
+      if (_tracing) {
+        unawaited(trace!.log({
+          'type': 'wire',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'rawRx',
+          'len': payload.value.length,
+          'path': payload.pathId,
+        }));
+      }
+      return;
+    }
     // Drop payloads unless the plugin currently marks the path ready. This
     // prevents late ANNOUNCE packets, hot-restart leftovers, or connected-but-
     // not-sendable paths from populating PeerState BLE role fields. NOTE the

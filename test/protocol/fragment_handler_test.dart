@@ -134,6 +134,37 @@ void main() {
       });
     });
 
+    group('framesFor with an explicit chunkBudget (neighbour-local path)', () {
+      test('a payload above the budget round-trips through accept', () {
+        // The cleartext ANNOUNCE/handshake path: fragments sized to a small
+        // per-leg budget, reassembled by the frame messageId.
+        final payload = Uint8List.fromList(
+            List<int>.generate(241, (i) => i & 0xFF));
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4(), chunkBudget: 100);
+        expect(frames.length, 3); // ceil(241 / 100)
+        expect(frames.every((f) => f.isFragmented), isTrue);
+        expect(frames.map((f) => f.chunk.length).reduce((a, b) => a + b), 241);
+
+        // Feed each frame back through accept; reassembles to identical bytes.
+        Uint8List? whole;
+        for (final f in frames) {
+          whole = handler.accept(f);
+        }
+        expect(whole, isNotNull);
+        expect(whole, equals(payload));
+      });
+
+      test('a payload at or below the budget yields one frame', () {
+        final payload = Uint8List.fromList(List<int>.filled(80, 7));
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4(), chunkBudget: 100);
+        expect(frames.length, 1);
+        expect(frames.first.isFragmented, isFalse);
+        expect(handler.accept(frames.first), equals(payload));
+      });
+    });
+
     group('accept - reassembly', () {
       test('returns chunk immediately for a single-fragment frame', () {
         final payload = Uint8List(100);

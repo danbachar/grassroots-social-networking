@@ -3,6 +3,7 @@ import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
+import 'package:uuid/uuid.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
 import 'package:grassroots_networking/src/models/peer.dart';
@@ -14,6 +15,15 @@ import 'package:grassroots_networking/src/session/noise_session_manager.dart';
 import 'package:grassroots_networking/src/store/store.dart';
 
 import '../helpers/sodium_test_bootstrap.dart';
+
+/// Wrap a raw neighbour-local payload (ANNOUNCE / handshake) as a single
+/// cleartext [SecureFrame] (fragCount defaults to 1), matching the on-wire
+/// format the router strips before dispatch.
+Uint8List _framed(Uint8List payload) => SecureFrame(
+      contentType: ContentType.message,
+      messageId: const Uuid().v4(),
+      chunk: payload,
+    ).encode();
 
 /// Build an UNSEALED secure MESSAGE packet whose sealed frame carries
 /// [messageId] as its logical id. The outer wire [packetId] is a *separate*
@@ -65,7 +75,7 @@ void main() {
   }) {
     return GrassrootsPacket(
       type: PacketType.announce,
-      payload: protocol.createAnnouncePayload(address: address),
+      payload: _framed(protocol.createAnnouncePayload(address: address)),
     );
   }
 
@@ -223,7 +233,7 @@ void main() {
       tampered[40] ^= 0xFF;
       final packet = GrassrootsPacket(
         type: PacketType.announce,
-        payload: tampered,
+        payload: _framed(tampered),
       );
 
       var announceFired = false;
@@ -377,10 +387,6 @@ void main() {
       bobRouter.onMessageReceived = (_, __, ___, ____) {
         messageReceived = true;
       };
-      GrassrootsPacket? relayed;
-      bobRouter.onRelay = (packet, {String? excludeBlePeerId}) {
-        relayed = packet;
-      };
 
       await bobRouter.processPacket(
         sealed,
@@ -390,10 +396,12 @@ void main() {
       );
 
       expect(messageReceived, isFalse);
-      // Relayed toward the (unreachable) recipient with a decremented TTL.
-      expect(relayed, isNotNull);
-      expect(relayed!.recipientPubkey, equals(otherPub));
-      expect(relayed!.ttl, equals(sealed.ttl - 1));
+      // Taken into custody for the recipient with a decremented TTL. Nothing
+      // is pushed: it leaves only when a neighbour asks for it by packetId.
+      final held = bobRouter.dtnBufferFor(otherPub);
+      expect(held, hasLength(1));
+      expect(held.single.recipientPubkey, equals(otherPub));
+      expect(held.single.ttl, equals(sealed.ttl - 1));
     });
   });
 

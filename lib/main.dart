@@ -387,6 +387,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   // Track nickname changes for animation
   final Map<String, _NicknameChange> _nicknameChanges = {};
 
+  // messageId of the last friend request we SENT per peer (hex), so a cancel
+  // can withdraw the still-buffered request. Session-only: the DTN buffer is
+  // memory-only, so a request from a previous process has nothing to withdraw.
+  final Map<String, String> _sentFriendRequestMsgIds = {};
+
+  // Nearby-list sort hysteresis. RSSI wobbles every reading, so re-sorting on
+  // each 1s refresh made the "In range" list churn. The order is recomputed at
+  // most once per announce cycle; between recomputes the cached order is kept.
+  List<String> _nearbySortOrder = [];
+  DateTime? _nearbySortAt;
+
   // Transport availability derived from Redux store
   bool get _bleAvailable => appStore.state.transports.bleState.isUsable;
   bool get _udpAvailable => appStore.state.transports.udpState.isUsable;
@@ -886,11 +897,44 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           store: appStore,
           onSendFriendRequest: () => _sendFriendRequest(peer),
           onAcceptFriendRequest: () => _acceptFriendRequest(peer),
+          onCancelFriendRequest: () => _cancelFriendRequest(peer),
           onUnfriend: () => _unfriend(peerHex),
           myUdpAddress: _myUdpAddress,
         ),
       ),
     );
+  }
+
+  /// Withdraw a pending OUTGOING friend request: stop conveying the buffered
+  /// request, tell the peer to drop it if it reached them, and clear our local
+  /// pending state.
+  Future<void> _cancelFriendRequest(PeerState peer) async {
+    if (_grassroots == null) return;
+    final peerHex = peer.pubkeyHex;
+
+    // Withdraw the still-buffered request so it stops being conveyed onward.
+    // This is a LOCAL cancel only — deliberately NOT a FriendshipRevokeBlock:
+    // a revoke removes the friendship and peer record on the other side, which
+    // in closed mode severs the link and can strand the Noise session (the
+    // handshake does not reliably re-establish). A pending request has no
+    // established friendship to revoke, so we just stop conveying it and clear
+    // our own pending; if the peer already received it they can decline it.
+    final messageId = _sentFriendRequestMsgIds.remove(peerHex);
+    if (messageId != null) {
+      _grassroots!.cancelBufferedMessage(messageId);
+    }
+
+    // Clear our pending outgoing locally.
+    appStore.dispatch(RemoveFriendshipAction(peerHex));
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Friend request to ${peer.displayName} canceled'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   Future<void> _sendFriendRequest(PeerState peer) async {
@@ -935,6 +979,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       peerPubkeyHex: peerHex,
       nickname: peer.displayName,
     ));
+    // Remember the message so a cancel can withdraw it from the buffer.
+    _sentFriendRequestMsgIds[peerHex] = messageId;
 
     // Save as a chat message in Redux
     appStore.dispatch(SaveChatMessageAction(
@@ -1636,9 +1682,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                             horizontal: GlSpace.s4, vertical: GlSpace.s2),
                         child: EyebrowLabel('In range'),
                       ),
-                      ...(_peers.values.toList()
-                            ..sort((a, b) =>
-                                (b.rssi ?? -100).compareTo(a.rssi ?? -100)))
+                      ..._nearbyPeersSorted()
                           .map((peer) => _buildPeerListItem(peer)),
                     ],
                   ],
@@ -1646,6 +1690,43 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         ),
       ],
     );
+  }
+
+  /// Peers for the "In range" list, RSSI-sorted but with HYSTERESIS: the order
+  /// is recomputed at most once per announce cycle, so a settled list stops
+  /// reshuffling on every 1s refresh as RSSI wobbles. Between recomputes the
+  /// cached order is kept for peers still present, the gone drop out, and
+  /// newcomers are appended (RSSI-sorted among themselves) so a fresh arrival
+  /// shows without disturbing the settled order.
+  List<PeerState> _nearbyPeersSorted() {
+    final byHex = {for (final p in _peers.values) p.pubkeyHex: p};
+    final now = DateTime.now();
+    final interval =
+        _grassroots?.config.announceInterval ?? const Duration(seconds: 10);
+    final recompute =
+        _nearbySortAt == null || now.difference(_nearbySortAt!) >= interval;
+    if (recompute) {
+      final sorted = byHex.values.toList()
+        ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+      _nearbySortOrder = [for (final p in sorted) p.pubkeyHex];
+      _nearbySortAt = now;
+      return sorted;
+    }
+    final result = <PeerState>[];
+    final placed = <String>{};
+    for (final hex in _nearbySortOrder) {
+      final p = byHex[hex];
+      if (p != null) {
+        result.add(p);
+        placed.add(hex);
+      }
+    }
+    final newcomers = [
+      for (final entry in byHex.entries)
+        if (!placed.contains(entry.key)) entry.value
+    ]..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+    result.addAll(newcomers);
+    return result;
   }
 
   Widget _buildOnlineFriendChip(PeerState friend) {
@@ -2443,12 +2524,16 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),
+          onColdCallTrustChanged: _grassroots == null
+              ? null
+              : (level) => _grassroots!.setColdCallTrustLevel(level),
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
           myPubkeyHex: _grassroots?.identity.publicKey
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(),
+          myNickname: _grassroots?.identity.nickname,
           experimentRecorder: experimentRecorder,
           onStartBulk:
               _grassroots == null ? null : () => _grassroots!.startBulkFlows(),
@@ -2470,8 +2555,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           bleUsableChanges: _grassroots?.bleUsableChanges,
           sendRaw: _grassroots == null
               ? null
-              : (peer, {required leg, required seq}) =>
-                  _grassroots!.sendRawBlob(peer, leg: leg, seq: seq),
+              : (peer, {required leg, required seq, sizeDelta = 0}) =>
+                  _grassroots!.sendRawBlob(peer,
+                      leg: leg, seq: seq, sizeDelta: sizeDelta),
           onSetBle: _grassroots == null
               ? null
               : (on) => _grassroots!.setBleActiveForTestbed(on),
@@ -2481,27 +2567,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           registerAckListener: _grassroots == null
               ? null
               : (listener) => _grassroots!.onTestbedAck = listener,
-          // Multi-device runs: every phone arms and one signals the rest, so
-          // devices spread over hundreds of metres begin within the flood's
-          // latency of each other rather than however long the walk takes.
-          onBroadcastStart: _grassroots == null
-              ? null
-              : (expId) => _grassroots!.broadcastTestbedStart(expId),
-          // Armed-time only: each phone gossips who it can see, so every
-          // phone can show how many are actually in the mesh before the
-          // start signal is asked to cross it.
           sessionPeerCount:
               _grassroots == null ? null : () => _grassroots!.sessionPeerCount,
-          onGossipNeighbours: _grassroots == null
-              ? null
-              : () => _grassroots!.broadcastTestbedNeighbours(),
-          meshComponentSize:
-              _grassroots == null ? null : () => _grassroots!.meshComponentSize,
-          onClearMeshView:
-              _grassroots == null ? null : () => _grassroots!.clearMeshView(),
-          registerStartListener: _grassroots == null
-              ? null
-              : (listener) => _grassroots!.onTestbedStartRequested = listener,
+          sessionTableCount:
+              _grassroots == null ? null : () => _grassroots!.noiseSessionCount,
         ),
       ),
     );

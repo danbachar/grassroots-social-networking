@@ -592,6 +592,37 @@ class ExperimentRecorder {
     return u;
   }
 
+  /// Move an abandoned recording aside, so the next arm under the same id
+  /// starts a clean file.
+  ///
+  /// [startExperiment] APPENDS to an existing file of the same id, which is
+  /// right for resuming but wrong after an abort: the dead run's records —
+  /// its own step labels, and message ids re-minted identically by the next
+  /// arm — end up interleaved with the real run in one upload, and every
+  /// reader downstream has to know to cut them out. Renaming makes the
+  /// abandoned run a separate experiment (`<id>-aborted-<n>`) that uploads on
+  /// its own and can be read, or ignored, on its own.
+  ///
+  /// Renamed, never deleted: an aborted run is still a recording of something
+  /// that happened, and on 2026-08-08 the aborted arm turned out to hold the
+  /// only uncontended-medium measurement of the day.
+  Future<String?> archiveAbortedExperiment(String id) async {
+    final src = await _file(_expFileName(sanitizeExperimentId(id)));
+    if (!await src.exists()) return null;
+    for (var n = 1; n < 1000; n++) {
+      final dst = await _file(_expFileName('${sanitizeExperimentId(id)}-aborted-$n'));
+      if (await dst.exists()) continue;
+      try {
+        await src.rename(dst.path);
+        return dst.path;
+      } catch (e) {
+        debugPrint('[exp] could not set aside aborted $id: $e');
+        return null;
+      }
+    }
+    return null;
+  }
+
   /// Delete all experiment files (after a successful share/upload).
   Future<void> clearExperimentFiles() async {
     for (final path in await experimentFilePaths()) {

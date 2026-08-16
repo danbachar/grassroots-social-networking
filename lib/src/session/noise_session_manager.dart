@@ -978,7 +978,7 @@ int _nonceFromBytes(Uint8List nonceBytes) {
 }
 
 /// Application AEAD AAD: binds the ciphertext to its type, sender, recipient
-/// and packet id — but NOT to ttl/timestamp. TTL is mutated by every relay, so
+/// and packet id — but NOT to ttl. TTL is mutated by every relay, so
 /// it cannot be authenticated end-to-end. [senderPubkey] is the originator: the
 /// local identity on encrypt, the session peer on (trial-)decrypt.
 Uint8List _applicationAad(

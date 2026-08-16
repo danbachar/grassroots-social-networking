@@ -24,6 +24,12 @@ class SettingsScreen extends StatefulWidget {
   /// Debug-only: switch which BLE roles the local device runs.
   final Future<void> Function(BleRoleMode mode)? onBleRoleModeChanged;
 
+  /// Apply an open ⇄ closed trust change. Routed through the network rather
+  /// than dispatched here, because closing has to re-filter the BLE scanner
+  /// at once — a store dispatch alone would leave the node meeting strangers
+  /// until the scan watchdog next fires.
+  final Future<void> Function(ColdCallTrustLevel level)? onColdCallTrustChanged;
+
   /// Re-run public-address (seeip) discovery, invoked by the "Retry" button
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
@@ -31,6 +37,10 @@ class SettingsScreen extends StatefulWidget {
   /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
   /// is not up. [myPubkeyHex] is this device's hex identity.
   final String? myPubkeyHex;
+
+  /// This device's ANNOUNCE nickname, forwarded to the testbed so a field
+  /// run can derive its join order from it.
+  final String? myNickname;
   final ExperimentRecorder? experimentRecorder;
   final VoidCallback? onStartBulk;
   final VoidCallback? onStopBulk;
@@ -42,17 +52,12 @@ class SettingsScreen extends StatefulWidget {
   final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
   final Stream<bool>? bleUsableChanges;
-  final Future<int> Function(String expId)? onBroadcastStart;
-
-  /// DEBUG/TESTBED. Armed-time mesh gossip, and the view it builds.
-  final Future<int> Function()? onGossipNeighbours;
   final int Function()? sessionPeerCount;
-  final int Function()? meshComponentSize;
-  final VoidCallback? onClearMeshView;
-  final void Function(void Function(String expId)? listener)?
-      registerStartListener;
+
+  /// Sessions in the Noise table, forwarded to the testbed.
+  final int Function()? sessionTableCount;
   final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+      {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
@@ -66,8 +71,10 @@ class SettingsScreen extends StatefulWidget {
     required this.store,
     this.onSettingsChanged,
     this.onBleRoleModeChanged,
+    this.onColdCallTrustChanged,
     this.onRetryPublicAddressDiscovery,
     this.myPubkeyHex,
+    this.myNickname,
     this.experimentRecorder,
     this.onStartBulk,
     this.onStopBulk,
@@ -78,12 +85,8 @@ class SettingsScreen extends StatefulWidget {
     this.bleWireBytes,
     this.bleUsable,
     this.bleUsableChanges,
-    this.onBroadcastStart,
-    this.registerStartListener,
-    this.onGossipNeighbours,
     this.sessionPeerCount,
-    this.meshComponentSize,
-    this.onClearMeshView,
+    this.sessionTableCount,
     this.sendRaw,
     this.onSetBle,
     this.onResetLinks,
@@ -312,6 +315,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context) => TestbedScreen(
                       store: widget.store,
                       myPubkeyHex: widget.myPubkeyHex,
+                      myNickname: widget.myNickname,
                       experimentRecorder: widget.experimentRecorder,
                       onStartBulk: widget.onStartBulk,
                       onStopBulk: widget.onStopBulk,
@@ -322,12 +326,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,
                       bleUsableChanges: widget.bleUsableChanges,
-                      onBroadcastStart: widget.onBroadcastStart,
-                      registerStartListener: widget.registerStartListener,
-                      onGossipNeighbours: widget.onGossipNeighbours,
                       sessionPeerCount: widget.sessionPeerCount,
-                      meshComponentSize: widget.meshComponentSize,
-                      onClearMeshView: widget.onClearMeshView,
+                      sessionTableCount: widget.sessionTableCount,
                       sendRaw: widget.sendRaw,
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
@@ -630,10 +630,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
             selected: {level},
-            onSelectionChanged: (selection) {
+            onSelectionChanged: (selection) async {
               if (selection.isEmpty) return;
-              widget.store
-                  .dispatch(SetColdCallTrustLevelAction(selection.first));
+              final next = selection.first;
+              if (widget.onColdCallTrustChanged != null) {
+                await widget.onColdCallTrustChanged!(next);
+              } else {
+                widget.store.dispatch(SetColdCallTrustLevelAction(next));
+              }
+              if (!mounted) return;
+              setState(() {});
               widget.onSettingsChanged?.call();
             },
           ),

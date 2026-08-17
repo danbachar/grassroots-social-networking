@@ -214,7 +214,18 @@ class BleTransportService extends TransportService {
 
   bool get _tracing => trace?.active ?? false;
 
+  /// pathId -> peer pubkey hex, learned at identification and kept for every
+  /// path we hold.
+  ///
+  /// PeerState cannot serve this: it stores ONE central and ONE peripheral
+  /// device id per peer, so the moment a rotated address is recorded the
+  /// previous path stops resolving — which is exactly the pair the duplicate
+  /// check has to compare. Entries are dropped with their path.
+  final Map<String, String> _peerHexByPath = {};
+
   String? _peerHexForPathId(String pathId) {
+    final known = _peerHexByPath[pathId];
+    if (known != null) return known;
     final pubkey = getPubkeyForPeerId(pathId);
     if (pubkey == null) return null;
     return pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -1221,7 +1232,10 @@ class BleTransportService extends TransportService {
     // separates "the link came up" from "we know who is on the other end".
     // Without it a run cannot tell a dial that failed from one that connected
     // to a peer which never announced.
+    _peerHexByPath[pathId] =
+        pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     if (role != null) _traceLink('identified', path, role);
+    if (role != null) _dropDuplicateLegFor(pathId, role);
     if (!_isReady(path)) return;
     if (role != BleRole.peripheral) return;
 
@@ -2050,9 +2064,55 @@ class BleTransportService extends TransportService {
           _emitDisconnect(path, role);
         }
         _paths.remove(path.pathId);
+        _peerHexByPath.remove(path.pathId);
         // A dropped leg may add or clear a reverse-leg scan target.
         unawaited(_applyScanTargets());
         break;
+    }
+  }
+
+  /// Identification is the first moment an address can be tied to a peer, so
+  /// it is the only place a redundant leg can be recognised.
+  ///
+  /// Android rotates its advertised address, and the plugin surfaces no
+  /// rotation event and no identity resolution (Grassroots does not bond, so
+  /// the OS cannot resolve the RPA either). A rotated peer therefore looks
+  /// like a brand new device: it is discovered, dialed, and `connectGatt`
+  /// opens a SECOND connection to hardware we are already linked to, because a
+  /// different address is a different `BluetoothDevice`. Measured on
+  /// dial-5-bounce-fixed-n6: 32 same-role duplicate legs across six phones,
+  /// overlapping for up to 69 s, each holding a real controller slot that the
+  /// dial cap then counts against genuinely new peers.
+  ///
+  /// The pair wants exactly one leg per role. When a newly identified path
+  /// duplicates a role we already hold to that peer, the NEW one goes: the
+  /// existing leg is already carrying the pair and may have a session and
+  /// traffic on it, and dropping the proven one to keep an unproven one
+  /// would trade a working link for a fresh handshake. If the survivor later
+  /// dies, the peer is re-dialed under whatever address it advertises then.
+  void _dropDuplicateLegFor(String pathId, BleRole role) {
+    final hex = _peerHexForPathId(pathId);
+    if (hex == null) return;
+    for (final other in _paths.values) {
+      if (other.pathId == pathId) continue;
+      if (_roleFromPathId(other.pathId) != role) continue;
+      if (!_isReady(other)) continue;
+      if (_peerHexForPathId(other.pathId) != hex) continue;
+      debugPrint('[ble] duplicate $role leg to ${hex.substring(0, 8)}: '
+          'dropping $pathId, keeping ${other.pathId}');
+      if (_tracing) {
+        unawaited(trace!.log({
+          'type': 'link',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'duplicateLeg',
+          'path': pathId,
+          'role': role.name,
+          'keptPath': other.pathId,
+          'peer': hex,
+        }));
+      }
+      unawaited(disconnectDevice(pathId));
+      return;
     }
   }
 

@@ -1608,6 +1608,65 @@ void main() {
       expect(transport.establishmentCount, 0);
     });
 
+    test('a second leg to an already-linked peer in the same role is dropped',
+        () async {
+      // Android rotates its advertised address and the plugin surfaces no
+      // rotation event, so the same phone is rediscovered under a new address
+      // and dialed again — connectGatt opens a SECOND real connection to
+      // hardware we already hold a leg to. Measured on dial-5: 32 same-role
+      // duplicates across six phones, overlapping up to 69s, each consuming a
+      // controller slot the dial cap then denies to a genuinely new peer.
+      final peer = Uint8List.fromList(List.generate(32, (i) => i + 7));
+      for (final mac in ['AA:1', 'BB:2']) {
+        callbacks.pushPath(BlePath(
+          pathId: 'central:$mac',
+          role: BleRole.central,
+          state: BlePathState.ready,
+          rssi: -50,
+          mtu: 247,
+          canSend: true,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+
+      // First identification: nothing to compare against, so it stands.
+      transport.onPeerIdentified('central:AA:1', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+
+      // The rotated address resolves to the SAME peer in the SAME role.
+      transport.onPeerIdentified('central:BB:2', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls, contains('disconnect:central:BB:2'),
+          reason: 'the new duplicate goes, not the proven leg');
+      expect(hostApi.calls, isNot(contains('disconnect:central:AA:1')));
+    });
+
+    test('the opposite role is NOT a duplicate — that is the dual-leg pair',
+        () async {
+      // Every pair is REQUIRED to converge to two legs, one per role. A
+      // check that keyed on peer alone would tear the pair down.
+      final peer = Uint8List.fromList(List.generate(32, (i) => i + 11));
+      callbacks.pushPath(BlePath(
+        pathId: 'central:CC:3',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50, mtu: 247, canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:CC:3',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -50, mtu: 247, canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      transport.onPeerIdentified('central:CC:3', peer);
+      transport.onPeerIdentified('peripheral:CC:3', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'one leg per role is the design, not a duplicate');
+    });
+
     test('the failed-dial cooldown still refuses a redial', () async {
       transport.setDialParallelism(maxParallel: 4, popN: 5);
       await adv(2);

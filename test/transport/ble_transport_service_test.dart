@@ -22,6 +22,27 @@ import 'package:grassroots_networking/src/transport/transport_service.dart'
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
+import 'package:grassroots_networking/src/trace/experiment_recorder.dart';
+
+/// An active recorder that keeps every record in memory: the dial grid's
+/// whole measurement is what the `link` records carry, so the assertions are
+/// on the records themselves, not on a file.
+class _CapturingTrace extends ExperimentRecorder {
+  final List<Map<String, dynamic>> records = [];
+  bool _active = false;
+
+  @override
+  bool get active => _active;
+
+  @override
+  Future<void> startExperiment(String id) async => _active = true;
+
+  @override
+  Future<void> stopExperiment() async => _active = false;
+
+  @override
+  Future<void> log(Map<String, dynamic> record) async => records.add(record);
+}
 
 /// Records the sequence of host API calls so tests can assert them.
 class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
@@ -1338,19 +1359,19 @@ void main() {
     });
   });
 
-  group('BleTransportService — testbed dial burst', () {
+  group('BleTransportService — testbed dial cap', () {
     // Fixed peer UUIDs above the initiator threshold: the transport under
     // test is built with a LOW identity, so it is always the election's
-    // initiator and every advertisement below auto-dials. Nothing suppresses
-    // that — the probe's burst runs on a fleet whose transports behave
-    // exactly as they do in production, and a peer dialing at the same
-    // moment is the contention a real burst meets.
-    const peerUuidA = '84c40316-0871-e5ad-aaaa-000000000001';
-    const peerUuidB = '84c40316-0871-e5ad-bbbb-000000000002';
+    // initiator and every advertisement below auto-dials. That greedy dial
+    // is the mechanism the grid measures — the cap is a bound ON it, never
+    // a replacement for it.
+    String peerUuid(int i) =>
+        '84c40316-0871-e5ad-aaaa-00000000000${i.toRadixString(16)}';
 
     late _RecordingHostApi hostApi;
     late FakeGrassrootsBluetoothCallbacks callbacks;
     late Store<AppState> store;
+    late _CapturingTrace trace;
     late BleTransportService transport;
 
     setUp(() async {
@@ -1359,10 +1380,13 @@ void main() {
       final ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       store = Store<AppState>(appReducer, initialState: AppState.initial);
       store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      trace = _CapturingTrace();
+      await trace.startExperiment('dial-cap');
       transport = BleTransportService(
         identity: await _makeLowIdentity('Prober'),
         store: store,
         grassrootsBluetooth: ble,
+        trace: trace,
       );
       await transport.initialize();
     });
@@ -1371,63 +1395,152 @@ void main() {
       await transport.dispose();
     });
 
-    void adv(String remoteId, String uuid, {int rssi = -55}) =>
-        callbacks.pushAdvertisement(BleAdvertisement(
-          remoteId: remoteId,
-          serviceUuids: [uuid],
-          rssi: rssi,
-          connectable: true,
-        ));
-
-    test('burstDialTargets: one entry per distinct peer, strongest first',
-        () async {
-      adv('MACA1', peerUuidA, rssi: -70);
-      adv('MACA2', peerUuidA, rssi: -50); // same identity, rotated MAC
-      adv('MACB1', peerUuidB, rssi: -60);
+    Future<void> adv(int i, {int rssi = -55}) async {
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'MAC$i',
+        serviceUuids: [peerUuid(i)],
+        rssi: rssi,
+        connectable: true,
+      ));
       await Future<void>.delayed(Duration.zero);
+    }
 
-      expect(transport.burstDialTargets(),
-          ['central:MACA2', 'central:MACB1'],
-          reason: 'Deduped by advertised service UUID (a rotated MAC must '
-              'not offer the same peer twice in one burst) and ordered '
-              'strongest first.');
-    });
-
-    test(
-        'dialBurst fires every target in one event-loop turn and reports the '
-        'dialed set', () async {
-      adv('AABB01', peerUuidA);
-      adv('CCDD02', peerUuidB);
-      await Future<void>.delayed(Duration.zero);
-      // The ordinary election already dialed both on discovery; the burst is
-      // measured as what it ADDS to that, not against an artificially idle
-      // transport.
-      int dials(String mac) =>
-          hostApi.calls.where((c) => c == 'connect:$mac').length;
-      final beforeA = dials('AABB01');
-      final beforeB = dials('CCDD02');
-
-      final dialed =
-          await transport.dialBurst(['central:AABB01', 'central:CCDD02']);
-
-      expect(dialed, ['central:AABB01', 'central:CCDD02']);
-      expect(dials('AABB01') - beforeA, 1);
-      expect(dials('CCDD02') - beforeB, 1);
-    });
-
-    test('dialBurst tears down an existing central leg before redialing',
-        () async {
-      // Auto-dial and connect the leg first, so the burst has
-      // a live central leg to the target — the rep-t>1 case, where the
-      // previous rep's leg would otherwise make the one-central-per-identity
-      // guard refuse the fresh dial.
-      const pathId = 'central:AABB01';
-      adv('AABB01', peerUuidA);
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1));
+    /// What the plugin does after a `connect()` it accepted: the path shows
+    /// up as `connecting`. Only then does the dial occupy a slot, exactly as
+    /// on a device — the cap reads `_paths`, not the calls we made.
+    Future<void> pushState(int i, BlePathState state) async {
       callbacks.pushPath(BlePath(
-        pathId: pathId,
+        pathId: 'central:MAC$i',
         role: BleRole.central,
+        state: state,
+        rssi: -55,
+        mtu: state == BlePathState.ready ? 247 : 23,
+        canSend: state == BlePathState.ready,
+      ));
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    int dials(int i) =>
+        hostApi.calls.where((c) => c == 'connect:MAC$i').length;
+
+    test('the cap defaults to the production value', () {
+      expect(transport.maxInFlightCentralDials,
+          BleTransportService.defaultMaxInFlightCentralDials);
+      expect(BleTransportService.defaultMaxInFlightCentralDials, 7);
+    });
+
+    test('setDialParallelism sets the cap and restores it on null', () {
+      transport.setDialParallelism(maxParallel: 2, popN: 5);
+      expect(transport.maxInFlightCentralDials, 2);
+      expect(transport.dialProbeMaxParallel, 2);
+      expect(transport.dialProbePopN, 5);
+
+      transport.setDialParallelism();
+      expect(transport.maxInFlightCentralDials, 7,
+          reason: 'A null M is how the runner puts production behaviour back '
+              'when a run ends; nothing else ever writes this field.');
+      expect(transport.dialProbeMaxParallel, isNull);
+      expect(transport.dialProbePopN, isNull);
+    });
+
+    test('with the cap at M, never more than M central dials are in flight',
+        () async {
+      transport.setDialParallelism(maxParallel: 2, popN: 5);
+      // Four peers appear. The transport wants to dial all four — that
+      // greedy behaviour is untouched — but only two may be underway.
+      for (var i = 1; i <= 4; i++) {
+        await adv(i);
+        if (dials(i) > 0) await pushState(i, BlePathState.connecting);
+        expect(store.state.peers.discoveredBlePeersList.length, i);
+      }
+
+      final inFlight = [for (var i = 1; i <= 4; i++) if (dials(i) > 0) i];
+      expect(inFlight, [1, 2],
+          reason: 'The third and fourth advertisements are refused at the '
+              'choke point while two dials occupy the cap.');
+      expect(dials(3), 0);
+      expect(dials(4), 0);
+    });
+
+    test('a freed slot lets a waiting peer dial — the cap tops up', () async {
+      transport.setDialParallelism(maxParallel: 1, popN: 3);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await adv(2);
+      expect(dials(2), 0, reason: 'One slot, and peer 1 is holding it.');
+
+      // Peer 1 lands. A `ready` path has finished dialing, so it no longer
+      // occupies an in-flight slot.
+      await pushState(1, BlePathState.ready);
+      // The scanner runs allowDuplicates: peer 2 re-advertises, and THAT is
+      // the top-up — the election refires on its own, nothing re-drives it.
+      await adv(2);
+      expect(dials(2), 1);
+      await pushState(2, BlePathState.connecting);
+
+      await adv(3);
+      expect(dials(3), 0,
+          reason: 'The freed slot was taken by peer 2; the cap still holds.');
+    });
+
+    test('a central establishment stamps inFlight, maxParallel and popN',
+        () async {
+      transport.setDialParallelism(maxParallel: 3, popN: 6);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await adv(2);
+      await pushState(2, BlePathState.connecting);
+      // Peer 1 lands while peer 2's dial is still underway.
+      await pushState(1, BlePathState.ready);
+
+      final rec = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'connected');
+      expect(rec['role'], 'central');
+      expect(rec['inFlight'], 1,
+          reason: 'The landed path is `ready` and no longer counts; peer 2 '
+              'is the one dial still in flight.');
+      expect(rec['maxParallel'], 3);
+      expect(rec['popN'], 6);
+      expect(rec['peripheralLinks'], 0);
+      expect(rec['totalLinks'], 1,
+          reason: 'The leg that just landed is the only live one.');
+    });
+
+    test('an establishment counts the inbound legs sharing the link budget',
+        () async {
+      transport.setDialParallelism(maxParallel: 2, popN: 8);
+      // Two peers dialed US: inbound legs nothing caps, because only a
+      // central issues connectGatt and nothing limits accepting.
+      for (final mac in ['IN1', 'IN2']) {
+        callbacks.pushPath(BlePath(
+          pathId: 'peripheral:$mac',
+          role: BleRole.peripheral,
+          state: BlePathState.ready,
+          rssi: -55,
+          mtu: 247,
+          canSend: true,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.ready);
+
+      final rec = trace.records.lastWhere((r) =>
+          r['type'] == 'link' && r['event'] == 'connected' &&
+          r['role'] == 'central');
+      expect(rec['peripheralLinks'], 2);
+      expect(rec['totalLinks'], 3,
+          reason: 'Both roles draw on ONE controller link budget, so a '
+              'failure at high N has to be separable from "out of slots".');
+      expect(rec['inFlight'], 0);
+    });
+
+    test('an inbound peripheral leg carries no dial context', () async {
+      transport.setDialParallelism(maxParallel: 3, popN: 6);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:INBOUND',
+        role: BleRole.peripheral,
         state: BlePathState.ready,
         rssi: -55,
         mtu: 247,
@@ -1435,96 +1548,51 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      final burst = transport.dialBurst([pathId]);
-      await Future<void>.delayed(const Duration(milliseconds: 10));
-      expect(hostApi.calls.where((c) => c == 'disconnect:$pathId'),
-          hasLength(1),
-          reason: 'The old leg is torn down (targeted disconnect, not a '
-              'transport bounce) before the probe redials.');
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1),
-          reason: 'The redial must WAIT for the plugin to report the leg '
-              'down — dialing earlier would be refused by the identity '
-              'guard.');
-
-      // The plugin acknowledges the teardown; the burst then dials.
-      callbacks.pushPath(BlePath(
-        pathId: pathId,
-        role: BleRole.central,
-        state: BlePathState.disconnected,
-        rssi: -55,
-        mtu: 23,
-        canSend: false,
-      ));
-      final dialed = await burst;
-      expect(dialed, [pathId]);
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(2));
+      final rec = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'connected');
+      expect(rec['role'], 'peripheral');
+      expect(rec.containsKey('inFlight'), isFalse,
+          reason: 'The grid counts what this phone DIALED; a leg someone '
+              'else opened is not an establishment of ours.');
+      expect(rec.containsKey('maxParallel'), isFalse);
     });
 
-    test('the in-flight cap refuses a normal dial but not a burst dial',
+    test('establishmentCount counts central legs and resets on demand',
         () async {
-      // Seven in-flight central dials BEFORE discovery: the cap (7) is fully
-      // consumed, so even the election's own dial on the advertisement is
-      // refused and every `connect:AABB01` below belongs to the burst.
-      for (var i = 1; i <= 7; i++) {
-        callbacks.pushPath(BlePath(
-          pathId: 'central:INFLIGHT$i',
-          role: BleRole.central,
-          state: BlePathState.connecting,
-          rssi: null,
-          mtu: 23,
-          canSend: false,
-        ));
-      }
-      // The plugin's path events must land before the advertisement: the cap
-      // reads `_paths`, and a dial racing ahead of them would not see it.
-      await Future<void>.delayed(Duration.zero);
-      adv('AABB01', peerUuidA);
-      await Future<void>.delayed(Duration.zero);
+      transport.setDialParallelism(maxParallel: 2, popN: 4);
+      expect(transport.establishmentCount, 0);
 
-      expect(await transport.connectToDevice('central:AABB01'), isFalse,
-          reason: 'A production dial at the cap stays refused — the cap '
-              'itself is untouched.');
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), isEmpty);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.ready);
+      expect(transport.establishmentCount, 1);
 
-      final dialed = await transport.dialBurst(['central:AABB01']);
-      expect(dialed, ['central:AABB01'],
-          reason: 'The probe burst bypasses the in-flight cap: at M=8 the '
-              'cap would silently swallow the eighth dial and the probe '
-              'would score our constant instead of the platform\'s '
-              'ceiling.');
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1));
-    });
-
-    test(
-        'the failed-dial cooldown refuses a normal dial but not a burst '
-        'dial', () async {
-      adv('CCDD02', peerUuidB);
-      await Future<void>.delayed(Duration.zero);
-      // A failed central dial arms the redial cooldown for this address.
+      // An inbound leg is not ours to count.
       callbacks.pushPath(BlePath(
-        pathId: 'central:CCDD02',
-        role: BleRole.central,
-        state: BlePathState.failed,
-        rssi: null,
-        mtu: 23,
-        canSend: false,
+        pathId: 'peripheral:INBOUND',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
       ));
       await Future<void>.delayed(Duration.zero);
-      int dials() =>
-          hostApi.calls.where((c) => c == 'connect:CCDD02').length;
-      final afterFailure = dials();
+      expect(transport.establishmentCount, 1);
 
-      expect(await transport.connectToDevice('central:CCDD02'), isFalse,
-          reason: 'Within the cooldown a production redial of the failed '
-              'address stays refused.');
-      expect(dials(), afterFailure);
+      transport.resetEstablishmentCount();
+      expect(transport.establishmentCount, 0);
+    });
 
-      final dialed = await transport.dialBurst(['central:CCDD02']);
-      expect(dialed, ['central:CCDD02'],
-          reason: 'One rep\'s failed dial must not swallow the next rep\'s '
-              'scheduled dial of the same address — each rep is its own '
-              'cold measurement.');
-      expect(dials() - afterFailure, 1);
+    test('the failed-dial cooldown still refuses a redial', () async {
+      transport.setDialParallelism(maxParallel: 4, popN: 5);
+      await adv(2);
+      final afterDial = dials(2);
+      await pushState(2, BlePathState.failed);
+
+      expect(await transport.connectToDevice('central:MAC2'), isFalse,
+          reason: 'The cooldown is production behaviour and the grid leaves '
+              'it exactly as it is — only the cap is the variable.');
+      expect(dials(2), afterDial);
     });
   });
 

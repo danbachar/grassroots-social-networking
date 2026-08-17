@@ -59,13 +59,13 @@ class SettingsScreen extends StatefulWidget {
   final Future<int?> Function(Uint8List peer,
       {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
-  final Future<void> Function()? onResetLinks;
+  final Future<void> Function(int? darkSec)? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
-  /// Parallel-dial probe hooks (see FieldRunner): the burst and its
-  /// candidate targets.
-  final Future<List<String>> Function(List<String> pathIds)? dialBurst;
-  final List<String> Function()? bleDialTargets;
+  /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
+  final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
+  final int Function()? establishmentCount;
+  final VoidCallback? onResetEstablishmentCount;
 
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
   final void Function(void Function(String messageId)? listener)?
@@ -96,8 +96,9 @@ class SettingsScreen extends StatefulWidget {
     this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
-    this.dialBurst,
-    this.bleDialTargets,
+    this.onSetDialParallelism,
+    this.establishmentCount,
+    this.onResetEstablishmentCount,
     this.registerAckListener,
   });
 
@@ -339,8 +340,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
-                      dialBurst: widget.dialBurst,
-                      bleDialTargets: widget.bleDialTargets,
+                      onSetDialParallelism: widget.onSetDialParallelism,
+                      establishmentCount: widget.establishmentCount,
+                      onResetEstablishmentCount:
+                          widget.onResetEstablishmentCount,
                       registerAckListener: widget.registerAckListener,
                     ),
                   ),

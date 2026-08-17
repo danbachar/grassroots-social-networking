@@ -2542,8 +2542,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           sendMessage: _grassroots?.send,
           onResetSessions:
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
-          onResetLinks:
-              _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
+          onResetLinks: _grassroots == null
+              ? null
+              : (darkSec) => _grassroots!.resetAllBleLinks(darkSec: darkSec),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
           onCryptoBench:
@@ -2564,12 +2565,17 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
-          dialBurst: _grassroots == null
+          onSetDialParallelism: _grassroots == null
               ? null
-              : (pathIds) => _grassroots!.bleDialBurst(pathIds),
-          bleDialTargets: _grassroots == null
+              : ({int? maxParallel, int? popN}) =>
+                  _grassroots!.setDialParallelismForTestbed(
+                      maxParallel: maxParallel, popN: popN),
+          establishmentCount: _grassroots == null
               ? null
-              : () => _grassroots!.bleBurstDialTargets(),
+              : () => _grassroots!.bleEstablishmentCount,
+          onResetEstablishmentCount: _grassroots == null
+              ? null
+              : () => _grassroots!.resetBleEstablishmentCount(),
           registerAckListener: _grassroots == null
               ? null
               : (listener) => _grassroots!.onTestbedAck = listener,

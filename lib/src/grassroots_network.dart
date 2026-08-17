@@ -739,6 +739,11 @@ class GrassrootsNetwork {
       // Wire-ledger content split: only we know what our sealed packets carry.
       _bleService!.secureContentResolver =
           (packetId) => _sealedContentById[packetId] ?? '';
+      // A dial-grid step bounces the transport, so the cap it set has to be
+      // re-applied to the replacement service or the step would silently run
+      // at the production cap.
+      _bleService!.setDialParallelism(
+          maxParallel: _dialProbeMaxParallel, popN: _dialProbePopN);
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
       // broadcast stream that drops events with no listener. BLE connections
@@ -1908,7 +1913,11 @@ class GrassrootsNetwork {
   /// (no chaotic same-identity redial race). The field runner pairs this with
   /// [resetAllSessions] for a clean per-step establishment ladder. Awaited by
   /// the runner so the step's sends only begin once the transport is back.
-  Future<void> resetAllBleLinks() async {
+  ///
+  /// [darkSec] overrides the dark gap (see below). Supply it only when EVERY
+  /// device bounces at the same instant — then both sides dispose together,
+  /// no stale path can survive on either, and there is nothing to wait for.
+  Future<void> resetAllBleLinks({int? darkSec}) async {
     if (_bleService == null) return;
     debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
     await _bleService!.dispose();
@@ -1928,7 +1937,9 @@ class GrassrootsNetwork {
     // longer outlives it. Accepted: a peer that missed the event still holds
     // a stale path, and its own connect handler closes stale GATTs on our
     // redial, so the pair re-establishes cold either way.
-    final darkGap = config.announceInterval * 2 + const Duration(seconds: 10);
+    final darkGap = darkSec != null
+        ? Duration(seconds: darkSec)
+        : config.announceInterval * 2 + const Duration(seconds: 10);
     debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
     await Future<void>.delayed(darkGap);
     if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
@@ -1966,17 +1977,30 @@ class GrassrootsNetwork {
     if (_started && _bleAvailable) await _bleService!.start();
   }
 
-  /// DEBUG/TESTBED ONLY. Dial-burst candidates for the parallel-dial probe:
-  /// one dialable central pathId per distinct discovered peer, strongest
-  /// advertisement first (see [BleTransportService.burstDialTargets]).
-  List<String> bleBurstDialTargets() =>
-      _bleService?.burstDialTargets() ?? const [];
+  /// DEBUG/TESTBED ONLY. The dial grid's step setting: cap the transport's
+  /// in-flight central dials at [maxParallel] (null = the production cap)
+  /// and stamp [popN] onto the establishments that follow.
+  ///
+  /// Held HERE, not only on the service, because a dial-grid step bounces
+  /// the BLE transport ([resetAllBleLinks]) and the bounce builds a fresh
+  /// [BleTransportService]. Re-applying it in [_initializeBle] is what makes
+  /// the setting survive that; a runner that set it on the live service
+  /// alone would have its cap thrown away by the next step's bounce.
+  void setDialParallelismForTestbed({int? maxParallel, int? popN}) {
+    _dialProbeMaxParallel = maxParallel;
+    _dialProbePopN = popN;
+    _bleService?.setDialParallelism(maxParallel: maxParallel, popN: popN);
+  }
 
-  /// DEBUG/TESTBED ONLY. Fire the parallel-dial probe's burst: tear down our
-  /// existing central legs to the targets, then launch every dial in one
-  /// event-loop turn. Returns the pathIds whose dial actually started.
-  Future<List<String>> bleDialBurst(List<String> pathIds) async =>
-      await _bleService?.dialBurst(pathIds) ?? const [];
+  int? _dialProbeMaxParallel;
+  int? _dialProbePopN;
+
+  /// DEBUG/TESTBED ONLY. Central legs that reached GATT-usable since the last
+  /// [resetBleEstablishmentCount] — the per-step establishment count the dial
+  /// grid records.
+  int get bleEstablishmentCount => _bleService?.establishmentCount ?? 0;
+
+  void resetBleEstablishmentCount() => _bleService?.resetEstablishmentCount();
 
   /// The application block class carried by a `message` payload, from its
   /// first byte (`BlockType`). Testbed traffic uses a reserved byte so it

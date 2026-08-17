@@ -875,7 +875,7 @@ void main() {
       final runner = FieldRunner(
         recorder: recorder,
         myPubkeyHex: hexOf(0),
-        onResetLinks: () async => order.add('links'),
+        onResetLinks: (_) async => order.add('links'),
         onResetSessions: () => order.add('sessions'),
       );
       runner.start(const FieldPlan(
@@ -919,7 +919,7 @@ void main() {
       var links = 0;
       final runner = FieldRunner(
         recorder: recorder,
-        onResetLinks: () async => links++,
+        onResetLinks: (_) async => links++,
       );
       runner.start(plan());
       async.flushMicrotasks();
@@ -1711,33 +1711,29 @@ void main() {
     });
   });
 
-  group('dial grid probe', () {
-    // A two-DUT slice of the grid at population N=3, tap-driven (no
-    // wall-clock anchor) so fakeAsync stays simple: step 1 belongs to phone
-    // #1, step 2 to phone #2.
-    FieldPlan probePlan() => const FieldPlan(
+  group('dial grid', () {
+    // A two-cell slice of the grid at population N=3, tap-driven (no
+    // wall-clock anchor) so fakeAsync stays simple. Every phone runs both
+    // steps — there is no device under test.
+    FieldPlan gridPlan() => const FieldPlan(
           expId: 'dial-t',
           settleSec: 1,
           resetSessions: false,
           resetDtnBuffer: false,
+          resetLinks: true,
+          linkResetDarkSec: 5,
           steps: [
+            FieldStep(label: 'N=3 converge', dwellSec: 5, cliqueN: 3),
             FieldStep(
-                label: 'N=3 DUT=1 M=2 t1',
+                label: 'N=3 M=2 t4',
                 dwellSec: 5,
                 cliqueN: 3,
-                dutOrder: 1,
-                parallelDials: 2),
-            FieldStep(
-                label: 'N=3 DUT=2 M=1 t1',
-                dwellSec: 5,
-                cliqueN: 3,
-                dutOrder: 2,
-                parallelDials: 1,
+                maxParallelDials: 2,
                 autoAdvance: true),
           ],
         );
 
-    test('a dial-probe plan refuses to launch without a numeric nickname', () {
+    test('a dial-grid plan refuses to launch without a numeric nickname', () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(recorder: recorder, myNickname: 'Alice');
@@ -1751,94 +1747,125 @@ void main() {
       });
     });
 
-    test(
-        'the DUT bursts its own step, stays quiet on the other DUT\'s, and '
-        'the record carries BOTH variables', () {
+    test('the step sets the cap after the bounce and restores it at the end',
+        () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
-        final bursts = <List<String>>[];
+        final calls = <String>[];
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '1',
-          bleDialTargets: () =>
-              ['central:AA', 'central:BB', 'central:CC'],
-          dialBurst: (ids) async {
-            bursts.add(ids);
-            return ids;
-          },
+          onResetLinks: (darkSec) async => calls.add('bounce:$darkSec'),
+          onSetDialParallelism: ({int? maxParallel, int? popN}) =>
+              calls.add('cap:$maxParallel/$popN'),
+          onResetEstablishmentCount: () => calls.add('reset'),
+          establishmentCount: () => 4,
         );
-        runner.start(probePlan());
+        runner.start(gridPlan());
         async.flushMicrotasks();
 
-        // Step 1: this phone IS the DUT — one burst of exactly M targets.
+        // Converge step: bounced, then explicitly UNCAPPED.
         runner.inPosition();
         async.flushMicrotasks();
-        expect(bursts, [
-          ['central:AA', 'central:BB']
-        ]);
-        final rec = recorder.records
-            .singleWhere((r) => r['type'] == 'dialburst');
-        expect(rec['dut'], 1);
-        expect(rec['popN'], 3,
-            reason: 'a burst size means nothing without its population');
-        expect(rec['m'], 2);
-        expect(rec['rep'], 1);
-        expect(rec['label'], 'N=3 DUT=1 M=2 t1');
-        expect(rec['targets'], ['central:AA', 'central:BB']);
-        expect(rec['t'], isA<int>());
-        expect(rec.containsKey('n'), isFalse,
-            reason: 'the ambiguous single `n` field is gone');
+        expect(calls, ['bounce:5', 'cap:null/3', 'reset'],
+            reason: 'The cap has to land on the transport the bounce just '
+                'built, and a step with no M must not inherit the previous '
+                'step\'s cap.');
 
-        // Step 2 (auto-advance): dutOrder 2 is another phone's burst.
+        calls.clear();
         async.elapse(const Duration(seconds: 5)); // dwell 1
         async.elapse(const Duration(seconds: 5)); // auto-advance gap
-        async.elapse(const Duration(seconds: 5)); // dwell 2
-        expect(bursts, hasLength(1),
-            reason: 'another phone\'s DUT step fires nothing here');
+        async.flushMicrotasks();
+        expect(calls, ['bounce:5', 'cap:2/3', 'reset']);
 
+        calls.clear();
+        async.elapse(const Duration(seconds: 5)); // dwell 2
         async.elapse(const Duration(seconds: 1)); // settle
         async.flushMicrotasks();
         expect(runner.phase, FieldPhase.finished);
+        expect(calls, contains('cap:null/null'),
+            reason: 'A finished run leaves the phone dialing as production '
+                'does — nothing else ever writes that field back.');
         runner.dispose();
       });
     });
 
-    test('fewer discovered peers than M: dial what exists, log the shortfall',
-        () {
+    test('an aborted run restores the cap too', () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
-        final bursts = <List<String>>[];
+        final caps = <String>[];
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '1',
-          bleDialTargets: () => ['central:AA'],
-          dialBurst: (ids) async {
-            bursts.add(ids);
-            return ids;
-          },
+          onSetDialParallelism: ({int? maxParallel, int? popN}) =>
+              caps.add('$maxParallel'),
         );
-        runner.start(probePlan()); // step 1 wants M=2
+        runner.start(gridPlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.flushMicrotasks();
+        caps.clear();
+
+        runner.abort();
+        async.flushMicrotasks();
+        expect(caps, ['null']);
+        runner.dispose();
+      });
+    });
+
+    test('each capped step logs its cell: M, N, rep and the count', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var established = 0;
+        final runner = FieldRunner(
+          recorder: recorder,
+          myNickname: '2',
+          onResetLinks: (_) async {},
+          onSetDialParallelism: ({int? maxParallel, int? popN}) {},
+          onResetEstablishmentCount: () => established = 0,
+          establishmentCount: () => established,
+        );
+        runner.start(gridPlan());
         async.flushMicrotasks();
         runner.inPosition();
         async.flushMicrotasks();
 
-        expect(bursts, [
-          ['central:AA']
-        ]);
-        final shortfall = recorder.records
-            .singleWhere((r) => r['event'] == 'dialShortfall');
-        expect(shortfall['popN'], 3);
-        expect(shortfall['m'], 2,
-            reason: 'm is the want; nothing repeats it under a second name');
-        expect(shortfall['have'], 1);
-        expect(shortfall.containsKey('want'), isFalse);
-        final rec = recorder.records
-            .singleWhere((r) => r['type'] == 'dialburst');
-        expect(rec['m'], 2,
-            reason: 'm stays the step\'s intended burst size — the '
-                'shortfall is visible as targets.length < m');
-        expect(rec['targets'], ['central:AA']);
-        async.elapse(const Duration(seconds: 20));
+        // The converge step establishes plenty, but it is not a cell.
+        established = 9;
+        async.elapse(const Duration(seconds: 5)); // dwell 1
+        expect(recorder.records.where((r) => r['type'] == 'dialcell'),
+            isEmpty);
+
+        async.elapse(const Duration(seconds: 5)); // auto-advance gap
+        async.flushMicrotasks();
+        established = 3;
+        async.elapse(const Duration(seconds: 5)); // dwell 2
+        async.flushMicrotasks();
+
+        final cell = recorder.records
+            .singleWhere((r) => r['type'] == 'dialcell');
+        expect(cell['step'], 'N=3 M=2 t4');
+        expect(cell['popN'], 3);
+        expect(cell['maxParallel'], 2);
+        expect(cell['rep'], 4, reason: 'read off the label\'s t-suffix');
+        expect(cell['order'], 2);
+        expect(cell['established'], 3);
+        expect(cell['dwellSec'], 5);
+
+        // The same three variables open the window on the step marker, so a
+        // cell that establishes nothing is still a segment the analyzer can
+        // find.
+        final marker = recorder.markerExtras
+            .lastWhere((e) => e.$1 == 'N=3 M=2 t4').$2;
+        expect(marker['maxParallel'], 2);
+        expect(marker['popN'], 3);
+        expect(marker['rep'], 4);
+        final converge = recorder.markerExtras
+            .lastWhere((e) => e.$1 == 'N=3 converge').$2;
+        expect(converge.containsKey('maxParallel'), isFalse);
+
+        async.elapse(const Duration(seconds: 1)); // settle
+        async.flushMicrotasks();
         runner.dispose();
       });
     });

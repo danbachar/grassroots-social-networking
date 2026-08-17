@@ -245,8 +245,33 @@ class BleTransportService extends TransportService {
   /// transport-local stages — `gattConnected` at the raw GATT link coming up,
   /// `connected` at `ready`, i.e. GATT-usable; discovered / session / usable
   /// are logged by the coordinator).
+  ///
+  /// A CENTRAL establishment (`connected` on a leg we dialed) additionally
+  /// carries the dial-parallelism context, so every establishment in a
+  /// dial-grid run is attributable without inferring anything offline:
+  ///
+  ///  - `inFlight` — how many OTHER central dials were still underway at that
+  ///    instant. This is [_inFlightCentralDials], the very counter the cap
+  ///    gates on, read after the path itself reached `ready` (a ready path no
+  ///    longer counts as in flight), so it is "how crowded the dial pipeline
+  ///    was when this one landed" and is directly comparable to the cap.
+  ///  - `maxParallel` / `popN` — the step's M (the cap the runner set) and N
+  ///    (radios up). The transport cannot see the plan, so the runner pushes
+  ///    them down the same call that sets the cap ([setDialParallelism]).
+  ///  - `peripheralLinks` / `totalLinks` — live INBOUND legs, and live legs
+  ///    across both roles. These separate the experiment's most likely
+  ///    confound from its subject. A peripheral cannot dial (only a central
+  ///    issues `connectGatt`), so the in-flight cap has no peripheral
+  ///    counterpart, and nothing — app or plugin — limits ACCEPTING inbound
+  ///    links. What does limit them is the controller's simultaneous-link
+  ///    budget, which both roles SHARE: with every device dialing at M, one
+  ///    device can hold up to (N-1) inbound plus M outbound, so N=8 reaches
+  ///    14 links on chips that may only carry ~7-10. Without these two
+  ///    counters a failure at (N=8, M=2) cannot be told apart from "the
+  ///    controller ran out of link slots" — the same number either way.
   void _traceLink(String event, ble.BlePath path, BleRole role) {
     if (!_tracing) return;
+    final establishment = event == 'connected' && role == BleRole.central;
     unawaited(trace!.log({
       'type': 'link',
       't': DateTime.now().millisecondsSinceEpoch,
@@ -255,8 +280,25 @@ class BleTransportService extends TransportService {
       'role': role.name,
       if (path.rssi != null) 'rssi': path.rssi,
       if (event == 'drop') 'reason': path.error ?? path.state.name,
+      if (establishment) 'inFlight': _inFlightCentralDials(),
+      if (establishment) 'peripheralLinks': _liveLinks(ble.BleRole.peripheral),
+      if (establishment) 'totalLinks': _liveLinks(null),
+      if (establishment && dialProbeMaxParallel != null)
+        'maxParallel': dialProbeMaxParallel,
+      if (establishment && dialProbePopN != null) 'popN': dialProbePopN,
       ...?_peerField(path.pathId),
     }));
+  }
+
+  /// Live (GATT-usable) legs in [role], or across both roles when null.
+  /// Counts against the controller's shared simultaneous-link budget.
+  int _liveLinks(ble.BleRole? role) {
+    var count = 0;
+    for (final p in _paths.values) {
+      if (role != null && p.role != role) continue;
+      if (_isReady(p)) count++;
+    }
+    return count;
   }
 
   /// Every currently-live leg, as the link records that WOULD have been
@@ -1358,13 +1400,9 @@ class BleTransportService extends TransportService {
   /// targets that have no scanner discovery entry — the reverse-leg dial to a
   /// live inbound link's remote address (see [_openReverseLeg]). Ignored when
   /// the discovery map already knows the advertised UUID (the fresher truth).
-  /// [forProbe] marks a [dialBurst] dial, exempting it from the in-flight
-  /// cap and the failed-dial cooldown ONLY (see [_maxInFlightCentralDials]);
-  /// every validity guard still applies, and no production dial sets it.
   Future<bool> connectToDevice(
     String pathId, {
     String? serviceUuidOverride,
-    bool forProbe = false,
   }) async {
     if (!pathId.startsWith('central:')) {
       // Peripheral-side paths are inbound — we don't dial them.
@@ -1395,26 +1433,20 @@ class BleTransportService extends TransportService {
     }
     // BLE address rotation produces a fresh pathId every ~30s for the same
     // peer. Cap the number of in-flight central dials so a chatty rotator
-    // can't exhaust the BLE stack's connection slots. Probe bursts are
-    // exempt (see [_maxInFlightCentralDials]): the probe measures the
-    // PLATFORM's parallel-dial ceiling, and this cap sitting inside the
-    // measurement would make the probe score our own limit.
-    if (!forProbe && _inFlightCentralDials() >= _maxInFlightCentralDials) {
+    // can't exhaust the BLE stack's connection slots. This cap is also the
+    // dial grid's independent variable (see [maxInFlightCentralDials]) — no
+    // dial is ever exempt from it.
+    if (_inFlightCentralDials() >= maxInFlightCentralDials) {
       return false;
     }
     // Rate-limit redials of an address that just failed: the peer's next
     // advertisement after the cooldown re-arms it (see [_centralDialCooldown]).
-    // Probe bursts are exempt here too — a dial that failed in one rep must
-    // not silently swallow the next rep's scheduled dial of the same
-    // address; each rep is its own cold measurement.
-    if (!forProbe) {
-      final failedAt = _centralDialFailedAt[pathId];
-      if (failedAt != null) {
-        if (DateTime.now().difference(failedAt) < _centralDialCooldown) {
-          return false;
-        }
-        _centralDialFailedAt.remove(pathId);
+    final failedAt = _centralDialFailedAt[pathId];
+    if (failedAt != null) {
+      if (DateTime.now().difference(failedAt) < _centralDialCooldown) {
+        return false;
       }
+      _centralDialFailedAt.remove(pathId);
     }
 
     final remoteId = pathId.substring('central:'.length);
@@ -1453,82 +1485,6 @@ class BleTransportService extends TransportService {
     } catch (e) {
       debugPrint('disconnect() failed for $pathId: $e');
     }
-  }
-
-  /// DEBUG/TESTBED ONLY. Dial-burst candidates: one dialable central pathId
-  /// per distinct discovered peer, strongest advertisement first. Distinct
-  /// by advertised service UUID — the discovery map is keyed by address, and
-  /// a rotated MAC would otherwise offer the same peer twice in one burst
-  /// (the second dial hits the one-central-per-identity guard and the burst
-  /// silently shrinks). The runner takes the first M of these.
-  List<String> burstDialTargets() {
-    final byUuid = <String, DiscoveredPeerState>{};
-    for (final dp in _peersState.discoveredBlePeersList) {
-      final uuid = dp.serviceUuid?.toLowerCase();
-      if (uuid == null) continue;
-      final existing = byUuid[uuid];
-      if (existing == null || dp.rssi > existing.rssi) byUuid[uuid] = dp;
-    }
-    final targets = byUuid.values.toList()
-      ..sort((a, b) => b.rssi.compareTo(a.rssi));
-    return [for (final dp in targets) dp.transportId];
-  }
-
-  /// DEBUG/TESTBED ONLY. The parallel-dial probe's burst: fire a central
-  /// dial at every target in the SAME event-loop turn, so the stack sees M
-  /// genuinely simultaneous `connectGatt`s. Returns the pathIds whose dial
-  /// actually started (a target the choke-point guards refused is omitted —
-  /// the trace then simply has no formation for it).
-  ///
-  /// Existing central legs to the targets are torn down first — a targeted
-  /// per-leg disconnect, never a transport bounce, so advertising, scanning
-  /// and every other pair's legs are untouched — because a probe rep must
-  /// measure a COLD dial and the one-central-per-identity guard in
-  /// [connectToDevice] would refuse a redial while the old leg lives. The
-  /// teardown is acknowledged by the plugin's path event, not by the
-  /// disconnect call returning, so the burst waits (bounded) for those paths
-  /// to actually leave the table before dialing; a leg still wedged at the
-  /// deadline leaves its target refused and reported un-dialed, which is the
-  /// honest outcome. Burst dials run with `forProbe: true`, which exempts
-  /// them from the in-flight cap and the failed-dial cooldown (and nothing
-  /// else): the probe measures the platform's parallel-dial ceiling, so our
-  /// own cap inside the measurement would measure ourselves, and one rep's
-  /// failed dial must not swallow the next rep's redial of that address.
-  Future<List<String>> dialBurst(List<String> pathIds) async {
-    final torn = <String>{};
-    final teardowns = <Future<void>>[];
-    for (final pathId in pathIds) {
-      final uuid = _peersState.getDiscoveredBlePeer(pathId)?.serviceUuid;
-      if (uuid == null) continue;
-      final live = _pairViewFor(uuid).liveCentralPathId;
-      if (live != null && torn.add(live)) {
-        teardowns.add(disconnectDevice(live));
-      }
-    }
-    // Concurrent, not sequential: a per-leg await would make the teardown
-    // cost grow with N and leak into the formation clock as a fake slope.
-    await Future.wait(teardowns);
-    final deadline = DateTime.now().add(const Duration(seconds: 2));
-    while (torn.any(_paths.containsKey) &&
-        DateTime.now().isBefore(deadline)) {
-      await Future<void>.delayed(const Duration(milliseconds: 25));
-    }
-
-    // The burst proper: every launch in one synchronous sweep — no awaits
-    // between them — collecting the futures to read the started/refused
-    // verdicts afterwards. [connectToDevice]'s guards run synchronously and
-    // its plugin connect is issued before its first suspension, so all N
-    // dials are on the channel before this turn yields.
-    final launches = <String, Future<bool>>{};
-    for (final pathId in pathIds) {
-      launches.putIfAbsent(
-          pathId, () => connectToDevice(pathId, forProbe: true));
-    }
-    final dialed = <String>[];
-    for (final entry in launches.entries) {
-      if (await entry.value) dialed.add(entry.key);
-    }
-    return dialed;
   }
 
   /// Reset the first-mover fallback clock for the identity behind [pathId]
@@ -1721,18 +1677,47 @@ class BleTransportService extends TransportService {
     unawaited(connectToDevice(pathId));
   }
 
-  /// Cap on simultaneous `connecting` central paths.
-  /// Each `connectGatt` consumes a controller slot for ~5s on Android; too
-  /// many parallel dials starve real connections.
+  /// Cap on simultaneous in-flight central dials (paths `connecting` /
+  /// `connected` / `subscribed` — a `ready` path has landed and no longer
+  /// counts). Each `connectGatt` consumes a controller slot for ~5s on
+  /// Android; too many parallel dials starve real connections.
   ///
-  /// The parallel-dial probe's [dialBurst] deliberately BYPASSES this cap
-  /// (and the failed-dial cooldown) via [connectToDevice]'s `forProbe`
-  /// flag: the probe exists to find the PLATFORM's real parallel-dial
-  /// ceiling, so an app-side cap inside the measurement would be measuring
-  /// ourselves — at M=8 this cap would silently swallow the eighth dial and
-  /// score our constant, not the stack. The cap itself stays exactly as-is
-  /// for every production dial path.
-  static const int _maxInFlightCentralDials = 7;
+  /// Settable, and that is the whole dial-grid experiment: the transport
+  /// already dials greedily — every discovered peer, election-driven, topped
+  /// up automatically as slots free — so the grid does not script bursts, it
+  /// simply moves this bound to M for the step and counts what the ordinary
+  /// dial path establishes. Nothing is ever exempt from it; an exemption
+  /// would delete the independent variable. Testbed-only writer
+  /// ([setDialParallelism]); [defaultMaxInFlightCentralDials] is what
+  /// production runs at and what the runner restores when a run ends.
+  int maxInFlightCentralDials = defaultMaxInFlightCentralDials;
+
+  static const int defaultMaxInFlightCentralDials = 7;
+
+  /// DEBUG/TESTBED ONLY. The dial grid's two step variables, stamped on
+  /// every central establishment (see [_traceLink]) so an establishment is
+  /// attributable to the cell it happened in. Null outside a dial-grid step.
+  int? dialProbeMaxParallel;
+  int? dialProbePopN;
+
+  /// Central legs that reached GATT-usable since [resetEstablishmentCount],
+  /// i.e. the establishments this device produced. Monotonic within a step;
+  /// the runner snapshots it at the step boundary so the per-step count is a
+  /// recorded fact rather than something the analyzer re-derives from link
+  /// records.
+  int get establishmentCount => _establishmentCount;
+  int _establishmentCount = 0;
+
+  void resetEstablishmentCount() => _establishmentCount = 0;
+
+  /// DEBUG/TESTBED ONLY. Set the in-flight central dial cap for a dial-grid
+  /// step, together with the step context the establishment records carry.
+  /// A null [maxParallel] restores the production cap.
+  void setDialParallelism({int? maxParallel, int? popN}) {
+    maxInFlightCentralDials = maxParallel ?? defaultMaxInFlightCentralDials;
+    dialProbeMaxParallel = maxParallel;
+    dialProbePopN = popN;
+  }
 
   int _inFlightCentralDials() {
     var count = 0;
@@ -1758,7 +1743,7 @@ class BleTransportService extends TransportService {
   /// its full connect timeout, exhausted the table into a GATT-133 storm. An
   /// advertisement is proof the peer still answers at that address, so we DO
   /// retry the same address — but no faster than once per cooldown, and never
-  /// more than [_maxInFlightCentralDials] at once. A peer that is truly gone
+  /// more than [maxInFlightCentralDials] at once. A peer that is truly gone
   /// stops advertising and ages out of discovery, taking its cooldown with it.
   static const Duration _centralDialCooldown = Duration(seconds: 3);
   final Map<String, DateTime> _centralDialFailedAt = {};
@@ -1947,6 +1932,7 @@ class BleTransportService extends TransportService {
         _centralDialFailedAt.remove(path.pathId);
         if (previous?.state != ble.BlePathState.ready) {
           store.dispatch(BleDeviceConnectedAction(path.pathId));
+          if (role == BleRole.central) _establishmentCount++;
           _traceLink('connected', path, role);
           _addConnectionEvent(TransportConnectionEvent(
             peerId: path.pathId,

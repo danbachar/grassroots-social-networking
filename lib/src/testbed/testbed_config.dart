@@ -226,23 +226,16 @@ class FieldStep {
   /// set.
   final int rawSizeDelta;
 
-  /// Parallel-dial probe: which phone (join order) is the DIALER at this
-  /// step. Like [cliqueN] the plan stays ROLE-FREE — every phone loads the
-  /// identical JSON — but unlike [cliqueN] this is NOT resolved away by
-  /// [FieldPlan.resolvedFor]: the runner compares it against its own
-  /// [joinOrder] at step start, so the full rotation survives in every
-  /// phone's plan. The phone whose order matches fires the burst; every
-  /// other phone runs its ordinary transport, which is deliberate — a peer
-  /// dialing at the same moment is the contention a real burst meets, and
-  /// the DUT measures its OWN dials off its own clock, so nobody else's
-  /// dialing can contaminate the numbers.
-  final int? dutOrder;
-
-  /// Parallel-dial probe: how many distinct peers the DUT dials
-  /// SIMULTANEOUSLY at this step's start — the burst size M, at most
-  /// [cliqueN] - 1 (a phone cannot dial itself). Ignored on phones whose
-  /// join order is not [dutOrder].
-  final int? parallelDials;
+  /// Dial grid: the most central dials this phone may have IN FLIGHT during
+  /// the step — the grid's M. Null leaves the production cap in place.
+  ///
+  /// This is a CAP ON ORDINARY BEHAVIOUR, not a scripted burst. The
+  /// transport already dials greedily (every discovered peer, topped up
+  /// automatically as slots free); the step just moves the bound and counts
+  /// what gets established. Every phone runs it — there is no device under
+  /// test and no rotation — so each phone measures its own dialing at M and
+  /// the whole fleet is a sample.
+  final int? maxParallelDials;
 
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
@@ -264,8 +257,7 @@ class FieldStep {
     this.rawSizeDelta = 0,
     this.bleOn,
     this.cliqueN,
-    this.dutOrder,
-    this.parallelDials,
+    this.maxParallelDials,
     this.resetSessions,
     this.resetDtnBuffer,
   });
@@ -291,8 +283,7 @@ class FieldStep {
         if (rawSizeDelta != 0) 'rawSizeDelta': rawSizeDelta,
         if (bleOn != null) 'bleOn': bleOn,
         if (cliqueN != null) 'cliqueN': cliqueN,
-        if (dutOrder != null) 'dutOrder': dutOrder,
-        if (parallelDials != null) 'parallelDials': parallelDials,
+        if (maxParallelDials != null) 'maxParallelDials': maxParallelDials,
         if (resetSessions != null) 'resetSessions': resetSessions,
         if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
       };
@@ -311,8 +302,7 @@ class FieldStep {
         rawSizeDelta: json['rawSizeDelta'] as int? ?? 0,
         bleOn: json['bleOn'] as bool?,
         cliqueN: json['cliqueN'] as int?,
-        dutOrder: json['dutOrder'] as int?,
-        parallelDials: json['parallelDials'] as int?,
+        maxParallelDials: json['maxParallelDials'] as int?,
         resetSessions: json['resetSessions'] as bool?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool?,
       );
@@ -333,8 +323,7 @@ class FieldStep {
       other.rawSizeDelta == rawSizeDelta &&
       other.bleOn == bleOn &&
       other.cliqueN == cliqueN &&
-      other.dutOrder == dutOrder &&
-      other.parallelDials == parallelDials &&
+      other.maxParallelDials == maxParallelDials &&
       other.resetSessions == resetSessions &&
       other.resetDtnBuffer == resetDtnBuffer;
 
@@ -342,7 +331,7 @@ class FieldStep {
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
           saturate, sendLanes, sendTo, rawLeg, rawSizeDelta, bleOn, cliqueN,
-          dutOrder, parallelDials, resetSessions, resetDtnBuffer);
+          maxParallelDials, resetSessions, resetDtnBuffer);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -375,6 +364,17 @@ class FieldPlan {
   /// fully independent discovered→connected→session→usable trial. Costs a
   /// few seconds of re-dial per step.
   final bool resetLinks;
+
+  /// Dark gap of the per-step BLE bounce ([resetLinks]), in seconds. Null
+  /// keeps the coordinator's default (two announce cycles + 10 s, ~30 s),
+  /// which is sized for a bounce only THIS device performs: the peer has to
+  /// notice the link died, and the gap outlasts that discovery.
+  ///
+  /// Set it short only when every device bounces simultaneously at the step
+  /// boundary — then both sides dispose their transports together, no stale
+  /// path survives on either, and there is nothing to wait for. The dial
+  /// grid does exactly that, so it spends ~5 s per step here instead of ~30.
+  final int? linkResetDarkSec;
 
   /// Empty the DTN memory buffer at the start of every step (default on):
   /// without it, an overrun step's undelivered backlog survives in the buffer
@@ -432,6 +432,7 @@ class FieldPlan {
     this.roster = const [],
     this.resetSessions = true,
     this.resetLinks = false,
+    this.linkResetDarkSec,
     this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
     this.manualJoin = false,
@@ -468,11 +469,9 @@ class FieldPlan {
                   rawSizeDelta: s.rawSizeDelta,
                   bleOn: joinOrder <= s.cliqueN!,
                   cliqueN: s.cliqueN,
-                  // Pass-through only: dutOrder is compared against joinOrder
-                  // at RUNTIME by the runner, never resolved into the plan —
-                  // every phone keeps the full DUT rotation.
-                  dutOrder: s.dutOrder,
-                  parallelDials: s.parallelDials,
+                  // Pass-through: the dial cap is the same on every phone,
+                  // so unlike bleOn there is nothing per-device to resolve.
+                  maxParallelDials: s.maxParallelDials,
                   resetSessions: s.resetSessions,
                   resetDtnBuffer: s.resetDtnBuffer,
                 ),
@@ -481,6 +480,7 @@ class FieldPlan {
       roster: roster,
       resetSessions: resetSessions,
       resetLinks: resetLinks,
+      linkResetDarkSec: linkResetDarkSec,
       resetDtnBuffer: resetDtnBuffer,
       autoAdvanceGapSec: autoAdvanceGapSec,
       manualJoin: manualJoin,
@@ -498,6 +498,7 @@ class FieldPlan {
           'roster': roster.map((r) => r.toJson()).toList(),
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
+        if (linkResetDarkSec != null) 'linkResetDarkSec': linkResetDarkSec,
         'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
         if (manualJoin) 'manualJoin': true,
@@ -519,6 +520,7 @@ class FieldPlan {
             const [],
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
+        linkResetDarkSec: json['linkResetDarkSec'] as int?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
         manualJoin: json['manualJoin'] as bool? ?? false,
@@ -536,6 +538,7 @@ class FieldPlan {
       listEquals(other.roster, roster) &&
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
+      other.linkResetDarkSec == linkResetDarkSec &&
       other.resetDtnBuffer == resetDtnBuffer &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
       other.manualJoin == manualJoin &&
@@ -545,7 +548,7 @@ class FieldPlan {
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
-      Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
-      autoAdvanceGapSec, manualJoin, placementSec, alignSec,
+      Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
+      resetDtnBuffer, autoAdvanceGapSec, manualJoin, placementSec, alignSec,
       scriptedRadio);
 }

@@ -94,7 +94,10 @@ Per step the runner: bounces the BLE transport when `resetLinks` is set (the
 line-sweep default — a full disable/enable like the settings toggle, so the
 pair goes dark and re-establishes through the clean cold-start election
 rather than a chaotic same-identity redial; the step waits for the transport
-to come back), drops all Noise sessions (`resetSessions`, so the
+to come back — the dark gap is two announce cycles + 10 s unless the plan
+sets `linkResetDarkSec`, which is only sound when EVERY device bounces at the
+same step boundary, since then both sides dispose together and no stale path
+survives to wait out), drops all Noise sessions (`resetSessions`, so the
 establishment ladder re-runs from a cold handshake every step), stamps the
 marker, and — when `sendCount` > 0 — sends that many `sendBytes`-sized
 messages (**default 132** — see Payload size below). Sends are **gated on the link being settled**

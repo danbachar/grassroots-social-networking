@@ -33,23 +33,23 @@ emits, under ``--out``:
     <exp>/wire_bytes.png       tx/rx bytes per packet type over time
     <exp>/latency.csv          per-message e2e latency (sent joined to
                                delivered on messageId)
-    <exp>/dial_probe.csv       dial grid: one row per (DUT, pop_n, m, rep,
-                               target) with ms from the burst to
-                               gattConnected / connected (= GATT-usable, the
-                               endpoint) / session / dual-leg converged (both
-                               legs to the target's identity live), and the
-                               20 s verdict. pop_n = radios up, m = dials
-                               fired at once
-    <exp>/dial_scores.csv      per (DUT device, pop_n): P* (largest m with
-                               every dial usable in every rep), median ms to
-                               usable / session / converged at P*, success
-                               fraction per m, and the m=4..6 ms-per-dial
-                               slope (stack-serialization flag)
-    <exp>/dial_probe_N<n>.png  three shared-X panels of median-vs-m per DUT
-                               at population n (p10-p90 bars): ms to
-                               GATT-usable (successful dials), to Noise
-                               session, to dual-leg convergence — plus a
-                               success-fraction strip
+    <exp>/dial_probe.csv       dial grid: one row per establishment, keyed
+                               (device, pop_n, m, rep), with the window's
+                               establishment count and, per connection, ms
+                               to GATT-usable / session / dual-leg converged
+                               plus the in-flight dial count, live inbound
+                               legs and total live legs at that instant.
+                               pop_n = radios up, m = allowed parallel dials
+    <exp>/dial_scores.csv      per (device, pop_n): establishments per window
+                               at each m, the saturation knee (smallest m
+                               already as good as the best), median ms to
+                               usable / session / converged at the knee, and
+                               the max in-flight / peripheral / TOTAL links
+                               observed — the device's link-budget ceiling
+    <exp>/dial_probe_N<n>.png  four shared-X panels of median-vs-m per device
+                               at population n (p10-p90 bars): establishments
+                               per window, then ms to GATT-usable, to Noise
+                               session, to dual-leg convergence
     <exp>/dial_probe.png       the same figure at the largest population
                                present (the headline)
 
@@ -2899,199 +2899,217 @@ DIAL_PROBE_DEADLINE_MS = 20_000
 
 
 def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per (DUT device, popN, M, rep, target pathId) of a dial-grid run.
+    """One row per ESTABLISHMENT of the dial grid, keyed by its cell.
 
-    The grid has TWO variables and both come off the `dialburst` record:
-    `popN` (how many phones had their radio up) and `m` (how many of them the
-    DUT dialled at once). The first version of this probe logged the burst
-    size alone, which made a burst of 4 into a two-phone room
-    indistinguishable from one into an eight-phone room.
+    The grid has TWO variables and the runner stamps both on the marker that
+    OPENS each step, so a cell is a per-device window and needs no inference:
 
-    Each `dialburst` record carries its targets; every target is joined to the
-    first link stage stamp for that pathId at t >= the burst's t, taken ONLY
-    from the DUT's own device trace — the burst and its link stages are both
-    local to the DUT, so no cross-device clock is involved. The stages, in the
-    names the transport actually emits:
+      popN        the population — how many phones have their radio up
+      maxParallel M — the cap on how many central dials this phone may have
+                  IN FLIGHT during the step. The transport dials greedily on
+                  its own; M only bounds it, which is why the answer is a
+                  RATE (establishments per fixed window) and not the fate of
+                  a scripted burst.
 
-      gattConnected  the raw GATT link came up (pre service-discovery /
-                     subscribe / MTU)                      -> ms_to_connected
-      connected      the path reached `ready` — connected + MTU, able to
-                     carry bytes. This is GATT-usable, the formation
-                     endpoint                              -> ms_to_usable
-      session        Noise session established (joined by the stamped
-                     pathId or by the leg's peer)          -> ms_to_session
+    Windows are PER DEVICE, opened by that device's own step marker and
+    closed by its next marker — every phone runs every cell, so there is no
+    device under test and nothing to join across clocks.
 
-    ms_to_converged is burst -> DUAL-LEG convergence: the first instant at
-    or after the burst when the DUT holds BOTH live legs to the target's
-    peer identity — its own central leg usable AND an inbound peripheral leg
-    from that same peer. The join problem is path -> peer identity: the
-    dialed target is `central:<addr>` but the peer's reverse leg arrives as
-    `peripheral:<its-own-mac>`, which need not equal <addr>. Both legs are
-    mapped to a peer hex through the trace's ANNOUNCE-driven binding: every
-    `link` record that carries both `path` and `peer` (`discovered` stamps
-    the path each verified ANNOUNCE arrived on, `session` the leg the peer
-    was attached to at establishment, and `gattConnected` / `connected` /
-    `drop` carry `peer` once the path is attributable). Leg liveness is the
-    per-path `connected` -> `drop` interval over the WHOLE device trace
-    (snapshot `connected` records included), because the target's reverse
-    leg can predate the burst — dialBurst tears down only the DUT's own
-    central legs, so a rep t>1 may start with the peer's leg already live,
-    making convergence coincide with usable. A convergence not reached
-    within the deadline (or the burst window) is null and does NOT fail the
-    dial — `ok` keys on usable alone.
+    Inside the window each central `connected` link record is one
+    establishment, and it carries its own attribution:
 
-    The join window for a burst closes at the DUT's NEXT burst: reps re-dial
-    the same peers, and an unbounded join would credit a failed rep with the
-    following rep's formation. `ok` is usable within DIAL_PROBE_DEADLINE_MS.
+      inFlight         other central dials still underway when it landed
+      peripheralLinks  live inbound legs at that instant
+      totalLinks       live legs across both roles
+
+    The last two are the experiment's confound control. Nothing caps inbound
+    links — only a central dials — but both roles draw on ONE controller
+    link budget, so at (N=8, M=2) a phone can be holding 7 inbound legs and
+    failing for want of slots rather than for dial concurrency. The two
+    numbers are what tells those apart.
+
+    Each establishment also gets the rest of the ladder: `ms_to_session` (the
+    Noise session on that leg or its peer) and `ms_to_converged` (the first
+    instant the phone holds BOTH legs to that peer identity — its own central
+    leg usable AND an inbound peripheral leg from the same peer). Leg
+    liveness is the per-path `connected` -> `drop` interval over the WHOLE
+    device trace, snapshots included, because a peer's reverse leg can
+    predate the window.
+
+    A cell that established NOTHING still gets a row (established=0, every ms
+    null): an absent row would be indistinguishable from a phone that never
+    ran the step, and the zero cells are exactly where the ceiling shows.
+    `recorded` is the runner's own `dialcell` count for the same step — an
+    independent witness to the count derived here.
     """
-    bursts = df[df._type == "dialburst"]
-    if bursts.empty:
+    markers = df[df._type == "marker"]
+    if markers.empty or "maxParallel" not in markers.columns:
         return pd.DataFrame()
     link = df[df._type == "link"]
+    cells = df[df._type == "dialcell"] if "dialcell" in set(df._type) else None
     rows = []
-    for dev, dev_bursts in bursts.groupby("_device"):
-        dev_bursts = dev_bursts.sort_values("_t")
-        burst_ts = dev_bursts._t.tolist()
+    for dev, dm in markers.groupby("_device"):
+        dm = dm.sort_values("_t")
+        marker_ts = dm._t.tolist()
         dl = link[link._device == dev].sort_values("_t")
         ev = _col(dl, "event")
         path = _col(dl, "path")
         peer = _col(dl, "peer")
+        role = _col(dl, "role")
         # Whole-trace path -> peer hex binding (first sighting wins; a
         # pathId never migrates between identities within one run).
         bound: dict = {}
-        for p, h in zip(path.tolist(), peer.tolist()):
-            if isinstance(p, str) and isinstance(h, str) and p not in bound:
-                bound[p] = h
+        for p_, h in zip(path.tolist(), peer.tolist()):
+            if isinstance(p_, str) and isinstance(h, str) and p_ not in bound:
+                bound[p_] = h
         # Per-path liveness intervals: `connected` opens (snapshots
         # included — a leg alive since before the recording), the next
         # `drop` closes, an unclosed leg runs to the end of the trace.
         opens: dict = {}
         live: dict = {}
-        for p, e, t in zip(path.tolist(), ev.tolist(), dl._t.tolist()):
-            if not isinstance(p, str):
+        for p_, e, t in zip(path.tolist(), ev.tolist(), dl._t.tolist()):
+            if not isinstance(p_, str):
                 continue
             if e == "connected":
-                opens.setdefault(p, t)
-            elif e == "drop" and p in opens:
-                live.setdefault(p, []).append((opens.pop(p), t))
-        for p, t in opens.items():
-            live.setdefault(p, []).append((t, math.inf))
-        for i, (_, b) in enumerate(dev_bursts.iterrows()):
-            t0 = b._t
-            t1 = burst_ts[i + 1] if i + 1 < len(burst_ts) else math.inf
-            targets = b.get("targets")
-            if not isinstance(targets, list):
+                opens.setdefault(p_, t)
+            elif e == "drop" and p_ in opens:
+                live.setdefault(p_, []).append((opens.pop(p_), t))
+        for p_, t in opens.items():
+            live.setdefault(p_, []).append((t, math.inf))
+        # The runner's own per-step count, keyed by step label.
+        recorded: dict = {}
+        if cells is not None:
+            dc = cells[cells._device == dev]
+            for _, c in dc.iterrows():
+                lbl = c.get("step")
+                if isinstance(lbl, str):
+                    recorded[lbl] = int(_num(c.get("established"), 0))
+        for i, (_, mk) in enumerate(dm.iterrows()):
+            m = mk.get("maxParallel")
+            if m is None or (isinstance(m, float) and math.isnan(m)):
                 continue
+            t0 = mk._t
+            t1 = marker_ts[i + 1] if i + 1 < len(marker_ts) else math.inf
+            label = mk.get("label", "")
+            cell = {
+                "device": dev,
+                "pop_n": int(_num(mk.get("popN"), 0)),
+                "m": int(m),
+                "rep": int(_num(mk.get("rep"), 1)),
+                "step": label if isinstance(label, str) else "",
+                "recorded": recorded.get(label),
+            }
             in_win = (dl._t >= t0) & (dl._t < t1)
-            for target in targets:
-                def first_ms(mask):
-                    hit = dl[in_win & mask]
-                    return None if hit.empty else float(hit._t.iloc[0] - t0)
-
-                mine = path == target
-                ms_conn = first_ms(mine & (ev == "gattConnected"))
-                ms_usable = first_ms(mine & (ev == "connected"))
-                # The peer behind this leg, read off its own stamps — needed
-                # because the session stamp's path is the peer's CURRENT
-                # attachment, which can lag the just-dialed leg by one event.
-                hits = dl[in_win & mine]
-                peers = hits.get("peer")
-                target_peer = None
-                if peers is not None:
-                    real = peers.dropna()
-                    if len(real):
-                        target_peer = real.iloc[0]
-                if target_peer is None:
-                    # The whole-trace binding: a previous rep dialed the same
-                    # address and its stamps carry the identity this rep's
-                    # window never got to see.
+            est = dl[in_win & (ev == "connected") & (role == "central")]
+            cell["established"] = len(est)
+            if est.empty:
+                rows.append({**cell, "conn_idx": 0, "ms_to_establish": None,
+                             "in_flight": None, "peripheral_links": None,
+                             "total_links": None, "ms_to_session": None,
+                             "ms_to_converged": None})
+                continue
+            for k, (_, e) in enumerate(est.iterrows(), start=1):
+                target = e.get("path")
+                t_usable = e._t
+                target_peer = e.get("peer")
+                if not isinstance(target_peer, str):
                     target_peer = bound.get(target)
-                sess = mine
+                sess_mask = path == target
                 if target_peer is not None:
-                    sess = mine | (peer == target_peer)
-                ms_sess = first_ms(sess & (ev == "session"))
-
-                # Dual-leg convergence: earliest instant >= this dial's
-                # usable stamp at which an inbound peripheral leg bound to
-                # the same peer identity is live — while our central leg
-                # still is. Both liveness reads come from the whole-trace
-                # intervals; the verdict is bounded by the burst window and
-                # the deadline.
+                    sess_mask = sess_mask | (peer == target_peer)
+                hit = dl[in_win & sess_mask & (ev == "session")
+                         & (dl._t >= t_usable)]
+                ms_sess = None if hit.empty else float(hit._t.iloc[0] - t0)
+                # Dual-leg convergence: earliest instant >= this leg's usable
+                # stamp at which an inbound peripheral leg bound to the same
+                # identity is live, while our central leg still is.
                 ms_conv = None
-                if ms_usable is not None and target_peer is not None:
-                    t_usable = t0 + ms_usable
-                    c_end = next((e for s, e in live.get(target, [])
-                                  if s <= t_usable < e), math.inf)
+                if target_peer is not None:
+                    c_end = next((y for x, y in live.get(target, [])
+                                  if x <= t_usable < y), math.inf)
                     best = math.inf
-                    for p, ivs in live.items():
-                        if not p.startswith("peripheral:"):
+                    for p_, ivs in live.items():
+                        if not p_.startswith("peripheral:"):
                             continue
-                        if bound.get(p) != target_peer:
+                        if bound.get(p_) != target_peer:
                             continue
-                        for s, e in ivs:
-                            cand = max(t_usable, s)
-                            if cand < e and cand < c_end:
+                        for x, y in ivs:
+                            cand = max(t_usable, x)
+                            if cand < y and cand < c_end:
                                 best = min(best, cand)
-                    if best < t1 and best - t0 <= DIAL_PROBE_DEADLINE_MS:
+                    if best < t1:
                         ms_conv = float(best - t0)
                 rows.append({
-                    "dut_device": dev,
-                    "dut": int(_num(b.get("dut"), 0)),
-                    "pop_n": int(_num(b.get("popN"), 0)),
-                    "m": int(_num(b.get("m"), len(targets))),
-                    "rep": int(_num(b.get("rep"), 1)),
-                    "target": target,
-                    "ms_to_connected": ms_conn,
-                    "ms_to_usable": ms_usable,
+                    **cell,
+                    "conn_idx": k,
+                    "ms_to_establish": float(t_usable - t0),
+                    "in_flight": _num(e.get("inFlight"), None),
+                    "peripheral_links": _num(e.get("peripheralLinks"), None),
+                    "total_links": _num(e.get("totalLinks"), None),
                     "ms_to_session": ms_sess,
                     "ms_to_converged": ms_conv,
-                    "ok": ms_usable is not None
-                          and ms_usable <= DIAL_PROBE_DEADLINE_MS,
                 })
     return pd.DataFrame(rows)
 
 
+# How far below the best median establishment count still counts as "as good
+# as it gets" — half an establishment, i.e. inside the resolution of the
+# measurement itself.
+KNEE_TOL = 0.5
+
+
 def dial_scores(dial: pd.DataFrame) -> pd.DataFrame:
-    """Per (DUT device, population) verdicts of the dial grid.
+    """Per (device, population): establishments per window against M, and the
+    M at which the count stops rising.
 
-    The score is per POPULATION as well as per device, because a phone's
-    parallel-dial capacity is not a property of the phone alone: the same
-    burst of 4 lands differently in a room of 5 radios and a room of 8, and
-    one row per device would average those together.
+    The SATURATION KNEE is the verdict. Raising M raises the establishment
+    rate only while the phone's dial pipeline is the binding constraint; past
+    that the curve flattens (or falls) and the extra parallelism buys
+    nothing. `knee_m` is the smallest M whose median count is within
+    [KNEE_TOL] of the best median seen at that population — the first M that
+    is already as good as it gets, which is the M worth shipping. It is
+    reported per POPULATION because a phone's dial capacity is not a property
+    of the phone alone: the same M lands differently in a room of 3 and a
+    room of 8.
 
-    P* is the largest burst size M at which EVERY dial of EVERY rep reached
-    GATT-usable inside the deadline — the phone's demonstrated parallel-dial
-    capacity at that population. The three medians at P* are the ladder's
-    stages: GATT-usable, Noise session, dual-leg converged.
-    `slope_ms_per_dial` is the mean over M=4..6 of (median ms-to-usable at M)
-    / M: if the stack serializes the dials, formation grows ~linearly with M
-    and this ratio sits near the per-dial service time; if the dials genuinely
-    run in parallel it falls with M.
+    `max_total_links` is the link-budget ceiling this device was actually
+    observed at, across both roles. Read it beside the knee: a knee that
+    coincides with the device's max_total_links flattening is the
+    CONTROLLER's limit, not the dial path's, and the two are otherwise the
+    same number.
     """
     rows = []
-    for (dev, dut, pop_n), g in dial.groupby(["dut_device", "dut", "pop_n"]):
-        row = {"dut_device": dev, "dut": dut, "pop_n": pop_n}
-        perfect = []
-        for m, gm in g.groupby("m"):
-            frac = float(gm.ok.mean())
-            row[f"ok_frac_m{m}"] = round(frac, 3)
-            if frac == 1.0:
-                perfect.append(m)
-        p_star = max(perfect) if perfect else 0
-        row["p_star"] = p_star
-        at_p = g[g.m == p_star]
-        for col, name in (("ms_to_usable", "median_ms_usable_at_pstar"),
-                          ("ms_to_session", "median_ms_session_at_pstar"),
-                          ("ms_to_converged", "median_ms_converged_at_pstar")):
-            v = at_p[col].dropna()
+    for (dev, pop_n), g in dial.groupby(["device", "pop_n"]):
+        row = {"device": dev, "pop_n": pop_n}
+        # One count per WINDOW: `established` repeats on each of a cell's
+        # rows, so the cell is deduped before any of this is averaged.
+        cells = g.drop_duplicates(subset=["m", "rep"])[
+            ["m", "rep", "established"]]
+        med = {}
+        for m, gm in cells.groupby("m"):
+            v = float(gm.established.median())
+            med[int(m)] = v
+            row[f"est_m{int(m)}"] = round(v, 2)
+        best = max(med.values()) if med else 0.0
+        knee = None
+        for m in sorted(med):
+            if med[m] >= best - KNEE_TOL:
+                knee = m
+                break
+        row["knee_m"] = knee
+        row["best_est"] = round(best, 2)
+        row["max_m"] = max(med) if med else None
+        for col, name in (("ms_to_establish", "median_ms_establish_at_knee"),
+                          ("ms_to_session", "median_ms_session_at_knee"),
+                          ("ms_to_converged", "median_ms_converged_at_knee")):
+            v = g[g.m == knee][col].dropna() if knee is not None \
+                else pd.Series(dtype=float)
             row[name] = round(float(v.median()), 1) if len(v) else None
-        slopes = []
-        for m in (4, 5, 6):
-            v = g[g.m == m].ms_to_usable.dropna()
-            if len(v):
-                slopes.append(float(v.median()) / m)
-        row["slope_ms_per_dial"] = (
-            round(float(np.mean(slopes)), 1) if slopes else None)
+        for col, name in (("in_flight", "max_in_flight"),
+                          ("peripheral_links", "max_peripheral_links"),
+                          ("total_links", "max_total_links")):
+            v = g[col].dropna()
+            row[name] = int(v.max()) if len(v) else None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -3099,44 +3117,58 @@ def dial_scores(dial: pd.DataFrame) -> pd.DataFrame:
 def plot_dial_probe(dial: pd.DataFrame, out: Path) -> list[Path]:
     """One figure per POPULATION N, plus a headline copy at the largest N.
 
-    Each figure keeps the three shared-X panels of median-vs-burst-size M,
-    one series per DUT device with p10-p90 bars — burst to GATT-usable
-    (successful dials only), to Noise session, and to dual-leg convergence —
-    plus the thin success-fraction strip underneath. The DUT is encoded by
-    marker shape + line style (the join-order keyed maps the load sweep
-    uses), so the figure survives greyscale.
+    X is M, the allowed parallel dials. The top panel is the experiment's
+    answer — establishments per fixed window — and the three below it are the
+    formation ladder for the legs that did establish: GATT-usable, Noise
+    session, dual-leg convergence. Every panel is a median with p10-p90 bars,
+    one series per DEVICE, shape- and line-coded so the figure survives
+    greyscale.
 
     Splitting by population is the whole point of the grid: overlaying every
-    N on one axis would put a burst of 4 into a five-phone room on the same
-    point as a burst of 4 into an eight-phone room. [out] is the headline
-    path; the per-N files sit beside it as `<stem>_N<n><suffix>`. Returns
-    every file written.
+    N on one axis would put M=4 in a five-phone room on the same point as M=4
+    in an eight-phone room. [out] is the headline path; the per-N files sit
+    beside it as `<stem>_N<n><suffix>`. Returns every file written.
     """
     written: list[Path] = []
     pops = sorted(int(n) for n in dial.pop_n.unique())
+    devs = sorted(str(d) for d in dial.device.unique())
+    keyed = {d: i + 1 for i, d in enumerate(devs)}
     for pop_n in pops:
         sub = dial[dial.pop_n == pop_n]
         if sub.empty:
             continue
-        fig, (ax_u, ax_s, ax_c, axf) = plt.subplots(
-            4, 1, figsize=(10, 13), sharex=True,
-            gridspec_kw={"height_ratios": [3, 3, 3, 1]})
+        fig, (ax_e, ax_u, ax_s, ax_c) = plt.subplots(
+            4, 1, figsize=(10, 14), sharex=True,
+            gridspec_kw={"height_ratios": [3, 3, 3, 3]})
         panels = [
-            (ax_u, "ms_to_usable", True,
-             "ms to GATT-usable\n(successful dials, median, p10-p90)"),
-            (ax_s, "ms_to_session", False,
-             "ms to Noise session\n(median, p10-p90)"),
-            (ax_c, "ms_to_converged", False,
+            (ax_u, "ms_to_establish",
+             "ms to GATT-usable\n(median, p10-p90)"),
+            (ax_s, "ms_to_session", "ms to Noise session\n(median, p10-p90)"),
+            (ax_c, "ms_to_converged",
              "ms to dual-leg converged\n(median, p10-p90)"),
         ]
-        for (dev, dut), g in sub.groupby(["dut_device", "dut"]):
-            style = dict(marker=_SWEEP_MARKER.get(dut, "o"), ms=7, lw=1.4,
+        for dev, g in sub.groupby("device"):
+            k = keyed[str(dev)]
+            style = dict(marker=_SWEEP_MARKER.get(k, "o"), ms=7, lw=1.4,
                          color="#222222", markeredgewidth=1.5,
-                         linestyle=_SWEEP_LINE.get(dut, "-"))
-            for ax, col, ok_only, _ in panels:
+                         linestyle=_SWEEP_LINE.get(k, "-"))
+            # The headline panel: one point per window, so the cell is
+            # deduped before the median.
+            cells = g.drop_duplicates(subset=["m", "rep"])
+            ms, med, lo, hi = [], [], [], []
+            for m, gm in sorted(cells.groupby("m"), key=lambda kv: kv[0]):
+                v = gm.established
+                ms.append(m)
+                med.append(float(v.median()))
+                lo.append(float(v.median() - v.quantile(0.10)))
+                hi.append(float(v.quantile(0.90) - v.median()))
+            if ms:
+                ax_e.errorbar(ms, med, yerr=[lo, hi], capsize=3,
+                              label=f"{short(str(dev))}", **style)
+            for ax, col, _ in panels:
                 ms, med, lo, hi = [], [], [], []
                 for m, gm in sorted(g.groupby("m"), key=lambda kv: kv[0]):
-                    v = (gm[gm.ok] if ok_only else gm)[col].dropna()
+                    v = gm[col].dropna()
                     if not len(v):
                         continue
                     ms.append(m)
@@ -3144,30 +3176,23 @@ def plot_dial_probe(dial: pd.DataFrame, out: Path) -> list[Path]:
                     lo.append(float(v.median() - v.quantile(0.10)))
                     hi.append(float(v.quantile(0.90) - v.median()))
                 if ms:
-                    ax.errorbar(ms, med, yerr=[lo, hi], capsize=3,
-                                label=f"DUT {dut} ({short(str(dev))})",
-                                **style)
-            frac = [(m, float(gm.ok.mean()))
-                    for m, gm in sorted(g.groupby("m"), key=lambda kv: kv[0])]
-            if frac:
-                axf.plot([m for m, _ in frac], [100 * f for _, f in frac],
-                         **style)
-        ax_u.legend(fontsize=8, ncol=2)
-        ax_u.set_title(f"population N={pop_n} radios up", fontsize=11)
-        for ax, _, _, ylabel in panels:
+                    ax.errorbar(ms, med, yerr=[lo, hi], capsize=3, **style)
+        ax_e.legend(fontsize=8, ncol=2)
+        ax_e.set_title(f"population N={pop_n} radios up", fontsize=11)
+        ax_e.set_ylabel("establishments per window\n(median, p10-p90)",
+                        fontsize=9)
+        for ax, _, ylabel in panels:
             ax.set_ylabel(ylabel, fontsize=9)
+        for ax in (ax_e, ax_u, ax_s, ax_c):
             ax.grid(alpha=0.3)
-        axf.set_ylabel("usable in 20 s (%)", fontsize=9)
-        axf.set_ylim(0, 105)
-        axf.set_xlabel("concurrent dials M")
-        axf.grid(alpha=0.3)
-        axf.set_xticks(sorted(sub.m.unique()))
+        ax_c.set_xlabel("allowed parallel dials M")
+        ax_c.set_xticks(sorted(sub.m.unique()))
         fig.tight_layout()
         per_n = out.with_name(f"{out.stem}_N{pop_n}{out.suffix}")
         fig.savefig(per_n, dpi=150)
         written.append(per_n)
         # The headline figure IS the largest population's — the crowded room
-        # is the one that decides whether a burst survives.
+        # is the one that decides whether the extra parallelism pays.
         if pop_n == pops[-1]:
             fig.savefig(out, dpi=150)
             written.append(out)

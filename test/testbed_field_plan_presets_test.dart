@@ -766,60 +766,69 @@ void main() {
     });
   });
 
-  group('dialGridProbe (population N x burst M, role-free)', () {
-    // sum(N=2..8) N*(N-1) = 168 cells, x5 reps = 840 burst steps.
-    const burstSteps = 840;
+  group('dialGridProbe (population N x dial cap M, role-free)', () {
+    // sum(N=2..8) of (N-1) = 28 cells, x5 reps = 140 measured steps.
+    const capSteps = 140;
     const convergeSteps = 7; // one per population
 
-    test('grid: N=2..8, DUT=1..N, M=1..N-1, 5 reps, plus a converge per N',
-        () {
+    test('grid: N=2..8, M=1..N-1, 5 reps, plus a converge per N', () {
       final plan = FieldPlanPresets.dialGridProbe();
-      expect(plan.expId, 'dial-2-nm-grid-converge');
-      expect(plan.steps, hasLength(burstSteps + convergeSteps));
+      expect(plan.expId, 'dial-3-cap-greedy-establish');
+      expect(plan.steps, hasLength(capSteps + convergeSteps));
       expect(plan.steps.map((s) => s.label).toSet(),
-          hasLength(burstSteps + convergeSteps),
+          hasLength(capSteps + convergeSteps),
           reason: 'labels unique so every rep stays its own segment');
       expect(plan.steps.first.label, 'N=2 converge');
-      expect(plan.steps.last.label, 'N=8 DUT=8 M=7 t5');
+      expect(plan.steps.last.label, 'N=8 M=7 t5');
       expect(plan.steps.first.autoAdvance, isFalse,
           reason: 'only the very first step waits for the tap');
       expect(plan.steps.skip(1).every((s) => s.autoAdvance), isTrue);
 
-      final converge = plan.steps.where((s) => s.dutOrder == null).toList();
+      final converge =
+          plan.steps.where((s) => s.maxParallelDials == null).toList();
       expect(converge, hasLength(convergeSteps));
       expect(converge.map((s) => s.label),
           [for (var n = 2; n <= 8; n++) 'N=$n converge']);
       expect(converge.first.dwellSec, 90,
           reason: 'the first pair forms from nothing');
-      expect(converge.skip(1).map((s) => s.dwellSec),
-          everyElement(60));
+      expect(converge.skip(1).map((s) => s.dwellSec), everyElement(60));
       for (final s in converge) {
-        expect(s.parallelDials, isNull);
         expect(s.sendCount, 0, reason: 'a converge step measures nothing');
       }
 
-      // Every (N, DUT, M) cell present exactly `reps` times, with M <= N-1.
+      // Every (N, M) cell present exactly `reps` times, with M <= N-1.
       final cells = <String, int>{};
-      for (final s in plan.steps.where((s) => s.dutOrder != null)) {
-        expect(s.dwellSec, 20,
-            reason: 'the dwell IS the 20 s failure deadline: ${s.label}');
+      for (final s in plan.steps.where((s) => s.maxParallelDials != null)) {
+        expect(s.dwellSec, 120,
+            reason: 'a fixed 120 s window, so the count IS a rate: '
+                '${s.label}');
         expect(s.cliqueN, inInclusiveRange(2, 8), reason: s.label);
-        expect(s.dutOrder, inInclusiveRange(1, s.cliqueN!),
-            reason: 'a DUT must have its own radio up: ${s.label}');
-        expect(s.parallelDials, inInclusiveRange(1, s.cliqueN! - 1),
+        expect(s.maxParallelDials, inInclusiveRange(1, s.cliqueN! - 1),
             reason: 'M <= N-1: a phone cannot dial itself: ${s.label}');
         expect(
             s.label,
-            'N=${s.cliqueN} DUT=${s.dutOrder} M=${s.parallelDials} '
+            'N=${s.cliqueN} M=${s.maxParallelDials} '
             't${RegExp(r't(\d+)$').firstMatch(s.label)!.group(1)}');
-        expect(s.sendCount, 0, reason: 'the probe moves no messages');
+        expect(s.sendCount, 0, reason: 'the grid moves no messages');
         expect(s.saturate, isFalse);
-        cells.update('${s.cliqueN}/${s.dutOrder}/${s.parallelDials}',
-            (v) => v + 1,
+        cells.update('${s.cliqueN}/${s.maxParallelDials}', (v) => v + 1,
             ifAbsent: () => 1);
       }
-      expect(cells, hasLength(168));
+      expect(cells, hasLength(28));
       expect(cells.values, everyElement(5));
+    });
+
+    test('every step bounces the links behind a SHORT dark gap', () {
+      final plan = FieldPlanPresets.dialGridProbe();
+      expect(plan.resetLinks, isTrue,
+          reason: 'the window has to open with nothing established, or the '
+              'count is not a per-window rate');
+      expect(plan.linkResetDarkSec, 5,
+          reason: 'every device bounces at the same step boundary, so both '
+              'sides dispose together and there is no stale path to wait '
+              'out — the ~30 s default is for the one-sided case');
+      expect(const FieldPlan(expId: 'x', steps: []).linkResetDarkSec, isNull,
+          reason: 'other plans keep the coordinator default');
     });
 
     test('warm fleet, wall-clock anchored, radios scripted', () {
@@ -832,35 +841,31 @@ void main() {
       expect(plan.scriptedRadio, isTrue,
           reason: 'the population IS a variable: each phone joins at its own N');
       expect(plan.resetSessions, isFalse);
-      expect(plan.resetLinks, isFalse);
       expect(plan.resetDtnBuffer, isFalse);
     });
 
-    test('cliqueN, dutOrder and parallelDials survive the JSON round-trip', () {
+    test('cliqueN, maxParallelDials and the dark gap survive the JSON '
+        'round-trip', () {
       final plan = FieldPlanPresets.dialGridProbe(reps: 1, maxPop: 3);
       final back = FieldPlan.fromJson(plan.toJson());
       expect(back, plan);
+      expect(back.linkResetDarkSec, 5);
       final first = back.steps[1];
       expect(first.cliqueN, 2);
-      expect(first.dutOrder, 1);
-      expect(first.parallelDials, 1);
+      expect(first.maxParallelDials, 1);
       expect(back.steps.last.cliqueN, 3);
-      expect(back.steps.last.dutOrder, 3);
-      expect(back.steps.last.parallelDials, 2);
+      expect(back.steps.last.maxParallelDials, 2);
     });
 
-    test('resolvedFor derives the radio and passes dutOrder through untouched',
+    test('resolvedFor derives the radio and passes the cap through untouched',
         () {
-      // cliqueN becomes THIS phone's radio schedule; dutOrder never resolves
-      // — the runner compares it against the nickname at RUNTIME, so every
-      // phone must keep the full rotation.
+      // cliqueN becomes THIS phone's radio schedule; the cap is identical on
+      // every phone, so there is nothing per-device to resolve about it.
       const mixed = FieldPlan(expId: 'x', steps: [
-        FieldStep(
-            label: 'l', dwellSec: 1, cliqueN: 2, dutOrder: 3, parallelDials: 4),
+        FieldStep(label: 'l', dwellSec: 1, cliqueN: 2, maxParallelDials: 4),
       ]);
       final resolved = mixed.resolvedFor(1).steps.single;
-      expect(resolved.dutOrder, 3);
-      expect(resolved.parallelDials, 4);
+      expect(resolved.maxParallelDials, 4);
       expect(resolved.bleOn, isTrue);
 
       final plan = FieldPlanPresets.dialGridProbe(reps: 1);
@@ -879,9 +884,9 @@ void main() {
       final names = FieldPlanPresets.presets.keys
           .where((n) => n.contains('Dial grid'))
           .toList();
-      expect(names, ['Dial grid N x M (shared plan, ~6h)']);
+      expect(names, ['Dial grid N x M (shared plan, ~5.5h)']);
       expect(FieldPlanPresets.presets[names.single]!.expId,
-          'dial-2-nm-grid-converge');
+          'dial-3-cap-greedy-establish');
     });
   });
 }

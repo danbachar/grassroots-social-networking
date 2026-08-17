@@ -43,7 +43,7 @@ class TestbedScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final Future<void> Function()? onResetLinks;
+  final Future<void> Function(int? darkSec)? onResetLinks;
   final VoidCallback? onResetDtnBuffer;
 
   /// Runs the on-device crypto bench (failed-AEAD and handshake cost).
@@ -64,10 +64,10 @@ class TestbedScreen extends StatefulWidget {
   final Future<void> Function(bool on)? onSetBle;
   final bool Function(Uint8List peer)? linkSettled;
 
-  /// Parallel-dial probe hooks (see FieldRunner.dialBurst /
-  /// FieldRunner.bleDialTargets).
-  final Future<List<String>> Function(List<String> pathIds)? dialBurst;
-  final List<String> Function()? bleDialTargets;
+  /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
+  final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
+  final int Function()? establishmentCount;
+  final VoidCallback? onResetEstablishmentCount;
 
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
   final void Function(void Function(String messageId)? listener)?
@@ -98,8 +98,9 @@ class TestbedScreen extends StatefulWidget {
     this.sendRaw,
     this.onSetBle,
     this.linkSettled,
-    this.dialBurst,
-    this.bleDialTargets,
+    this.onSetDialParallelism,
+    this.establishmentCount,
+    this.onResetEstablishmentCount,
     this.registerAckListener,
     this.sessionPeerCount,
     this.sessionTableCount,
@@ -319,8 +320,9 @@ class _TestbedScreenState extends State<TestbedScreen> {
       bleUsable: widget.bleUsable,
       bleUsableChanges: widget.bleUsableChanges,
       linkSettled: widget.linkSettled,
-      dialBurst: widget.dialBurst,
-      bleDialTargets: widget.bleDialTargets,
+      onSetDialParallelism: widget.onSetDialParallelism,
+      establishmentCount: widget.establishmentCount,
+      onResetEstablishmentCount: widget.onResetEstablishmentCount,
       // Rosterless plans (the two-device default) target every peer the
       // store currently knows.
       knownPeers: () => widget.store.state.peers.peersList

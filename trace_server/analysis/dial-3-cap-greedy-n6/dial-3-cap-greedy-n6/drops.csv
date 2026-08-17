@@ -1,0 +1,4 @@
+_device,where,reason,count
+929a022c,bleRx,notReady,57
+929a022c,bleStale,sweep,1
+b7d04acb,bleStale,sweep,1

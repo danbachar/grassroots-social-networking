@@ -241,20 +241,32 @@ class BleTransportService extends TransportService {
     }));
   }
 
-  /// Emit one `link` stage record (gattConnected / connected / drop are
-  /// transport-local stages — `gattConnected` at the raw GATT link coming up,
-  /// `connected` at `ready`, i.e. GATT-usable; discovered / session / usable
-  /// are logged by the coordinator).
+  /// Emit one `link` stage record. The stages are SEPARATE facts about one
+  /// path and each can fail without unmaking the ones before it:
   ///
-  /// A CENTRAL establishment (`connected` on a leg we dialed) additionally
-  /// carries the dial-parallelism context, so every establishment in a
-  /// dial-grid run is attributable without inferring anything offline:
+  ///  1. `gattConnected` — the link established. On a leg we dialed this IS
+  ///     the establishment, and it is what the dial grid counts.
+  ///  2. `identified` — a verified ANNOUNCE bound a pubkey to the path, so we
+  ///     now know who is on the other end.
+  ///  3. `connected` — the path reached `ready`: GATT-usable, MTU negotiated,
+  ///     subscribed.
+  ///  4. `session` — a Noise session exists with that peer.
+  ///
+  /// Keeping them apart is what lets a run distinguish "the dial never
+  /// connected" from "it connected to a peer that never announced" from "it
+  /// identified but the handshake failed". Collapsing them reports all three
+  /// as a failed dial. (`drop` is the terminal stage; discovered / usable are
+  /// logged by the coordinator.)
+  ///
+  /// A CENTRAL establishment additionally carries the dial-parallelism
+  /// context, so every establishment in a dial-grid run is attributable
+  /// without inferring anything offline:
   ///
   ///  - `inFlight` — how many OTHER central dials were still underway at that
   ///    instant. This is [_inFlightCentralDials], the very counter the cap
-  ///    gates on, read after the path itself reached `ready` (a ready path no
-  ///    longer counts as in flight), so it is "how crowded the dial pipeline
-  ///    was when this one landed" and is directly comparable to the cap.
+  ///    gates on, read as the link comes up and excluding this path itself,
+  ///    so it is "how crowded the dial pipeline was when this one landed" and
+  ///    is directly comparable to the cap.
   ///  - `maxParallel` / `popN` — the step's M (the cap the runner set) and N
   ///    (radios up). The transport cannot see the plan, so the runner pushes
   ///    them down the same call that sets the cap ([setDialParallelism]).
@@ -271,7 +283,23 @@ class BleTransportService extends TransportService {
   ///    controller ran out of link slots" — the same number either way.
   void _traceLink(String event, ble.BlePath path, BleRole role) {
     if (!_tracing) return;
-    final establishment = event == 'connected' && role == BleRole.central;
+    // THE establishment is the link coming up — `gattConnected` — on a leg we
+    // dialed. It is emphatically NOT `ready`: reaching `ready` additionally
+    // requires the peer's ANNOUNCE to have identified the path, so anchoring
+    // the count there conflates three independent outcomes and reports a link
+    // that demonstrably established as if the dial had failed. Measured on
+    // dial-3-cap-greedy-n6: 181 GATT links came up while the runs recorded ~0
+    // establishments, because no ANNOUNCE was flowing and not one path
+    // reached `ready`.
+    final establishment = event == 'gattConnected' && role == BleRole.central;
+    // Every stage of the same path carries the cell context, so the analyzer
+    // can subtract stage timestamps per (popN, maxParallel) cell and get
+    // time-to-link, time-to-identity and time-to-ready as separate results
+    // instead of one all-or-nothing number.
+    final staged = establishment ||
+        event == 'identified' ||
+        event == 'connected' ||
+        event == 'session';
     unawaited(trace!.log({
       'type': 'link',
       't': DateTime.now().millisecondsSinceEpoch,
@@ -280,23 +308,39 @@ class BleTransportService extends TransportService {
       'role': role.name,
       if (path.rssi != null) 'rssi': path.rssi,
       if (event == 'drop') 'reason': path.error ?? path.state.name,
-      if (establishment) 'inFlight': _inFlightCentralDials(),
-      if (establishment) 'peripheralLinks': _liveLinks(ble.BleRole.peripheral),
-      if (establishment) 'totalLinks': _liveLinks(null),
-      if (establishment && dialProbeMaxParallel != null)
+      if (establishment) 'establishment': true,
+      if (establishment)
+        'inFlight': _inFlightCentralDials(excludePathId: path.pathId),
+      if (establishment)
+        'peripheralLinks':
+            _linksHoldingControllerSlot(ble.BleRole.peripheral),
+      if (establishment) 'totalLinks': _linksHoldingControllerSlot(null),
+      if (staged && dialProbeMaxParallel != null)
         'maxParallel': dialProbeMaxParallel,
-      if (establishment && dialProbePopN != null) 'popN': dialProbePopN,
+      if (staged && dialProbePopN != null) 'popN': dialProbePopN,
       ...?_peerField(path.pathId),
     }));
   }
 
-  /// Live (GATT-usable) legs in [role], or across both roles when null.
-  /// Counts against the controller's shared simultaneous-link budget.
-  int _liveLinks(ble.BleRole? role) {
+  /// Legs holding a controller link slot in [role], or across both roles when
+  /// null.
+  ///
+  /// A slot is taken from the moment GATT connects, NOT when the path reaches
+  /// `ready` — `ready` additionally requires identity and `canSend`, neither
+  /// of which the controller knows or cares about. Counting only `ready` legs
+  /// undercounts precisely the confound these fields exist to expose: at the
+  /// instant a link comes up, the link itself and any sibling still short of
+  /// `ready` are already consuming the budget that decides whether the next
+  /// dial can succeed at all.
+  int _linksHoldingControllerSlot(ble.BleRole? role) {
     var count = 0;
     for (final p in _paths.values) {
       if (role != null && p.role != role) continue;
-      if (_isReady(p)) count++;
+      if (p.state == ble.BlePathState.connected ||
+          p.state == ble.BlePathState.subscribed ||
+          p.state == ble.BlePathState.ready) {
+        count++;
+      }
     }
     return count;
   }
@@ -1168,8 +1212,17 @@ class BleTransportService extends TransportService {
   /// Central-role paths need nothing here: the peer opens its own reverse leg.
   void onPeerIdentified(String pathId, Uint8List pubkey) {
     final path = _paths[pathId];
-    if (path == null || !_isReady(path)) return;
-    if (_roleFromPathId(pathId) != BleRole.peripheral) return;
+    if (path == null) return;
+    final role = _roleFromPathId(pathId);
+    // Stamp the IDENTIFIED stage for every path, both roles, before any of the
+    // reverse-leg early-outs below — this is a measurement fact about the
+    // link, not a step in the reverse-leg policy, and it is the stage that
+    // separates "the link came up" from "we know who is on the other end".
+    // Without it a run cannot tell a dial that failed from one that connected
+    // to a peer which never announced.
+    if (role != null) _traceLink('identified', path, role);
+    if (!_isReady(path)) return;
+    if (role != BleRole.peripheral) return;
 
     if (store.state.settings.bleRoleMode != BleRoleMode.auto) return;
 
@@ -1719,10 +1772,15 @@ class BleTransportService extends TransportService {
     dialProbePopN = popN;
   }
 
-  int _inFlightCentralDials() {
+  /// [excludePathId] leaves one path out of the tally. The establishment
+  /// record needs it: the count is read the moment the link comes up, when
+  /// that path is itself in `connected` and would otherwise count itself, and
+  /// the figure is meant to be "how many OTHER dials were still underway".
+  int _inFlightCentralDials({String? excludePathId}) {
     var count = 0;
     for (final p in _paths.values) {
       if (p.role != ble.BleRole.central) continue;
+      if (p.pathId == excludePathId) continue;
       if (p.state == ble.BlePathState.connecting ||
           p.state == ble.BlePathState.connected ||
           p.state == ble.BlePathState.subscribed) {
@@ -1924,6 +1982,11 @@ class BleTransportService extends TransportService {
         if (previous == null ||
             previous.state == ble.BlePathState.discovered ||
             previous.state == ble.BlePathState.connecting) {
+          // The link is UP. This is the establishment the dial grid counts —
+          // it is the outcome a dial produces. Identity and the Noise session
+          // are later, separate stages that can each fail on their own without
+          // unmaking the fact that this link established.
+          if (role == BleRole.central) _establishmentCount++;
           _traceLink('gattConnected', path, role);
         }
         break;
@@ -1932,7 +1995,9 @@ class BleTransportService extends TransportService {
         _centralDialFailedAt.remove(path.pathId);
         if (previous?.state != ble.BlePathState.ready) {
           store.dispatch(BleDeviceConnectedAction(path.pathId));
-          if (role == BleRole.central) _establishmentCount++;
+          // `ready` is its OWN stage (GATT-usable: identified, MTU negotiated,
+          // subscribed). It is not the establishment — that was counted when
+          // the link came up — so nothing increments here.
           _traceLink('connected', path, role);
           _addConnectionEvent(TransportConnectionEvent(
             peerId: path.pathId,

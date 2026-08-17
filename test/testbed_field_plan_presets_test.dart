@@ -886,9 +886,13 @@ void main() {
       final names = FieldPlanPresets.presets.keys
           .where((n) => n.contains('Dial grid'))
           .toList();
-      expect(names, ['Dial grid N x M (shared plan, 1 rep, ~1.3h)']);
-      expect(FieldPlanPresets.presets[names.single]!.expId,
-          'dial-3-cap-greedy-establish');
+      expect(names, ['Dial grid N x M (6 phones, 1 rep, ~47min)']);
+      final entry = FieldPlanPresets.presets[names.single]!;
+      expect(entry.expId, 'dial-4-stages-n6');
+      // sum(N=2..6) of (N-1) = 15 cells, + 5 converge. The population ceiling
+      // must match the phones on the bench or a step lies about its N.
+      expect(entry.steps, hasLength(20));
+      expect(entry.steps.map((s) => s.cliqueN).reduce((a, b) => a! > b! ? a : b), 6);
     });
   });
 }

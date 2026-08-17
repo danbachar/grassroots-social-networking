@@ -1944,8 +1944,46 @@ class GrassrootsNetwork {
     await Future<void>.delayed(darkGap);
     if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
     debugPrint('[testbed] BLE bounce: re-initializing transport');
-    await _initializeBle();
-    if (_started && _bleAvailable) await _bleService!.start();
+
+    // The bounce is BUDGETED, never awaited to success. Steps are anchored to
+    // wall clock and every device must be in the same step at the same time,
+    // so retrying here until the radio came back would make this phone late
+    // and put it in a different step from the rest of the fleet — worse than
+    // the outage. We bring the transport up, check ONCE, record what actually
+    // happened, and return on time either way. A step that ran without a
+    // radio is then visible as such instead of reporting honest-looking zeros.
+    //
+    // dial-3-cap-greedy-n6 is why this is recorded: the transport came back as
+    // `ready` and never reached `active`, so `start()` never ran, no ANNOUNCE
+    // went out, and 20 steps of silence were indistinguishable from 20 steps
+    // of failed dials.
+    final initOk = await _initializeBle();
+    var startCalled = false;
+    if (initOk && _bleService != null) {
+      startCalled = true;
+      await _bleService!.start();
+    }
+    if (trace?.active ?? false) {
+      unawaited(trace!.log({
+        'type': 'link',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'bounce',
+        'darkSec': darkGap.inSeconds,
+        'initOk': initOk,
+        'startCalled': startCalled,
+        'started': _started,
+        'bleState': store.state.transports.bleState.name,
+        'usable': bleUsable,
+      }));
+    }
+    if (!bleUsable) {
+      debugPrint('[testbed] BLE bounce: transport NOT active after '
+          '${darkGap.inSeconds}s (state ${store.state.transports.bleState.name})');
+      _traceDrop('testbed', 'bounceNotActive', {
+        'bleState': store.state.transports.bleState.name,
+        'initOk': initOk,
+      });
+    }
   }
 
   /// DEBUG/TESTBED ONLY. Hold the BLE transport down or bring it back up,

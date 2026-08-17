@@ -1483,27 +1483,40 @@ void main() {
           reason: 'The freed slot was taken by peer 2; the cap still holds.');
     });
 
-    test('a central establishment stamps inFlight, maxParallel and popN',
-        () async {
+    test('the establishment is the LINK coming up, not `ready`', () async {
+      // Anchoring the count on `ready` conflated three outcomes: reaching
+      // `ready` also needs the peer's ANNOUNCE to identify the path, so a
+      // link that demonstrably established was reported as a failed dial
+      // whenever announces were not flowing (dial-3-cap-greedy-n6: 181 GATT
+      // links up, ~0 establishments recorded).
       transport.setDialParallelism(maxParallel: 3, popN: 6);
       await adv(1);
       await pushState(1, BlePathState.connecting);
       await adv(2);
       await pushState(2, BlePathState.connecting);
-      // Peer 1 lands while peer 2's dial is still underway.
-      await pushState(1, BlePathState.ready);
+      // Peer 1's link comes up while peer 2's dial is still underway.
+      await pushState(1, BlePathState.connected);
 
       final rec = trace.records.lastWhere(
-          (r) => r['type'] == 'link' && r['event'] == 'connected');
+          (r) => r['type'] == 'link' && r['event'] == 'gattConnected');
       expect(rec['role'], 'central');
+      expect(rec['establishment'], isTrue);
       expect(rec['inFlight'], 1,
-          reason: 'The landed path is `ready` and no longer counts; peer 2 '
-              'is the one dial still in flight.');
+          reason: 'This path is excluded from its own tally; peer 2 is the '
+              'one dial still in flight.');
       expect(rec['maxParallel'], 3);
       expect(rec['popN'], 6);
       expect(rec['peripheralLinks'], 0);
       expect(rec['totalLinks'], 1,
-          reason: 'The leg that just landed is the only live one.');
+          reason: 'A slot is held from GATT connect, not from `ready` — this '
+              'link is already consuming the controller budget.');
+
+      // Reaching `ready` later is its own stage and must NOT re-count.
+      await pushState(1, BlePathState.ready);
+      expect(transport.establishmentCount, 1);
+      final ready = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'connected');
+      expect(ready.containsKey('establishment'), isFalse);
     });
 
     test('an establishment counts the inbound legs sharing the link budget',
@@ -1524,10 +1537,10 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       await adv(1);
       await pushState(1, BlePathState.connecting);
-      await pushState(1, BlePathState.ready);
+      await pushState(1, BlePathState.connected);
 
       final rec = trace.records.lastWhere((r) =>
-          r['type'] == 'link' && r['event'] == 'connected' &&
+          r['type'] == 'link' && r['event'] == 'gattConnected' &&
           r['role'] == 'central');
       expect(rec['peripheralLinks'], 2);
       expect(rec['totalLinks'], 3,
@@ -1551,10 +1564,16 @@ void main() {
       final rec = trace.records.lastWhere(
           (r) => r['type'] == 'link' && r['event'] == 'connected');
       expect(rec['role'], 'peripheral');
-      expect(rec.containsKey('inFlight'), isFalse,
+      expect(rec.containsKey('establishment'), isFalse,
           reason: 'The grid counts what this phone DIALED; a leg someone '
               'else opened is not an establishment of ours.');
-      expect(rec.containsKey('maxParallel'), isFalse);
+      expect(rec.containsKey('inFlight'), isFalse,
+          reason: 'in-flight dials are a central-side fact');
+      // maxParallel/popN DO ride every stage record: they are the step's
+      // context, not a claim that this leg was an establishment. The analyzer
+      // needs them on each stage to join stages to their (N, M) cell.
+      expect(rec['maxParallel'], 3);
+      expect(rec['popN'], 6);
     });
 
     test('establishmentCount counts central legs and resets on demand',
@@ -1564,8 +1583,12 @@ void main() {
 
       await adv(1);
       await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.connected);
+      expect(transport.establishmentCount, 1,
+          reason: 'counted when the link came up');
       await pushState(1, BlePathState.ready);
-      expect(transport.establishmentCount, 1);
+      expect(transport.establishmentCount, 1,
+          reason: '`ready` is a later stage, not a second establishment');
 
       // An inbound leg is not ours to count.
       callbacks.pushPath(BlePath(

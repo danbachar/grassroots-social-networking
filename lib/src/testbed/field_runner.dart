@@ -977,6 +977,12 @@ class FieldRunner extends ChangeNotifier {
       'rep': _repOf(step.label),
       'dwellSec': step.dwellSec,
       'established': count(),
+      // Whether the radio was actually up for this cell. Without it a zero is
+      // ambiguous: dial-3-cap-greedy-n6 recorded `established: 0` for 90 cells
+      // that had no working transport at all, which reads identically to 90
+      // cells where every dial was refused. A cell with radioUp false is not a
+      // measurement and must be discarded, not averaged in.
+      'radioUp': _radioUp,
     });
   }
 

@@ -232,8 +232,9 @@ class FieldStep {
   /// [FieldPlan.resolvedFor]: the runner compares it against its own
   /// [joinOrder] at step start, so the full rotation survives in every
   /// phone's plan. The phone whose order matches fires the burst; every
-  /// other phone holds passive (no automatic central dials) for the whole
-  /// run.
+  /// other phone holds respond-only passive for the whole run (no
+  /// first-contact central dials — the reverse leg toward a peer it already
+  /// holds a live inbound leg from still fires, so dialed pairs converge).
   final int? dutOrder;
 
   /// Parallel-dial probe: how many distinct peers the DUT dials

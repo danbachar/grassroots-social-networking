@@ -730,13 +730,20 @@ class FieldPlanPresets {
   /// PARALLEL DIAL PROBE: how many central dials can one phone land AT ONCE,
   /// and how does formation time scale with the burst size?
   ///
-  /// One phone at a time is the DIALER (DUT); every other phone is PASSIVE —
-  /// it advertises and accepts inbound GATT but never initiates a central
-  /// dial (the runner holds the whole fleet's passive mode for the entire
-  /// run; the DUT's own bursts are manual dials and exempt). At each step
+  /// One phone at a time is the DIALER (DUT); every other phone is PASSIVE
+  /// in the respond-only sense — it advertises, accepts inbound GATT, and
+  /// answers a leg dialed AT it with its reverse (central) leg so the pair
+  /// converges dual-role, but never initiates first contact (the runner
+  /// holds the whole fleet's passive mode for the entire run; the DUT's own
+  /// bursts are manual dials and exempt — the run's only first-contact
+  /// initiator). At each step
   /// the DUT fires N central dials SIMULTANEOUSLY, one per distinct
-  /// discovered peer, N = 1..6 — under the transport's in-flight cap of 7 by
-  /// design — with [reps] reps per N, rotating the DUT through phones 1..7.
+  /// discovered peer, N = 1..8 (devices minus one: the top rung dials every
+  /// other phone at once) — with [reps] reps per N, rotating the DUT through
+  /// phones 1..9. Burst dials deliberately BYPASS the transport's in-flight
+  /// dial cap and failed-dial cooldown (`forProbe`): the probe exists to
+  /// find the PLATFORM's parallel-dial ceiling, and an app-side cap inside
+  /// the measurement would be measuring ourselves.
   ///
   /// ROLE-FREE like the diluting sweep: every phone loads this identical
   /// plan, each step carries [FieldStep.dutOrder], and the runner compares
@@ -744,14 +751,16 @@ class FieldPlanPresets {
   /// resolved into the plan). The formation clock is the burst's `dialburst`
   /// record joined offline to the DUT's own per-path link stages: raw GATT
   /// link up (`gattConnected`), GATT-usable (`connected` — connected + MTU,
-  /// ready to carry bytes; the endpoint), and the Noise `session` as a
-  /// bonus. A dial not usable within the 20 s dwell counts failed, which is
-  /// why the dwell IS the failure deadline.
+  /// ready to carry bytes; the endpoint), the Noise `session`, and dual-leg
+  /// convergence (the passive target answers with its reverse leg; the
+  /// analyzer stamps the first instant the DUT holds both legs). A dial not
+  /// usable within the 20 s dwell counts failed, which is why the dwell IS
+  /// the failure deadline.
   ///
   /// Everything stays warm on purpose: no session/link/buffer resets and no
   /// scripted radio — the burst itself tears down exactly the legs it is
   /// about to re-dial, and nothing else in the fleet is disturbed.
-  /// 7 DUTs x 6 Ns x [reps] = ~420 steps at (20 s dwell + 5 s gap) ≈ 3 h.
+  /// 9 DUTs x 8 Ns x [reps]=10 = 720 steps at (20 s dwell + 5 s gap) = 5 h.
   static FieldPlan parallelDialProbe({
     String expId = 'dial-1-parallel-burst-ladder',
     int reps = 10,
@@ -759,8 +768,8 @@ class FieldPlanPresets {
   }) {
     final trials = reps < 1 ? 1 : reps;
     final steps = <FieldStep>[];
-    for (var dut = 1; dut <= 7; dut++) {
-      for (var n = 1; n <= 6; n++) {
+    for (var dut = 1; dut <= 9; dut++) {
+      for (var n = 1; n <= 8; n++) {
         for (var t = 1; t <= trials; t++) {
           steps.add(FieldStep(
             label: 'DUT=$dut N=$n t$t',
@@ -889,7 +898,7 @@ class FieldPlanPresets {
         // the steps' dutOrder and each phone's nickname decides at runtime
         // which bursts are its own — there is no per-role entry to pick
         // wrongly.
-        'Parallel dial probe (shared plan, ~3h)': parallelDialProbe(),
+        'Parallel dial probe (shared plan, ~5h)': parallelDialProbe(),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

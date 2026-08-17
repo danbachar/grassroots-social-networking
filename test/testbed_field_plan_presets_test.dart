@@ -767,24 +767,24 @@ void main() {
   });
 
   group('parallelDialProbe (role-free DUT rotation)', () {
-    test('full ladder: 7 DUTs x N=1..6 x 10 reps, 20s dwell, one tap', () {
+    test('full ladder: 9 DUTs x N=1..8 x 10 reps, 20s dwell, one tap', () {
       final plan = FieldPlanPresets.parallelDialProbe();
       expect(plan.expId, 'dial-1-parallel-burst-ladder');
-      expect(plan.steps, hasLength(7 * 6 * 10)); // ~420 steps ≈ 3 h
-      expect(plan.steps.map((s) => s.label).toSet(), hasLength(420),
+      expect(plan.steps, hasLength(9 * 8 * 10)); // 720 steps = 5 h
+      expect(plan.steps.map((s) => s.label).toSet(), hasLength(720),
           reason: 'labels unique so every rep stays its own segment');
       expect(plan.steps.first.label, 'DUT=1 N=1 t1');
-      expect(plan.steps.last.label, 'DUT=7 N=6 t10');
+      expect(plan.steps.last.label, 'DUT=9 N=8 t10');
       expect(plan.steps.map((s) => s.autoAdvance),
-          [false, ...List.filled(419, true)],
+          [false, ...List.filled(719, true)],
           reason: 'stationary probe: only the very first step waits');
       for (final s in plan.steps) {
         expect(s.dwellSec, 20,
             reason: 'the dwell IS the 20 s failure deadline: ${s.label}');
-        expect(s.dutOrder, inInclusiveRange(1, 7), reason: s.label);
-        expect(s.parallelDials, inInclusiveRange(1, 6),
-            reason: 'max burst 6 stays under the in-flight cap of 7: '
-                '${s.label}');
+        expect(s.dutOrder, inInclusiveRange(1, 9), reason: s.label);
+        expect(s.parallelDials, inInclusiveRange(1, 8),
+            reason: 'top rung dials all 8 other phones at once (burst dials '
+                'bypass the in-flight cap via forProbe): ${s.label}');
         expect(s.label, 'DUT=${s.dutOrder} N=${s.parallelDials} '
             't${RegExp(r't(\d+)$').firstMatch(s.label)!.group(1)}');
         expect(s.sendCount, 0, reason: 'the probe moves no messages');
@@ -815,8 +815,8 @@ void main() {
       expect(back, plan);
       expect(back.steps.first.dutOrder, 1);
       expect(back.steps.first.parallelDials, 1);
-      expect(back.steps.last.dutOrder, 7);
-      expect(back.steps.last.parallelDials, 6);
+      expect(back.steps.last.dutOrder, 9);
+      expect(back.steps.last.parallelDials, 8);
     });
 
     test('resolvedFor passes dutOrder through untouched', () {
@@ -840,7 +840,7 @@ void main() {
       final names = FieldPlanPresets.presets.keys
           .where((n) => n.contains('Parallel dial probe'))
           .toList();
-      expect(names, ['Parallel dial probe (shared plan, ~3h)']);
+      expect(names, ['Parallel dial probe (shared plan, ~5h)']);
       expect(FieldPlanPresets.presets[names.single]!.expId,
           'dial-1-parallel-burst-ladder');
     });

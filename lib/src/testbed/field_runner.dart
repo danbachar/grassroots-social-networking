@@ -131,11 +131,16 @@ class FieldRunner extends ChangeNotifier {
   /// [FieldStep.parallelDials] of them as the burst's targets.
   final List<String> Function()? bleDialTargets;
 
-  /// Parallel-dial probe: suppress (true) / restore (false) every automatic
-  /// BLE central dial. Armed at run start when the plan carries any
-  /// [FieldStep.dutOrder] step — on EVERY phone, the DUT included, because
-  /// its own bursts go through [dialBurst], which passive mode exempts —
-  /// and disarmed when the run ends, however it ends.
+  /// Parallel-dial probe: arm (true) / disarm (false) the transport's
+  /// respond-only passive mode, which suppresses every automatic
+  /// FIRST-CONTACT central dial while still allowing the reverse (central)
+  /// leg toward a peer the phone already holds a live inbound peripheral leg
+  /// from — so a dialed pair converges to dual-leg, deliberately. Armed at
+  /// run start when the plan carries any [FieldStep.dutOrder] step — on
+  /// EVERY phone, the DUT included, because its own bursts go through
+  /// [dialBurst], which passive mode exempts; the DUT's burst is the run's
+  /// only first-contact initiator — and disarmed when the run ends, however
+  /// it ends.
   final void Function(bool on)? onSetBlePassive;
 
   static const _uuid = Uuid();
@@ -418,10 +423,13 @@ class FieldRunner extends ChangeNotifier {
     _runId = nowMs();
     _btOnSeen = false;
     _radioUp = false;
-    // Dial-probe plan: hold passive for the WHOLE run, on every phone — the
-    // DUT's own bursts are manual dials through [dialBurst] and are exempt.
-    // Turning it on per-step would let the gap between steps re-form legs
-    // automatically and hand the next burst a warm pair to measure.
+    // Dial-probe plan: hold respond-only passive for the WHOLE run, on every
+    // phone — the DUT's own bursts are manual dials through [dialBurst] and
+    // are exempt, making them the run's only first-contact initiator (a
+    // passive phone still answers a burst's leg with its reverse leg, so
+    // pairs converge). Turning it on per-step would let the gap between
+    // steps re-form legs automatically and hand the next burst a warm pair
+    // to measure.
     if (plan.steps.any((s) => s.dutOrder != null) && onSetBlePassive != null) {
       _passiveArmed = true;
       onSetBlePassive!.call(true);

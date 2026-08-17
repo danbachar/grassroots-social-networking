@@ -9,7 +9,7 @@ import '../protocol/fragment_handler.dart';
 /// message, the old default, was silently TWO packets — 132 + 52 — costing
 /// 392 wire bytes to move 184), which is worth measuring deliberately as a
 /// payload arm rather than baking into every experiment.
-const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 136
+const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 130
 
 /// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:
 /// [BulkFlowConfig] (sustained throughput) and [FieldPlan] (scripted field

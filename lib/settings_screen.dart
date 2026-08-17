@@ -62,6 +62,12 @@ class SettingsScreen extends StatefulWidget {
   final Future<void> Function()? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Parallel-dial probe hooks (see FieldRunner): the burst, its candidate
+  /// targets, and the fleet-wide passive mode the probe holds.
+  final Future<List<String>> Function(List<String> pathIds)? dialBurst;
+  final List<String> Function()? bleDialTargets;
+  final void Function(bool on)? onSetBlePassive;
+
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
   final void Function(void Function(String messageId)? listener)?
       registerAckListener;
@@ -91,6 +97,9 @@ class SettingsScreen extends StatefulWidget {
     this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
+    this.dialBurst,
+    this.bleDialTargets,
+    this.onSetBlePassive,
     this.registerAckListener,
   });
 
@@ -332,6 +341,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
+                      dialBurst: widget.dialBurst,
+                      bleDialTargets: widget.bleDialTargets,
+                      onSetBlePassive: widget.onSetBlePassive,
                       registerAckListener: widget.registerAckListener,
                     ),
                   ),

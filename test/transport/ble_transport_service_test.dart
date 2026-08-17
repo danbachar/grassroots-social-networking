@@ -1338,6 +1338,174 @@ void main() {
     });
   });
 
+  group('BleTransportService — testbed passive mode + dial burst', () {
+    // Fixed peer UUIDs above the initiator threshold: the transport under
+    // test is built with a LOW identity, so it is always the election's
+    // initiator and every advertisement below WOULD auto-dial — which is
+    // exactly what makes the passive suppression observable.
+    const peerUuidA = '84c40316-0871-e5ad-aaaa-000000000001';
+    const peerUuidB = '84c40316-0871-e5ad-bbbb-000000000002';
+
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeLowIdentity('Prober'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+    });
+
+    tearDown(() async {
+      await transport.dispose();
+    });
+
+    void adv(String remoteId, String uuid, {int rssi = -55}) =>
+        callbacks.pushAdvertisement(BleAdvertisement(
+          remoteId: remoteId,
+          serviceUuids: [uuid],
+          rssi: rssi,
+          connectable: true,
+        ));
+
+    test(
+        'passive mode suppresses the scan-result dial but keeps discovery '
+        'flowing', () async {
+      transport.passiveModeForTestbed = true;
+      adv('AABB01', peerUuidA);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'A passive device never initiates a central dial, even as '
+              'the election\'s initiator.');
+      expect(store.state.peers.discoveredBlePeers.containsKey('central:AABB01'),
+          true,
+          reason: 'Discovery must keep flowing — a passive phone stays a '
+              'dialable, observable target for the DUT.');
+    });
+
+    test('passive mode suppresses the ANNOUNCE-driven reverse leg', () async {
+      transport.passiveModeForTestbed = true;
+      const connectionMac = '99:88:77:66:55:02';
+      final peer = await _makeIdentity('Remote');
+
+      // Advertised MAC known (the fallback dial target) AND a live inbound
+      // peripheral leg (the over-ACL dial target): both reverse-leg forms
+      // must stay quiet.
+      adv('AA:BB:CC:DD:EE:01', peer.bleServiceUuid);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'The reverse leg is an automatic central dial; passive '
+              'mode must suppress the over-ACL attempt and the advertised-MAC '
+              'fallback alike.');
+    });
+
+    test('burstDialTargets: one entry per distinct peer, strongest first',
+        () async {
+      transport.passiveModeForTestbed = true;
+      adv('MACA1', peerUuidA, rssi: -70);
+      adv('MACA2', peerUuidA, rssi: -50); // same identity, rotated MAC
+      adv('MACB1', peerUuidB, rssi: -60);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(transport.burstDialTargets(),
+          ['central:MACA2', 'central:MACB1'],
+          reason: 'Deduped by advertised service UUID (a rotated MAC must '
+              'not offer the same peer twice in one burst) and ordered '
+              'strongest first.');
+    });
+
+    test(
+        'dialBurst fires every target in one event-loop turn and reports the '
+        'dialed set', () async {
+      transport.passiveModeForTestbed = true;
+      adv('AABB01', peerUuidA);
+      adv('CCDD02', peerUuidB);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'Passive: nothing dials until the burst is fired by hand.');
+
+      final dialed =
+          await transport.dialBurst(['central:AABB01', 'central:CCDD02']);
+
+      expect(dialed, ['central:AABB01', 'central:CCDD02']);
+      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1));
+      expect(hostApi.calls.where((c) => c == 'connect:CCDD02'), hasLength(1));
+    });
+
+    test('dialBurst tears down an existing central leg before redialing',
+        () async {
+      // Auto-dial and connect the leg first (passive off), so the burst has
+      // a live central leg to the target — the rep-t>1 case, where the
+      // previous rep's leg would otherwise make the one-central-per-identity
+      // guard refuse the fresh dial.
+      const pathId = 'central:AABB01';
+      adv('AABB01', peerUuidA);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1));
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      transport.passiveModeForTestbed = true;
+      final burst = transport.dialBurst([pathId]);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(hostApi.calls.where((c) => c == 'disconnect:$pathId'),
+          hasLength(1),
+          reason: 'The old leg is torn down (targeted disconnect, not a '
+              'transport bounce) before the probe redials.');
+      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1),
+          reason: 'The redial must WAIT for the plugin to report the leg '
+              'down — dialing earlier would be refused by the identity '
+              'guard.');
+
+      // The plugin acknowledges the teardown; the burst then dials.
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.disconnected,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+      ));
+      final dialed = await burst;
+      expect(dialed, [pathId]);
+      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(2));
+    });
+  });
+
   group('BleTransportService — scan-liveness watchdog', () {
     late _RecordingHostApi hostApi;
     late FakeGrassrootsBluetoothCallbacks callbacks;

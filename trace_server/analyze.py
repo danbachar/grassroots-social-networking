@@ -33,6 +33,16 @@ emits, under ``--out``:
     <exp>/wire_bytes.png       tx/rx bytes per packet type over time
     <exp>/latency.csv          per-message e2e latency (sent joined to
                                delivered on messageId)
+    <exp>/dial_probe.csv       parallel-dial probe: one row per
+                               (DUT, N, rep, target) with ms from the burst
+                               to gattConnected / connected (= GATT-usable,
+                               the endpoint) / session, and the 20 s verdict
+    <exp>/dial_scores.csv      per DUT device: P* (largest N with every dial
+                               usable in every rep), median formation at P*,
+                               success fraction per N, and the N=4..6
+                               ms-per-dial slope (stack-serialization flag)
+    <exp>/dial_probe.png       median ms-to-usable vs N per DUT (p10-p90
+                               bars) plus a success-fraction panel
 
 Markers drive the ground truth: every step marker opens a segment that runs
 until the next one (or the ``end`` marker), and the step's variables are read
@@ -2214,6 +2224,169 @@ def write_load_sweep(steps: pd.DataFrame, out: Path, exp: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Parallel dial probe (dial-1-parallel-burst-ladder)
+# --------------------------------------------------------------------------- #
+# The failure deadline: a dial not GATT-usable within the step dwell counts
+# failed. Matches the preset's dwellSec (20 s).
+DIAL_PROBE_DEADLINE_MS = 20_000
+
+
+def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per (DUT device, N, rep, target pathId) of a parallel-dial run.
+
+    Each `dialburst` record carries its targets; every target is joined to the
+    first link stage stamp for that pathId at t >= the burst's t, taken ONLY
+    from the DUT's own device trace — the burst and its link stages are both
+    local to the DUT, so no cross-device clock is involved. The stages, in the
+    names the transport actually emits:
+
+      gattConnected  the raw GATT link came up (pre service-discovery /
+                     subscribe / MTU)                      -> ms_to_connected
+      connected      the path reached `ready` — connected + MTU, able to
+                     carry bytes. This is GATT-usable, the formation
+                     endpoint                              -> ms_to_usable
+      session        Noise session established (bonus metric, joined by the
+                     stamped pathId or by the leg's peer)  -> ms_to_session
+
+    The join window for a burst closes at the DUT's NEXT burst: reps re-dial
+    the same peers, and an unbounded join would credit a failed rep with the
+    following rep's formation. `ok` is usable within DIAL_PROBE_DEADLINE_MS.
+    """
+    bursts = df[df._type == "dialburst"]
+    if bursts.empty:
+        return pd.DataFrame()
+    link = df[df._type == "link"]
+    rows = []
+    for dev, dev_bursts in bursts.groupby("_device"):
+        dev_bursts = dev_bursts.sort_values("_t")
+        burst_ts = dev_bursts._t.tolist()
+        dl = link[link._device == dev].sort_values("_t")
+        ev = _col(dl, "event")
+        path = _col(dl, "path")
+        peer = _col(dl, "peer")
+        for i, (_, b) in enumerate(dev_bursts.iterrows()):
+            t0 = b._t
+            t1 = burst_ts[i + 1] if i + 1 < len(burst_ts) else math.inf
+            targets = b.get("targets")
+            if not isinstance(targets, list):
+                continue
+            in_win = (dl._t >= t0) & (dl._t < t1)
+            for target in targets:
+                def first_ms(mask):
+                    hit = dl[in_win & mask]
+                    return None if hit.empty else float(hit._t.iloc[0] - t0)
+
+                mine = path == target
+                ms_conn = first_ms(mine & (ev == "gattConnected"))
+                ms_usable = first_ms(mine & (ev == "connected"))
+                # The peer behind this leg, read off its own stamps — needed
+                # because the session stamp's path is the peer's CURRENT
+                # attachment, which can lag the just-dialed leg by one event.
+                hits = dl[in_win & mine]
+                peers = hits.get("peer")
+                target_peer = None
+                if peers is not None:
+                    real = peers.dropna()
+                    if len(real):
+                        target_peer = real.iloc[0]
+                sess = mine
+                if target_peer is not None:
+                    sess = mine | (peer == target_peer)
+                ms_sess = first_ms(sess & (ev == "session"))
+                rows.append({
+                    "dut_device": dev,
+                    "dut": int(_num(b.get("dut"), 0)),
+                    "n": int(_num(b.get("n"), len(targets))),
+                    "rep": int(_num(b.get("rep"), 1)),
+                    "target": target,
+                    "ms_to_connected": ms_conn,
+                    "ms_to_usable": ms_usable,
+                    "ms_to_session": ms_sess,
+                    "ok": ms_usable is not None
+                          and ms_usable <= DIAL_PROBE_DEADLINE_MS,
+                })
+    return pd.DataFrame(rows)
+
+
+def dial_scores(dial: pd.DataFrame) -> pd.DataFrame:
+    """Per-DUT verdicts of the parallel-dial probe.
+
+    P* is the largest burst size N at which EVERY dial of EVERY rep reached
+    GATT-usable inside the deadline — the phone's demonstrated parallel-dial
+    capacity. `slope_ms_per_dial` is the mean over N=4..6 of (median
+    ms-to-usable at N) / N: if the stack serializes the dials, formation
+    grows ~linearly with N and this ratio sits near the per-dial service
+    time; if the dials genuinely run in parallel it falls with N.
+    """
+    rows = []
+    for (dev, dut), g in dial.groupby(["dut_device", "dut"]):
+        row = {"dut_device": dev, "dut": dut}
+        perfect = []
+        for n, gn in g.groupby("n"):
+            frac = float(gn.ok.mean())
+            row[f"ok_frac_n{n}"] = round(frac, 3)
+            if frac == 1.0:
+                perfect.append(n)
+        p_star = max(perfect) if perfect else 0
+        row["p_star"] = p_star
+        at_p = g[(g.n == p_star)].ms_to_usable.dropna()
+        row["median_ms_usable_at_pstar"] = (
+            round(float(at_p.median()), 1) if len(at_p) else None)
+        slopes = []
+        for n in (4, 5, 6):
+            v = g[g.n == n].ms_to_usable.dropna()
+            if len(v):
+                slopes.append(float(v.median()) / n)
+        row["slope_ms_per_dial"] = (
+            round(float(np.mean(slopes)), 1) if slopes else None)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def plot_dial_probe(dial: pd.DataFrame, out: Path):
+    """Median ms-to-usable vs burst size N, one series per DUT device, with
+    p10-p90 bars, plus a small success-fraction panel underneath. The DUT is
+    encoded by marker shape + line style (the join-order keyed maps the load
+    sweep uses), so the figure survives greyscale."""
+    fig, (ax, axf) = plt.subplots(
+        2, 1, figsize=(10, 7), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]})
+    for (dev, dut), g in dial.groupby(["dut_device", "dut"]):
+        ns, med, lo, hi, frac = [], [], [], [], []
+        for n, gn in sorted(g.groupby("n"), key=lambda kv: kv[0]):
+            v = gn.ms_to_usable.dropna()
+            frac.append((n, float(gn.ok.mean())))
+            if not len(v):
+                continue
+            ns.append(n)
+            med.append(float(v.median()))
+            lo.append(float(v.median() - v.quantile(0.10)))
+            hi.append(float(v.quantile(0.90) - v.median()))
+        style = dict(marker=_SWEEP_MARKER.get(dut, "o"), ms=7, lw=1.4,
+                     color="#222222", markeredgewidth=1.5,
+                     linestyle=_SWEEP_LINE.get(dut, "-"))
+        if ns:
+            ax.errorbar(ns, med, yerr=[lo, hi], capsize=3,
+                        label=f"DUT {dut} ({short(str(dev))})", **style)
+        if frac:
+            axf.plot([n for n, _ in frac], [100 * f for _, f in frac],
+                     **style)
+    ax.axhline(DIAL_PROBE_DEADLINE_MS, color="#888888", lw=1,
+               linestyle=":", label="20 s deadline")
+    ax.set_ylabel("ms to GATT-usable (median, p10-p90)")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, ncol=2)
+    axf.set_ylabel("usable in 20 s (%)")
+    axf.set_ylim(0, 105)
+    axf.set_xlabel("parallel dials N")
+    axf.grid(alpha=0.3)
+    axf.set_xticks(sorted(dial.n.unique()))
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2337,6 +2510,14 @@ def main() -> int:
         scale = mesh_scale(edf, segs)
         if not scale.empty:
             scale.to_csv(out / "mesh_scale.csv", index=False)
+
+        dial = dial_probe_table(edf)
+        if not dial.empty:
+            dial.to_csv(out / "dial_probe.csv", index=False)
+            scores = dial_scores(dial)
+            if not scores.empty:
+                scores.to_csv(out / "dial_scores.csv", index=False)
+            plot_dial_probe(dial, out / "dial_probe.png")
 
         plot_rssi(edf, out / "rssi_timeline.png")
         plot_link_stages(edf, out / "link_stages.png")

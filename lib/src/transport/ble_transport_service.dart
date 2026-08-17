@@ -153,6 +153,19 @@ class BleTransportService extends TransportService {
   /// adapter-on auto-restart.
   bool _stopped = false;
 
+  /// DEBUG/TESTBED ONLY. While set, every AUTOMATIC central dial is
+  /// suppressed: the advertisement-driven election in [_onAdvertisement]
+  /// (scan-result dials and the over-ACL reverse dial it issues) and the
+  /// ANNOUNCE-driven reverse leg in [_openReverseLeg]. Advertising,
+  /// scanning, the GATT server and inbound peripheral legs are untouched —
+  /// a passive device keeps discovering, keeps its RSSI records flowing,
+  /// and accepts every dial made AT it; it just never initiates one itself.
+  ///
+  /// [dialBurst] is deliberately exempt: it is the parallel-dial probe's
+  /// MANUAL dial, and the probe's DUT runs with this flag set too (its own
+  /// bursts are the experiment; anything automatic would contaminate them).
+  bool passiveModeForTestbed = false;
+
   /// Stream controllers for the public TransportService API.
   final _dataController = StreamController<TransportDataEvent>.broadcast();
   final _connectionController =
@@ -241,8 +254,10 @@ class BleTransportService extends TransportService {
     }));
   }
 
-  /// Emit one `link` stage record (connected / drop are transport-local
-  /// stages; discovered / session / usable are logged by the coordinator).
+  /// Emit one `link` stage record (gattConnected / connected / drop are
+  /// transport-local stages — `gattConnected` at the raw GATT link coming up,
+  /// `connected` at `ready`, i.e. GATT-usable; discovered / session / usable
+  /// are logged by the coordinator).
   void _traceLink(String event, ble.BlePath path, BleRole role) {
     if (!_tracing) return;
     unawaited(trace!.log({
@@ -1157,6 +1172,10 @@ class BleTransportService extends TransportService {
     String peripheralPathId,
     Uint8List pubkey,
   ) async {
+    // TESTBED passive mode: the reverse leg is an automatic central dial
+    // (both its over-ACL attempt and the advertised-MAC fallback), so a
+    // passive device skips it entirely and stays single-link on purpose.
+    if (passiveModeForTestbed) return;
     // A scanned advertising MAC for this identity, if the scanner has one.
     // Its UUID is the peer's current advertised (= GATT, they rotate
     // together) service UUID — fresher than a clock-derived one.
@@ -1441,6 +1460,78 @@ class BleTransportService extends TransportService {
     }
   }
 
+  /// DEBUG/TESTBED ONLY. Dial-burst candidates: one dialable central pathId
+  /// per distinct discovered peer, strongest advertisement first. Distinct
+  /// by advertised service UUID — the discovery map is keyed by address, and
+  /// a rotated MAC would otherwise offer the same peer twice in one burst
+  /// (the second dial hits the one-central-per-identity guard and the burst
+  /// silently shrinks). The runner takes the first N of these.
+  List<String> burstDialTargets() {
+    final byUuid = <String, DiscoveredPeerState>{};
+    for (final dp in _peersState.discoveredBlePeersList) {
+      final uuid = dp.serviceUuid?.toLowerCase();
+      if (uuid == null) continue;
+      final existing = byUuid[uuid];
+      if (existing == null || dp.rssi > existing.rssi) byUuid[uuid] = dp;
+    }
+    final targets = byUuid.values.toList()
+      ..sort((a, b) => b.rssi.compareTo(a.rssi));
+    return [for (final dp in targets) dp.transportId];
+  }
+
+  /// DEBUG/TESTBED ONLY. The parallel-dial probe's burst: fire a central
+  /// dial at every target in the SAME event-loop turn, so the stack sees N
+  /// genuinely simultaneous `connectGatt`s. Returns the pathIds whose dial
+  /// actually started (a target the choke-point guards refused is omitted —
+  /// the trace then simply has no formation for it).
+  ///
+  /// Existing central legs to the targets are torn down first — a targeted
+  /// per-leg disconnect, never a transport bounce, so advertising, scanning
+  /// and every other pair's legs are untouched — because a probe rep must
+  /// measure a COLD dial and the one-central-per-identity guard in
+  /// [connectToDevice] would refuse a redial while the old leg lives. The
+  /// teardown is acknowledged by the plugin's path event, not by the
+  /// disconnect call returning, so the burst waits (bounded) for those paths
+  /// to actually leave the table before dialing; a leg still wedged at the
+  /// deadline leaves its target refused and reported un-dialed, which is the
+  /// honest outcome. The in-flight cap in [connectToDevice] stays in force —
+  /// the probe's largest burst (6) sits under it (7) by design.
+  Future<List<String>> dialBurst(List<String> pathIds) async {
+    final torn = <String>{};
+    final teardowns = <Future<void>>[];
+    for (final pathId in pathIds) {
+      final uuid = _peersState.getDiscoveredBlePeer(pathId)?.serviceUuid;
+      if (uuid == null) continue;
+      final live = _pairViewFor(uuid).liveCentralPathId;
+      if (live != null && torn.add(live)) {
+        teardowns.add(disconnectDevice(live));
+      }
+    }
+    // Concurrent, not sequential: a per-leg await would make the teardown
+    // cost grow with N and leak into the formation clock as a fake slope.
+    await Future.wait(teardowns);
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (torn.any(_paths.containsKey) &&
+        DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 25));
+    }
+
+    // The burst proper: every launch in one synchronous sweep — no awaits
+    // between them — collecting the futures to read the started/refused
+    // verdicts afterwards. [connectToDevice]'s guards run synchronously and
+    // its plugin connect is issued before its first suspension, so all N
+    // dials are on the channel before this turn yields.
+    final launches = <String, Future<bool>>{};
+    for (final pathId in pathIds) {
+      launches.putIfAbsent(pathId, () => connectToDevice(pathId));
+    }
+    final dialed = <String>[];
+    for (final entry in launches.entries) {
+      if (await entry.value) dialed.add(entry.key);
+    }
+    return dialed;
+  }
+
   /// Reset the first-mover fallback clock for the identity behind [pathId]
   /// (see [_lastLocalTeardownAt]). Written under both the discovered
   /// service-UUID key and — when the path is attached to an identified peer —
@@ -1608,6 +1699,15 @@ class BleTransportService extends TransportService {
     }
 
     if (centralActive) {
+      return;
+    }
+    // TESTBED passive mode: everything above still ran — the discovery
+    // entry, RSSI records and peer freshness keep flowing, which is what
+    // lets a passive phone stay a dialable, observable target — but the
+    // election below never fires. Both dial forms of this handler (the
+    // over-ACL reverse dial and the plain scan-result dial) sit behind this
+    // return.
+    if (passiveModeForTestbed) {
       return;
     }
     if (!_shouldDialNow(pair, serviceUuid, existing)) {
@@ -1830,7 +1930,19 @@ class BleTransportService extends TransportService {
         break;
       case ble.BlePathState.connected:
       case ble.BlePathState.subscribed:
-        // Not yet sendable — wait for `ready`.
+        // Not yet sendable — wait for `ready`. Stamped for the trace all the
+        // same: this is the raw GATT link coming up, BEFORE service
+        // discovery / subscribe / MTU complete (the `connected` link stage
+        // is only stamped at `ready`). The gap between this stamp and the
+        // `connected` one is exactly where parallel central dials serialize
+        // on the stack, which is what the dial-probe analysis measures.
+        // Upward transitions only — a path drifting ready→subscribed is a
+        // degradation, not a second link formation.
+        if (previous == null ||
+            previous.state == ble.BlePathState.discovered ||
+            previous.state == ble.BlePathState.connecting) {
+          _traceLink('gattConnected', path, role);
+        }
         break;
       case ble.BlePathState.ready:
         // A successful connect clears any dial-failure cooldown for this path.

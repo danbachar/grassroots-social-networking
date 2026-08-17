@@ -2564,6 +2564,15 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
+          dialBurst: _grassroots == null
+              ? null
+              : (pathIds) => _grassroots!.bleDialBurst(pathIds),
+          bleDialTargets: _grassroots == null
+              ? null
+              : () => _grassroots!.bleBurstDialTargets(),
+          onSetBlePassive: _grassroots == null
+              ? null
+              : (on) => _grassroots!.setBlePassiveForTestbed(on),
           registerAckListener: _grassroots == null
               ? null
               : (listener) => _grassroots!.onTestbedAck = listener,

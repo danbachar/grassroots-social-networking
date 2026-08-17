@@ -739,6 +739,9 @@ class GrassrootsNetwork {
       // Wire-ledger content split: only we know what our sealed packets carry.
       _bleService!.secureContentResolver =
           (packetId) => _sealedContentById[packetId] ?? '';
+      // A dial-probe run holds passive across the whole plan; a fresh service
+      // instance must not silently fall back to auto-dialing mid-run.
+      _bleService!.passiveModeForTestbed = _blePassiveForTestbed;
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
       // broadcast stream that drops events with no listener. BLE connections
@@ -1963,6 +1966,35 @@ class GrassrootsNetwork {
     if (_started && _bleAvailable) await _bleService!.start();
   }
 
+  /// DEBUG/TESTBED ONLY. Suppress every automatic BLE central dial (the
+  /// advertisement election and the ANNOUNCE-driven reverse leg) while [on].
+  /// Advertising, scanning and inbound legs are untouched, and [bleDialBurst]
+  /// stays available — that is the manual dial the parallel-dial probe fires.
+  /// Kept as a field here as well as on the service so a scripted transport
+  /// bounce mid-run cannot silently drop the fleet back to auto-dialing
+  /// ([_initializeBle] re-applies it to the fresh service).
+  void setBlePassiveForTestbed(bool on) {
+    if (_blePassiveForTestbed == on) return;
+    _blePassiveForTestbed = on;
+    debugPrint('[testbed] BLE passive mode ${on ? 'ON' : 'OFF'} '
+        '(automatic central dials ${on ? 'suppressed' : 'restored'})');
+    _bleService?.passiveModeForTestbed = on;
+  }
+
+  bool _blePassiveForTestbed = false;
+
+  /// DEBUG/TESTBED ONLY. Dial-burst candidates for the parallel-dial probe:
+  /// one dialable central pathId per distinct discovered peer, strongest
+  /// advertisement first (see [BleTransportService.burstDialTargets]).
+  List<String> bleBurstDialTargets() =>
+      _bleService?.burstDialTargets() ?? const [];
+
+  /// DEBUG/TESTBED ONLY. Fire the parallel-dial probe's burst: tear down our
+  /// existing central legs to the targets, then launch every dial in one
+  /// event-loop turn. Returns the pathIds whose dial actually started.
+  Future<List<String>> bleDialBurst(List<String> pathIds) async =>
+      await _bleService?.dialBurst(pathIds) ?? const [];
+
   /// The application block class carried by a `message` payload, from its
   /// first byte (`BlockType`). Testbed traffic uses a reserved byte so it
   /// never masquerades as a real block — see `testbedPayloadMarker`.
@@ -2396,11 +2428,21 @@ class GrassrootsNetwork {
     if (trace?.active ?? false) {
       final hex = _pubkeyToHex(pubkey);
       _awaitingFirstAck.add(hex);
+      // The BLE leg this peer is attached to at establishment time, central
+      // (the leg we dialed) preferred. The dial-probe analysis joins a
+      // burst's targets to their session stamps by (pathId, stage, t), and
+      // `peer` alone cannot carry that join when the same peer forms legs
+      // across reps — the pathId is the per-dial identity.
+      final peer = _peersState.getPeerByPubkey(pubkey);
+      final blePath = transport == PeerTransport.udp
+          ? null
+          : (peer?.bleCentralDeviceId ?? peer?.blePeripheralDeviceId);
       unawaited(trace!.log({
         'type': 'link',
         't': DateTime.now().millisecondsSinceEpoch,
         'event': 'session',
         'peer': hex,
+        if (blePath != null) 'path': blePath,
         'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
       }));
     }

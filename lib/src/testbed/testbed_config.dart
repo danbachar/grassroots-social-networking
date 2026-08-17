@@ -226,6 +226,21 @@ class FieldStep {
   /// set.
   final int rawSizeDelta;
 
+  /// Parallel-dial probe: which phone (join order) is the DIALER at this
+  /// step. Like [cliqueN] the plan stays ROLE-FREE — every phone loads the
+  /// identical JSON — but unlike [cliqueN] this is NOT resolved away by
+  /// [FieldPlan.resolvedFor]: the runner compares it against its own
+  /// [joinOrder] at step start, so the full rotation survives in every
+  /// phone's plan. The phone whose order matches fires the burst; every
+  /// other phone holds passive (no automatic central dials) for the whole
+  /// run.
+  final int? dutOrder;
+
+  /// Parallel-dial probe: how many distinct peers the DUT dials
+  /// SIMULTANEOUSLY at this step's start — the burst size N. Ignored on
+  /// phones whose join order is not [dutOrder].
+  final int? parallelDials;
+
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
   /// repeat trial at the same position — nothing to walk to). A step at a new
@@ -246,6 +261,8 @@ class FieldStep {
     this.rawSizeDelta = 0,
     this.bleOn,
     this.cliqueN,
+    this.dutOrder,
+    this.parallelDials,
     this.resetSessions,
     this.resetDtnBuffer,
   });
@@ -271,6 +288,8 @@ class FieldStep {
         if (rawSizeDelta != 0) 'rawSizeDelta': rawSizeDelta,
         if (bleOn != null) 'bleOn': bleOn,
         if (cliqueN != null) 'cliqueN': cliqueN,
+        if (dutOrder != null) 'dutOrder': dutOrder,
+        if (parallelDials != null) 'parallelDials': parallelDials,
         if (resetSessions != null) 'resetSessions': resetSessions,
         if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
       };
@@ -289,6 +308,8 @@ class FieldStep {
         rawSizeDelta: json['rawSizeDelta'] as int? ?? 0,
         bleOn: json['bleOn'] as bool?,
         cliqueN: json['cliqueN'] as int?,
+        dutOrder: json['dutOrder'] as int?,
+        parallelDials: json['parallelDials'] as int?,
         resetSessions: json['resetSessions'] as bool?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool?,
       );
@@ -309,6 +330,8 @@ class FieldStep {
       other.rawSizeDelta == rawSizeDelta &&
       other.bleOn == bleOn &&
       other.cliqueN == cliqueN &&
+      other.dutOrder == dutOrder &&
+      other.parallelDials == parallelDials &&
       other.resetSessions == resetSessions &&
       other.resetDtnBuffer == resetDtnBuffer;
 
@@ -316,7 +339,7 @@ class FieldStep {
   int get hashCode =>
       Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
           saturate, sendLanes, sendTo, rawLeg, rawSizeDelta, bleOn, cliqueN,
-          resetSessions, resetDtnBuffer);
+          dutOrder, parallelDials, resetSessions, resetDtnBuffer);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -442,6 +465,11 @@ class FieldPlan {
                   rawSizeDelta: s.rawSizeDelta,
                   bleOn: joinOrder <= s.cliqueN!,
                   cliqueN: s.cliqueN,
+                  // Pass-through only: dutOrder is compared against joinOrder
+                  // at RUNTIME by the runner, never resolved into the plan —
+                  // every phone keeps the full DUT rotation.
+                  dutOrder: s.dutOrder,
+                  parallelDials: s.parallelDials,
                   resetSessions: s.resetSessions,
                   resetDtnBuffer: s.resetDtnBuffer,
                 ),

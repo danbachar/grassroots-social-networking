@@ -765,4 +765,84 @@ void main() {
       expect(names.single, contains('shared plan'));
     });
   });
+
+  group('parallelDialProbe (role-free DUT rotation)', () {
+    test('full ladder: 7 DUTs x N=1..6 x 10 reps, 20s dwell, one tap', () {
+      final plan = FieldPlanPresets.parallelDialProbe();
+      expect(plan.expId, 'dial-1-parallel-burst-ladder');
+      expect(plan.steps, hasLength(7 * 6 * 10)); // ~420 steps ≈ 3 h
+      expect(plan.steps.map((s) => s.label).toSet(), hasLength(420),
+          reason: 'labels unique so every rep stays its own segment');
+      expect(plan.steps.first.label, 'DUT=1 N=1 t1');
+      expect(plan.steps.last.label, 'DUT=7 N=6 t10');
+      expect(plan.steps.map((s) => s.autoAdvance),
+          [false, ...List.filled(419, true)],
+          reason: 'stationary probe: only the very first step waits');
+      for (final s in plan.steps) {
+        expect(s.dwellSec, 20,
+            reason: 'the dwell IS the 20 s failure deadline: ${s.label}');
+        expect(s.dutOrder, inInclusiveRange(1, 7), reason: s.label);
+        expect(s.parallelDials, inInclusiveRange(1, 6),
+            reason: 'max burst 6 stays under the in-flight cap of 7: '
+                '${s.label}');
+        expect(s.label, 'DUT=${s.dutOrder} N=${s.parallelDials} '
+            't${RegExp(r't(\d+)$').firstMatch(s.label)!.group(1)}');
+        expect(s.sendCount, 0, reason: 'the probe moves no messages');
+        expect(s.saturate, isFalse);
+        expect(s.bleOn, isNull,
+            reason: 'radios stay on — the burst manages its own teardown');
+      }
+    });
+
+    test('warm fleet, wall-clock anchored, radios untouched', () {
+      final plan = FieldPlanPresets.parallelDialProbe();
+      expect(plan.settleSec, 30);
+      expect(plan.autoAdvanceGapSec, 5);
+      expect(plan.manualJoin, isTrue);
+      expect(plan.alignSec, 300);
+      expect(plan.placementSec, 120);
+      expect(plan.scriptedRadio, isFalse,
+          reason: 'nothing scripts the radio: formation is the subject and '
+              'the burst tears down exactly the legs it re-dials');
+      expect(plan.resetSessions, isFalse);
+      expect(plan.resetLinks, isFalse);
+      expect(plan.resetDtnBuffer, isFalse);
+    });
+
+    test('dutOrder and parallelDials survive the JSON round-trip', () {
+      final plan = FieldPlanPresets.parallelDialProbe(reps: 2);
+      final back = FieldPlan.fromJson(plan.toJson());
+      expect(back, plan);
+      expect(back.steps.first.dutOrder, 1);
+      expect(back.steps.first.parallelDials, 1);
+      expect(back.steps.last.dutOrder, 7);
+      expect(back.steps.last.parallelDials, 6);
+    });
+
+    test('resolvedFor passes dutOrder through untouched', () {
+      // A dial-probe step is never resolved away: the runner compares
+      // dutOrder against the nickname at RUNTIME, so every phone must keep
+      // the full rotation — including through a resolve triggered by a
+      // cliqueN step elsewhere in a plan.
+      const mixed = FieldPlan(expId: 'x', steps: [
+        FieldStep(
+            label: 'l', dwellSec: 1, cliqueN: 2, dutOrder: 3, parallelDials: 4),
+      ]);
+      final resolved = mixed.resolvedFor(1).steps.single;
+      expect(resolved.dutOrder, 3);
+      expect(resolved.parallelDials, 4);
+      final probe = FieldPlanPresets.parallelDialProbe(reps: 1);
+      expect(identical(probe.resolvedFor(5), probe), isTrue,
+          reason: 'no cliqueN steps: nothing to resolve');
+    });
+
+    test('ONE shared dropdown entry', () {
+      final names = FieldPlanPresets.presets.keys
+          .where((n) => n.contains('Parallel dial probe'))
+          .toList();
+      expect(names, ['Parallel dial probe (shared plan, ~3h)']);
+      expect(FieldPlanPresets.presets[names.single]!.expId,
+          'dial-1-parallel-burst-ladder');
+    });
+  });
 }

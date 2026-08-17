@@ -49,11 +49,19 @@ def link(dev: str, t: int, event: str, path: str, peer: str | None = None,
 
 def establishment(dev: str, t: int, i: int, peer: str, in_flight: int,
                   peripheral_links: int, total_links: int) -> list[dict]:
-    """One central leg landing, plus the session and the peer's reverse leg."""
+    """One central leg landing, then identity, session, and the reverse leg.
+
+    The landing is `gattConnected` — the link coming up — which is what an
+    establishment IS. `connected` (= BlePathState.ready) is a LATER stage that
+    also needs a verified ANNOUNCE, so a fixture that lands on `connected`
+    silently asserts the old, broken anchor.
+    """
     return [
-        link(dev, t, "connected", f"central:T{i}", peer, "central",
+        link(dev, t, "gattConnected", f"central:T{i}", peer, "central",
              inFlight=in_flight, peripheralLinks=peripheral_links,
              totalLinks=total_links),
+        link(dev, t + 100, "identified", f"central:T{i}", peer, "central"),
+        link(dev, t + 150, "connected", f"central:T{i}", peer, "central"),
         link(dev, t + 200, "session", f"central:T{i}", peer, "central"),
         link(dev, t + 300, "connected", f"peripheral:P{i}", peer,
              "peripheral"),

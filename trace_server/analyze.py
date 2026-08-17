@@ -112,7 +112,8 @@ MARKER_LANES_RE = re.compile(r"\blanes\s*=\s*(\d+)", re.I)
 # A raw-link marker: `leg=<notify|write|stripe>` — which GATT leg the raw
 # blobs rode.
 MARKER_LEG_RE = re.compile(r"\bleg\s*=\s*(\w+)", re.I)
-LINK_STAGES = ["discovered", "connected", "session", "usable", "drop"]
+LINK_STAGES = ["discovered", "gattConnected", "identified", "connected",
+               "session", "usable", "drop"]
 # FragmentHandler.fragmentThreshold: payloads above this are split, and each
 # fragment gets a RANDOM packetId — so relay records can no longer be joined
 # to the messageId and hop counts for such messages are not trustworthy.
@@ -2978,12 +2979,14 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
             live.setdefault(p_, []).append((t, math.inf))
         # The runner's own per-step count, keyed by step label.
         recorded: dict = {}
+        radio_up: dict = {}
         if cells is not None:
             dc = cells[cells._device == dev]
             for _, c in dc.iterrows():
                 lbl = c.get("step")
                 if isinstance(lbl, str):
                     recorded[lbl] = int(_num(c.get("established"), 0))
+                    radio_up[lbl] = c.get("radioUp")
         for i, (_, mk) in enumerate(dm.iterrows()):
             m = mk.get("maxParallel")
             if m is None or (isinstance(m, float) and math.isnan(m)):
@@ -2998,15 +3001,24 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                 "rep": int(_num(mk.get("rep"), 1)),
                 "step": label if isinstance(label, str) else "",
                 "recorded": recorded.get(label),
+                # False => the transport was not up for this cell, so the cell is
+                # not a measurement and must be dropped, never averaged as 0.
+                "radio_up": radio_up.get(label),
             }
             in_win = (dl._t >= t0) & (dl._t < t1)
-            est = dl[in_win & (ev == "connected") & (role == "central")]
+            # The establishment is the LINK coming up, not `ready`. Keying on
+            # "connected" (= BlePathState.ready) additionally required a
+            # verified ANNOUNCE to have identified the path, so a link that
+            # demonstrably established was counted as a failed dial whenever
+            # announce traffic was absent. The dial context (inFlight,
+            # peripheralLinks, totalLinks) rides these records too.
+            est = dl[in_win & (ev == "gattConnected") & (role == "central")]
             cell["established"] = len(est)
             if est.empty:
                 rows.append({**cell, "conn_idx": 0, "ms_to_establish": None,
                              "in_flight": None, "peripheral_links": None,
-                             "total_links": None, "ms_to_session": None,
-                             "ms_to_converged": None})
+                             "total_links": None, "ms_to_identified": None,
+                             "ms_to_session": None, "ms_to_converged": None})
                 continue
             for k, (_, e) in enumerate(est.iterrows(), start=1):
                 target = e.get("path")
@@ -3020,6 +3032,14 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                 hit = dl[in_win & sess_mask & (ev == "session")
                          & (dl._t >= t_usable)]
                 ms_sess = None if hit.empty else float(hit._t.iloc[0] - t0)
+                # Identity is its OWN stage: the link can come up and never be
+                # identified (no ANNOUNCE), which is exactly the case that used
+                # to erase the establishment entirely. Take the FIRST stamp per
+                # path — onBlePeerIdentified fires on every verified announce,
+                # so later ones are re-confirmations, not the transition.
+                idh = dl[in_win & (path == target) & (ev == "identified")
+                         & (dl._t >= t_usable)]
+                ms_ident = None if idh.empty else float(idh._t.iloc[0] - t0)
                 # Dual-leg convergence: earliest instant >= this leg's usable
                 # stamp at which an inbound peripheral leg bound to the same
                 # identity is live, while our central leg still is.
@@ -3046,6 +3066,7 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                     "in_flight": _num(e.get("inFlight"), None),
                     "peripheral_links": _num(e.get("peripheralLinks"), None),
                     "total_links": _num(e.get("totalLinks"), None),
+                    "ms_to_identified": ms_ident,
                     "ms_to_session": ms_sess,
                     "ms_to_converged": ms_conv,
                 })

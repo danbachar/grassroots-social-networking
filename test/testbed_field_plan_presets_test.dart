@@ -767,11 +767,12 @@ void main() {
   });
 
   group('dialGridProbe (population N x dial cap M, role-free)', () {
-    // sum(N=2..8) of (N-1) = 28 cells, x5 reps = 140 measured steps.
-    const capSteps = 140;
+    // sum(N=2..8) of (N-1) = 28 cells, x1 rep = 28 measured steps. One rep
+    // is the shakedown default; reps is the knob for the measured campaign.
+    const capSteps = 28;
     const convergeSteps = 7; // one per population
 
-    test('grid: N=2..8, M=1..N-1, 5 reps, plus a converge per N', () {
+    test('grid: N=2..8, M=1..N-1, 1 rep, plus a converge per N', () {
       final plan = FieldPlanPresets.dialGridProbe();
       expect(plan.expId, 'dial-3-cap-greedy-establish');
       expect(plan.steps, hasLength(capSteps + convergeSteps));
@@ -779,7 +780,7 @@ void main() {
           hasLength(capSteps + convergeSteps),
           reason: 'labels unique so every rep stays its own segment');
       expect(plan.steps.first.label, 'N=2 converge');
-      expect(plan.steps.last.label, 'N=8 M=7 t5');
+      expect(plan.steps.last.label, 'N=8 M=7 t1');
       expect(plan.steps.first.autoAdvance, isFalse,
           reason: 'only the very first step waits for the tap');
       expect(plan.steps.skip(1).every((s) => s.autoAdvance), isTrue);
@@ -815,7 +816,8 @@ void main() {
             ifAbsent: () => 1);
       }
       expect(cells, hasLength(28));
-      expect(cells.values, everyElement(5));
+      expect(cells.values, everyElement(1),
+          reason: 'one rep per cell at the shakedown default');
     });
 
     test('every step bounces the links behind a SHORT dark gap', () {
@@ -884,7 +886,7 @@ void main() {
       final names = FieldPlanPresets.presets.keys
           .where((n) => n.contains('Dial grid'))
           .toList();
-      expect(names, ['Dial grid N x M (shared plan, ~5.5h)']);
+      expect(names, ['Dial grid N x M (shared plan, 1 rep, ~1.3h)']);
       expect(FieldPlanPresets.presets[names.single]!.expId,
           'dial-3-cap-greedy-establish');
     });

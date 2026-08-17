@@ -30,16 +30,38 @@ import 'package:flutter/foundation.dart';
 /// - Callback dispatch to application layer
 ///
 /// All transports feed into [processPacket] — one entry point, one format.
-/// The authenticated reply context of a sync exchange: the peer a sealed
-/// sync frame decrypted under, plus the BLE path it arrived on. Replies
-/// (requests, conveyed packets) go back over that same path. BLE only —
-/// the buffer is a mesh mechanism and the Internet transport stays direct
-/// point-to-point, so a sync frame off UDP is never acted on.
+/// Which transport a sync exchange is running over.
+///
+/// The distinction is not cosmetic: it decides WHAT may be conveyed on the
+/// answer (see [MessageRouter._handleSyncFilter]).
+enum SyncTransport {
+  /// The BLE mesh. A node conveys anything it holds, for any recipient — that
+  /// open relay is what gives the mesh reach beyond direct neighbours.
+  ble,
+
+  /// A direct UDX link. A node conveys ONLY packets addressed to the peer on
+  /// the other end of it, never third-party transit traffic.
+  udx,
+}
+
+/// The link a sync exchange runs over.
+///
+/// [handle] is the transport-level peer id used to send: a BLE device id under
+/// [SyncTransport.ble], and the peer's pubkey hex under [SyncTransport.udx]
+/// (which is exactly what `UdpTransportService.sendToPeer` keys on, so no
+/// lookup table is needed to answer over the Internet).
 class SyncLink {
   final Uint8List peerPubkey;
-  final String bleDeviceId;
+  final String handle;
+  final SyncTransport transport;
 
-  const SyncLink(this.peerPubkey, this.bleDeviceId);
+  const SyncLink.ble(this.peerPubkey, this.handle)
+      : transport = SyncTransport.ble;
+
+  const SyncLink.udx(this.peerPubkey, this.handle)
+      : transport = SyncTransport.udx;
+
+  bool get isUdx => transport == SyncTransport.udx;
 }
 
 class MessageRouter {
@@ -67,9 +89,11 @@ class MessageRouter {
   final DeliveredMessages _deliveredMessages = DeliveredMessages();
 
   /// Store-carry-forward cache: packets held for recipients not currently in
-  /// range. Conveyed ONLY through the sync exchange — a peer offers the ids it
-  /// carries and the other side requests what its seen-set lacks. Nothing is
-  /// ever pushed blindly on connect (see [buildSyncFilter]).
+  /// range. Conveyed ONLY through the sync exchange — a peer advertises a
+  /// compact filter of what it has SEEN and we answer with what that filter
+  /// lacks. Nothing is ever pushed blindly on connect (see [buildSyncFilter]).
+  /// Over BLE we answer with anything we hold; over UDX, only with packets
+  /// addressed to that peer (see [SyncTransport]).
   final DtnStore _dtnStore = DtnStore();
 
   /// Called when a message is received. [transport] is the transport the packet
@@ -520,14 +544,18 @@ class MessageRouter {
           observedPort: observedPort,
         );
       case ContentType.syncFilter:
-        // Buffer reconciliation is a MESH mechanism: BLE only. UDP is direct
-        // point-to-point and moves nothing out of the buffer — it neither
-        // relays for third parties nor delivers held packets, so a sync frame
-        // arriving over it is not something we participate in. The reply link
-        // carries the authenticated peer (trial decrypt proved it), so
-        // conveyances never depend on a transport-level id lookup.
+        // Buffer reconciliation runs over BOTH transports, but they answer
+        // different question sets — see [SyncTransport]. Over BLE the node
+        // answers as a mesh relay, with anything it holds; over UDX it answers
+        // only as an endpoint's counterparty, with that peer's own packets.
+        // The reply link carries the authenticated peer (trial decrypt proved
+        // it), so a conveyance never depends on a transport-level id lookup.
         if (transport == PeerTransport.bleDirect && bleDeviceId != null) {
-          _handleSyncFilter(frame.chunk, SyncLink(senderPubkey, bleDeviceId));
+          _handleSyncFilter(
+              frame.chunk, SyncLink.ble(senderPubkey, bleDeviceId));
+        } else if (transport == PeerTransport.udp) {
+          _handleSyncFilter(frame.chunk,
+              SyncLink.udx(senderPubkey, _pubkeyToHex(senderPubkey)));
         }
     }
   }
@@ -1121,7 +1149,7 @@ class MessageRouter {
       toMs = f.toMs;
       filterData = f.filter;
     } on FormatException catch (e) {
-      debugPrint('[sync] Malformed filter from ${link.bleDeviceId}: $e');
+      debugPrint('[sync] Malformed filter from ${link.handle}: $e');
       _traceDrop('sync', 'malformedFilter', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
     }
@@ -1129,25 +1157,41 @@ class MessageRouter {
     try {
       values = GcsFilter.decode(data: filterData, n: n);
     } on FormatException catch (e) {
-      debugPrint('[sync] Undecodable filter from ${link.bleDeviceId}: $e');
+      debugPrint('[sync] Undecodable filter from ${link.handle}: $e');
       _traceDrop('sync', 'malformedFilter', {'peer': _pubkeyToHex(link.peerPubkey)});
       return;
     }
-    // Direct delivery to the connected peer outranks relay. Convey packets
-    // ADDRESSED TO this peer first, so when [_maxConveyPerFilter] cuts the
-    // round short, the peer's own packets (its pending message, an ACK owed to
-    // it) are the ones that made it out rather than being starved behind relay
-    // backlog for other recipients. The GCS window stays creation-time ordered
-    // for cross-node agreement — this only reorders WITHIN the window, and
-    // preserves that order inside each group.
     final peerHex = _pubkeyToHex(link.peerPubkey);
     final inWindow = _dtnStore.windowBetween(fromMs, toMs);
-    final ordered = [
-      for (final p in inWindow)
-        if (_recipientHex(p) == peerHex) p,
-      for (final p in inWindow)
-        if (_recipientHex(p) != peerHex) p,
-    ];
+    final ordered = link.isUdx
+        // TARGETED ONLY over UDX: the peer gets what is addressed to IT and
+        // nothing else — its own bucket intersected with the window, never
+        // third-party transit traffic. The restriction is about volume, not
+        // trust. BLE encounters are sporadic and airtime is scarce, so the
+        // mesh's open relay is bounded by the medium itself; a UDX link is
+        // continuous and fast, and conveying everything over it would push the
+        // whole buffer at every connected friend at link speed — turning
+        // well-connected nodes into the infrastructure that removing the
+        // rendezvous servers deleted. Delivery to the endpoint is the part
+        // that carries no such cost, so that is the part UDX gets.
+        ? [
+            for (final p in inWindow)
+              if (_recipientHex(p) == peerHex) p,
+          ]
+        // Over BLE, direct delivery to the connected peer outranks relay, but
+        // relay still happens. Convey packets ADDRESSED TO this peer first, so
+        // when [_maxConveyPerFilter] cuts the round short, the peer's own
+        // packets (its pending message, an ACK owed to it) are the ones that
+        // made it out rather than being starved behind relay backlog for other
+        // recipients. The GCS window stays creation-time ordered for cross-node
+        // agreement — this only reorders WITHIN the window, and preserves that
+        // order inside each group.
+        : [
+            for (final p in inWindow)
+              if (_recipientHex(p) == peerHex) p,
+            for (final p in inWindow)
+              if (_recipientHex(p) != peerHex) p,
+          ];
     var conveyed = 0;
     for (final stored in ordered) {
       if (GcsFilter.mightContain(values, n, stored.packetId)) {
@@ -1168,7 +1212,8 @@ class MessageRouter {
           't': _nowMs(),
           'event': 'convey',
           'packetId': stored.packetId,
-          'toDevice': link.bleDeviceId,
+          'toDevice': link.handle,
+          'via': link.transport.name,
           'toPeer': _pubkeyToHex(link.peerPubkey),
           'ttl': stored.ttl,
         }));
@@ -1184,7 +1229,7 @@ class MessageRouter {
       }
     }
     if (conveyed > 0) {
-      debugPrint('[sync] Conveyed $conveyed packet(s) to ${link.bleDeviceId} '
+      debugPrint('[sync] Conveyed $conveyed packet(s) to ${link.handle} '
           'for window [$fromMs, $toMs]');
     }
   }

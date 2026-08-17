@@ -225,7 +225,8 @@ void main() {
     Future<void> deliverSyncFilter({
       required int fromMs,
       required int toMs,
-      required String bleDeviceId,
+      String bleDeviceId = 'neighbor-1',
+      PeerTransport transport = PeerTransport.bleDirect,
     }) async {
       final frame = SecureFrame(
         contentType: ContentType.syncFilter,
@@ -243,8 +244,10 @@ void main() {
           (p.copyWith(payload: frame.encode()), neighbourPubkey);
       await router.processPacket(
         sealed,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: bleDeviceId,
+        transport: transport,
+        bleDeviceId:
+            transport == PeerTransport.bleDirect ? bleDeviceId : null,
+        udpPeerId: transport == PeerTransport.udp ? 'udp-peer' : null,
       );
     }
 
@@ -410,11 +413,49 @@ void main() {
           reason: 'held at the post-arrival value, conveyed unchanged');
     });
 
-    test('sync over UDP is ignored — the buffer is BLE-only', () async {
-      // The Internet transport stays direct point-to-point: it neither relays
-      // for third parties nor reconciles buffers, so a sync filter arriving
-      // over it is never acted on. A held packet the peer lacks is NOT
-      // conveyed back over UDP.
+    test('UDX conveys a packet addressed to the peer on the other end',
+        () async {
+      // Targeted conveyance. The peer answering a UDX filter is an ENDPOINT,
+      // and handing an endpoint its own packet costs exactly those packets —
+      // so this is the part of store-carry-forward the Internet path gets. It
+      // closes the gap where a friend reachable only over the Internet never
+      // received a buffered message until a BLE encounter happened to occur.
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: neighbourPubkey,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
+      );
+      router.storeInDtnBuffer(neighbourPubkey, p);
+      final sent = <GrassrootsPacket>[];
+      final links = <SyncLink>[];
+      router.onSyncSend = (packet, link) {
+        sent.add(packet);
+        links.add(link);
+      };
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
+      expect(sent.single.packetId, p.packetId);
+      expect(links.single.transport, SyncTransport.udx);
+      expect(
+          links.single.handle,
+          neighbourPubkey
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(),
+          reason: 'a UDX handle IS the peer pubkey hex — no lookup table');
+    });
+
+    test('UDX never conveys third-party transit traffic', () async {
+      // The restriction is about VOLUME, not trust. BLE encounters are
+      // sporadic and airtime is scarce, so the mesh's open relay is bounded by
+      // the medium itself; a UDX link is continuous and fast, and answering
+      // with the whole buffer would push it at every connected friend at link
+      // speed — turning well-connected nodes into the infrastructure that
+      // removing the rendezvous servers deleted.
+      //
+      // This exact packet IS conveyed over BLE — see 'conveyance sends the
+      // held packet unchanged', which stores the same third-party recipient.
       final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
       final p = GrassrootsPacket(
         type: PacketType.secure,
@@ -426,25 +467,46 @@ void main() {
       router.storeInDtnBuffer(other, p);
       var called = false;
       router.onSyncSend = (_, __) => called = true;
-      final frame = SecureFrame(
-        contentType: ContentType.syncFilter,
-        messageId: uuid.v4(),
-        chunk: encodeSyncFilter(
-            n: 0, fromMs: 0, toMs: 2000, filter: Uint8List(0)),
-      );
-      router.trialDecrypt = (p) async =>
-          (p.copyWith(payload: frame.encode()), neighbourPubkey);
-      await router.processPacket(
-        GrassrootsPacket(
-          type: PacketType.secure,
-          ttl: 1,
-          recipientPubkey: identity.publicKey,
-          payload: Uint8List.fromList([1, 2]),
-        ),
-        transport: PeerTransport.udp,
-        udpPeerId: 'udp-peer',
-      );
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
       expect(called, isFalse);
+    });
+
+    test('BLE still conveys third-party traffic the same round UDX refuses it',
+        () async {
+      // Guards the pair of rules against being collapsed into one: the mesh
+      // must keep relaying for strangers, or multi-hop reach is gone.
+      final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
+      final mine = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: neighbourPubkey,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
+      );
+      final theirs = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: other,
+        payload: Uint8List.fromList([2]),
+        createdAtMs: 1001,
+      );
+      router.storeInDtnBuffer(neighbourPubkey, mine);
+      router.storeInDtnBuffer(other, theirs);
+
+      final overUdx = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => overUdx.add(packet);
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
+
+      final overBle = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => overBle.add(packet);
+      await deliverSyncFilter(fromMs: 0, toMs: 2000);
+
+      expect(overUdx.map((p) => p.packetId), [mine.packetId]);
+      expect(overBle.map((p) => p.packetId),
+          containsAll([mine.packetId, theirs.packetId]),
+          reason: 'the mesh relays for recipients it has no relationship with');
     });
 
     test('malformed sync filter is dropped without side effects', () async {

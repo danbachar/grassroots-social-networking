@@ -2473,22 +2473,26 @@ class GrassrootsNetwork {
         break;
     }
 
-    // Buffered packets move ONLY through the sync exchange: offer packetIds,
-    // let the
-    // peer request what its seen-set lacks, convey exactly that. Never a
-    // blind push of held packets — measured on soak-night-1, the old push
-    // re-sent ~32 already-delivered packets on every reconnection (31% of
-    // all ACK bytes on the air) because the receiver has no way to know
-    // what the peer already holds. The offer costs ids, not packets.
-    // BLE only: the buffer is a mesh mechanism and the Internet transport
-    // stays
-    // direct point-to-point (CLAUDE.md). A buffered message is
-    // therefore redelivered over BLE alone — see the docs' note on the
-    // UDP-only-friend gap this leaves.
-    if (transport == PeerTransport.bleDirect) {
-      final bleDeviceId =
-          _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
-      if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+    // Buffered packets move ONLY through the sync exchange: advertise a
+    // compact filter of what we have SEEN and let the peer answer with what
+    // that filter lacks. Never a blind push of held packets — measured on
+    // soak-night-1, the old push re-sent ~32 already-delivered packets on
+    // every reconnection (31% of all ACK bytes on the air) because the sender
+    // has no way to know what the peer already holds. The filter costs a few
+    // hundred bytes whatever the buffer size.
+    //
+    // Both transports ask; they differ in what they may be answered with. Over
+    // BLE the peer answers as a mesh relay, with anything it holds. Over UDX it
+    // answers only with packets addressed to us — enough to close the gap where
+    // a friend reachable solely over the Internet never received a buffered
+    // message, without turning a continuous link into a buffer firehose.
+    switch (transport) {
+      case PeerTransport.bleDirect:
+        final bleDeviceId =
+            _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
+        if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+      case PeerTransport.udp:
+        _sendSyncFilterUdx(pubkey);
     }
 
     // Cold-bootstrap invitee: if this session is with an inviter whose invite
@@ -3743,17 +3747,23 @@ class GrassrootsNetwork {
     // Sync-on-connect: directed (never flooded) send of an offer/request/
     // conveyed buffered packet to one specific neighbor.
     _messageRouter.onSyncSend = (packet, link) {
-      final ble = _bleService;
-      if (ble == null) {
+      // The conveyance goes back over the link the filter arrived on. The
+      // router already decided WHAT may go (everything held over BLE, only
+      // the peer's own packets over UDX); this only picks the wire.
+      final send = link.isUdx
+          ? _udpService?.sendToPeer
+          : _bleService?.sendToPeer;
+      if (send == null) {
         // The router already logged custody 'convey' for this packet — say
         // the conveyance never reached a transport.
-        _traceDrop('sync', 'conveyNoTransport', {'packetId': packet.packetId});
+        _traceDrop('sync', 'conveyNoTransport',
+            {'packetId': packet.packetId, 'via': link.transport.name});
         return;
       }
-      unawaited(
-          ble.sendToPeer(link.bleDeviceId, packet.serialize()).then((ok) {
+      unawaited(send(link.handle, packet.serialize()).then((ok) {
         if (!ok) {
-          _traceDrop('sync', 'conveySendFailed', {'packetId': packet.packetId});
+          _traceDrop('sync', 'conveySendFailed',
+              {'packetId': packet.packetId, 'via': link.transport.name});
         }
       }));
     };
@@ -3927,9 +3937,10 @@ class GrassrootsNetwork {
               ? udpPeerId
               : _connectedBleDeviceIdForPeer(peer),
         ));
-      } else if (transport == PeerTransport.bleDirect) {
+      } else {
         // A peer we ALREADY hold a session with has just announced — it went
-        // away and came back. Offer what we are carrying for it.
+        // away and came back. Ask it what we are missing, so anything it holds
+        // for us comes back on this encounter.
         //
         // Sync-on-connect used to hang off session establishment alone, and
         // sessions outlive the link that formed them: a neighbour whose radio
@@ -3940,12 +3951,21 @@ class GrassrootsNetwork {
         // every one of three return windows delivered nothing at all.
         //
         // ANNOUNCE is the "recipient appears" signal. It repeats every ~10 s;
-        // `_sendSyncFilter` carries its own per-address debounce, and one
+        // the send carries its own per-(transport, peer) debounce, and one
         // filter is a few hundred bytes whatever the buffer size, so the
         // steady-state cost of re-advertising is bounded and small.
-        final peer = _peersState.getPeerByPubkey(data.publicKey);
-        final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
-        if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+        //
+        // UDX needs no new trigger of its own: ANNOUNCE already goes out over
+        // UDP on the same `_announceTimer`, so the Internet path re-asks on the
+        // same cycle the radio one does.
+        switch (transport) {
+          case PeerTransport.bleDirect:
+            final peer = _peersState.getPeerByPubkey(data.publicKey);
+            final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
+            if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+          case PeerTransport.udp:
+            _sendSyncFilterUdx(data.publicKey);
+        }
       }
     };
 
@@ -4945,20 +4965,43 @@ class GrassrootsNetwork {
     if (_bleService == null || !_bleAvailable) return;
     final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
     if (pubkey == null) return; // path not yet identified; retry next connect
-    final peerHex = _pubkeyToHex(pubkey);
+    _sendSyncFilterOver(SyncLink.ble(pubkey, deviceId));
+  }
+
+  /// The UDX counterpart of [_sendSyncFilter]. The peer answers it with packets
+  /// addressed to US and nothing else, which is what closes the gap where a
+  /// friend reachable only over the Internet never received a buffered message
+  /// until a BLE encounter happened to occur.
+  ///
+  /// The peer id on a UDX connection IS the pubkey hex, so unlike the BLE side
+  /// there is no path-to-identity lookup that can come back null.
+  void _sendSyncFilterUdx(Uint8List pubkey) {
+    if (_udpService == null) return;
+    _sendSyncFilterOver(SyncLink.udx(pubkey, _pubkeyToHex(pubkey)));
+  }
+
+  /// Build and send one seen-filter over [link], debounced.
+  ///
+  /// The debounce key is (transport, peer), not peer: the two links ask
+  /// different question sets — BLE can be answered with anything we hold, UDX
+  /// only with our own packets — so a BLE round must not suppress the UDX one
+  /// or the Internet path would go silent whenever a peer was also in radio
+  /// range, which is exactly when both are worth asking.
+  void _sendSyncFilterOver(SyncLink link) {
+    final key = '${link.transport.name}:${_pubkeyToHex(link.peerPubkey)}';
     final now = DateTime.now();
     _lastSyncOfferAt.removeWhere(
         (_, at) => now.difference(at) > const Duration(minutes: 10));
-    final last = _lastSyncOfferAt[peerHex];
+    final last = _lastSyncOfferAt[key];
     if (last != null && now.difference(last) < _syncOfferDebounce) return;
 
-    final payload = _messageRouter.buildSyncFilter(pubkey);
+    final payload = _messageRouter.buildSyncFilter(link.peerPubkey);
     if (payload == null) return; // nothing to advertise this round
-    _lastSyncOfferAt[peerHex] = now;
-    debugPrint('[sync] Advertising ${_messageRouter.dtnBufferedCount} carried '
-        'packet(s) to $deviceId as a ${payload.length}-byte filter');
-    unawaited(
-        _sealAndSendSyncFrame(ContentType.syncFilter, payload, SyncLink(pubkey, deviceId)));
+    _lastSyncOfferAt[key] = now;
+    debugPrint('[sync] Advertising a ${payload.length}-byte seen-filter to '
+        '${link.handle} over ${link.transport.name} '
+        '(${_messageRouter.dtnBufferedCount} carried)');
+    unawaited(_sealAndSendSyncFrame(ContentType.syncFilter, payload, link));
   }
 
   /// Seal a sync control frame to the link's peer and send it back over the
@@ -4979,9 +5022,10 @@ class GrassrootsNetwork {
         remotePubkey: link.peerPubkey,
       );
       _noteSealedContent(sealed.packetId, type);
-      return await _bleService?.sendToPeer(
-              link.bleDeviceId, sealed.serialize()) ??
-          false;
+      final send =
+          link.isUdx ? _udpService?.sendToPeer : _bleService?.sendToPeer;
+      if (send == null) return false;
+      return await send(link.handle, sealed.serialize());
     } catch (e) {
       debugPrint('[sync] Failed to seal/send ${type.name}: $e');
       return false;

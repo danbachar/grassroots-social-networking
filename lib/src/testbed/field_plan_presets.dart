@@ -790,11 +790,16 @@ class FieldPlanPresets {
   /// Sessions and the buffer are never reset; only the links are, and that
   /// IS the measurement's reset.
   ///
-  /// sum(N=2..8) of (N-1) = 28 cells x [reps]=5 = 140 measured steps at
-  /// (120 s dwell + 5 s gap), plus 7 converge steps ~= 5.5 h.
+  /// sum(N=2..8) of (N-1) = 28 cells x [reps]=1 = 28 measured steps at
+  /// (120 s dwell + 5 s dark + 5 s gap), plus 7 converge steps ~= 1.3 h.
+  /// [reps] is the knob to raise for the measured campaign; the cell count
+  /// and step labels scale with it.
   static FieldPlan dialGridProbe({
     String expId = 'dial-3-cap-greedy-establish',
-    int reps = 5,
+    // ONE rep: this is a correctness shakedown of the grid, not the measured
+    // campaign. Raise it once the traces are confirmed to carry inFlight /
+    // maxParallel / popN on every establishment.
+    int reps = 1,
     int dwellSec = 120,
     int convergeSec = 60,
     int firstConvergeSec = 90,
@@ -946,7 +951,7 @@ class FieldPlanPresets {
         // steps' cliqueN (resolved from the nickname at launch) and M in
         // their maxParallelDials, which every phone applies identically —
         // there is no per-role entry to pick wrongly.
-        'Dial grid N x M (shared plan, ~5.5h)': dialGridProbe(),
+        'Dial grid N x M (shared plan, 1 rep, ~1.3h)': dialGridProbe(),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

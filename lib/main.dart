@@ -2570,9 +2570,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           bleDialTargets: _grassroots == null
               ? null
               : () => _grassroots!.bleBurstDialTargets(),
-          onSetBlePassive: _grassroots == null
-              ? null
-              : (on) => _grassroots!.setBlePassiveForTestbed(on),
           registerAckListener: _grassroots == null
               ? null
               : (listener) => _grassroots!.onTestbedAck = listener,

@@ -65,10 +65,9 @@ class TestbedScreen extends StatefulWidget {
   final bool Function(Uint8List peer)? linkSettled;
 
   /// Parallel-dial probe hooks (see FieldRunner.dialBurst /
-  /// FieldRunner.bleDialTargets / FieldRunner.onSetBlePassive).
+  /// FieldRunner.bleDialTargets).
   final Future<List<String>> Function(List<String> pathIds)? dialBurst;
   final List<String> Function()? bleDialTargets;
-  final void Function(bool on)? onSetBlePassive;
 
   /// Registers a listener for end-to-end ACKs (saturating throughput mode).
   final void Function(void Function(String messageId)? listener)?
@@ -101,7 +100,6 @@ class TestbedScreen extends StatefulWidget {
     this.linkSettled,
     this.dialBurst,
     this.bleDialTargets,
-    this.onSetBlePassive,
     this.registerAckListener,
     this.sessionPeerCount,
     this.sessionTableCount,
@@ -323,7 +321,6 @@ class _TestbedScreenState extends State<TestbedScreen> {
       linkSettled: widget.linkSettled,
       dialBurst: widget.dialBurst,
       bleDialTargets: widget.bleDialTargets,
-      onSetBlePassive: widget.onSetBlePassive,
       // Rosterless plans (the two-device default) target every peer the
       // store currently knows.
       knownPeers: () => widget.store.state.peers.peersList

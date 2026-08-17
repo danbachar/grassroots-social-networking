@@ -1,0 +1,4 @@
+records: 732   span: nans
+
+receiver (2026-08-):
+  records by type: {}

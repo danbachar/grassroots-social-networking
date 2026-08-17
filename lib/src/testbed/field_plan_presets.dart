@@ -730,63 +730,99 @@ class FieldPlanPresets {
     );
   }
 
-  /// PARALLEL DIAL PROBE: how many central dials can one phone land AT ONCE,
-  /// and how does formation time scale with the burst size?
+  /// DIAL GRID: how many central dials can one phone land AT ONCE, as a
+  /// function of BOTH the burst size and how crowded the room is?
   ///
-  /// One phone at a time is the DIALER (DUT); every other phone is PASSIVE
-  /// in the respond-only sense — it advertises, accepts inbound GATT, and
-  /// answers a leg dialed AT it with its reverse (central) leg so the pair
-  /// converges dual-role, but never initiates first contact (the runner
-  /// holds the whole fleet's passive mode for the entire run; the DUT's own
-  /// bursts are manual dials and exempt — the run's only first-contact
-  /// initiator). At each step
-  /// the DUT fires N central dials SIMULTANEOUSLY, one per distinct
-  /// discovered peer, N = 1..8 (devices minus one: the top rung dials every
-  /// other phone at once) — with [reps] reps per N, rotating the DUT through
-  /// phones 1..9. Burst dials deliberately BYPASS the transport's in-flight
-  /// dial cap and failed-dial cooldown (`forProbe`): the probe exists to
-  /// find the PLATFORM's parallel-dial ceiling, and an app-side cap inside
-  /// the measurement would be measuring ourselves.
+  /// Two independent variables, and the previous version of this probe
+  /// confounded them badly enough to invalidate a five-hour run:
   ///
-  /// ROLE-FREE like the diluting sweep: every phone loads this identical
-  /// plan, each step carries [FieldStep.dutOrder], and the runner compares
-  /// it against its own nickname-derived join order at RUNTIME (never
-  /// resolved into the plan). The formation clock is the burst's `dialburst`
-  /// record joined offline to the DUT's own per-path link stages: raw GATT
-  /// link up (`gattConnected`), GATT-usable (`connected` — connected + MTU,
-  /// ready to carry bytes; the endpoint), the Noise `session`, and dual-leg
-  /// convergence (the passive target answers with its reverse leg; the
-  /// analyzer stamps the first instant the DUT holds both legs). A dial not
-  /// usable within the 20 s dwell counts failed, which is why the dwell IS
-  /// the failure deadline.
+  ///   N — the POPULATION: how many phones have their radio up. Scripted
+  ///       through [FieldStep.cliqueN], exactly like the diluting sweep, so
+  ///       the runner derives this phone's radio schedule from its own
+  ///       nickname (on iff `joinOrder <= cliqueN`) and every phone loads
+  ///       the identical plan.
+  ///   M — the BURST: how many of those phones the DUT dials in one
+  ///       simultaneous sweep, M = 1..N-1 (it cannot dial itself). The old
+  ///       probe asked for up to 8 dials in a room where only ~3 peers were
+  ///       ever discoverable, so most of its "dials" never fired and the
+  ///       success curve came out non-monotonic.
   ///
-  /// Everything stays warm on purpose: no session/link/buffer resets and no
-  /// scripted radio — the burst itself tears down exactly the legs it is
-  /// about to re-dial, and nothing else in the fleet is disturbed.
-  /// 9 DUTs x 8 Ns x [reps]=10 = 720 steps at (20 s dwell + 5 s gap) = 5 h.
-  static FieldPlan parallelDialProbe({
-    String expId = 'dial-1-parallel-burst-ladder',
-    int reps = 10,
+  /// Per population N = 2..[maxPop], the radios for join orders 1..N come up
+  /// and the plan holds a CONVERGE step — no bursts, [convergeSec] (or
+  /// [firstConvergeSec] at N=2, where the first pair forms from nothing) —
+  /// so every pair reaches dual-leg with a negotiated MTU and a Noise
+  /// session BEFORE anything is measured. That step is the fix for the
+  /// deadlock that killed the first run: identity needs ANNOUNCE, ANNOUNCE
+  /// needs a workable MTU, and MTU 247 is requested by a CENTRAL — so a
+  /// fleet where nobody dials first sits at the 23-byte default forever and
+  /// cannot even put a packet header on the air. Nothing in this plan
+  /// suppresses ordinary dialing; a peer dialing while the DUT bursts is
+  /// contention a real burst meets, and since the DUT times its OWN dials on
+  /// its OWN clock, that contention is realism rather than contamination.
+  ///
+  /// Then, for every DUT (join order 1..N) and every M, [reps] repeat burst
+  /// steps at [dwellSec]. Burst dials deliberately BYPASS the transport's
+  /// in-flight dial cap and failed-dial cooldown (`forProbe`): the probe
+  /// exists to find the PLATFORM's parallel-dial ceiling, and an app-side cap
+  /// inside the measurement would be measuring ourselves.
+  ///
+  /// ROLE-FREE: every phone loads this identical plan. [FieldStep.cliqueN]
+  /// is resolved into a radio schedule at launch; [FieldStep.dutOrder] is
+  /// NOT resolved — the runner compares it against its nickname-derived join
+  /// order at each step, so the full rotation survives in every phone's plan.
+  /// The formation clock is the burst's `dialburst` record (which carries
+  /// both `popN` and `m`) joined offline to the DUT's own per-path link
+  /// stages: raw GATT link up (`gattConnected`), GATT-usable (`connected` —
+  /// connected + MTU, ready to carry bytes; the endpoint), the Noise
+  /// `session`, and dual-leg convergence (the analyzer stamps the first
+  /// instant the DUT holds both legs to that identity). A dial not usable
+  /// within the 20 s dwell counts failed, which is why the dwell IS the
+  /// failure deadline.
+  ///
+  /// Sessions, links and the buffer are never reset: the burst tears down
+  /// exactly the legs it is about to re-dial and nothing else in the fleet is
+  /// disturbed.
+  ///
+  /// sum(N=2..8) of N*(N-1) = 168 cells x [reps]=5 = 840 burst steps at
+  /// (20 s dwell + 5 s gap), plus 7 converge steps ~= 6 h.
+  static FieldPlan dialGridProbe({
+    String expId = 'dial-2-nm-grid-converge',
+    int reps = 5,
     int dwellSec = 20,
+    int convergeSec = 60,
+    int firstConvergeSec = 90,
+    int maxPop = 8,
   }) {
     final trials = reps < 1 ? 1 : reps;
     final steps = <FieldStep>[];
-    for (var dut = 1; dut <= 9; dut++) {
-      for (var n = 1; n <= 8; n++) {
-        for (var t = 1; t <= trials; t++) {
-          steps.add(FieldStep(
-            label: 'DUT=$dut N=$n t$t',
-            dwellSec: dwellSec,
-            dutOrder: dut,
-            parallelDials: n,
-            autoAdvance: steps.isNotEmpty,
-          ));
+    for (var n = 2; n <= maxPop; n++) {
+      // The joining device's radio just came up; no bursts while the
+      // population converges to dual-leg + MTU + sessions.
+      steps.add(FieldStep(
+        label: 'N=$n converge',
+        dwellSec: n == 2 ? firstConvergeSec : convergeSec,
+        cliqueN: n,
+        sendCount: 0,
+        autoAdvance: steps.isNotEmpty,
+      ));
+      for (var dut = 1; dut <= n; dut++) {
+        for (var m = 1; m <= n - 1; m++) {
+          for (var t = 1; t <= trials; t++) {
+            steps.add(FieldStep(
+              label: 'N=$n DUT=$dut M=$m t$t',
+              dwellSec: dwellSec,
+              cliqueN: n,
+              dutOrder: dut,
+              parallelDials: m,
+              autoAdvance: true,
+            ));
+          }
         }
       }
     }
     return FieldPlan(
       expId: expId,
-      settleSec: 30,
+      settleSec: 60,
       autoAdvanceGapSec: 5,
       resetSessions: false,
       resetLinks: false,
@@ -794,9 +830,9 @@ class FieldPlanPresets {
       manualJoin: true,
       alignSec: 300,
       placementSec: 120,
-      // Radios stay ON everywhere for the whole run: the probe's variable is
-      // the burst size, and the burst manages its own teardown.
-      scriptedRadio: false,
+      // The population IS a variable here, so the radios are scripted: each
+      // phone's own nickname decides when it joins.
+      scriptedRadio: true,
       steps: steps,
     );
   }
@@ -897,11 +933,11 @@ class FieldPlanPresets {
         // the runner derives each phone's schedule from it at launch. Radios
         // off at start; each turns on at its join. N=2..7, 3 levels, 10 reps.
         'Warmup sweep N=2..7 (shared plan, ~3h20)': dilutingWarmupSweep(),
-        // ONE shared entry for the whole fleet: the DUT rotation lives in
-        // the steps' dutOrder and each phone's nickname decides at runtime
-        // which bursts are its own — there is no per-role entry to pick
-        // wrongly.
-        'Parallel dial probe (shared plan, ~5h)': parallelDialProbe(),
+        // ONE shared entry for the whole fleet: the population lives in the
+        // steps' cliqueN (resolved from the nickname at launch) and the DUT
+        // rotation in their dutOrder (compared against the nickname at each
+        // step) — there is no per-role entry to pick wrongly.
+        'Dial grid N x M (shared plan, ~6h)': dialGridProbe(),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

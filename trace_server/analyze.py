@@ -33,21 +33,25 @@ emits, under ``--out``:
     <exp>/wire_bytes.png       tx/rx bytes per packet type over time
     <exp>/latency.csv          per-message e2e latency (sent joined to
                                delivered on messageId)
-    <exp>/dial_probe.csv       parallel-dial probe: one row per
-                               (DUT, N, rep, target) with ms from the burst
-                               to gattConnected / connected (= GATT-usable,
-                               the endpoint) / session / dual-leg converged
-                               (both legs to the target's identity live),
-                               and the 20 s verdict
-    <exp>/dial_scores.csv      per DUT device: P* (largest N with every dial
-                               usable in every rep), median ms to usable /
-                               session / converged at P*, success fraction
-                               per N, and the N=4..6 ms-per-dial slope
-                               (stack-serialization flag)
-    <exp>/dial_probe.png       three shared-X panels of median-vs-N per DUT
-                               (p10-p90 bars): ms to GATT-usable (successful
-                               dials), to Noise session, to dual-leg
-                               convergence — plus a success-fraction strip
+    <exp>/dial_probe.csv       dial grid: one row per (DUT, pop_n, m, rep,
+                               target) with ms from the burst to
+                               gattConnected / connected (= GATT-usable, the
+                               endpoint) / session / dual-leg converged (both
+                               legs to the target's identity live), and the
+                               20 s verdict. pop_n = radios up, m = dials
+                               fired at once
+    <exp>/dial_scores.csv      per (DUT device, pop_n): P* (largest m with
+                               every dial usable in every rep), median ms to
+                               usable / session / converged at P*, success
+                               fraction per m, and the m=4..6 ms-per-dial
+                               slope (stack-serialization flag)
+    <exp>/dial_probe_N<n>.png  three shared-X panels of median-vs-m per DUT
+                               at population n (p10-p90 bars): ms to
+                               GATT-usable (successful dials), to Noise
+                               session, to dual-leg convergence — plus a
+                               success-fraction strip
+    <exp>/dial_probe.png       the same figure at the largest population
+                               present (the headline)
 
 Markers drive the ground truth: every step marker opens a segment that runs
 until the next one (or the ``end`` marker), and the step's variables are read
@@ -2887,7 +2891,7 @@ def write_load_sweep(steps: pd.DataFrame, out: Path, exp: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Parallel dial probe (dial-1-parallel-burst-ladder)
+# Dial grid probe (dial-2-nm-grid-converge)
 # --------------------------------------------------------------------------- #
 # The failure deadline: a dial not GATT-usable within the step dwell counts
 # failed. Matches the preset's dwellSec (20 s).
@@ -2895,7 +2899,13 @@ DIAL_PROBE_DEADLINE_MS = 20_000
 
 
 def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per (DUT device, N, rep, target pathId) of a parallel-dial run.
+    """One row per (DUT device, popN, M, rep, target pathId) of a dial-grid run.
+
+    The grid has TWO variables and both come off the `dialburst` record:
+    `popN` (how many phones had their radio up) and `m` (how many of them the
+    DUT dialled at once). The first version of this probe logged the burst
+    size alone, which made a burst of 4 into a two-phone room
+    indistinguishable from one into an eight-phone room.
 
     Each `dialburst` record carries its targets; every target is joined to the
     first link stage stamp for that pathId at t >= the burst's t, taken ONLY
@@ -3027,7 +3037,8 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                 rows.append({
                     "dut_device": dev,
                     "dut": int(_num(b.get("dut"), 0)),
-                    "n": int(_num(b.get("n"), len(targets))),
+                    "pop_n": int(_num(b.get("popN"), 0)),
+                    "m": int(_num(b.get("m"), len(targets))),
                     "rep": int(_num(b.get("rep"), 1)),
                     "target": target,
                     "ms_to_connected": ms_conn,
@@ -3041,97 +3052,127 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dial_scores(dial: pd.DataFrame) -> pd.DataFrame:
-    """Per-DUT verdicts of the parallel-dial probe.
+    """Per (DUT device, population) verdicts of the dial grid.
 
-    P* is the largest burst size N at which EVERY dial of EVERY rep reached
+    The score is per POPULATION as well as per device, because a phone's
+    parallel-dial capacity is not a property of the phone alone: the same
+    burst of 4 lands differently in a room of 5 radios and a room of 8, and
+    one row per device would average those together.
+
+    P* is the largest burst size M at which EVERY dial of EVERY rep reached
     GATT-usable inside the deadline — the phone's demonstrated parallel-dial
-    capacity. The three medians at P* are the ladder's stages: GATT-usable,
-    Noise session, dual-leg converged. `slope_ms_per_dial` is the mean over
-    N=4..6 of (median ms-to-usable at N) / N: if the stack serializes the
-    dials, formation grows ~linearly with N and this ratio sits near the
-    per-dial service time; if the dials genuinely run in parallel it falls
-    with N.
+    capacity at that population. The three medians at P* are the ladder's
+    stages: GATT-usable, Noise session, dual-leg converged.
+    `slope_ms_per_dial` is the mean over M=4..6 of (median ms-to-usable at M)
+    / M: if the stack serializes the dials, formation grows ~linearly with M
+    and this ratio sits near the per-dial service time; if the dials genuinely
+    run in parallel it falls with M.
     """
     rows = []
-    for (dev, dut), g in dial.groupby(["dut_device", "dut"]):
-        row = {"dut_device": dev, "dut": dut}
+    for (dev, dut, pop_n), g in dial.groupby(["dut_device", "dut", "pop_n"]):
+        row = {"dut_device": dev, "dut": dut, "pop_n": pop_n}
         perfect = []
-        for n, gn in g.groupby("n"):
-            frac = float(gn.ok.mean())
-            row[f"ok_frac_n{n}"] = round(frac, 3)
+        for m, gm in g.groupby("m"):
+            frac = float(gm.ok.mean())
+            row[f"ok_frac_m{m}"] = round(frac, 3)
             if frac == 1.0:
-                perfect.append(n)
+                perfect.append(m)
         p_star = max(perfect) if perfect else 0
         row["p_star"] = p_star
-        at_p = g[g.n == p_star]
+        at_p = g[g.m == p_star]
         for col, name in (("ms_to_usable", "median_ms_usable_at_pstar"),
                           ("ms_to_session", "median_ms_session_at_pstar"),
                           ("ms_to_converged", "median_ms_converged_at_pstar")):
             v = at_p[col].dropna()
             row[name] = round(float(v.median()), 1) if len(v) else None
         slopes = []
-        for n in (4, 5, 6):
-            v = g[g.n == n].ms_to_usable.dropna()
+        for m in (4, 5, 6):
+            v = g[g.m == m].ms_to_usable.dropna()
             if len(v):
-                slopes.append(float(v.median()) / n)
+                slopes.append(float(v.median()) / m)
         row["slope_ms_per_dial"] = (
             round(float(np.mean(slopes)), 1) if slopes else None)
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def plot_dial_probe(dial: pd.DataFrame, out: Path):
-    """Three shared-X panels of median-vs-burst-size N, one series per DUT
-    device with p10-p90 bars — burst to GATT-usable (successful dials only),
-    to Noise session, and to dual-leg convergence — plus the thin
-    success-fraction strip underneath. The DUT is encoded by marker shape +
-    line style (the join-order keyed maps the load sweep uses), so the
-    figure survives greyscale."""
-    fig, (ax_u, ax_s, ax_c, axf) = plt.subplots(
-        4, 1, figsize=(10, 13), sharex=True,
-        gridspec_kw={"height_ratios": [3, 3, 3, 1]})
-    panels = [
-        (ax_u, "ms_to_usable", True,
-         "ms to GATT-usable\n(successful dials, median, p10-p90)"),
-        (ax_s, "ms_to_session", False,
-         "ms to Noise session\n(median, p10-p90)"),
-        (ax_c, "ms_to_converged", False,
-         "ms to dual-leg converged\n(median, p10-p90)"),
-    ]
-    for (dev, dut), g in dial.groupby(["dut_device", "dut"]):
-        style = dict(marker=_SWEEP_MARKER.get(dut, "o"), ms=7, lw=1.4,
-                     color="#222222", markeredgewidth=1.5,
-                     linestyle=_SWEEP_LINE.get(dut, "-"))
-        for ax, col, ok_only, _ in panels:
-            ns, med, lo, hi = [], [], [], []
-            for n, gn in sorted(g.groupby("n"), key=lambda kv: kv[0]):
-                v = (gn[gn.ok] if ok_only else gn)[col].dropna()
-                if not len(v):
-                    continue
-                ns.append(n)
-                med.append(float(v.median()))
-                lo.append(float(v.median() - v.quantile(0.10)))
-                hi.append(float(v.quantile(0.90) - v.median()))
-            if ns:
-                ax.errorbar(ns, med, yerr=[lo, hi], capsize=3,
-                            label=f"DUT {dut} ({short(str(dev))})", **style)
-        frac = [(n, float(gn.ok.mean()))
-                for n, gn in sorted(g.groupby("n"), key=lambda kv: kv[0])]
-        if frac:
-            axf.plot([n for n, _ in frac], [100 * f for _, f in frac],
-                     **style)
-    ax_u.legend(fontsize=8, ncol=2)
-    for ax, _, _, ylabel in panels:
-        ax.set_ylabel(ylabel, fontsize=9)
-        ax.grid(alpha=0.3)
-    axf.set_ylabel("usable in 20 s (%)", fontsize=9)
-    axf.set_ylim(0, 105)
-    axf.set_xlabel("parallel dials N")
-    axf.grid(alpha=0.3)
-    axf.set_xticks(sorted(dial.n.unique()))
-    fig.tight_layout()
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
+def plot_dial_probe(dial: pd.DataFrame, out: Path) -> list[Path]:
+    """One figure per POPULATION N, plus a headline copy at the largest N.
+
+    Each figure keeps the three shared-X panels of median-vs-burst-size M,
+    one series per DUT device with p10-p90 bars — burst to GATT-usable
+    (successful dials only), to Noise session, and to dual-leg convergence —
+    plus the thin success-fraction strip underneath. The DUT is encoded by
+    marker shape + line style (the join-order keyed maps the load sweep
+    uses), so the figure survives greyscale.
+
+    Splitting by population is the whole point of the grid: overlaying every
+    N on one axis would put a burst of 4 into a five-phone room on the same
+    point as a burst of 4 into an eight-phone room. [out] is the headline
+    path; the per-N files sit beside it as `<stem>_N<n><suffix>`. Returns
+    every file written.
+    """
+    written: list[Path] = []
+    pops = sorted(int(n) for n in dial.pop_n.unique())
+    for pop_n in pops:
+        sub = dial[dial.pop_n == pop_n]
+        if sub.empty:
+            continue
+        fig, (ax_u, ax_s, ax_c, axf) = plt.subplots(
+            4, 1, figsize=(10, 13), sharex=True,
+            gridspec_kw={"height_ratios": [3, 3, 3, 1]})
+        panels = [
+            (ax_u, "ms_to_usable", True,
+             "ms to GATT-usable\n(successful dials, median, p10-p90)"),
+            (ax_s, "ms_to_session", False,
+             "ms to Noise session\n(median, p10-p90)"),
+            (ax_c, "ms_to_converged", False,
+             "ms to dual-leg converged\n(median, p10-p90)"),
+        ]
+        for (dev, dut), g in sub.groupby(["dut_device", "dut"]):
+            style = dict(marker=_SWEEP_MARKER.get(dut, "o"), ms=7, lw=1.4,
+                         color="#222222", markeredgewidth=1.5,
+                         linestyle=_SWEEP_LINE.get(dut, "-"))
+            for ax, col, ok_only, _ in panels:
+                ms, med, lo, hi = [], [], [], []
+                for m, gm in sorted(g.groupby("m"), key=lambda kv: kv[0]):
+                    v = (gm[gm.ok] if ok_only else gm)[col].dropna()
+                    if not len(v):
+                        continue
+                    ms.append(m)
+                    med.append(float(v.median()))
+                    lo.append(float(v.median() - v.quantile(0.10)))
+                    hi.append(float(v.quantile(0.90) - v.median()))
+                if ms:
+                    ax.errorbar(ms, med, yerr=[lo, hi], capsize=3,
+                                label=f"DUT {dut} ({short(str(dev))})",
+                                **style)
+            frac = [(m, float(gm.ok.mean()))
+                    for m, gm in sorted(g.groupby("m"), key=lambda kv: kv[0])]
+            if frac:
+                axf.plot([m for m, _ in frac], [100 * f for _, f in frac],
+                         **style)
+        ax_u.legend(fontsize=8, ncol=2)
+        ax_u.set_title(f"population N={pop_n} radios up", fontsize=11)
+        for ax, _, _, ylabel in panels:
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.grid(alpha=0.3)
+        axf.set_ylabel("usable in 20 s (%)", fontsize=9)
+        axf.set_ylim(0, 105)
+        axf.set_xlabel("concurrent dials M")
+        axf.grid(alpha=0.3)
+        axf.set_xticks(sorted(sub.m.unique()))
+        fig.tight_layout()
+        per_n = out.with_name(f"{out.stem}_N{pop_n}{out.suffix}")
+        fig.savefig(per_n, dpi=150)
+        written.append(per_n)
+        # The headline figure IS the largest population's — the crowded room
+        # is the one that decides whether a burst survives.
+        if pop_n == pops[-1]:
+            fig.savefig(out, dpi=150)
+            written.append(out)
+        plt.close(fig)
+    return written
 
 
 # --------------------------------------------------------------------------- #

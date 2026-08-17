@@ -1338,11 +1338,13 @@ void main() {
     });
   });
 
-  group('BleTransportService — testbed passive mode + dial burst', () {
+  group('BleTransportService — testbed dial burst', () {
     // Fixed peer UUIDs above the initiator threshold: the transport under
     // test is built with a LOW identity, so it is always the election's
-    // initiator and every advertisement below WOULD auto-dial — which is
-    // exactly what makes the passive suppression observable.
+    // initiator and every advertisement below auto-dials. Nothing suppresses
+    // that — the probe's burst runs on a fleet whose transports behave
+    // exactly as they do in production, and a peer dialing at the same
+    // moment is the contention a real burst meets.
     const peerUuidA = '84c40316-0871-e5ad-aaaa-000000000001';
     const peerUuidB = '84c40316-0871-e5ad-bbbb-000000000002';
 
@@ -1377,143 +1379,8 @@ void main() {
           connectable: true,
         ));
 
-    test(
-        'passive mode suppresses the scan-result dial but keeps discovery '
-        'flowing', () async {
-      transport.passiveModeForTestbed = true;
-      adv('AABB01', peerUuidA);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'A passive device never initiates a central dial, even as '
-              'the election\'s initiator.');
-      expect(store.state.peers.discoveredBlePeers.containsKey('central:AABB01'),
-          true,
-          reason: 'Discovery must keep flowing — a passive phone stays a '
-              'dialable, observable target for the DUT.');
-    });
-
-    test(
-        'respond-only passive: the ANNOUNCE-driven reverse leg toward an '
-        'inbound-connected peer is allowed', () async {
-      transport.passiveModeForTestbed = true;
-      const connectionMac = '99:88:77:66:55:02';
-      final peer = await _makeIdentity('Remote');
-
-      // Advertised MAC known AND a live inbound peripheral leg. Until the
-      // leg is identified there is nothing to respond to — no dial.
-      adv('AA:BB:CC:DD:EE:01', peer.bleServiceUuid);
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:$connectionMac',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'An unidentified inbound leg licenses nothing: dialing '
-              'here would be first contact, which passive suppresses.');
-
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: peer.publicKey,
-        nickname: 'Remote',
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:$connectionMac',
-      ));
-      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
-          hasLength(1),
-          reason: 'The reverse leg toward a peer we hold a live inbound '
-              'peripheral leg from is a RESPONSE to being dialed — '
-              'respond-only passive lets it through (over the existing '
-              'ACL), completing the dual-role pair.');
-    });
-
-    test(
-        'respond-only passive: the advertisement election dials the reverse '
-        'leg over the live inbound leg', () async {
-      transport.passiveModeForTestbed = true;
-      const connectionMac = '99:88:77:66:55:03';
-      final peer = await _makeIdentity('Responder');
-
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:$connectionMac',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: peer.publicKey,
-        nickname: 'Responder',
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:$connectionMac',
-      ));
-
-      adv('AA:BB:CC:DD:EE:03', peer.bleServiceUuid);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
-          hasLength(1),
-          reason: 'With a live inbound peripheral leg from this identity '
-              'the election is a response, so passive mode lets the '
-              'reverse dial through.');
-      expect(hostApi.calls.where((c) => c == 'connect:AA:BB:CC:DD:EE:03'),
-          isEmpty,
-          reason: 'The allowed dial targets the inbound link\'s own remote '
-              'address (over-ACL), never the advertised MAC first.');
-    });
-
-    test(
-        'respond-only passive: a dead inbound leg is no licence to dial',
-        () async {
-      transport.passiveModeForTestbed = true;
-      const connectionMac = '99:88:77:66:55:04';
-      final peer = await _makeIdentity('Ghost');
-
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:$connectionMac',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: peer.publicKey,
-        nickname: 'Ghost',
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:$connectionMac',
-      ));
-      // The inbound leg drops before any advertisement arrives.
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:$connectionMac',
-        role: BleRole.peripheral,
-        state: BlePathState.disconnected,
-        rssi: null,
-        mtu: 23,
-        canSend: false,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      adv('AA:BB:CC:DD:EE:04', peer.bleServiceUuid);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'With the inbound leg dead this dial would be first '
-              'contact again, which respond-only passive still suppresses.');
-    });
-
     test('burstDialTargets: one entry per distinct peer, strongest first',
         () async {
-      transport.passiveModeForTestbed = true;
       adv('MACA1', peerUuidA, rssi: -70);
       adv('MACA2', peerUuidA, rssi: -50); // same identity, rotated MAC
       adv('MACB1', peerUuidB, rssi: -60);
@@ -1529,24 +1396,28 @@ void main() {
     test(
         'dialBurst fires every target in one event-loop turn and reports the '
         'dialed set', () async {
-      transport.passiveModeForTestbed = true;
       adv('AABB01', peerUuidA);
       adv('CCDD02', peerUuidB);
       await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'Passive: nothing dials until the burst is fired by hand.');
+      // The ordinary election already dialed both on discovery; the burst is
+      // measured as what it ADDS to that, not against an artificially idle
+      // transport.
+      int dials(String mac) =>
+          hostApi.calls.where((c) => c == 'connect:$mac').length;
+      final beforeA = dials('AABB01');
+      final beforeB = dials('CCDD02');
 
       final dialed =
           await transport.dialBurst(['central:AABB01', 'central:CCDD02']);
 
       expect(dialed, ['central:AABB01', 'central:CCDD02']);
-      expect(hostApi.calls.where((c) => c == 'connect:AABB01'), hasLength(1));
-      expect(hostApi.calls.where((c) => c == 'connect:CCDD02'), hasLength(1));
+      expect(dials('AABB01') - beforeA, 1);
+      expect(dials('CCDD02') - beforeB, 1);
     });
 
     test('dialBurst tears down an existing central leg before redialing',
         () async {
-      // Auto-dial and connect the leg first (passive off), so the burst has
+      // Auto-dial and connect the leg first, so the burst has
       // a live central leg to the target — the rep-t>1 case, where the
       // previous rep's leg would otherwise make the one-central-per-identity
       // guard refuse the fresh dial.
@@ -1564,7 +1435,6 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      transport.passiveModeForTestbed = true;
       final burst = transport.dialBurst([pathId]);
       await Future<void>.delayed(const Duration(milliseconds: 10));
       expect(hostApi.calls.where((c) => c == 'disconnect:$pathId'),
@@ -1592,10 +1462,9 @@ void main() {
 
     test('the in-flight cap refuses a normal dial but not a burst dial',
         () async {
-      transport.passiveModeForTestbed = true;
-      adv('AABB01', peerUuidA);
-      await Future<void>.delayed(Duration.zero);
-      // Seven in-flight central dials: the cap (7) is fully consumed.
+      // Seven in-flight central dials BEFORE discovery: the cap (7) is fully
+      // consumed, so even the election's own dial on the advertisement is
+      // refused and every `connect:AABB01` below belongs to the burst.
       for (var i = 1; i <= 7; i++) {
         callbacks.pushPath(BlePath(
           pathId: 'central:INFLIGHT$i',
@@ -1606,6 +1475,10 @@ void main() {
           canSend: false,
         ));
       }
+      // The plugin's path events must land before the advertisement: the cap
+      // reads `_paths`, and a dial racing ahead of them would not see it.
+      await Future<void>.delayed(Duration.zero);
+      adv('AABB01', peerUuidA);
       await Future<void>.delayed(Duration.zero);
 
       expect(await transport.connectToDevice('central:AABB01'), isFalse,
@@ -1615,7 +1488,7 @@ void main() {
 
       final dialed = await transport.dialBurst(['central:AABB01']);
       expect(dialed, ['central:AABB01'],
-          reason: 'The probe burst bypasses the in-flight cap: at N=8 the '
+          reason: 'The probe burst bypasses the in-flight cap: at M=8 the '
               'cap would silently swallow the eighth dial and the probe '
               'would score our constant instead of the platform\'s '
               'ceiling.');
@@ -1625,7 +1498,6 @@ void main() {
     test(
         'the failed-dial cooldown refuses a normal dial but not a burst '
         'dial', () async {
-      transport.passiveModeForTestbed = true;
       adv('CCDD02', peerUuidB);
       await Future<void>.delayed(Duration.zero);
       // A failed central dial arms the redial cooldown for this address.
@@ -1638,18 +1510,21 @@ void main() {
         canSend: false,
       ));
       await Future<void>.delayed(Duration.zero);
+      int dials() =>
+          hostApi.calls.where((c) => c == 'connect:CCDD02').length;
+      final afterFailure = dials();
 
       expect(await transport.connectToDevice('central:CCDD02'), isFalse,
           reason: 'Within the cooldown a production redial of the failed '
               'address stays refused.');
-      expect(hostApi.calls.where((c) => c == 'connect:CCDD02'), isEmpty);
+      expect(dials(), afterFailure);
 
       final dialed = await transport.dialBurst(['central:CCDD02']);
       expect(dialed, ['central:CCDD02'],
           reason: 'One rep\'s failed dial must not swallow the next rep\'s '
               'scheduled dial of the same address — each rep is its own '
               'cold measurement.');
-      expect(hostApi.calls.where((c) => c == 'connect:CCDD02'), hasLength(1));
+      expect(dials() - afterFailure, 1);
     });
   });
 

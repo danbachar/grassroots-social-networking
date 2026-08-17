@@ -131,18 +131,6 @@ class FieldRunner extends ChangeNotifier {
   /// [FieldStep.parallelDials] of them as the burst's targets.
   final List<String> Function()? bleDialTargets;
 
-  /// Parallel-dial probe: arm (true) / disarm (false) the transport's
-  /// respond-only passive mode, which suppresses every automatic
-  /// FIRST-CONTACT central dial while still allowing the reverse (central)
-  /// leg toward a peer the phone already holds a live inbound peripheral leg
-  /// from — so a dialed pair converges to dual-leg, deliberately. Armed at
-  /// run start when the plan carries any [FieldStep.dutOrder] step — on
-  /// EVERY phone, the DUT included, because its own bursts go through
-  /// [dialBurst], which passive mode exempts; the DUT's burst is the run's
-  /// only first-contact initiator — and disarmed when the run ends, however
-  /// it ends.
-  final void Function(bool on)? onSetBlePassive;
-
   static const _uuid = Uuid();
 
   /// Uploads the experiment files; returns a user-facing status line.
@@ -217,7 +205,6 @@ class FieldRunner extends ChangeNotifier {
     this.linkSettled,
     this.dialBurst,
     this.bleDialTargets,
-    this.onSetBlePassive,
     this.upload,
     this.onWindowElapsed,
   });
@@ -255,18 +242,6 @@ class FieldRunner extends ChangeNotifier {
   int _rawBytes = 0;
   Timer? _bleWatchdog;
   String? _abortReason;
-
-  /// True while this run holds the fleet's BLE passive mode on (dial-probe
-  /// plans). Disarmed on EVERY way a run can end — finish, force-finish,
-  /// abort, dispose — because passive mode outliving its run would leave a
-  /// phone that silently never dials anyone again.
-  bool _passiveArmed = false;
-
-  void _disarmPassive() {
-    if (!_passiveArmed) return;
-    _passiveArmed = false;
-    onSetBlePassive?.call(false);
-  }
 
   /// Manual-join wall-clock schedule: the shared start instant and each
   /// step's absolute start, precomputed so 61 steps cannot accumulate the
@@ -423,17 +398,6 @@ class FieldRunner extends ChangeNotifier {
     _runId = nowMs();
     _btOnSeen = false;
     _radioUp = false;
-    // Dial-probe plan: hold respond-only passive for the WHOLE run, on every
-    // phone — the DUT's own bursts are manual dials through [dialBurst] and
-    // are exempt, making them the run's only first-contact initiator (a
-    // passive phone still answers a burst's leg with its reverse leg, so
-    // pairs converge). Turning it on per-step would let the gap between
-    // steps re-form legs automatically and hand the next burst a warm pair
-    // to measure.
-    if (plan.steps.any((s) => s.dutOrder != null) && onSetBlePassive != null) {
-      _passiveArmed = true;
-      onSetBlePassive!.call(true);
-    }
     await recorder.startExperiment(plan.expId);
     if (plan.manualJoin) {
       // Anchor on the wall clock, not the tap: every phone rounds up to the
@@ -607,9 +571,11 @@ class FieldRunner extends ChangeNotifier {
     // response is to keep recording, not to abort seven other phones' run.
     if (!manualJoin) _armBleWatchdog(step);
     // Dial-probe step: only the phone whose join order IS the step's DUT
-    // fires the burst; everyone else just holds passive through the dwell.
-    // Un-awaited so the dwell countdown starts on schedule regardless of how
-    // long the burst's teardown + dials take.
+    // fires the burst; every other phone just runs its normal transport
+    // through the dwell, and the dials it makes of its own accord are the
+    // contention the DUT is measured under. Un-awaited so the dwell
+    // countdown starts on schedule regardless of how long the burst's
+    // teardown + dials take.
     if (step.dutOrder != null && step.dutOrder == joinOrder) {
       unawaited(_fireDialBurst(step));
     }
@@ -975,32 +941,47 @@ class FieldRunner extends ChangeNotifier {
     }));
   }
 
-  /// Trailing rep suffix in a dial-probe label ('DUT=3 N=4 t7' → 7).
+  /// Trailing rep suffix in a dial-probe label ('N=6 DUT=3 M=4 t7' → 7).
   static final RegExp _repSuffix = RegExp(r'\bt(\d+)$');
 
   /// Fire this DUT step's parallel-dial burst and log its `dialburst`
   /// record — the trace contract the offline join is built on: one record
-  /// per burst carrying {t, dut, n, rep, label, targets}, where `targets`
-  /// is the pathIds ACTUALLY dialed (the join iterates exactly these) and
-  /// `t` is stamped at the burst request. The teardown of the previous
-  /// rep's legs sits inside the clock after that stamp; it is concurrent in
-  /// [dialBurst], so it is a small additive cost, not an N-dependent one.
+  /// per burst carrying {t, dut, popN, m, rep, label, targets}, where
+  /// `targets` is the pathIds ACTUALLY dialed (the join iterates exactly
+  /// these) and `t` is stamped at the burst request. The teardown of the
+  /// previous rep's legs sits inside the clock after that stamp; it is
+  /// concurrent in [dialBurst], so it is a small additive cost, not an
+  /// M-dependent one.
+  ///
+  /// The record carries BOTH of the experiment's variables, because a burst
+  /// size means nothing without the population it was fired into: `popN` is
+  /// the step's [FieldStep.cliqueN] (how many phones have their radio up)
+  /// and `m` is [FieldStep.parallelDials] (how many of them this phone dials
+  /// at once). The first run of this probe logged the burst size alone under
+  /// the name `n`, which made a burst of 4 into a two-phone room
+  /// indistinguishable from one into an eight-phone room.
   Future<void> _fireDialBurst(FieldStep step) async {
     final burst = dialBurst;
     if (burst == null) return;
     final want = step.parallelDials ?? 1;
+    final popN = step.cliqueN;
     final candidates = bleDialTargets?.call() ?? const <String>[];
     final picked = candidates.take(want).toList();
     if (picked.length < want) {
       // The shortfall is a fact about the ROOM (fewer peers discovered than
       // the step wants), not about the dial path — its own record keeps it
-      // from masquerading as N failed formations downstream.
+      // from masquerading as M failed formations downstream. It carries the
+      // same two variables as the burst so a shortfall can be attributed to
+      // a population without re-parsing the label.
       await recorder.log({
         'type': 'runner',
         't': nowMs(),
         'event': 'dialShortfall',
         'step': step.label,
-        'want': want,
+        if (popN != null) 'popN': popN,
+        // `m` IS the want — the step's intended burst size — so there is no
+        // second field repeating it; `have` is what the room could offer.
+        'm': want,
         'have': picked.length,
       });
     }
@@ -1010,7 +991,8 @@ class FieldRunner extends ChangeNotifier {
       'type': 'dialburst',
       't': t0,
       'dut': joinOrder,
-      'n': want,
+      if (popN != null) 'popN': popN,
+      'm': want,
       'rep': int.tryParse(
               _repSuffix.firstMatch(step.label)?.group(1) ?? '') ??
           1,
@@ -1134,7 +1116,6 @@ class FieldRunner extends ChangeNotifier {
   double? _uploadFraction;
 
   Future<void> _finish() async {
-    _disarmPassive();
     recorder.onBatteryFloor = null;
     _finishing = true;
     _finishingWhat = 'writing the recording to disk';
@@ -1185,7 +1166,6 @@ class FieldRunner extends ChangeNotifier {
   /// find out which.
   Future<void> forceFinish() async {
     if (!_running) return;
-    _disarmPassive();
     _cancelSends();
     _bleWatchdog?.cancel();
     _bleWatchdog = null;
@@ -1215,7 +1195,6 @@ class FieldRunner extends ChangeNotifier {
   /// Abandon the run: marker the abort, stop bulk + recording. Files stay.
   Future<void> abort() async {
     if (!_running) return;
-    _disarmPassive();
     _cancelSends();
     _bleWatchdog?.cancel();
     _bleWatchdog = null;
@@ -1269,7 +1248,6 @@ class FieldRunner extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
-    _disarmPassive();
     _cancelSends();
     _bleWatchdog?.cancel();
     _bleWatchdog = null;

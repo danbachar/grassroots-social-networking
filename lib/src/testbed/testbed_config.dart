@@ -232,14 +232,16 @@ class FieldStep {
   /// [FieldPlan.resolvedFor]: the runner compares it against its own
   /// [joinOrder] at step start, so the full rotation survives in every
   /// phone's plan. The phone whose order matches fires the burst; every
-  /// other phone holds respond-only passive for the whole run (no
-  /// first-contact central dials — the reverse leg toward a peer it already
-  /// holds a live inbound leg from still fires, so dialed pairs converge).
+  /// other phone runs its ordinary transport, which is deliberate — a peer
+  /// dialing at the same moment is the contention a real burst meets, and
+  /// the DUT measures its OWN dials off its own clock, so nobody else's
+  /// dialing can contaminate the numbers.
   final int? dutOrder;
 
   /// Parallel-dial probe: how many distinct peers the DUT dials
-  /// SIMULTANEOUSLY at this step's start — the burst size N. Ignored on
-  /// phones whose join order is not [dutOrder].
+  /// SIMULTANEOUSLY at this step's start — the burst size M, at most
+  /// [cliqueN] - 1 (a phone cannot dial itself). Ignored on phones whose
+  /// join order is not [dutOrder].
   final int? parallelDials;
 
   /// Begin this step automatically without the IN POSITION tap. Set by the

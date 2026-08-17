@@ -1711,9 +1711,10 @@ void main() {
     });
   });
 
-  group('parallel dial probe', () {
-    // A two-DUT slice of the probe, tap-driven (no wall-clock anchor) so
-    // fakeAsync stays simple: step 1 belongs to phone #1, step 2 to phone #2.
+  group('dial grid probe', () {
+    // A two-DUT slice of the grid at population N=3, tap-driven (no
+    // wall-clock anchor) so fakeAsync stays simple: step 1 belongs to phone
+    // #1, step 2 to phone #2.
     FieldPlan probePlan() => const FieldPlan(
           expId: 'dial-t',
           settleSec: 1,
@@ -1721,13 +1722,15 @@ void main() {
           resetDtnBuffer: false,
           steps: [
             FieldStep(
-                label: 'DUT=1 N=2 t1',
+                label: 'N=3 DUT=1 M=2 t1',
                 dwellSec: 5,
+                cliqueN: 3,
                 dutOrder: 1,
                 parallelDials: 2),
             FieldStep(
-                label: 'DUT=2 N=1 t1',
+                label: 'N=3 DUT=2 M=1 t1',
                 dwellSec: 5,
+                cliqueN: 3,
                 dutOrder: 2,
                 parallelDials: 1,
                 autoAdvance: true),
@@ -1738,7 +1741,7 @@ void main() {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final runner = FieldRunner(recorder: recorder, myNickname: 'Alice');
-        runner.start(FieldPlanPresets.parallelDialProbe());
+        runner.start(FieldPlanPresets.dialGridProbe());
         async.flushMicrotasks();
         expect(runner.isRunning, isFalse);
         expect(runner.abortReason, contains('not a join order'));
@@ -1750,11 +1753,10 @@ void main() {
 
     test(
         'the DUT bursts its own step, stays quiet on the other DUT\'s, and '
-        'the fleet holds passive for the whole run', () {
+        'the record carries BOTH variables', () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final bursts = <List<String>>[];
-        final passive = <bool>[];
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '1',
@@ -1764,15 +1766,11 @@ void main() {
             bursts.add(ids);
             return ids;
           },
-          onSetBlePassive: passive.add,
         );
         runner.start(probePlan());
         async.flushMicrotasks();
-        expect(passive, [true],
-            reason: 'passive is armed at run start, the DUT phone included — '
-                'its own bursts are manual dials and exempt');
 
-        // Step 1: this phone IS the DUT — one burst of exactly N targets.
+        // Step 1: this phone IS the DUT — one burst of exactly M targets.
         runner.inPosition();
         async.flushMicrotasks();
         expect(bursts, [
@@ -1781,29 +1779,31 @@ void main() {
         final rec = recorder.records
             .singleWhere((r) => r['type'] == 'dialburst');
         expect(rec['dut'], 1);
-        expect(rec['n'], 2);
+        expect(rec['popN'], 3,
+            reason: 'a burst size means nothing without its population');
+        expect(rec['m'], 2);
         expect(rec['rep'], 1);
-        expect(rec['label'], 'DUT=1 N=2 t1');
+        expect(rec['label'], 'N=3 DUT=1 M=2 t1');
         expect(rec['targets'], ['central:AA', 'central:BB']);
         expect(rec['t'], isA<int>());
+        expect(rec.containsKey('n'), isFalse,
+            reason: 'the ambiguous single `n` field is gone');
 
         // Step 2 (auto-advance): dutOrder 2 is another phone's burst.
         async.elapse(const Duration(seconds: 5)); // dwell 1
         async.elapse(const Duration(seconds: 5)); // auto-advance gap
         async.elapse(const Duration(seconds: 5)); // dwell 2
         expect(bursts, hasLength(1),
-            reason: 'a passive step fires nothing');
+            reason: 'another phone\'s DUT step fires nothing here');
 
         async.elapse(const Duration(seconds: 1)); // settle
         async.flushMicrotasks();
         expect(runner.phase, FieldPhase.finished);
-        expect(passive, [true, false],
-            reason: 'passive must not outlive the run');
         runner.dispose();
       });
     });
 
-    test('fewer discovered peers than N: dial what exists, log the shortfall',
+    test('fewer discovered peers than M: dial what exists, log the shortfall',
         () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
@@ -1816,9 +1816,8 @@ void main() {
             bursts.add(ids);
             return ids;
           },
-          onSetBlePassive: (_) {},
         );
-        runner.start(probePlan()); // step 1 wants N=2
+        runner.start(probePlan()); // step 1 wants M=2
         async.flushMicrotasks();
         runner.inPosition();
         async.flushMicrotasks();
@@ -1828,40 +1827,18 @@ void main() {
         ]);
         final shortfall = recorder.records
             .singleWhere((r) => r['event'] == 'dialShortfall');
-        expect(shortfall['want'], 2);
+        expect(shortfall['popN'], 3);
+        expect(shortfall['m'], 2,
+            reason: 'm is the want; nothing repeats it under a second name');
         expect(shortfall['have'], 1);
+        expect(shortfall.containsKey('want'), isFalse);
         final rec = recorder.records
             .singleWhere((r) => r['type'] == 'dialburst');
-        expect(rec['n'], 2,
-            reason: 'n stays the step\'s intended burst size — the '
-                'shortfall is visible as targets.length < n');
+        expect(rec['m'], 2,
+            reason: 'm stays the step\'s intended burst size — the '
+                'shortfall is visible as targets.length < m');
         expect(rec['targets'], ['central:AA']);
         async.elapse(const Duration(seconds: 20));
-        runner.dispose();
-      });
-    });
-
-    test('abort disarms passive mode', () {
-      fakeAsync((async) {
-        final recorder = _FakeRecorder();
-        final passive = <bool>[];
-        final runner = FieldRunner(
-          recorder: recorder,
-          myNickname: '2',
-          dialBurst: (ids) async => ids,
-          onSetBlePassive: passive.add,
-        );
-        runner.start(probePlan());
-        async.flushMicrotasks();
-        runner.inPosition();
-        async.flushMicrotasks();
-        async.elapse(const Duration(seconds: 2));
-        expect(passive, [true]);
-        runner.abort();
-        async.flushMicrotasks();
-        expect(passive, [true, false],
-            reason: 'an aborted run must not leave a phone that silently '
-                'never dials anyone again');
         runner.dispose();
       });
     });

@@ -153,27 +153,6 @@ class BleTransportService extends TransportService {
   /// adapter-on auto-restart.
   bool _stopped = false;
 
-  /// DEBUG/TESTBED ONLY. RESPOND-ONLY mode: while set, a device never
-  /// initiates FIRST CONTACT — the automatic central dial toward a pair it
-  /// holds no leg with is suppressed at both dial sites (the
-  /// advertisement-driven election in [_onAdvertisement] and the
-  /// ANNOUNCE-driven reverse leg in [_openReverseLeg]). What IS allowed is
-  /// the RESPONSE: when the pair identity already has a live inbound
-  /// peripheral leg on this device, the reverse (central) dial toward it may
-  /// proceed — that dial answers being dialed, and it is what lets a probe
-  /// pair reach the mandatory dual-leg convergence (deliberate: the probe
-  /// measures burst → converged, not a hobbled single-leg pair). Advertising,
-  /// scanning, the GATT server and inbound peripheral legs are untouched —
-  /// a passive device keeps discovering, keeps its RSSI records flowing,
-  /// and accepts every dial made AT it.
-  ///
-  /// [dialBurst] is deliberately exempt: it is the parallel-dial probe's
-  /// MANUAL dial, and the probe's DUT runs with this flag set too (its own
-  /// bursts are the experiment; anything automatic would contaminate them).
-  /// The DUT's burst is therefore the only FIRST-CONTACT initiator in a
-  /// probe run; every leg a passive phone opens is a response to it.
-  bool passiveModeForTestbed = false;
-
   /// Stream controllers for the public TransportService API.
   final _dataController = StreamController<TransportDataEvent>.broadcast();
   final _connectionController =
@@ -1180,18 +1159,6 @@ class BleTransportService extends TransportService {
     String peripheralPathId,
     Uint8List pubkey,
   ) async {
-    // TESTBED respond-only passive mode: the reverse leg toward a peer we
-    // hold a live inbound peripheral leg from is a RESPONSE to being dialed
-    // and is allowed — it is what carries the pair to dual-leg convergence.
-    // Only first contact is suppressed. The liveness re-check (the same
-    // identity-keyed [_pairViewFor] lookup the call site used) is what keeps
-    // this a response: a leg that dropped between ANNOUNCE and here would
-    // turn this dial back into first contact.
-    if (passiveModeForTestbed) {
-      final pair = _pairViewFor(GrassrootsIdentity.deriveServiceUuidForSlot(
-          pubkey, GrassrootsIdentity.currentBleSlot()));
-      if (pair.livePeripheralPathId == null) return;
-    }
     // A scanned advertising MAC for this identity, if the scanner has one.
     // Its UUID is the peer's current advertised (= GATT, they rotate
     // together) service UUID — fresher than a clock-derived one.
@@ -1493,7 +1460,7 @@ class BleTransportService extends TransportService {
   /// by advertised service UUID — the discovery map is keyed by address, and
   /// a rotated MAC would otherwise offer the same peer twice in one burst
   /// (the second dial hits the one-central-per-identity guard and the burst
-  /// silently shrinks). The runner takes the first N of these.
+  /// silently shrinks). The runner takes the first M of these.
   List<String> burstDialTargets() {
     final byUuid = <String, DiscoveredPeerState>{};
     for (final dp in _peersState.discoveredBlePeersList) {
@@ -1508,7 +1475,7 @@ class BleTransportService extends TransportService {
   }
 
   /// DEBUG/TESTBED ONLY. The parallel-dial probe's burst: fire a central
-  /// dial at every target in the SAME event-loop turn, so the stack sees N
+  /// dial at every target in the SAME event-loop turn, so the stack sees M
   /// genuinely simultaneous `connectGatt`s. Returns the pathIds whose dial
   /// actually started (a target the choke-point guards refused is omitted —
   /// the trace then simply has no formation for it).
@@ -1733,17 +1700,6 @@ class BleTransportService extends TransportService {
     if (centralActive) {
       return;
     }
-    // TESTBED respond-only passive mode: everything above still ran — the
-    // discovery entry, RSSI records and peer freshness keep flowing, which
-    // is what lets a passive phone stay a dialable, observable target — and
-    // the election below fires only as a RESPONSE. With a live inbound
-    // peripheral leg from this identity the reverse (central) dial is
-    // allowed — dual-leg convergence is deliberate — while first contact
-    // (the plain scan-result dial toward a pair with no leg) stays
-    // suppressed behind this return.
-    if (passiveModeForTestbed && !pair.livePeripheral) {
-      return;
-    }
     if (!_shouldDialNow(pair, serviceUuid, existing)) {
       return;
     }
@@ -1773,7 +1729,7 @@ class BleTransportService extends TransportService {
   /// (and the failed-dial cooldown) via [connectToDevice]'s `forProbe`
   /// flag: the probe exists to find the PLATFORM's real parallel-dial
   /// ceiling, so an app-side cap inside the measurement would be measuring
-  /// ourselves — at N=8 this cap would silently swallow the eighth dial and
+  /// ourselves — at M=8 this cap would silently swallow the eighth dial and
   /// score our constant, not the stack. The cap itself stays exactly as-is
   /// for every production dial path.
   static const int _maxInFlightCentralDials = 7;

@@ -957,7 +957,7 @@ class FieldPlanPresets {
         // present — a plan asking for N=7 with six radios silently relabels a
         // six-phone population as seven.
         'Dial grid N x M (6 phones, 1 rep, ~47min)':
-            dialGridProbe(expId: 'dial-4-stages-n6', maxPop: 6),
+            dialGridProbe(expId: 'dial-5-bounce-fixed-n6', maxPop: 6),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

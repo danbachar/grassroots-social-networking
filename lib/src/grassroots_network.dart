@@ -681,6 +681,10 @@ class GrassrootsNetwork {
     try {
       // Initialize BLE if enabled
       if (_isBleEnabledInSettings) {
+        // First start: no service exists, so state must read uninitialized
+        // for BleTransportService.initialize() to proceed.
+        store.dispatch(
+            BleTransportStateChangedAction(TransportState.uninitialized));
         anyTransportInitialized =
             await _initializeBle() || anyTransportInitialized;
       }
@@ -713,20 +717,48 @@ class GrassrootsNetwork {
   }
 
   /// Initialize BLE transport
-  Future<bool> _initializeBle() async {
+  /// [promptForPermissions] false = verify the grants we already hold and
+  /// never issue a request.
+  ///
+  /// A transport RESTART is not a fresh app start. Re-requesting on every
+  /// restart is what silently killed dial-4: each per-step bounce called
+  /// `requestPermissions()`, a later call stopped coming back `granted`, and
+  /// `_initializeBle` returned before it ever touched the BLE stack — leaving
+  /// `_bleService` null, so every subsequent bounce returned at its first line
+  /// and the radio never came back for the rest of the run. All six phones
+  /// recorded `initOk: false, bleState: uninitialized`, which is only
+  /// reachable through this gate.
+  Future<bool> _initializeBle({bool promptForPermissions = true}) async {
+    if (_bleInitInFlight) {
+      debugPrint('BLE init already in flight — refusing to race it');
+      return false;
+    }
+    _bleInitInFlight = true;
     try {
       debugPrint('Initializing BLE transport');
 
-      // Reset Redux state so the service sees uninitialized
-      store.dispatch(
-        BleTransportStateChangedAction(TransportState.uninitialized),
-      );
-
-      // Request BLE permissions
-      final permResult = await _permissions.requestPermissions();
-      if (permResult != PermissionResult.granted) {
-        debugPrint('BLE permissions not granted: $permResult');
-        return false;
+      // NOTE: this deliberately does NOT reset the transport state. It used to
+      // dispatch `uninitialized` here, which meant any call — including one
+      // that then failed or bailed — blanked a transport that was working.
+      // `BleTransportService.initialize()` only proceeds from `uninitialized`,
+      // so a caller that is genuinely replacing a disposed service sets that
+      // state itself, next to the dispose that made it true.
+      if (promptForPermissions) {
+        final permResult = await _permissions.requestPermissions();
+        _lastPermissionOutcome = permResult.name;
+        debugPrint('[perm] requestPermissions -> $permResult');
+        if (permResult != PermissionResult.granted) {
+          debugPrint('BLE permissions not granted: $permResult');
+          return false;
+        }
+      } else {
+        final held = await _permissions.hasRequiredPermissions();
+        _lastPermissionOutcome = held ? 'held' : 'notHeld';
+        debugPrint('[perm] hasRequiredPermissions -> $held (no prompt)');
+        if (!held) {
+          debugPrint('BLE permissions not held on restart');
+          return false;
+        }
       }
 
       // Create BLE transport service (manages BLE manager + router)
@@ -766,8 +798,16 @@ class GrassrootsNetwork {
       debugPrint('Stack trace: $stack');
       _bleService = null;
       return false;
+    } finally {
+      _bleInitInFlight = false;
     }
   }
+
+  /// True while [_initializeBle] is running. Two initializations overlapping
+  /// is how the transport ended up neither old nor new: the scripted bring-up
+  /// and the bounce's delayed re-init both ran, and the loser left the state
+  /// pointing at a service the winner had replaced.
+  bool _bleInitInFlight = false;
 
   /// Initialize UDP transport
   Future<bool> _initializeUdp() async {
@@ -1209,6 +1249,11 @@ class GrassrootsNetwork {
         await _bleService!.dispose();
         _bleService = null;
       }
+      // The dispose above is what makes `uninitialized` true; say so here,
+      // next to it, rather than inside _initializeBle where it also applied
+      // to callers that were not replacing anything.
+      store.dispatch(
+          BleTransportStateChangedAction(TransportState.uninitialized));
       await _initializeBle();
       if (wasStarted && _bleAvailable) {
         await _bleService!.start();
@@ -1957,7 +2002,34 @@ class GrassrootsNetwork {
     // `ready` and never reached `active`, so `start()` never ran, no ANNOUNCE
     // went out, and 20 steps of silence were indistinguishable from 20 steps
     // of failed dials.
-    final initOk = await _initializeBle();
+    // Something else may have brought the transport up while we were dark —
+    // the step's scripted `bleOn: true` does exactly that, and on dial-4 it
+    // landed 2.8s into a 5s dark gap and left the radio scanning and
+    // advertising. Re-initializing on top of that tore down a working
+    // transport and left the state `uninitialized`, which is why every cell
+    // recorded radioUp false while links were visibly forming. If the radio
+    // is already up, the bounce has nothing left to do.
+    if (_bleService != null && bleUsable) {
+      debugPrint('[testbed] BLE bounce: transport already back up — '
+          'leaving it alone');
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'link',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'bounce',
+          'darkSec': darkGap.inSeconds,
+          'reinit': false,
+          'usable': true,
+          'bleState': store.state.transports.bleState.name,
+        }));
+      }
+      return;
+    }
+    // We are genuinely replacing the disposed service, so the state the
+    // service checks has to say so.
+    store.dispatch(
+        BleTransportStateChangedAction(TransportState.uninitialized));
+    final initOk = await _initializeBle(promptForPermissions: false);
     var startCalled = false;
     if (initOk && _bleService != null) {
       startCalled = true;
@@ -1974,6 +2046,7 @@ class GrassrootsNetwork {
         'started': _started,
         'bleState': store.state.transports.bleState.name,
         'usable': bleUsable,
+        if (_lastPermissionOutcome != null) 'perm': _lastPermissionOutcome,
       }));
     }
     if (!bleUsable) {
@@ -2011,7 +2084,13 @@ class GrassrootsNetwork {
     if (_bleService != null) return;
     if (!_isBleEnabledInSettings) return;
     debugPrint('[testbed] BLE up (scripted segment)');
-    await _initializeBle();
+    // Reached only with _bleService == null (checked above), i.e. after a
+    // dispose — so the state genuinely is uninitialized and must read that
+    // way for initialize() to run.
+    store.dispatch(
+        BleTransportStateChangedAction(TransportState.uninitialized));
+    // A restart, not a first start — same reason as the bounce.
+    await _initializeBle(promptForPermissions: false);
     if (_started && _bleAvailable) await _bleService!.start();
   }
 
@@ -2029,6 +2108,10 @@ class GrassrootsNetwork {
     _dialProbePopN = popN;
     _bleService?.setDialParallelism(maxParallel: maxParallel, popN: popN);
   }
+
+  /// What the last permission evaluation returned, stamped into the bounce
+  /// record so a failed restart names its own cause instead of needing a log.
+  String? _lastPermissionOutcome;
 
   int? _dialProbeMaxParallel;
   int? _dialProbePopN;

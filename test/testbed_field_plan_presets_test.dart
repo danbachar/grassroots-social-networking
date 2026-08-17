@@ -888,7 +888,7 @@ void main() {
           .toList();
       expect(names, ['Dial grid N x M (6 phones, 1 rep, ~47min)']);
       final entry = FieldPlanPresets.presets[names.single]!;
-      expect(entry.expId, 'dial-4-stages-n6');
+      expect(entry.expId, 'dial-5-bounce-fixed-n6');
       // sum(N=2..6) of (N-1) = 15 cells, + 5 converge. The population ceiling
       // must match the phones on the bench or a step lies about its N.
       expect(entry.steps, hasLength(20));

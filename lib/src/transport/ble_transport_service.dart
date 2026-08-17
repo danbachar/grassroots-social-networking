@@ -1935,6 +1935,19 @@ class BleTransportService extends TransportService {
     // discovery map's advertised UUID (pre-ANNOUNCE window, rotated-MAC
     // dials) or by sharing the attached peripheral leg's remote address (the
     // over-ACL reverse dial, which never appears in scan results).
+    // The identity this path was PROVEN to belong to, learned from its
+    // ANNOUNCE. This is the rotation-stable match and it outranks the two
+    // heuristics below, which both read caches that expire on their own
+    // schedule: the discovery entry can be pruned while its link is still
+    // up, and once it is, a live leg becomes invisible here — `centralActive`
+    // reads false and the peer is dialed a second time. That is how
+    // dial-5-bounce-fixed-n6 accumulated 32 same-role duplicate legs despite
+    // this suppression already existing.
+    final identityHex = identified == null
+        ? null
+        : identified.publicKey
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
     var inFlight = false;
     for (final p in _paths.values) {
       if (p.role != ble.BleRole.central) continue;
@@ -1945,7 +1958,9 @@ class BleTransportService extends TransportService {
       final matchesByUuid = du != null && candidates.contains(du);
       final matchesByRemoteId = peripheralRemoteId != null &&
           p.pathId.substring('central:'.length) == peripheralRemoteId;
-      if (!matchesByUuid && !matchesByRemoteId) continue;
+      final matchesByIdentity =
+          identityHex != null && _peerHexByPath[p.pathId] == identityHex;
+      if (!matchesByUuid && !matchesByRemoteId && !matchesByIdentity) continue;
       if (_isReady(p)) {
         liveCentral ??= p.pathId;
       } else if (p.state == ble.BlePathState.connecting ||

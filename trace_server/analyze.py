@@ -662,9 +662,13 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
     return pd.DataFrame(rows)
 
 
-def pathloss_fit(steps: pd.DataFrame) -> str | None:
-    """Log-distance fit RSSI = A - 10 n log10(d), over the per-distance mean
-    adv RSSI so repeat trials at a distance don't over-weight it."""
+def pathloss_coeffs(steps: pd.DataFrame) -> tuple[float, float, float, int] | None:
+    """`(A, n, residual_std, n_distances)` of the log-distance fit
+    RSSI = A - 10 n log10(d), over the per-distance mean adv RSSI so repeat
+    trials at a distance don't over-weight it. None when fewer than three
+    distances carry an RSSI mean — two points fit any line exactly."""
+    if steps.empty or "rssi_adv_mean" not in steps.columns:
+        return None
     pts = steps.dropna(subset=["rssi_adv_mean"])
     pts = pts[pts.d > 0]
     if pts.d.nunique() < 3:
@@ -674,12 +678,21 @@ def pathloss_fit(steps: pd.DataFrame) -> str | None:
     y = means.to_numpy(dtype=float)
     n, a = np.polyfit(-x, y, 1)  # y = a - n * x
     resid = y - (a - n * x)
+    return float(a), float(n), float(resid.std()), len(means)
+
+
+def pathloss_fit(steps: pd.DataFrame) -> str | None:
+    """The log-distance fit as the text block `pathloss.txt` carries."""
+    fit = pathloss_coeffs(steps)
+    if fit is None:
+        return None
+    a, n, resid_std, n_d = fit
     return (
-        f"log-distance fit over {len(means)} distances "
+        f"log-distance fit over {n_d} distances "
         f"(per-distance mean adv RSSI):\n"
         f"  RSSI(d) = {a:.1f} - 10 * {n:.2f} * log10(d)\n"
         f"  path-loss exponent n = {n:.2f}, RSSI@1m = {a:.1f} dBm, "
-        f"residual std = {resid.std():.1f} dB\n"
+        f"residual std = {resid_std:.1f} dB\n"
     )
 
 
@@ -2038,6 +2051,647 @@ def plot_range(steps: pd.DataFrame, out: Path):
     plt.close(fig)
 
 
+# --------------------------------------------------------------------------- #
+# Field line sweep — the `fieldday_*` tables and figures
+# --------------------------------------------------------------------------- #
+# What the OS puts on the air for ADVERTISING is a MODEL, not a measurement:
+# the controller broadcasts autonomously below the app, so no wire ledger ever
+# sees those bytes (the same reason `steps_table` only reports receiver-side
+# advPerMin / advCoverage). The model is one advertising event per interval per
+# advertising device, repeated on all three primary channels, each carrying a
+# full-size advertising PDU. The constants are stated here rather than buried
+# in an expression so the figure can be recomputed when the advertising
+# parameters change.
+ADV_PDU_B = 37            # AdvA (6) + AdvData (31), the maximum legacy PDU
+ADV_CHANNELS = 3          # 37/38/39, one copy of the PDU on each
+ADV_INTERVAL_S = 0.130    # effective advertising interval per device
+
+
+def _sem(vals: pd.Series) -> float:
+    """Standard error of the mean. NaN below two samples — one sample has no
+    spread to report, and reporting 0 there would read as a resolved point."""
+    v = pd.to_numeric(vals, errors="coerce").dropna()
+    if len(v) < 2:
+        return float("nan")
+    return float(v.std(ddof=1) / math.sqrt(len(v)))
+
+
+def _line_steps(steps: pd.DataFrame) -> pd.DataFrame:
+    """The distance-carrying steps of a line sweep, or an empty frame. Two
+    distances are the minimum that makes any of these figures a curve."""
+    if steps.empty or "d" not in steps.columns:
+        return pd.DataFrame()
+    df = steps[pd.to_numeric(steps["d"], errors="coerce").notna()].copy()
+    if df.empty or df["d"].nunique() < 2:
+        return pd.DataFrame()
+    return df
+
+
+# Establishment stages the time table reports, and how the figure names them.
+# `connected` is deliberately absent: a raw GATT link with no session carries
+# nothing, so the three stages that matter are seeing the peer, having a
+# session, and having a message acknowledged.
+_LINE_STAGES = [
+    ("t_discovered_s", "Discovered"),
+    ("t_session_s", "Noise session up"),
+    ("t_usable_s", "Usable (first ACK back)"),
+]
+
+
+def line_experiment_tables(steps: pd.DataFrame,
+                           df: pd.DataFrame | None = None
+                           ) -> dict[str, pd.DataFrame]:
+    """The three `fieldday_*` tables of a line sweep, keyed by file stem.
+
+    A key is present only when the run carries what that table needs, so a
+    trace without wire or power records simply yields fewer tables rather
+    than failing:
+
+    * `fieldday_establish_time` — per distance, the cold establishment ladder:
+      how many trials reached each stage and the mean / median / standard
+      error of the seconds it took. Derived from `steps` alone.
+    * `fieldday_establish_bytes` — per distance, the control-plane bytes one
+      trial costs: ANNOUNCE and Noise handshake read off the wire ledger
+      (both devices), next to the modelled OS advertising cost. Needs `wire`
+      records.
+    * `fieldday_power` — per device, the whole run's discharge: hours, battery
+      level travelled, charge drawn, mean draw, the gauge's own capacity
+      estimate and the runtime that implies. Needs `power` records.
+    """
+    line = _line_steps(steps)
+    if line.empty:
+        return {}
+    out: dict[str, pd.DataFrame] = {}
+
+    rows = []
+    for d, g in line.groupby("d"):
+        row: dict[str, float] = {"d": float(d), "trials": len(g)}
+        for col, _ in _LINE_STAGES:
+            v = (pd.to_numeric(g[col], errors="coerce").dropna()
+                 if col in g.columns else pd.Series(dtype=float))
+            row[f"n_{col}"] = len(v)
+            row[f"mean_{col}"] = float(v.mean()) if len(v) else float("nan")
+            row[f"median_{col}"] = float(v.median()) if len(v) else float("nan")
+            row[f"sem_{col}"] = _sem(v)
+        rows.append(row)
+    out["fieldday_establish_time"] = pd.DataFrame(rows).sort_values("d")
+
+    if df is not None and not df.empty:
+        wire = df[df._type == "wire"] if "_type" in df.columns else pd.DataFrame()
+        if not wire.empty:
+            out["fieldday_establish_bytes"] = _establish_bytes(line, wire, df)
+        power = df[df._type == "power"] if "_type" in df.columns else pd.DataFrame()
+        if not power.empty:
+            pw = _line_power(df)
+            if not pw.empty:
+                out["fieldday_power"] = pw
+    return out
+
+
+def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
+                     df: pd.DataFrame) -> pd.DataFrame:
+    """Control-plane bytes per trial, per distance.
+
+    ANNOUNCE and handshake bytes are summed over BOTH devices inside each
+    step's marker span and divided by the distance's trial count — the cost of
+    one trial to the pair, which is what the establishment argument is about.
+
+    `dwell_s` is the plan's declared dwell, recovered as the SHORTEST step span
+    in the run: every other span is inflated by the inter-step link bounce and
+    the settle window that follow the dwell, so the minimum is the only span
+    that is close to what the plan asked for.
+    """
+    spans = (pd.to_numeric(line["t1"], errors="coerce")
+             - pd.to_numeric(line["t0"], errors="coerce")) / 1000.0
+    dwell_s = round(float(spans.min()), 1) if spans.notna().any() else float("nan")
+    # Devices that ever advertised, which for a two-phone line sweep is both.
+    n_adv = int(df["_device"].nunique()) if "_device" in df.columns else 0
+    os_adv = dwell_s * n_adv * ADV_CHANNELS * ADV_PDU_B / ADV_INTERVAL_S
+
+    rows = []
+    for d, g in line.groupby("d"):
+        totals = {"announce": 0.0, "handshake": 0.0}
+        for _, s in g.iterrows():
+            in_step = wire[(wire._t >= s["t0"]) & (wire._t < s["t1"])]
+            for _, w in in_step.iterrows():
+                tx = _dict(w.get("txBytes"))
+                for key in totals:
+                    totals[key] += float(tx.get(key, 0))
+        n = len(g)
+        rows.append({
+            "d": float(d),
+            "os_adv": os_adv,
+            "announce": totals["announce"] / n,
+            "handshake": totals["handshake"] / n,
+            "dwell_s": dwell_s,
+            "usable_n": int((pd.to_numeric(g.get("usable"), errors="coerce")
+                             .fillna(0) > 0).sum()),
+            "trials": n,
+        })
+    return pd.DataFrame(rows).sort_values("d")
+
+
+def _line_power(df: pd.DataFrame) -> pd.DataFrame:
+    """Whole-run discharge, one row per device.
+
+    Built on `power_series`, so the charging exclusion and the collapse of
+    repeated gauge readings match every other power output. `capacity_mAh` is
+    the FUEL GAUGE's own view — charge counter divided by reported level,
+    averaged over the run — not charge drawn divided by level travelled: the
+    level percentage is an integer, so the endpoints of a 30-point discharge
+    carry a whole point of quantisation each. `runtime_h` is that capacity at
+    the run's mean draw: how long this workload would flatten a full battery.
+    """
+    series = power_series(df)
+    if series.empty:
+        return pd.DataFrame()
+    # Line-sweep roles: the phone that sends is the one that walks the line.
+    roles = device_roles(df)
+    named = {short(str(dev)): ("mover (sends)" if role.startswith("sender")
+                               else "relay (forwards)" if role.startswith("relay")
+                               else "static (receives)")
+             for dev, role in roles.items()}
+    rows = []
+    for dev, g in series.groupby("device"):
+        g = g.sort_values("t")
+        cc = pd.to_numeric(g["chargeCounterUah"], errors="coerce").dropna()
+        lvl = pd.to_numeric(g["levelPct"], errors="coerce")
+        mA = pd.to_numeric(g["mA"], errors="coerce").dropna()
+        if cc.empty or mA.empty or lvl.dropna().empty:
+            continue
+        hours = float(g["t"].max() - g["t"].min()) / 3_600_000.0
+        mah_used = float(cc.iloc[0] - cc.iloc[-1]) / 1000.0
+        mean_mA = float(mA.mean())
+        gauge = pd.to_numeric(g["chargeCounterUah"], errors="coerce")[lvl > 0]
+        capacity = float((gauge / (10.0 * lvl[lvl > 0])).mean())
+        rows.append({
+            "dev": dev,
+            "role": named.get(dev, dev),
+            "hours": hours,
+            "level_from": int(lvl.dropna().iloc[0]),
+            "level_to": int(lvl.dropna().iloc[-1]),
+            "mAh_used": mah_used,
+            "mean_mA": mean_mA,
+            "capacity_mAh": capacity,
+            "runtime_h": capacity / mean_mA if mean_mA else float("nan"),
+        })
+    return pd.DataFrame(rows)
+
+
+def _field_axes(fig, axes) -> None:
+    """The house style shared by the fieldday figures: paper-white ground, no
+    top/right spines, a light grid behind everything."""
+    fig.patch.set_facecolor(_SURFACE)
+    for a in axes:
+        a.set_facecolor(_SURFACE)
+        a.grid(color="#e8e7e2", lw=0.8, zorder=0)
+        for side in ("top", "right"):
+            a.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            a.spines[side].set_color("#d9d8d2")
+        a.tick_params(colors=_INK_2, labelsize=10)
+
+
+def _usable_header(ax, d: list[float], usable: list[int],
+                   trials: list[int]) -> None:
+    """`10/10`, `0/10` … above each distance: how many trials at that distance
+    ever became usable. Red at zero, because a point plotted from no usable
+    trial says nothing and the reader has to be told."""
+    ax.text(-0.012, 1.02, "usable", transform=ax.transAxes, ha="right",
+            va="bottom", fontsize=10.5, color=_INK_2)
+    for x, u, n in zip(d, usable, trials):
+        ax.text(x, 1.02, f"{u}/{n}", transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=11,
+                color="#d13b2e" if u == 0 else _INK)
+
+
+def plot_line_experiment(steps: pd.DataFrame, tables: dict[str, pd.DataFrame],
+                         df: pd.DataFrame, out: Path) -> None:
+    """The field line sweep's figures, written into [out].
+
+    Emits `fieldday_establish_time.png`, `fieldday_establish_bytes.png`,
+    `fieldday_power.png` and `fieldday_lineexp.png`. Each is skipped when the
+    run does not carry its inputs, so a line sweep with no wire ledger still
+    gets the ones it can support.
+
+    The fifth field-day figure, `throughput_story.png`, is NOT here: its
+    panels are the lane / GATT-leg / payload arms of the laboratory runs, and
+    a line sweep carries none of them. It self-gates in
+    `plot_throughput_story`, called from `main` for whichever run holds those
+    arms.
+    """
+    line = _line_steps(steps)
+    if line.empty:
+        return
+    _plot_establish_time(tables.get("fieldday_establish_time"),
+                         tables.get("fieldday_establish_bytes"),
+                         out / "fieldday_establish_time.png")
+    _plot_establish_bytes(tables.get("fieldday_establish_bytes"),
+                          out / "fieldday_establish_bytes.png")
+    _plot_field_power(tables.get("fieldday_power"), line, df,
+                      out / "fieldday_power.png")
+    _plot_lineexp(line, out / "fieldday_lineexp.png")
+
+
+def _plot_establish_time(t: pd.DataFrame | None, b: pd.DataFrame | None,
+                         out: Path) -> None:
+    """Mean seconds to each establishment stage against distance, +/- SEM, with
+    the usable-trial count over each distance. The three curves separating is
+    the finding: discovery holds up long after an ACK can come back."""
+    if t is None or t.empty:
+        return
+    fig, ax = plt.subplots(figsize=(11.5, 6.4))
+    _field_axes(fig, [ax])
+    colors = [_C_DELIVERY, _C_USABLE, _C_SESSION]
+    for (col, label), color in zip(_LINE_STAGES, colors):
+        ax.errorbar(t["d"], t[f"mean_{col}"], yerr=t[f"sem_{col}"],
+                    color=color, lw=2.0, marker="o", ms=9,
+                    markeredgecolor=_SURFACE, markeredgewidth=2,
+                    capsize=3, ecolor=color, elinewidth=1.4,
+                    label=label, zorder=3)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Distance (m)", fontsize=12, color=_INK_2, labelpad=9)
+    ax.set_ylabel("Control plane establishment time (s)", fontsize=12,
+                  color=_INK_2, labelpad=9)
+    ax.set_xticks(t["d"].tolist())
+    usable = (b["usable_n"].tolist() if b is not None and not b.empty
+              else t["n_t_usable_s"].tolist())
+    _usable_header(ax, t["d"].tolist(), [int(u) for u in usable],
+                   [int(n) for n in t["trials"]])
+    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3,
+                    frameon=False, fontsize=11.5)
+    for txt in leg.get_texts():
+        txt.set_color(_INK_2)
+    fig.subplots_adjust(left=0.085, right=0.98, top=0.93, bottom=0.2)
+    fig.savefig(out, dpi=160, facecolor=_SURFACE)
+    plt.close(fig)
+
+
+def _plot_establish_bytes(b: pd.DataFrame | None, out: Path) -> None:
+    """What one establishment trial costs the pair on the air, in kB: ANNOUNCE
+    stacked under the Noise handshake. The bar shrinking with distance is not
+    a saving — it is trials that never got far enough to spend the bytes."""
+    if b is None or b.empty:
+        return
+    fig, ax = plt.subplots(figsize=(11.5, 6.4))
+    _field_axes(fig, [ax])
+    width = (float(b["d"].diff().dropna().min()) * 0.55
+             if len(b) > 1 else 0.8)
+    ann = b["announce"] / 1000.0
+    hs = b["handshake"] / 1000.0
+    ax.bar(b["d"], ann, width=width, color=_C_USABLE, label="ANNOUNCE",
+           zorder=3)
+    ax.bar(b["d"], hs, width=width, bottom=ann, color=_C_DELIVERY,
+           label="Noise handshake", zorder=3)
+    ax.set_xlabel("Distance (m)", fontsize=12, color=_INK_2, labelpad=9)
+    ax.set_ylabel("kB per trial (both devices)", fontsize=12, color=_INK_2,
+                  labelpad=9)
+    ax.set_xticks(b["d"].tolist())
+    _usable_header(ax, b["d"].tolist(),
+                   [int(u) for u in b["usable_n"]],
+                   [int(n) for n in b["trials"]])
+    ax.set_title("Control plane costs", fontsize=15, color=_INK,
+                 loc="left", pad=34)
+    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2,
+                    frameon=False, fontsize=11.5)
+    for txt in leg.get_texts():
+        txt.set_color(_INK_2)
+    fig.subplots_adjust(left=0.085, right=0.98, top=0.88, bottom=0.2)
+    fig.savefig(out, dpi=160, facecolor=_SURFACE)
+    plt.close(fig)
+
+
+def _plot_field_power(pw: pd.DataFrame | None, line: pd.DataFrame,
+                      df: pd.DataFrame, out: Path) -> None:
+    """Left: charge drawn since the run started, per device — the discharge
+    curve itself, which is what says the draw is flat rather than bursty.
+    Right: mean draw during each step, against distance. Distance costs the
+    static receiver more (it scans harder for a fading peer) and the mover
+    less (fewer sends complete)."""
+    series = power_series(df) if df is not None and not df.empty else pd.DataFrame()
+    if series.empty:
+        return
+    role_of = (dict(zip(pw["dev"], pw["role"])) if pw is not None
+               and not pw.empty else {})
+    colors = {}
+    palette = [_C_USABLE, _C_SESSION, _C_DELIVERY]
+
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(13.5, 6.2))
+    _field_axes(fig, [ax, ax2])
+    for i, (dev, g) in enumerate(sorted(series.groupby("device"))):
+        colors[dev] = palette[i % len(palette)]
+        g = g.sort_values("t")
+        cc = pd.to_numeric(g["chargeCounterUah"], errors="coerce")
+        if cc.dropna().empty:
+            continue
+        drawn = (cc.iloc[0] - cc) / 1000.0
+        ax.plot(g["elapsed_s"] / 3600.0, drawn, color=colors[dev], lw=1.8,
+                label=role_of.get(dev, dev), zorder=3)
+    ax.set_xlabel("Elapsed (h)", fontsize=12, color=_INK_2, labelpad=9)
+    ax.set_ylabel("Charge drawn since start (mAh)", fontsize=12, color=_INK_2,
+                  labelpad=9)
+    leg = ax.legend(loc="upper left", frameon=False, fontsize=11.5)
+    for txt in leg.get_texts():
+        txt.set_color(_INK_2)
+
+    drawn_any = False
+    for dev, color in colors.items():
+        col = f"power_mA_{dev}"
+        if col not in line.columns:
+            continue
+        agg = line.groupby("d")[col]
+        mean = agg.mean()
+        sem = agg.apply(_sem)
+        if mean.dropna().empty:
+            continue
+        ax2.errorbar(mean.index, mean.values, yerr=sem.values, color=color,
+                     lw=1.8, marker="o", ms=8, markeredgecolor=_SURFACE,
+                     markeredgewidth=2, capsize=3, ecolor=color,
+                     elinewidth=1.4, label=role_of.get(dev, dev), zorder=3)
+        drawn_any = True
+    if drawn_any:
+        ax2.set_ylim(bottom=0)
+        ax2.set_xticks(sorted(line["d"].unique()))
+        leg2 = ax2.legend(loc="lower left", frameon=False, fontsize=11.5)
+        for txt in leg2.get_texts():
+            txt.set_color(_INK_2)
+    ax2.set_xlabel("Distance (m)", fontsize=12, color=_INK_2, labelpad=9)
+    ax2.set_ylabel("Mean draw during dwell (mA)", fontsize=12, color=_INK_2,
+                   labelpad=9)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.95, bottom=0.12,
+                        wspace=0.22)
+    fig.savefig(out, dpi=160, facecolor=_SURFACE)
+    plt.close(fig)
+
+
+def _plot_lineexp(line: pd.DataFrame, out: Path) -> None:
+    """The line sweep on one sheet: what fraction of trials reached each link
+    stage, how much of the offered traffic arrived one-way versus round trip,
+    and the path loss the RSSI implies. The three panels share only the x
+    axis on purpose — they are three different questions about one walk."""
+    ds = sorted(line["d"].unique())
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.4))
+    _field_axes(fig, list(axes))
+    ax_p, ax_d, ax_r = axes
+
+    # (a) establishment probability — a stage counts as reached when its
+    # per-step event count is above zero, the same rule establishment.csv uses.
+    stages = [("discovered", _C_DELIVERY, 6.0, "Discovered"),
+              ("session", _C_USABLE, 3.0, "Noise session"),
+              ("usable", _C_SESSION, 1.2, "Usable (ACK back)")]
+    for col, color, lw, label in stages:
+        if col not in line.columns:
+            continue
+        pct = line.assign(_hit=pd.to_numeric(line[col], errors="coerce")
+                          .fillna(0) > 0).groupby("d")["_hit"].mean() * 100
+        ax_p.plot(pct.index, pct.values, color=color, lw=lw, marker="o",
+                  ms=7, solid_capstyle="round", label=label, zorder=3)
+    ax_p.set_ylim(-3, 105)
+    ax_p.set_ylabel("Trials reaching the stage (%)", fontsize=11,
+                    color=_INK_2, labelpad=8)
+    ax_p.set_title("Establishment probability", fontsize=13, color=_INK,
+                   loc="left")
+    leg = ax_p.legend(loc="lower left", frameon=False, fontsize=10.5)
+    for txt in leg.get_texts():
+        txt.set_color(_INK_2)
+
+    # (b) delivery — pooled over the distance's trials, not averaged over
+    # them: a trial that sent nothing must not weigh as much as one that sent
+    # a hundred. The gap between the two curves is the return path's cost.
+    sent = line.groupby("d")["msg_sent"].sum()
+    recv = line.groupby("d")["msg_recv"].sum()
+    deliv = line.groupby("d")["msg_delivered"].sum()
+    ok = sent > 0
+    fwd = (100.0 * recv[ok] / sent[ok])
+    rtt = (100.0 * deliv[ok] / sent[ok])
+    ax_d.fill_between(fwd.index, rtt.values, fwd.values, color=_C_USABLE,
+                      alpha=0.12, zorder=2)
+    ax_d.plot(fwd.index, fwd.values, color=_C_SESSION, lw=1.8, marker="o",
+              ms=6, label="Received (forward path)", zorder=3)
+    ax_d.plot(rtt.index, rtt.values, color=_C_USABLE, lw=1.8, marker="o",
+              ms=6, label="ACK-confirmed (round trip)", zorder=3)
+    for x in ds:
+        ax_d.text(x, 1.02, f"{int(sent.get(x, 0))}",
+                  transform=ax_d.get_xaxis_transform(), ha="center",
+                  va="bottom", fontsize=9.5, color=_INK_2)
+    ax_d.set_ylim(-3, 105)
+    ax_d.set_ylabel("Share of messages sent (%)", fontsize=11, color=_INK_2,
+                    labelpad=8)
+    ax_d.set_title("Delivery: forward vs. round trip", fontsize=13,
+                   color=_INK, loc="left", pad=22)
+    leg = ax_d.legend(loc="lower left", frameon=False, fontsize=10.5)
+    for txt in leg.get_texts():
+        txt.set_color(_INK_2)
+
+    # (c) path loss — measured advert RSSI per distance with its spread, over
+    # the log-distance fit `pathloss.txt` reports in words.
+    if "rssi_adv_mean" in line.columns:
+        m = line.groupby("d")["rssi_adv_mean"].mean()
+        sd = line.groupby("d")["rssi_adv_mean"].std(ddof=1)
+        fit = pathloss_coeffs(line)
+        if fit is not None:
+            a, n, _, _ = fit
+            xs = np.linspace(max(min(ds), 1.0), max(ds), 200)
+            ax_r.plot(xs, a - 10 * n * np.log10(xs), color=_C_USABLE, lw=2.0,
+                      label="Log-distance fit", zorder=2)
+        ax_r.errorbar(m.index, m.values, yerr=sd.values, color=_C_SESSION,
+                      lw=0, marker="o", ms=7, capsize=3, ecolor=_C_SESSION,
+                      elinewidth=1.4, label="Measured (mean +- sd)", zorder=3)
+        leg = ax_r.legend(loc="lower left", frameon=False, fontsize=10.5)
+        for txt in leg.get_texts():
+            txt.set_color(_INK_2)
+    ax_r.set_ylabel("Advertisement RSSI (dBm)", fontsize=11, color=_INK_2,
+                    labelpad=8)
+    ax_r.set_title("Path loss", fontsize=13, color=_INK, loc="left")
+
+    for a in axes:
+        a.set_xlabel("Distance (m)", fontsize=11, color=_INK_2, labelpad=8)
+        a.set_xticks(ds)
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.9, bottom=0.13,
+                        wspace=0.24)
+    fig.savefig(out, dpi=160, facecolor=_SURFACE)
+    plt.close(fig)
+
+
+def plot_throughput_story(steps: pd.DataFrame, out: Path) -> None:
+    """The laboratory characterisation of one pair at close range, as up to
+    four panels — each drawn only when the run actually carried that arm, and
+    the figure skipped entirely when none of them did.
+
+    The arms are the throughput-ceiling lane sweep (`lanes=`), the raw-GATT
+    leg comparison (`leg=`) and the payload arm (`p=<n>B`). A line sweep
+    carries none of them, so a line-sweep-only trace produces nothing here.
+    """
+    if steps.empty:
+        return
+    lanes = (steps[pd.to_numeric(steps.get("lanes"), errors="coerce").notna()]
+             if "lanes" in steps.columns else pd.DataFrame())
+    legs = (steps[steps["leg"].notna()] if "leg" in steps.columns
+            else pd.DataFrame())
+    if not legs.empty and "raw_rx_Bps" in legs.columns:
+        legs = legs[pd.to_numeric(legs["raw_rx_Bps"], errors="coerce").notna()]
+    else:
+        legs = pd.DataFrame()
+    payloads = pd.DataFrame()
+    if {"payloadB", "airB_per_msg"} <= set(steps.columns):
+        p = steps.dropna(subset=["payloadB", "airB_per_msg"])
+        if p["payloadB"].nunique() > 1:
+            payloads = p
+
+    panels = []
+    if not lanes.empty and "active_s" in lanes.columns:
+        panels += ["capacity", "latency"]
+    if not legs.empty:
+        panels.append("raw")
+    if not payloads.empty:
+        panels.append("payload")
+    if not panels:
+        return
+
+    # A floor on the width: one panel alone still has to leave room for the
+    # figure title and the y-axis label, which a 4.6" canvas clips.
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=(max(4.6 * len(panels), 9.5), 4.6),
+                             squeeze=False)
+    axes = list(axes[0])
+    _field_axes(fig, axes)
+    by_name = dict(zip(panels, axes))
+
+    if "capacity" in by_name:
+        # Offered = every message pushed into the send path; carried = those
+        # whose end-to-end ACK came back. Both per second of the step's ACTIVE
+        # window, with each trial plotted as a dot over the bar: two trials do
+        # not make a tight estimate and the figure should not pretend they do.
+        ax = by_name["capacity"]
+        ns = sorted(lanes["lanes"].unique())
+        off, car, off_pts, car_pts = [], [], [], []
+        for n in ns:
+            g = lanes[lanes["lanes"] == n]
+            a = pd.to_numeric(g["active_s"], errors="coerce")
+            o = pd.to_numeric(g["msg_sent"], errors="coerce") / a
+            c = pd.to_numeric(g["msg_delivered"], errors="coerce") / a
+            off.append(o.mean())
+            car.append(c.mean())
+            off_pts.append(o.dropna().tolist())
+            car_pts.append(c.dropna().tolist())
+        x = np.arange(len(ns), dtype=float)
+        ax.bar(x - 0.19, off, width=0.36, color="#e0a51f", label="Offered",
+               zorder=3)
+        ax.bar(x + 0.19, car, width=0.36, color=_C_SESSION, label="Carried",
+               zorder=3)
+        for xi, pts in zip(x - 0.19, off_pts):
+            ax.plot([xi] * len(pts), pts, "o", ms=4, color=_INK_MUTED, zorder=4)
+        for xi, pts in zip(x + 0.19, car_pts):
+            ax.plot([xi] * len(pts), pts, "o", ms=4, color=_INK_MUTED, zorder=4)
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(int(n)) for n in ns])
+        ax.set_xlabel("Concurrent senders", fontsize=11, color=_INK_2)
+        ax.set_ylabel("Messages/s", fontsize=11, color=_INK_2)
+        ax.set_title("Capacity does not scale", fontsize=12, color=_INK,
+                     loc="left")
+        leg = ax.legend(frameon=False, fontsize=10)
+        for txt in leg.get_texts():
+            txt.set_color(_INK_2)
+
+    if "latency" in by_name:
+        # Log scale, because the interesting range spans two decades. The
+        # reference line is the run's OWN fastest step median: everything
+        # above it is queueing, not loss — the delivery panel shows nothing
+        # was dropped at the same points.
+        ax = by_name["latency"]
+        ns = sorted(lanes["lanes"].unique())
+        med = [pd.to_numeric(lanes[lanes["lanes"] == n]["rtt_median_ms"],
+                             errors="coerce").mean() for n in ns]
+        p90 = [pd.to_numeric(lanes[lanes["lanes"] == n]["rtt_p90_ms"],
+                             errors="coerce").mean() for n in ns]
+        ax.plot(range(len(ns)), med, color=_C_SESSION, lw=1.8, marker="o",
+                ms=6, label="RTT median", zorder=3)
+        ax.plot(range(len(ns)), p90, color=_C_USABLE, lw=1.8, marker="o",
+                ms=6, label="RTT p90", zorder=3)
+        floor = pd.to_numeric(steps.get("rtt_median_ms"),
+                              errors="coerce").min()
+        if pd.notna(floor) and floor > 0:
+            ax.axhline(floor, color="#d13b2e", lw=1.1, ls=":", zorder=2)
+            ax.text(0.02, floor, f"unsaturated {floor:.0f} ms",
+                    transform=ax.get_yaxis_transform(), va="bottom",
+                    fontsize=9.5, color="#d13b2e")
+        ax.set_yscale("log")
+        ax.set_xticks(range(len(ns)))
+        ax.set_xticklabels([str(int(n)) for n in ns])
+        ax.set_xlabel("Concurrent senders", fontsize=11, color=_INK_2)
+        ax.set_ylabel("Round trip (ms, log)", fontsize=11, color=_INK_2)
+        ax.set_title("Bufferbloat, not loss", fontsize=12, color=_INK,
+                     loc="left")
+        leg = ax.legend(frameon=False, fontsize=10)
+        for txt in leg.get_texts():
+            txt.set_color(_INK_2)
+
+    if "raw" in by_name:
+        # Counted at the RECEIVER: a raw write completes at enqueue, so the
+        # sender's own ledger measures the queue, not the air. The reference
+        # line is what a pair would carry if its two GATT legs added up — the
+        # gap to `stripe` is the measurement that says they share one radio.
+        ax = by_name["raw"]
+        seen = set(legs["leg"])
+        order = [name for name in ("notify", "write", "stripe") if name in seen]
+        order += [name for name in sorted(seen) if name not in order]
+        means, pts = [], []
+        for name in order:
+            v = pd.to_numeric(legs[legs["leg"] == name]["raw_rx_Bps"],
+                              errors="coerce").dropna() / 1000.0
+            means.append(v.mean())
+            pts.append(v.tolist())
+        ax.bar(range(len(order)), means,
+               color=[_C_SESSION, _C_USABLE, "#5b3ec4"][:len(order)]
+               if len(order) <= 3 else _C_SESSION, width=0.6, zorder=3)
+        for i, v in enumerate(pts):
+            ax.plot([i] * len(v), v, "o", ms=4, color=_INK_MUTED, zorder=4)
+            ax.text(i, max([means[i]] + v), f"n={len(v)}", ha="center",
+                    va="bottom", fontsize=9.5, color=_INK_2)
+        both = {name: m for name, m in zip(order, means)
+                if name in ("notify", "write")}
+        if len(both) == 2:
+            total = sum(both.values())
+            ax.axhline(total, color="#d13b2e", lw=1.1, ls=":", zorder=2)
+            ax.text(0.02, total, "if the two legs added up",
+                    transform=ax.get_yaxis_transform(), va="bottom",
+                    fontsize=9.5, color="#d13b2e")
+            ax.set_ylim(top=total * 1.18)
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels(order)
+        ax.set_xlabel("GATT leg used", fontsize=11, color=_INK_2)
+        ax.set_ylabel("Received (KB/s)", fontsize=11, color=_INK_2)
+        ax.set_title("Raw pipe: one shared radio", fontsize=12, color=_INK,
+                     loc="left")
+
+    if "payload" in by_name:
+        # Air bytes per delivered message against payload size, labelled with
+        # the ratio to the payload: flat overhead means a bigger message is
+        # cheaper per byte, which is the whole argument for batching.
+        ax = by_name["payload"]
+        sizes = sorted(payloads["payloadB"].unique())
+        vals = [pd.to_numeric(payloads[payloads["payloadB"] == s]
+                              ["airB_per_msg"], errors="coerce").mean()
+                for s in sizes]
+        ax.bar(range(len(sizes)), vals, color=_C_SESSION, width=0.6, zorder=3)
+        for i, (s, v) in enumerate(zip(sizes, vals)):
+            if s:
+                ax.text(i, v, f"{v / s:.2f}x", ha="center", va="bottom",
+                        fontsize=9.5, color=_INK_2)
+        ax.set_xticks(range(len(sizes)))
+        ax.set_xticklabels([f"{int(s)} B" for s in sizes])
+        ax.set_xlabel("Payload per message", fontsize=11, color=_INK_2)
+        ax.set_ylabel("Air bytes per message", fontsize=11, color=_INK_2)
+        ax.set_title("Wire cost is flat in payload", fontsize=12, color=_INK,
+                     loc="left")
+
+    fig.suptitle("Laboratory characterization: the same pair at close range",
+                 fontsize=14, color=_INK, x=0.012, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.92), w_pad=2.4)
+    fig.savefig(out, dpi=160, facecolor=_SURFACE)
+    plt.close(fig)
+
+
 def plot_rssi(df: pd.DataFrame, out: Path):
     rssi = df[df._type == "rssi"]
     if rssi.empty:
@@ -2600,7 +3254,21 @@ def main() -> int:
             if fit:
                 (out / "pathloss.txt").write_text(fit)
             plot_range(steps, out / "range.png")
+            # The field line sweep's own tables and figures. Gated on the run
+            # carrying distances, so a stationary experiment writes none of
+            # them; each individual table is skipped again when the trace
+            # lacks its records (wire, power).
+            fieldday = line_experiment_tables(steps, edf)
+            for stem, table in fieldday.items():
+                table.to_csv(out / f"{stem}.csv", index=False)
+            if fieldday:
+                plot_line_experiment(steps, fieldday, edf, out)
             write_load_sweep(steps, out / "load_sweep_delivery.png", exp)
+            # The lab companion to the line sweep. Self-gating on its own arms
+            # (lanes / GATT leg / payload sizes) rather than on distance,
+            # because those arms are run stationary — gating it on distance
+            # would mean it could never be produced at all.
+            plot_throughput_story(steps, out / "throughput_story.png")
         scale = mesh_scale(edf, segs)
         if not scale.empty:
             scale.to_csv(out / "mesh_scale.csv", index=False)

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:redux/redux.dart';
@@ -125,6 +126,23 @@ class _TestbedScreenState extends State<TestbedScreen> {
   /// the on-disk file set changes (a new run recorded, or files cleared), so
   /// green can never refer to a file that has since grown.
   bool _uploadComplete = false;
+
+  /// Set when an attempt finished with at least one chunk unaccepted. Drives
+  /// the red X: a failed upload used to leave the button in its neutral state
+  /// with only a transient snackbar, so a phone that failed to deliver its
+  /// recording looked exactly like one that had never been asked.
+  bool _uploadFailed = false;
+
+  /// Auto-upload trigger. Runs are recorded with Wi-Fi off (it starves BLE
+  /// scanning), so the end-of-run upload always fails and the data sat on the
+  /// device until someone pressed the button on every phone. Re-attaching to a
+  /// network is the moment that can succeed.
+  StreamSubscription<List<ConnectivityResult>>? _connSub;
+
+  /// The pushed runner route, so the upload can close it. The full-screen
+  /// runner covers the button that reports upload state, so leaving it up
+  /// hides the very thing the operator needs to see.
+  Route<void>? _runnerRoute;
   bool _benchRunning = false;
   String? _benchResult;
 
@@ -144,6 +162,31 @@ class _TestbedScreenState extends State<TestbedScreen> {
     _planController = TextEditingController();
     _statusTimer = Timer.periodic(
         const Duration(milliseconds: 500), (_) => _refreshStatus());
+    _connSub = Connectivity().onConnectivityChanged.listen(_onConnectivity);
+  }
+
+  /// A network appeared: upload without being asked.
+  ///
+  /// Gated on there being something to send and nothing in flight. Wi-Fi and
+  /// ethernet only — mobile data is deliberately excluded, since a multi-hour
+  /// recording is tens of MB and nothing about this is urgent enough to spend
+  /// a data plan on.
+  void _onConnectivity(List<ConnectivityResult> results) {
+    final onNetwork = results.contains(ConnectivityResult.wifi) ||
+        results.contains(ConnectivityResult.ethernet);
+    if (!onNetwork) return;
+    if (!TraceConfig.isConfigured) return;
+    if (_uploading || _uploadComplete) return;
+    if (_expFileBytes <= 0) return;
+    unawaited(_uploadExperimentFiles());
+  }
+
+  /// Close the runner if it is up, so the upload's own state is visible.
+  void _closeRunner() {
+    final route = _runnerRoute;
+    if (route == null || !route.isActive) return;
+    _runnerRoute = null;
+    route.navigator?.removeRoute(route);
   }
 
   void _refreshStatus() {
@@ -155,7 +198,10 @@ class _TestbedScreenState extends State<TestbedScreen> {
           // Any change in what is on disk invalidates a previous "all chunks
           // landed": uploadId embeds the file length, so a grown file uploads
           // under new ids and the old green would be a lie.
-          if (bytes != _expFileBytes) _uploadComplete = false;
+          if (bytes != _expFileBytes) {
+            _uploadComplete = false;
+            _uploadFailed = false;
+          }
           _expFileBytes = bytes;
         });
       }));
@@ -167,6 +213,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
   @override
   void dispose() {
     _statusTimer?.cancel();
+    unawaited(_connSub?.cancel());
     _bulkController.dispose();
     _expIdController.dispose();
     _markerController.dispose();
@@ -255,9 +302,13 @@ class _TestbedScreenState extends State<TestbedScreen> {
       return;
     }
     if (_uploading) return;
+    // The upload's state lives on this screen's button, so the full-screen
+    // runner comes down as the attempt starts rather than after it ends.
+    _closeRunner();
     setState(() {
       _uploading = true;
       _uploadComplete = false; // a fresh attempt is not yet proven complete
+      _uploadFailed = false;
     });
     UploadOutcome outcome;
     try {
@@ -273,6 +324,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
     setState(() {
       _uploading = false;
       _uploadComplete = outcome.complete;
+      _uploadFailed = !outcome.complete;
     });
     _snack(outcome.message);
   }
@@ -336,6 +388,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
       // is still on the device, but nothing on screen says to go get it.
       upload: TraceConfig.isConfigured
           ? () async {
+              // Starting the end-of-run upload closes the runner and shows the
+              // spinner, so the operator watches the attempt, not a finished
+              // run screen that says nothing about whether the data left.
+              if (mounted) {
+                _closeRunner();
+                setState(() {
+                  _uploading = true;
+                  _uploadFailed = false;
+                  _uploadComplete = false;
+                });
+              }
               final outcome = await recorder.uploadExperimentFiles(
                 url: TraceConfig.serverUrl,
                 token: TraceConfig.serverToken,
@@ -343,8 +406,14 @@ class _TestbedScreenState extends State<TestbedScreen> {
               );
               // The end-of-run auto-upload drives the same indicator as the
               // manual button, so a finished run shows green without needing
-              // a press to find out.
-              if (mounted) setState(() => _uploadComplete = outcome.complete);
+              // a press to find out — and red when a chunk did not land.
+              if (mounted) {
+                setState(() {
+                  _uploading = false;
+                  _uploadComplete = outcome.complete;
+                  _uploadFailed = !outcome.complete;
+                });
+              }
               return outcome.message;
             }
           : () async => 'NOT UPLOADED — this build has no TRACE_TOKEN. The '
@@ -362,15 +431,18 @@ class _TestbedScreenState extends State<TestbedScreen> {
     final runner = _makeRunner(recorder);
     // Saturating steps refill their window on each end-to-end ACK.
     widget.registerAckListener?.call(runner.onAck);
+    final route = MaterialPageRoute<void>(
+      fullscreenDialog: true,
+      builder: (_) => FieldRunnerScreen(
+        runner: runner,
+        plan: plan,
+      ),
+    );
+    _runnerRoute = route;
     Navigator.of(context)
-        .push(MaterialPageRoute(
-          fullscreenDialog: true,
-          builder: (_) => FieldRunnerScreen(
-            runner: runner,
-            plan: plan,
-          ),
-        ))
+        .push(route)
         .then((_) {
+      _runnerRoute = null;
       widget.registerAckListener?.call(null);
       runner.dispose();
     });
@@ -542,12 +614,21 @@ class _TestbedScreenState extends State<TestbedScreen> {
         // server cannot recognise as already-stored.
         OutlinedButton.icon(
           onPressed: _uploading ? null : () async => _uploadExperimentFiles(),
+          // Three terminal appearances, because three outcomes matter to an
+          // operator standing at the bench: in flight, everything landed, or
+          // something did not. Green and red both persist — a snackbar is
+          // gone by the time you have walked to the next phone.
           style: _uploadComplete
               ? OutlinedButton.styleFrom(
                   foregroundColor: Colors.green.shade700,
                   side: BorderSide(color: Colors.green.shade700, width: 2),
                 )
-              : null,
+              : _uploadFailed
+                  ? OutlinedButton.styleFrom(
+                      foregroundColor: Colors.red.shade700,
+                      side: BorderSide(color: Colors.red.shade700, width: 2),
+                    )
+                  : null,
           icon: _uploading
               ? const SizedBox(
                   width: 16,
@@ -556,12 +637,16 @@ class _TestbedScreenState extends State<TestbedScreen> {
                 )
               : Icon(_uploadComplete
                   ? Icons.cloud_done
-                  : Icons.cloud_upload_outlined),
+                  : _uploadFailed
+                      ? Icons.close
+                      : Icons.cloud_upload_outlined),
           label: Text(_uploading
               ? 'Uploading…'
               : _uploadComplete
                   ? 'Uploaded ✓'
-                  : 'Upload files'),
+                  : _uploadFailed
+                      ? 'Upload failed — retry'
+                      : 'Upload files'),
         ),
         OutlinedButton.icon(
           onPressed: () async => _clearExperimentFiles(),

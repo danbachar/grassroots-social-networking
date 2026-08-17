@@ -47,8 +47,11 @@ class FieldPlanPresets {
   ///
   /// [payloadSizes] is the PAYLOAD ARM: one saturating step per size, so the
   /// per-message cost of fragmentation is a measured result instead of a
-  /// hidden constant. [defaultSendBytes] (136 B) is exactly one sealed packet;
-  /// 264 B is exactly two; 1200 B is ten. Every step runs from the same spot,
+  /// hidden constant. [defaultSendBytes] (130 B) is exactly one sealed packet;
+  /// 264 B is three and 1200 B is ten — the sizes were chosen against the old
+  /// 136 B budget (where 264 was exactly two), and the header's restored
+  /// creation stamp moved the budget to 130 without moving the arm's sizes.
+  /// Every step runs from the same spot,
   /// so only the very first waits for the tap — a whole arm is hands-free
   /// after one press. Labels carry the size (`p=264B`) so the analyzer
   /// segments the arms apart.
@@ -519,10 +522,10 @@ class FieldPlanPresets {
   ///   medium  — steady traffic
   ///   high    — the field-day setting (saturate, ONE lane, one sealed packet
   ///             per message), so a desk result is comparable to
-  ///             mesh-scale-30m-2. The packet header lost its unused 4-byte
-  ///             timestamp after that run, so the payload is 136 B where the
-  ///             field day sent 132 B — the packet on the wire is 236 B in
-  ///             both, which is what contention actually sees.
+  ///             mesh-scale-30m-2. The payload has tracked the header since:
+  ///             that field day sent 132 B, and the header's 6-byte creation
+  ///             stamp now puts it at 130 B — the packet on the wire is 236 B
+  ///             throughout, which is what contention actually sees.
   ///
   /// Each arm is three steps. `warm` lets sessions form (SEALING NEEDS A
   /// SESSION — a recipient never paired with is held unsealed and is a

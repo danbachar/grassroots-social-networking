@@ -18,9 +18,12 @@ class FragmentHandler {
   /// silently truncated on the wire and the receiver can't parse it. A flooded
   /// packet reaches peers with different MTUs, so we size for the floor MTU we
   /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
-  ///   54 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
-  ///   = 100 bytes.
-  /// So chunk ≤ 244 − 100 = 144; we use 136, holding 8 bytes back.
+  ///   60 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
+  ///   = 106 bytes.
+  /// So chunk ≤ 244 − 106 = 138; we use 130, holding 8 bytes back. The
+  /// overhead is DERIVED from [GrassrootsPacket.headerSize], so restoring the
+  /// 6-byte creation stamp (54 → 60) moved the budget 136 → 130 by itself and
+  /// kept the margin intact.
   ///
   /// That 8 is a CHOSEN margin, not a measured one. What it buys is the one
   /// number here that is not a constant: 247 is the MTU the transport
@@ -32,9 +35,9 @@ class FragmentHandler {
   /// unmeasured. Reclaiming it is worth ~6% more payload per fragment.
   static const int _bleFloorMtu = 247;
   static const int _packetFixedOverhead =
-      GrassrootsPacket.headerSize + 25 + 21; // = 100
+      GrassrootsPacket.headerSize + 25 + 21; // = 106
   static const int maxFragmentPayload =
-      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 136
+      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 130
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
   /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a

@@ -44,10 +44,12 @@ enum PacketType {
 /// [2-33]   : Recipient public key (32 bytes, zeros for broadcast)
 /// [34-49]  : Packet ID (16 bytes, UUID — dedup / loop prevention)
 /// [50-53]  : Payload length (4 bytes, big-endian)
-/// [54-N]   : Payload (variable length; Noise-sealed for session types)
+/// [54-59]  : Creation time (6 bytes, big-endian ms since epoch —
+///            originator-stamped; the GCS sync window is expressed in it)
+/// [60-N]   : Payload (variable length; Noise-sealed for session types)
 /// ```
 ///
-/// Total header size: 54 bytes. The 4-byte payload length is the on-wire
+/// Total header size: 60 bytes. The 4-byte payload length is the on-wire
 /// framer: stream transports (UDP/UDX) accumulate bytes until
 /// `headerSize + payloadLength` are available before treating a buffer as
 /// one packet.
@@ -104,8 +106,9 @@ class GrassrootsPacket {
   ///
   /// Privacy: this tells any relay the AGE of traffic it carries. The
   /// envelope is otherwise sender-anonymous, so it is a weak correlation aid
-  /// — packets minted together look alike. Accepted deliberately; seconds
-  /// rather than milliseconds keeps the resolution coarse.
+  /// — packets minted together look alike. Accepted deliberately: the sync
+  /// window needs a shared, originator-stamped clock, and no coarser
+  /// resolution gives one (see the tie/boundary reasoning above).
   final int createdAtMs;
 
   /// Unique packet identifier for deduplication

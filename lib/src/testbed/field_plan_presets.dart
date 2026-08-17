@@ -951,13 +951,17 @@ class FieldPlanPresets {
         // steps' cliqueN (resolved from the nickname at launch) and M in
         // their maxParallelDials, which every phone applies identically —
         // there is no per-role entry to pick wrongly.
-        // Six phones: the Pixel 2 and Pixel 10 Pro are held out (their clocks sit
-        // ~0.7 s behind true time and cannot be corrected from adb), and the
-        // Pixel 7a is wireless-only. maxPop MUST match the phones actually
-        // present — a plan asking for N=7 with six radios silently relabels a
-        // six-phone population as seven.
-        'Dial grid N x M (6 phones, 1 rep, ~47min)':
-            dialGridProbe(expId: 'dial-5-bounce-fixed-n6', maxPop: 6),
+        // EIGHT phones, nicknamed 1..8: the nickname IS the join order, so the
+        // fleet has to carry every slot up to maxPop. maxPop MUST match the
+        // phones actually present — a plan asking for N=8 with six radios
+        // silently relabels a six-phone population as eight.
+        // A FRESH id: -5 was the six-phone grid, and the recorder APPENDS, so
+        // re-using it would merge two different populations into one file and
+        // one analysis.
+        // 28 measured cells x 120 s + (90 + 6x60) converge + 35 x (5 s dark +
+        // 5 s gap) + (60 settle + 300 align + 120 placement) = 4640 s ~= 1.3 h.
+        'Dial grid N x M (8 phones, 1 rep, ~1.3h)':
+            dialGridProbe(expId: 'dial-6-n8', maxPop: 8),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

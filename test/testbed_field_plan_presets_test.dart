@@ -886,13 +886,62 @@ void main() {
       final names = FieldPlanPresets.presets.keys
           .where((n) => n.contains('Dial grid'))
           .toList();
-      expect(names, ['Dial grid N x M (6 phones, 1 rep, ~47min)']);
+      expect(names, ['Dial grid N x M (8 phones, 1 rep, ~1.3h)']);
       final entry = FieldPlanPresets.presets[names.single]!;
-      expect(entry.expId, 'dial-5-bounce-fixed-n6');
-      // sum(N=2..6) of (N-1) = 15 cells, + 5 converge. The population ceiling
-      // must match the phones on the bench or a step lies about its N.
-      expect(entry.steps, hasLength(20));
-      expect(entry.steps.map((s) => s.cliqueN).reduce((a, b) => a! > b! ? a : b), 6);
+      // A FRESH id per campaign: the recorder appends, so re-using the
+      // six-phone -5 id would merge two populations into one file.
+      expect(entry.expId, 'dial-6-n8');
+      // sum(N=2..8) of (N-1) = 28 cells, + 8-1 = 7 converge. The population
+      // ceiling must match the phones on the bench or a step lies about its N.
+      expect(entry.steps, hasLength(capSteps + convergeSteps));
+      expect(entry.steps.map((s) => s.cliqueN).reduce((a, b) => a! > b! ? a : b), 8);
+      expect(entry.steps.map((s) => s.label).toSet(),
+          hasLength(entry.steps.length),
+          reason: 'labels unique so every cell stays its own segment');
+
+      // Every (N, M) cell exactly once, M <= N-1.
+      final cells = <String, int>{};
+      for (final s in entry.steps.where((s) => s.maxParallelDials != null)) {
+        expect(s.cliqueN, inInclusiveRange(2, 8), reason: s.label);
+        expect(s.maxParallelDials, inInclusiveRange(1, s.cliqueN! - 1),
+            reason: 'M <= N-1: a phone cannot dial itself: ${s.label}');
+        cells.update('${s.cliqueN}/${s.maxParallelDials}', (v) => v + 1,
+            ifAbsent: () => 1);
+      }
+      expect(cells, hasLength(capSteps));
+      expect(cells.values, everyElement(1));
+    });
+
+    test('the dropdown duration is the arithmetic of the plan itself', () {
+      final entry = FieldPlanPresets
+          .presets['Dial grid N x M (8 phones, 1 rep, ~1.3h)']!;
+
+      // What the operator actually waits through, all of it read off the plan:
+      // every step's dwell, plus the per-step BLE bounce (dark gap) and the
+      // auto-advance gap that precede it, plus the preamble (walk to the
+      // marks, wait for the shared wall-clock anchor) and the closing settle.
+      final dwell = entry.steps.fold<int>(0, (a, s) => a + s.dwellSec);
+      final perStep = entry.steps.length *
+          ((entry.linkResetDarkSec ?? 0) + entry.autoAdvanceGapSec);
+      final preamble = entry.placementSec + entry.alignSec + entry.settleSec;
+      final totalSec = dwell + perStep + preamble;
+
+      // 28 x 120 measured + 90 first converge + 6 x 60 converge.
+      expect(dwell, capSteps * 120 + 90 + 6 * 60);
+      expect(dwell, 3810);
+      expect(perStep, (capSteps + convergeSteps) * 10); // 35 x (5 dark + 5 gap)
+      expect(perStep, 350);
+      expect(preamble, 480); // 120 placement + 300 align + 60 settle
+      expect(totalSec, 4640);
+
+      // Rounded the way the label rounds it: 4640 s = 1h17m20s -> ~1.3h.
+      final hours = (totalSec / 3600 * 10).round() / 10;
+      expect(hours, 1.3);
+      expect(
+          FieldPlanPresets.presets.keys
+              .singleWhere((n) => n.contains('Dial grid')),
+          contains('~${hours}h'),
+          reason: 'the label must state the duration the plan actually runs');
     });
   });
 }

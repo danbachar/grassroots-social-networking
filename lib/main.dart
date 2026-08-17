@@ -392,10 +392,19 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   // memory-only, so a request from a previous process has nothing to withdraw.
   final Map<String, String> _sentFriendRequestMsgIds = {};
 
-  // Nearby-list sort hysteresis. RSSI wobbles every reading, so re-sorting on
-  // each 1s refresh made the "In range" list churn. The order is recomputed at
-  // most once per announce cycle; between recomputes the cached order is kept.
+  // Nearby-list hysteresis. RSSI wobbles every reading and `lastSeen` advances
+  // every second, so rendering live state made the "In range" list churn
+  // continuously: rows resorted, dBm numbers flickered, and "Heard Ns ago"
+  // counted up in place. Both the ORDER and the VALUES are now recomputed at
+  // most once per announce cycle — the cycle is what actually refreshes the
+  // underlying facts, so showing them faster only shows noise.
+  //
+  // Newcomers are exempt: a peer that has just appeared is rendered
+  // immediately rather than waiting up to a cycle to become visible, since
+  // presence is the one thing the panel exists to report promptly. It folds
+  // into the snapshot at the next recompute.
   List<String> _nearbySortOrder = [];
+  Map<String, PeerState> _nearbySnapshot = {};
   DateTime? _nearbySortAt;
 
   // Transport availability derived from Redux store
@@ -1709,13 +1718,18 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       final sorted = byHex.values.toList()
         ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
       _nearbySortOrder = [for (final p in sorted) p.pubkeyHex];
+      _nearbySnapshot = {for (final p in sorted) p.pubkeyHex: p};
       _nearbySortAt = now;
       return sorted;
     }
     final result = <PeerState>[];
     final placed = <String>{};
     for (final hex in _nearbySortOrder) {
-      final p = byHex[hex];
+      // Still present? Then render the value frozen at the last recompute, not
+      // the live one — that is what stops the row from twitching between
+      // cycles. A peer that has gone is simply absent.
+      if (!byHex.containsKey(hex)) continue;
+      final p = _nearbySnapshot[hex] ?? byHex[hex];
       if (p != null) {
         result.add(p);
         placed.add(hex);

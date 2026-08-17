@@ -434,7 +434,7 @@ class PeersState {
   /// transition. The BLE device-id fields are the ground truth of whether
   /// we still hold a path. The `_removeStalePeers` sweep in
   /// `GrassrootsNetwork` clears those ids on `lastBleSeen` staleness so a
-  /// peer that's gone silent for two announce cycles falls off this list.
+  /// peer that's gone silent for ten announce cycles falls off this list.
   List<PeerState> get nearbyBlePeers =>
       peers.values.where((p) => p.hasBleConnection).toList();
 

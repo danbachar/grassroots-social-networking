@@ -558,7 +558,7 @@ Each slice owns one concern and nothing more.
 
 The governing rule is that the Redux state is a \emph{strict projection} of facts the transport layers explicitly emit --- never an inference. The rule binds \emph{reducers}: a reducer must not synthesise state from ``I have not heard from peer $X$ in $N$ seconds'' heuristics. \code{StalePeersRemovedAction} shows the discipline --- it only \emph{removes} non-friend peers past a staleness threshold and explicitly refuses to touch \code{connectionState}, because that field is driven solely by BLE plugin and UDX events (\code{lib/src/store/peers_reducer.dart}); friends are never removed at all.
 
-Where timeout reasoning does live is one layer up, and it is worth being exact rather than claiming the system contains no such timer. A UDP disconnect drops reachability immediately when an explicit disconnect event arrives --- that is the primary path. \emph{In addition}, the coordinator runs a periodic stale sweep: \code{computeStaleUdpPeerPubkeys} flags any UDP-connected peer whose \code{lastUdpSeen} is older than twice the announce interval, and \code{_removeStalePeers} acts on the result (\code{lib/src/grassroots_network.dart}). That is a silence-based inference, deliberately sited in the coordinator --- which owns transport facts and may derive from them --- rather than in a reducer, which may not. The invariant constrains \emph{who} may infer; it does not claim that nothing anywhere reasons from silence.
+Where timeout reasoning does live is one layer up, and it is worth being exact rather than claiming the system contains no such timer. A UDP disconnect drops reachability immediately when an explicit disconnect event arrives --- that is the primary path. \emph{In addition}, the coordinator runs a periodic stale sweep: \code{computeStaleUdpPeerPubkeys} flags any UDP-connected peer whose \code{lastUdpSeen} is older than ten announce intervals, and \code{_removeStalePeers} acts on the result (\code{lib/src/grassroots_network.dart}). That is a silence-based inference, deliberately sited in the coordinator --- which owns transport facts and may derive from them --- rather than in a reducer, which may not. The invariant constrains \emph{who} may infer; it does not claim that nothing anywhere reasons from silence.
 
 \subsection{Transport independence and consolidated reachability}
 
@@ -666,7 +666,7 @@ sequence.
     there. Nothing is held --- there is no plaintext hold, no pre-seal queue,
     and the send path does not establish sessions (pairing is eager and lives
     at ANNOUNCE). The gate is deliberately the \emph{session} and never the
-    peer \emph{record}: the stale sweep deletes a non-friend's record after two
+    peer \emph{record}: the stale sweep deletes a non-friend's record after ten
     silent announce cycles while its Noise session survives untouched, so a
     recipient that has merely gone quiet is still sealed and buffered ---
     requiring a record here was measured on 2026-08-10 to strand every send to

@@ -1413,7 +1413,7 @@ class GrassrootsNetwork {
     // fails, and the user retries once the peer is actually there.
     //
     // A peer RECORD is not what sending needs — a session is. The stale sweep
-    // deletes a non-friend peer from `peersList` after two announce cycles of
+    // deletes a non-friend peer from `peersList` after ten announce cycles of
     // silence while its Noise session survives untouched, so a recipient that
     // has merely gone quiet has no record but is still perfectly sendable:
     // `hasSession` short-circuits the establish below and the message seals,
@@ -1856,7 +1856,7 @@ class GrassrootsNetwork {
   /// Sessions actually held, straight from the session table.
   ///
   /// [sessionPeerCount] intersects the table with Redux `peersList`, and a
-  /// non-friend peer is pruned from that list after two announce cycles of
+  /// non-friend peer is pruned from that list after ten announce cycles of
   /// silence while its Noise session survives untouched — so the two numbers
   /// diverge exactly when a link goes quiet, which is the case field runs
   /// care about. Recording both makes "the session is gone" distinguishable
@@ -1924,10 +1924,13 @@ class GrassrootsNetwork {
         store.dispatch(PeerBleDisconnectedAction(peer.publicKey));
       }
     }
-    // Dark gap = 2 announce cycles + 10s. Long enough for the peer's own
-    // stale sweep (staleThreshold = announceInterval * 2) to fire and drop
-    // the connection before we reappear, so the pair re-establishes fully
-    // cold rather than over any half-stale state.
+    // Dark gap = 2 announce cycles + 10s. Going dark disposes the transport,
+    // so the peer learns through real link-layer disconnect events, not the
+    // stale sweep — the sweep (now 10 announce cycles) is only the safety net
+    // for a disconnect the peer's plugin failed to surface, and this gap no
+    // longer outlives it. Accepted: a peer that missed the event still holds
+    // a stale path, and its own connect handler closes stale GATTs on our
+    // redial, so the pair re-establishes cold either way.
     final darkGap = config.announceInterval * 2 + const Duration(seconds: 10);
     debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
     await Future<void>.delayed(darkGap);
@@ -5223,9 +5226,15 @@ class GrassrootsNetwork {
   /// independently via [PeerState.lastUdpSeen] so a nearby BLE friend can age
   /// out of "Friends Online" without disappearing from "Nearby".
   void _removeStalePeers() {
-    final staleThreshold = config.announceInterval * 2; // Give 2x grace period
+    // TEN missed announces, not two. Two cycles meant one announce lost on a
+    // busy air — or delayed by screen-off scan batching — put a peer one tick
+    // from eviction, and the sweep then tore down state that was about to
+    // refresh. At 10 cycles (~100 s at the default interval) only a peer that
+    // is genuinely gone ages out; a friend's Noise session was never touched
+    // by this sweep either way.
+    final staleThreshold = config.announceInterval * 10;
 
-    // Tear down quiet UDP sessions that have missed 2 announce cycles.
+    // Tear down quiet UDP sessions that have missed 10 announce cycles.
     final connectedUdpPubkeys = <String>{};
     if (_udpService != null) {
       for (final peer in _peersState.peersList) {
@@ -5270,7 +5279,7 @@ class GrassrootsNetwork {
     // `bleCentralDeviceId` / `blePeripheralDeviceId` stay set indefinitely
     // and `nearbyBlePeers` keeps showing them. Friends and strangers are
     // treated identically — both should fall off "Connected Peers" once
-    // they've been silent over BLE for two announce cycles.
+    // they've been silent over BLE for ten announce cycles.
     final staleBlePeers = computeStaleBlePeerPubkeys(
       peers: _peersState.peersList,
       staleThreshold: staleThreshold,

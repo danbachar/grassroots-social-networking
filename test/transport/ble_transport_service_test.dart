@@ -1501,9 +1501,10 @@ void main() {
           (r) => r['type'] == 'link' && r['event'] == 'gattConnected');
       expect(rec['role'], 'central');
       expect(rec['establishment'], isTrue);
-      expect(rec['inFlight'], 1,
-          reason: 'This path is excluded from its own tally; peer 2 is the '
-              'one dial still in flight.');
+      expect(rec['inFlight'], 2,
+          reason: 'Both dials hold a slot: this one is `connected` but not '
+              'yet `ready`, and the cap counts it too — so the field runs '
+              '1..M and equals M when saturated.');
       expect(rec['maxParallel'], 3);
       expect(rec['popN'], 6);
       expect(rec['peripheralLinks'], 0);
@@ -1546,7 +1547,8 @@ void main() {
       expect(rec['totalLinks'], 3,
           reason: 'Both roles draw on ONE controller link budget, so a '
               'failure at high N has to be separable from "out of slots".');
-      expect(rec['inFlight'], 0);
+      expect(rec['inFlight'], 1,
+          reason: 'this dial itself still holds a slot at `connected`');
     });
 
     test('an inbound peripheral leg carries no dial context', () async {

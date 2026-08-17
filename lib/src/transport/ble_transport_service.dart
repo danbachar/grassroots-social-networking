@@ -263,10 +263,12 @@ class BleTransportService extends TransportService {
   /// without inferring anything offline:
   ///
   ///  - `inFlight` — how many OTHER central dials were still underway at that
-  ///    instant. This is [_inFlightCentralDials], the very counter the cap
-  ///    gates on, read as the link comes up and excluding this path itself,
-  ///    so it is "how crowded the dial pipeline was when this one landed" and
-  ///    is directly comparable to the cap.
+  ///    instant, INCLUDING this one. This is [_inFlightCentralDials], the
+  ///    very counter the cap gates on, and a dial is not finished until the
+  ///    path reaches `ready` — so a path that has just connected still holds
+  ///    one of the M slots. Counting it is what makes the field directly
+  ///    comparable to the cap: it runs 1..M, and `inFlight == maxParallel`
+  ///    means the cap was saturated at that moment.
   ///  - `maxParallel` / `popN` — the step's M (the cap the runner set) and N
   ///    (radios up). The transport cannot see the plan, so the runner pushes
   ///    them down the same call that sets the cap ([setDialParallelism]).
@@ -309,8 +311,7 @@ class BleTransportService extends TransportService {
       if (path.rssi != null) 'rssi': path.rssi,
       if (event == 'drop') 'reason': path.error ?? path.state.name,
       if (establishment) 'establishment': true,
-      if (establishment)
-        'inFlight': _inFlightCentralDials(excludePathId: path.pathId),
+      if (establishment) 'inFlight': _inFlightCentralDials(),
       if (establishment)
         'peripheralLinks':
             _linksHoldingControllerSlot(ble.BleRole.peripheral),
@@ -1772,15 +1773,10 @@ class BleTransportService extends TransportService {
     dialProbePopN = popN;
   }
 
-  /// [excludePathId] leaves one path out of the tally. The establishment
-  /// record needs it: the count is read the moment the link comes up, when
-  /// that path is itself in `connected` and would otherwise count itself, and
-  /// the figure is meant to be "how many OTHER dials were still underway".
-  int _inFlightCentralDials({String? excludePathId}) {
+  int _inFlightCentralDials() {
     var count = 0;
     for (final p in _paths.values) {
       if (p.role != ble.BleRole.central) continue;
-      if (p.pathId == excludePathId) continue;
       if (p.state == ble.BlePathState.connecting ||
           p.state == ble.BlePathState.connected ||
           p.state == ble.BlePathState.subscribed) {

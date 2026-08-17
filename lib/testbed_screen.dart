@@ -960,7 +960,12 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   /// anchored start). Default ON — it is the current field procedure, and
   /// forgetting it on one of eight phones would silently give that phone a
   /// different timeline.
-  bool _meshManual = true;
+  /// Every experiment runs the manual logic: the operator owns system
+  /// Bluetooth and every phone starts on the same wall-clock instant. The
+  /// switch that could turn this off offered the retired app-controlled,
+  /// tap-anchored mode, which no plan has used since the Arm flow was
+  /// deleted — a run started that way is not comparable with any recorded
+  /// result, so the option is gone rather than merely defaulted off.
   /// Whether THIS device walks the sweep (mover) or stays put (static,
   /// record-only). Drives the whole form.
   bool _moves = true;
@@ -1074,20 +1079,6 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
                     _resetLinks = null;
                   }),
                 ),
-                ...[
-                  const SizedBox(height: 4),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    dense: true,
-                    title: Text(_meshManual
-                        ? 'Manual running logic: you toggle Bluetooth in '
-                            'Settings; all phones start at the same '
-                            'wall-clock instant'
-                        : 'Legacy: app-controlled radio, tap-anchored start'),
-                    value: _meshManual,
-                    onChanged: (v) => setState(() => _meshManual = v),
-                  ),
-                ],
                 const SizedBox(height: 12),
                 ..._fieldsForKind(),
                 const Divider(height: 24),
@@ -1346,7 +1337,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
     // system Bluetooth, wall-clock anchored start, no GPS. Kinds that build
     // it in (mesh scale, join time) pass through untouched; everything else
     // is wrapped here.
-    if (_meshManual && !plan.manualJoin) {
+    if (!plan.manualJoin) {
       return FieldPlanPresets.manualized(plan);
     }
     return plan;
@@ -1371,7 +1362,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
         meshRole: int.tryParse(_meshRole.text.trim()) ?? 1,
         travellerPrefix: _travellerPrefix.text.trim(),
         saturate: _meshSaturate,
-        manualJoin: _meshManual,
+        manualJoin: true,
         rawLegs: [
           for (final leg in _rawLegs.text.split(','))
             if (const {'notify', 'write', 'stripe'}.contains(leg.trim()))

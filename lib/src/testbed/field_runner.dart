@@ -714,16 +714,6 @@ class FieldRunner extends ChangeNotifier {
     ];
   }
 
-  String get _srcLabel {
-    final me = myPubkeyHex?.toLowerCase();
-    final plan = _plan!;
-    if (plan.roster.isNotEmpty && me != null) {
-      final mine =
-          plan.roster.where((r) => r.pubkeyHex.toLowerCase() == me).firstOrNull;
-      if (mine != null) return mine.label;
-    }
-    return me == null ? 'src' : me.substring(0, 8);
-  }
 
   /// Schedule [FieldStep.sendCount] messages for this step. With a
   /// [linkSettled] predicate: poll until some target's pair is settled
@@ -900,7 +890,7 @@ class FieldRunner extends ChangeNotifier {
     if (doSend == null || plan == null) return;
     if (!_running || _phase != FieldPhase.dwelling) return;
     final seq = _satSeq++;
-    for (final (dstLabel, pubkey) in _sendTargets()) {
+    for (final (_, pubkey) in _sendTargets()) {
       final messageId = _uuid.v4();
       final payload = Uint8List(step.sendBytes);
       for (var i = 0; i < payload.length; i++) {

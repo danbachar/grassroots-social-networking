@@ -71,9 +71,6 @@ class GrassrootsPacket {
   /// framing for a field neither of them needs.
   static const int createdAtOffset = 54;
 
-  /// Soft target for fragmented payloads — chosen to keep a single
-  /// encrypted packet under ~500 byte MTU on BLE.
-  static const int maxPayloadSize = 440; // 500 - 60
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();

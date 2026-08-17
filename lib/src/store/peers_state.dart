@@ -250,7 +250,10 @@ class PeerState {
   bool get hasKnownAddress =>
       hasBleConnection || allUdpAddressCandidates.isNotEmpty;
 
-  /// UDP candidates in first-seen order, including legacy fields.
+  /// UDP candidates in first-seen order. The single-valued
+  /// [linkLocalAddress] and [udpAddress] are current fields, not remnants:
+  /// one peer advertises several candidates and each pair picks the one that
+  /// works between them.
   Set<String> get allUdpAddressCandidates => normalizeAddressStrings([
         linkLocalAddress,
         udpAddress,

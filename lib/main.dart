@@ -3,7 +3,7 @@ import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:logger/logger.dart' show Logger, Level;
+import 'package:logger/logger.dart' show Level;
 import 'src/debug/log_buffer.dart';
 import 'src/trace/experiment_recorder.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -24,8 +24,6 @@ final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
 
 // Global key for navigation from notification
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-
-final Logger _log = Logger();
 
 // Pending chat to open from notification
 String? _pendingChatPeerHex;
@@ -75,54 +73,6 @@ Future<GrassrootsIdentity> _initIdentity() async {
   return identity;
 }
 
-Map<String, dynamic> _serializeAppState(AppState state) {
-  return {
-    'bleTransportState': state.transports.bleState.name,
-    'udpTransportState': state.transports.udpState.name,
-    'peers': {
-      'discoveredBlePeers': {
-        for (final e in state.peers.discoveredBlePeers.entries)
-          e.key: {
-            'transportId': e.value.transportId,
-            'displayName': e.value.displayName,
-            'rssi': e.value.rssi,
-            'isConnecting': e.value.isConnecting,
-            'isConnected': e.value.isConnected,
-            'lastSeen': e.value.lastSeen.toIso8601String(),
-          },
-      },
-      'peers': {
-        for (final e in state.peers.peers.entries)
-          e.key: {
-            'nickname': e.value.nickname,
-            'connectionState': e.value.connectionState.name,
-            'transport': e.value.transport.name,
-            'activeTransport': e.value.activeTransport.name,
-            'rssi': e.value.rssi,
-            'bleDeviceId': e.value.bleDeviceId,
-            'udpAddress': e.value.udpAddress,
-            'isFriend': e.value.isFriend,
-            'lastSeen': e.value.lastSeen?.toIso8601String(),
-          },
-      },
-    },
-    'messages': {
-      'conversationCount': state.messages.conversations.length,
-      'unreadCounts': state.messages.unreadCounts,
-      'outgoingCount': state.messages.outgoingMessages.length,
-      'incomingCount': state.messages.incomingMessages.length,
-    },
-    'friendships': {
-      for (final e in state.friendships.friendships.entries)
-        e.key: {
-          'nickname': e.value.nickname,
-          'status': e.value.status.name,
-          'udpAddress': e.value.udpAddress,
-        },
-    },
-    'settings': state.settings.toJson(),
-  };
-}
 
 /// Set up debug log capture by intercepting debugPrint.
 ///
@@ -2799,60 +2749,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     );
   }
 
-  void _showNicknameChangeAnimation(
-      String oldName, String newName, String peerId) {
-    // Store the nickname change for UI animation
-    _nicknameChanges[peerId] = _NicknameChange(
-      oldName: oldName,
-      newName: newName,
-      timestamp: DateTime.now(),
-    );
-
-    // Show a snackbar notification
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.person_rounded, color: GlColors.textInverse),
-            const SizedBox(width: GlSpace.s3),
-            Expanded(
-              child: RichText(
-                text: TextSpan(
-                  style: const TextStyle(
-                      fontFamily: GlType.sans, color: GlColors.textInverse),
-                  children: [
-                    TextSpan(
-                      text: oldName.isEmpty ? 'Unknown' : oldName,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        decoration: TextDecoration.lineThrough,
-                        color: GlColors.textInverse.withValues(alpha: 0.7),
-                      ),
-                    ),
-                    const TextSpan(text: ' → '),
-                    TextSpan(
-                      text: newName,
-                      style: const TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-        duration: const Duration(seconds: 3),
-      ),
-    );
-
-    // Clear the animation after a delay
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() {
-          _nicknameChanges.remove(peerId);
-        });
-      }
-    });
-  }
 }
 
 /// Helper class for tracking nickname changes

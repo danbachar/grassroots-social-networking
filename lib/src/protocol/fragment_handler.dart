@@ -15,29 +15,30 @@ class FragmentHandler {
   ///
   /// Each fragment is sent as ONE BLE GATT write — the plugin does not
   /// split/reassemble, so a sealed packet larger than `ATT_MTU - 3` is
-  /// silently truncated on the wire and the receiver can't parse it. A flooded
-  /// packet reaches peers with different MTUs, so we size for the floor MTU we
-  /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
+  /// silently truncated on the wire and the receiver can't parse it. A packet
+  /// conveyed onward reaches peers with different MTUs, so we size for the
+  /// floor MTU we request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead
+  /// per packet:
   ///   60 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
   ///   = 106 bytes.
-  /// So chunk ≤ 244 − 106 = 138; we use 130, holding 8 bytes back. The
-  /// overhead is DERIVED from [GrassrootsPacket.headerSize], so restoring the
-  /// 6-byte creation stamp (54 → 60) moved the budget 136 → 130 by itself and
-  /// kept the margin intact.
+  /// So the chunk is the whole remainder, 244 − 106 = 138. The overhead is
+  /// DERIVED from [GrassrootsPacket.headerSize], so a header change moves the
+  /// budget with it rather than silently overrunning the ceiling.
   ///
-  /// That 8 is a CHOSEN margin, not a measured one. What it buys is the one
-  /// number here that is not a constant: 247 is the MTU the transport
-  /// *requests*, not necessarily the one a given pair negotiates. A chunk cut
-  /// to exactly 144 truncates silently against any peer that settles below
-  /// 247, and 8 bytes covers down to a 239-byte MTU. Whether such a peer
-  /// exists on real hardware is measurable and, until the ATT-ceiling probe
-  /// runs (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]),
-  /// unmeasured. Reclaiming it is worth ~6% more payload per fragment.
+  /// This spends the ATT ceiling exactly, which is the same thing the sync
+  /// filter does (`sync_codec.dart`), and it rests on 247 being the MTU a pair
+  /// actually negotiates rather than merely the one requested. Against a peer
+  /// that settles lower, a full-width fragment truncates. Nothing in the
+  /// traces reports a negotiated value — MTU is recorded only alongside a
+  /// drop — so the way to hold this number honest is the ATT-ceiling probe
+  /// (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]), which
+  /// walks the write size across the boundary and finds where the peer stops
+  /// parsing.
   static const int _bleFloorMtu = 247;
   static const int _packetFixedOverhead =
       GrassrootsPacket.headerSize + 25 + 21; // = 106
   static const int maxFragmentPayload =
-      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 130
+      _bleFloorMtu - 3 - _packetFixedOverhead; // = 138
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
   /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a
@@ -48,7 +49,7 @@ class FragmentHandler {
   static const Duration fragmentDelay = Duration(milliseconds: 20);
 
   /// Timeout for an incomplete reassembly. Must outlast the slowest transfer
-  /// we allow: a capped file at ~132 B/fragment × 20 ms/fragment. Sized for
+  /// we allow: a capped file at ~138 B/fragment × 20 ms/fragment. Sized for
   /// the ~1 MB attachment cap (~8k fragments ≈ 160 s) plus slack.
   static const Duration reassemblyTimeout = Duration(minutes: 4);
 

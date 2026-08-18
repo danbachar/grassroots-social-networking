@@ -288,6 +288,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
+        // A Noise session is keyed by peer identity and outlives the link that
+        // formed it, so a BLE drop leaves it untouched.
+        hasNoiseSession: existing.hasNoiseSession,
         // Clear BLE auth only when the last BLE path is gone; a partial drop
         // (one role) leaves the Noise session intact.
         bleAuthenticated: hasAnyBle ? existing.bleAuthenticated : false,
@@ -389,8 +392,10 @@ PeersState peersReducer(PeersState state, dynamic action) {
         isFriend: existing.isFriend,
         lastDirectReachAt: existing.lastDirectReachAt,
         hasLiveUdpConnection: false,
-        // Transport independence: a UDP drop must not touch BLE auth.
+        // Transport independence: a UDP drop must not touch BLE auth, and the
+        // Noise session is keyed by identity rather than by either path.
         bleAuthenticated: existing.bleAuthenticated,
+        hasNoiseSession: existing.hasNoiseSession,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,
@@ -483,6 +488,9 @@ PeersState peersReducer(PeersState state, dynamic action) {
         lastDirectReachAt: preserveReach ? existing.lastDirectReachAt : null,
         hasLiveUdpConnection: existing.hasLiveUdpConnection,
         bleAuthenticated: existing.bleAuthenticated,
+        // An address is where a peer is, not who it is; the session keyed by
+        // its identity is unaffected by learning a new one.
+        hasNoiseSession: existing.hasNoiseSession,
       );
       return state.copyWith(
         peers: Map.from(state.peers)..[pubkeyHex] = updated,

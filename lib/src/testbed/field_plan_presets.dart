@@ -47,11 +47,9 @@ class FieldPlanPresets {
   ///
   /// [payloadSizes] is the PAYLOAD ARM: one saturating step per size, so the
   /// per-message cost of fragmentation is a measured result instead of a
-  /// hidden constant. [defaultSendBytes] (130 B) is exactly one sealed packet;
-  /// 264 B is three and 1200 B is ten — the sizes were chosen against the old
-  /// 136 B budget (where 264 was exactly two), and the header's restored
-  /// creation stamp moved the budget to 130 without moving the arm's sizes.
-  /// Every step runs from the same spot,
+  /// hidden constant. [defaultSendBytes] (138 B) is exactly one sealed packet;
+  /// 264 B is two and 1200 B is nine, so the arm walks the fragment boundary
+  /// and then well past it. Every step runs from the same spot,
   /// so only the very first waits for the tap — a whole arm is hands-free
   /// after one press. Labels carry the size (`p=264B`) so the analyzer
   /// segments the arms apart.
@@ -260,6 +258,8 @@ class FieldPlanPresets {
       settleSec: 15,
       resetSessions: false,
       resetLinks: false,
+      // The app-level toggle is the subject here, so the runner works it.
+      scriptedRadio: true,
       steps: steps,
     );
   }
@@ -312,6 +312,9 @@ class FieldPlanPresets {
       settleSec: 30,
       resetSessions: false,
       resetLinks: false,
+      // Hours of unattended discharge: the condition's radio state is the
+      // plan's to hold, not something to ask a human for.
+      scriptedRadio: true,
       steps: [step],
     );
   }
@@ -371,6 +374,9 @@ class FieldPlanPresets {
       settleSec: settleSec,
       resetSessions: false,
       resetLinks: false,
+      // Each rung IS a radio condition, so the runner sets it and the ladder
+      // runs hands-free.
+      scriptedRadio: true,
       steps: steps,
     );
   }
@@ -431,6 +437,9 @@ class FieldPlanPresets {
       // rises, and clearing between steps would erase exactly that effect.
       resetDtnBuffer: false,
       manualJoin: true,
+      // The population is the variable: each step's bleOn decides who is in
+      // the mesh, so the runner works every radio.
+      scriptedRadio: true,
       placementSec: placementSec,
       alignSec: alignSec,
       steps: steps,
@@ -503,6 +512,8 @@ class FieldPlanPresets {
       // the sync exchange and blur its usable stage.
       resetDtnBuffer: true,
       manualJoin: true,
+      // A join is exactly a radio coming up on schedule; the runner owns it.
+      scriptedRadio: true,
       placementSec: placementSec,
       alignSec: alignSec,
       steps: steps,
@@ -520,12 +531,11 @@ class FieldPlanPresets {
   /// Three arms, run back to back:
   ///   low     — a trickle; the buffer holds tens of packets
   ///   medium  — steady traffic
-  ///   high    — the field-day setting (saturate, ONE lane, one sealed packet
-  ///             per message), so a desk result is comparable to
-  ///             mesh-scale-30m-2. The payload has tracked the header since:
-  ///             that field day sent 132 B, and the header's 6-byte creation
-  ///             stamp now puts it at 130 B — the packet on the wire is 236 B
-  ///             throughout, which is what contention actually sees.
+  ///   high    — saturate, ONE lane, one sealed packet per message, which is
+  ///             the shape mesh-scale-30m-2 ran under and what makes a desk
+  ///             result comparable to it. The payload tracks the header, so
+  ///             what stays fixed across runs is the packet on the wire —
+  ///             which is what contention actually sees.
   ///
   /// Each arm is three steps. `warm` lets sessions form (SEALING NEEDS A
   /// SESSION — a recipient never paired with is held unsealed and is a
@@ -849,11 +859,16 @@ class FieldPlanPresets {
     );
   }
 
-  /// Rebuild [p] under the manual running logic: operator-toggled system
-  /// Bluetooth, wall-clock-anchored start. This is the ONE flow every
-  /// experiment runs under; walk-driven plans no longer exist. The lone
-  /// exception is the bounce-stress diagnostic, whose subject IS the
-  /// app-level toggle.
+  /// Rebuild [p] under the manual running logic: wall-clock-anchored start.
+  /// This is the ONE flow every experiment runs under; walk-driven plans no
+  /// longer exist. The lone exception is the bounce-stress diagnostic, whose
+  /// subject IS the app-level toggle.
+  ///
+  /// Who works the radio is the PLAN's property and is carried through
+  /// untouched: anchoring a plan on the clock says nothing about whether its
+  /// steps toggle BLE themselves. Dropping [FieldPlan.scriptedRadio] here
+  /// turned every hands-free ladder into one that stops and asks an operator
+  /// for a toggle the plan was built to perform.
   ///
   /// Only valid for stationary plans, where every step can open on the
   /// clock.
@@ -870,6 +885,7 @@ class FieldPlanPresets {
       resetDtnBuffer: p.resetDtnBuffer,
       autoAdvanceGapSec: p.autoAdvanceGapSec,
       manualJoin: true,
+      scriptedRadio: p.scriptedRadio,
       placementSec: placementSec,
       alignSec: alignSec,
     );
@@ -976,7 +992,7 @@ class FieldPlanPresets {
         'Home soak (stationary, 40 min)': manualized(homeSoak()),
         'Link-cycle check (5×1 min)': manualized(cycleCheck()),
         'Throughput (saturate 60s)': manualized(throughput()),
-        'Throughput: payload arm (132/264/1200 B)': manualized(throughput(
+        'Throughput: payload arm (138/264/1200 B)': manualized(throughput(
             expId: 'throughput-arm-1',
             payloadSizes: const [defaultSendBytes, 264, 1200])),
         'Throughput: ceiling sweep (1/4/16/64 lanes)': manualized(throughputCeiling()),

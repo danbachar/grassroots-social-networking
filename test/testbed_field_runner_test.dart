@@ -1523,7 +1523,8 @@ void main() {
       });
     });
 
-    test('steps open at absolute offsets; the radio is never touched', () {
+    test('steps open at absolute offsets; a scripted plan works its own radio',
+        () {
       fakeAsync((async) {
         final recorder = _FakeRecorder();
         final ble = <bool>[];
@@ -1553,12 +1554,46 @@ void main() {
         expect(runner.phase, FieldPhase.dwelling);
         expect(recorder.events, contains('marker:n=4'));
 
-        expect(ble, isEmpty,
-            reason: 'manual mode: system BT belongs to the operator');
+        expect(ble, equals([true, true]),
+            reason: 'meshScale scripts the radio: each step\'s bleOn IS the '
+                'population, so the runner sets it and no operator is asked');
         final pl = recorder.markerExtras
             .firstWhere((e) => e.$1 == 'placement')
             .$2;
         expect(pl['targetMs'], b0 + 600000);
+        runner.dispose();
+      });
+    });
+
+    test('a manual plan that does NOT script the radio leaves it alone', () {
+      fakeAsync((async) {
+        final ble = <bool>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          onSetBle: (on) async => ble.add(on),
+          upload: () async => 'ok',
+        );
+        runner.start(FieldPlan(
+          expId: 'operator-radio-t',
+          manualJoin: true,
+          alignSec: 600,
+          placementSec: 60,
+          settleSec: 1,
+          steps: [
+            FieldStep(label: 'up', dwellSec: 30, bleOn: true),
+            FieldStep(label: 'down', dwellSec: 30, bleOn: false, autoAdvance: true),
+          ],
+        ));
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 600));
+        async.flushMicrotasks();
+        async.elapse(const Duration(seconds: 35));
+        async.flushMicrotasks();
+
+        expect(ble, isEmpty,
+            reason: 'without scriptedRadio the toggle belongs to the operator, '
+                'and bleOn is intent for the marker rather than a command');
         runner.dispose();
       });
     });

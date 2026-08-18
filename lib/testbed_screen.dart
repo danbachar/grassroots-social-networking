@@ -949,8 +949,8 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
   late final TextEditingController _dwellSec =
       TextEditingController(text: '180');
   late final TextEditingController _repeat = TextEditingController(text: '1');
-  // Payload ARM: one saturating step per size. 132 B is exactly one sealed
-  // packet at the BLE floor MTU, 264 B exactly two, 1200 B ten — so the
+  // Payload ARM: one saturating step per size. [defaultSendBytes] is exactly
+  // one sealed packet at the BLE floor MTU, 264 B two and 1200 B nine — so the
   // per-message cost of fragmentation comes out as a measured curve.
   late final TextEditingController _payloadBytes =
       TextEditingController(text: '$defaultSendBytes, 264, 1200');
@@ -1264,7 +1264,7 @@ class _PlanWizardDialogState extends State<_PlanWizardDialog> {
               'everyone with one member away — the field-day shape. '
               'Desk test — distance is not the variable, offered load is. '
               'Three arms run back to back: low, medium, then HIGH, which is '
-              'the field-day setting exactly (saturate, one lane, 132 B). '
+              'the heaviest arm (saturate, one lane, one sealed packet). '
               'Phone 1 drops its radio for the dark window while everyone '
               'else messages it; on return nobody sends, so every delivery in '
               'that window came out of a buffer. Start all phones together.',

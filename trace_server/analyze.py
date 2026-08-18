@@ -71,8 +71,8 @@ next to ``t0``/``t1`` makes the difference visible.
 ``airB_per_msg`` is every sealed byte both devices put on the air during the
 step (data + acks + custody sync) divided by the messages delivered, and
 ``air_overhead`` is that over the payload size. This is what the payload arm
-measures: a payload above one sealed packet (136 B) fragments, and each
-fragment re-pays the full 100-byte header.
+measures: a payload above one sealed packet (138 B) fragments, and each
+fragment re-pays the full 106-byte overhead.
 
 Usage:
     python3 analyze.py data/traces.db --out analysis
@@ -117,7 +117,7 @@ LINK_STAGES = ["discovered", "gattConnected", "identified", "connected",
 # FragmentHandler.fragmentThreshold: payloads above this are split, and each
 # fragment gets a RANDOM packetId — so relay records can no longer be joined
 # to the messageId and hop counts for such messages are not trustworthy.
-FRAGMENT_THRESHOLD_B = 136  # 247 - 3 - (54 hdr + 25 noise + 21 frame) - 8
+FRAGMENT_THRESHOLD_B = 138  # 247 - 3 - (60 hdr + 25 noise + 21 frame)
 # Runner markers that annotate a boundary or an event but are not steps. Every
 # OTHER marker opens a step segment — a throughput step ("saturate", "p=264B")
 # has no position at all, and dropping it would make the whole experiment
@@ -522,8 +522,8 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
         # Total SEALED bytes this step put on the air, both devices, all
         # content (data + acks + custody sync). Divided by the delivered
         # messages this is the real per-message cost — the number the payload
-        # arm exists to produce, since a payload above one packet pays a full
-        # 104-byte header again per fragment. Wire records are drained on a
+        # arm exists to produce, since a payload above one packet pays the
+        # full 106-byte overhead again per fragment. Wire records are drained on a
         # timer, so counts at a segment boundary can spill by one window.
         in_seg_wire = wire[(wire._t >= seg["t0"]) & (wire._t < seg["t1"])]
         air_b = 0

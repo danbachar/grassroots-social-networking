@@ -1063,7 +1063,7 @@ class BleTransportService extends TransportService {
     }
   }
 
-  /// Refuse nothing, but NAME a write the link cannot carry intact.
+  /// Whether this leg can carry [data] intact, naming it when it cannot.
   ///
   /// These writes are WRITE_TYPE_NO_RESPONSE, so the stack cannot promote an
   /// oversized payload to a GATT long write — it clamps at `MTU - 3` and the
@@ -1074,12 +1074,12 @@ class BleTransportService extends TransportService {
   /// negotiated MTU because a peer that settled below the floor is a
   /// different fault from a payload that was mis-sized.
   ///
-  /// It is deliberately NOT dropped here: what the run needs to measure is
-  /// how often this happens and to whom, and a silent local drop would move
-  /// the evidence rather than produce it.
-  void _checkWritable(Uint8List data, ble.BlePath path, String site) {
+  /// False stops the write, so the caller can try the pair's other leg. The
+  /// refusal is still recorded, so how often this happens and to whom stays
+  /// visible in the run.
+  bool _checkWritable(Uint8List data, ble.BlePath path, String site) {
     final usable = path.mtu - 3;
-    if (data.length <= usable) return;
+    if (data.length <= usable) return true;
     debugPrint('[ble-mtu] OVERSIZED $site ${data.length}B > ${usable}B usable '
         '(mtu ${path.mtu}) on ${path.pathId} — the stack will truncate this '
         'write and the peer cannot parse it');
@@ -1089,6 +1089,7 @@ class BleTransportService extends TransportService {
       'usable': usable,
       'mtu': path.mtu,
     });
+    return false;
   }
 
   /// The neighbour-fragment chunk budget for [deviceId], sized to that leg's
@@ -1161,7 +1162,12 @@ class BleTransportService extends TransportService {
   Future<bool> _writeLeg(
       ble.BlePath path, Uint8List data, String site) async {
     try {
-      _checkWritable(data, path, site);
+      // Do not air a write this leg would truncate. The peer would get a
+      // prefix it must discard, the airtime is spent either way, and
+      // reporting it as sent hides the one remedy that exists: a pair holds
+      // two legs, they negotiate their MTUs separately, and the other may
+      // carry what this one cannot.
+      if (!_checkWritable(data, path, site)) return false;
       await _ble.send(path.pathId, data);
       if (_tracing) _wireLedger.onTx(data);
       return true;

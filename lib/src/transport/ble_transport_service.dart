@@ -349,6 +349,16 @@ class BleTransportService extends TransportService {
       'path': path.pathId,
       'role': role.name,
       if (path.rssi != null) 'rssi': path.rssi,
+      // The negotiated ATT MTU at this stage. Recorded on EVERY stage, not
+      // only beside a drop: a link that never leaves the 23-byte ATT default
+      // is reported ready and then refuses every ANNOUNCE and handshake write
+      // as oversized, so it can never identify a peer or reach a session —
+      // and with the value logged only on failure, a healthy link's MTU was
+      // absent from the traces entirely and the two cases were
+      // indistinguishable. Stamping it per stage also dates the negotiation:
+      // whether the exchange lands before `gattConnected`, between there and
+      // `identified`, or never.
+      'mtu': path.mtu,
       if (event == 'drop') 'reason': path.error ?? path.state.name,
       if (establishment) 'establishment': true,
       if (establishment) 'inFlight': _inFlightCentralDials(),

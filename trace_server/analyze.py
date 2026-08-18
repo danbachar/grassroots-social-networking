@@ -3018,7 +3018,8 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                 rows.append({**cell, "conn_idx": 0, "ms_to_establish": None,
                              "in_flight": None, "peripheral_links": None,
                              "total_links": None, "ms_to_identified": None,
-                             "ms_to_session": None, "ms_to_converged": None})
+                             "ms_to_session": None, "ms_to_converged": None,
+                             "mtu_establish": None, "mtu_identified": None})
                 continue
             for k, (_, e) in enumerate(est.iterrows(), start=1):
                 target = e.get("path")
@@ -3040,6 +3041,16 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                 idh = dl[in_win & (path == target) & (ev == "identified")
                          & (dl._t >= t_usable)]
                 ms_ident = None if idh.empty else float(idh._t.iloc[0] - t0)
+                # The ATT MTU at each stage. A link that is still at the
+                # 23-byte default when it comes up cannot carry an ANNOUNCE
+                # (~182 B) or a Noise handshake (86/113 B), so it reports
+                # ready and then refuses every write that would identify the
+                # peer. Comparing the two columns dates the negotiation:
+                # equal and low means it never happened, low then high means
+                # it landed between the link and the identity.
+                mtu_est = _num(e.get("mtu"), None)
+                mtu_ident = (None if idh.empty
+                             else _num(idh.iloc[0].get("mtu"), None))
                 # Dual-leg convergence: earliest instant >= this leg's usable
                 # stamp at which an inbound peripheral leg bound to the same
                 # identity is live, while our central leg still is.
@@ -3069,6 +3080,8 @@ def dial_probe_table(df: pd.DataFrame) -> pd.DataFrame:
                     "ms_to_identified": ms_ident,
                     "ms_to_session": ms_sess,
                     "ms_to_converged": ms_conv,
+                    "mtu_establish": mtu_est,
+                    "mtu_identified": mtu_ident,
                 })
     return pd.DataFrame(rows)
 

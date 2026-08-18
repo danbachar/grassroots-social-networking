@@ -177,15 +177,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
     if (!onNetwork) return;
     if (!TraceConfig.isConfigured) return;
     if (_uploading || _uploadComplete) return;
-    // Ask the disk, do not trust the cached count: this fires on a network
-    // change that can arrive long after the last refresh, and a wrong cached
-    // zero silently cancels the upload.
+    // Ask the disk rather than the cached count. Not because the cache is
+    // wrong — the status poll keeps it current — but because this fires on a
+    // network change, which can land inside the first poll interval after the
+    // screen mounts, when the count is still its initial zero. Reading disk
+    // makes the trigger independent of the poll's timing.
+    //
+    // No need to re-test the in-flight flag afterwards: _uploadExperimentFiles
+    // opens with its own `if (_uploading) return`, so a tap that starts an
+    // upload during this await is refused there.
     unawaited(() async {
       final trace = widget.experimentRecorder;
       if (trace == null) return;
       final bytes = await trace.experimentFileSize();
       if (!mounted || bytes <= 0) return;
-      if (_uploading || _uploadComplete) return;
       await _uploadExperimentFiles();
     }());
   }

@@ -1667,7 +1667,7 @@ void main() {
           reason: 'one leg per role is the design, not a duplicate');
     });
 
-    test('a path stuck short of ready is reaped; a healthy one is not',
+    test('an address that never reaches ready is pruned; a ready one is not',
         () async {
       // Nothing else removes it: _paths.remove runs only from a plugin-reported
       // failed/disconnected/stale, so a peer that vanishes without the OS
@@ -1683,7 +1683,7 @@ void main() {
       await pushState(2, BlePathState.ready);
 
       // Not yet old enough — neither goes.
-      transport.reapStuckPathsNow();
+      transport.pruneNeverReadyPathsNow();
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
 
@@ -1691,17 +1691,19 @@ void main() {
       // a live link must never be reaped for being long-lived.
       transport.ageNotReadyForTest('central:MAC1', const Duration(seconds: 121));
       transport.ageNotReadyForTest('central:MAC2', const Duration(seconds: 121));
-      transport.reapStuckPathsNow();
+      transport.pruneNeverReadyPathsNow();
       await Future<void>.delayed(Duration.zero);
 
       expect(hostApi.calls, contains('disconnect:central:MAC1'),
           reason: 'stuck at `connected` for a full dwell — it is not coming');
       expect(hostApi.calls, isNot(contains('disconnect:central:MAC2')),
           reason: 'reached ready, so age is irrelevant');
-      expect(trace.records.any((r) =>
-              r['event'] == 'reaped' && r['path'] == 'central:MAC1'),
-          isTrue,
-          reason: 'a reap is a measurement fact, not a silent cleanup');
+      final rec = trace.records.singleWhere((r) => r['event'] == 'pruned');
+      expect(rec['path'], 'central:MAC1');
+      expect(rec['reason'], 'neverReady');
+      expect(rec['stuckState'], 'connected',
+          reason: 'the link came up and the peer never identified itself — '
+              'distinct from a dial that never landed');
     });
 
     test('the failed-dial cooldown still refuses a redial', () async {

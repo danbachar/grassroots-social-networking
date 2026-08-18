@@ -223,7 +223,8 @@ class BleTransportService extends TransportService {
   /// check has to compare. Entries are dropped with their path.
   final Map<String, String> _peerHexByPath = {};
 
-  /// When a path first entered a live-but-not-`ready` state, for [_reapStuck].
+  /// When a path first entered a live-but-not-`ready` state, for
+  /// [_pruneNeverReadyPaths].
   final Map<String, DateTime> _notReadySince = {};
 
   /// Backdates a path's not-ready stamp so a test can age it past
@@ -244,12 +245,21 @@ class BleTransportService extends TransportService {
   /// [_linksHoldingControllerSlot]. Measured on dial-6-n8: 300 of 1419 paths
   /// that came up, 21%, never reached `ready` and never dropped.
   ///
+  /// This is NOT an idle timeout. It does not look at traffic: a path that
+  /// reached `ready` is never pruned, however long it then sits silent —
+  /// that case belongs to the stale-peer sweep. What ages out here is an
+  /// address that never became SENDABLE at all.
+  ///
   /// 120 s is the measured choice: `gattConnected -> ready` ran p50 1.6 s and
   /// p90 15.5 s, so this is far above any healthy path, and it equals one
   /// dial-grid dwell — a path stuck for a whole measurement window cannot be
-  /// part of that window's result. The p99 of that distribution is NOT used,
-  /// because pathIds are reused when an address returns and the tail is
-  /// contaminated (its mean comes out negative).
+  /// part of that window's result. The p99 and the 442 s max of that
+  /// distribution are NOT used: 12 paths reported a NEGATIVE latency, and
+  /// reading their event streams showed why — `liveLinkSnapshot` stamps a
+  /// synthetic `connected` at recording start for links already up, and a
+  /// single address cycles up and down many times (one had 8 `connected`,
+  /// 10 `gattConnected`, 7 `drop`), so first-of-each-event pairs stages from
+  /// different incarnations. The median and p90 are unaffected.
   static const Duration _stuckPathTimeout = Duration(seconds: 120);
 
   String? _peerHexForPathId(String pathId) {
@@ -363,7 +373,7 @@ class BleTransportService extends TransportService {
     }));
   }
 
-  /// Drop paths that came up and then stopped progressing.
+  /// Prune addresses that never became usable.
   ///
   /// `_paths.remove` runs only from a plugin-reported failed/disconnected/
   /// stale, so a peer that goes away without the OS surfacing it leaves an
@@ -377,9 +387,9 @@ class BleTransportService extends TransportService {
   /// Runs one reap sweep. The production caller is the link-snapshot timer;
   /// tests drive it directly rather than waiting 120 s of wall clock.
   @visibleForTesting
-  void reapStuckPathsNow() => _reapStuck();
+  void pruneNeverReadyPathsNow() => _pruneNeverReadyPaths();
 
-  void _reapStuck() {
+  void _pruneNeverReadyPaths() {
     final now = DateTime.now();
     final dead = <String>[];
     for (final entry in _notReadySince.entries) {
@@ -391,18 +401,28 @@ class BleTransportService extends TransportService {
     }
     for (final pathId in dead) {
       final path = _paths[pathId];
-      debugPrint('[ble] reaping stuck path $pathId (${path?.state.name}) '
-          'after ${_stuckPathTimeout.inSeconds}s');
+      debugPrint('[ble] pruning $pathId — never reached ready '
+          '(stuck at ${path?.state.name} for '
+          '${_stuckPathTimeout.inSeconds}s)');
       if (_tracing && path != null) {
         final role = _roleFromPathId(pathId);
         unawaited(trace!.log({
           'type': 'link',
           't': now.millisecondsSinceEpoch,
-          'event': 'reaped',
+          // What actually happened: an ADDRESS we connected to never became
+          // usable, and we are giving up on it. Not a drop (the peer never
+          // told us anything), not a disconnect of a working link — this
+          // path never carried a byte, because `ready` is what makes a path
+          // sendable.
+          'event': 'pruned',
+          'reason': 'neverReady',
           'path': pathId,
           if (role != null) 'role': role.name,
-          'state': path.state.name,
-          'stuckSec': _stuckPathTimeout.inSeconds,
+          // The stage it died in: `connecting` means the dial never landed,
+          // `connected`/`subscribed` mean the link came up and the peer never
+          // identified itself, which is the rotated-address case.
+          'stuckState': path.state.name,
+          'afterSec': _stuckPathTimeout.inSeconds,
           ...?_peerField(pathId),
         }));
       }
@@ -702,7 +722,7 @@ class BleTransportService extends TransportService {
     _linkSnapshotTimer = Timer.periodic(
       _linkSnapshotInterval,
       (_) {
-        _reapStuck();
+        _pruneNeverReadyPaths();
         unawaited(_pollLinkSnapshot());
       },
     );

@@ -1570,11 +1570,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                     ),
                   ),
                   const Spacer(),
-                  Text(
-                    '${_peers.length} nearby · ${onlineFriends.length} friends',
-                    style: const TextStyle(
-                        fontSize: GlType.textXs, color: GlColors.textMuted),
-                  ),
+                  Builder(builder: (context) {
+                    final counts =
+                        '${_peers.length} nearby · ${onlineFriends.length} friends';
+                    // What the radio is actually holding, beside what the app
+                    // can see: peers and friends are app-level facts, while
+                    // ACLs are the controller's own budget, and the gap
+                    // between them is the thing worth noticing.
+                    final acls = state.transports.bleLinks.length;
+                    return Text(
+                      state.settings.showLinkDiagnostics
+                          ? '$counts · $acls ACL${acls == 1 ? '' : 's'}'
+                          : counts,
+                      style: const TextStyle(
+                          fontSize: GlType.textXs, color: GlColors.textMuted),
+                    );
+                  }),
                 ],
               ),
             );

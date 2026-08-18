@@ -523,14 +523,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(
                   fontSize: GlType.textSm, fontWeight: FontWeight.w600),
             ),
-            subtitle: Text(
+            subtitle: const Text(
               'Show what each pair\'s connection is made of: legs on peer rows '
-              'and in chat, where 2 legs means the pair converged to dual-role. '
-              'Ground truth from the OS. This device holds '
-              '${widget.store.state.transports.bleLinks.length} ACL'
-              '${widget.store.state.transports.bleLinks.length == 1 ? '' : 's'} '
-              'right now.',
-              style: const TextStyle(
+              'and in chat, where 2 legs means the pair converged to dual-role, '
+              'and this device\'s ACL count beside the Nearby totals. Ground '
+              'truth from the OS.',
+              style: TextStyle(
                   fontSize: GlType.textXs, color: GlColors.textMuted),
             ),
           ),

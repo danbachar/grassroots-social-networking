@@ -953,15 +953,23 @@ class FieldPlanPresets {
         // there is no per-role entry to pick wrongly.
         // EIGHT phones, nicknamed 1..8: the nickname IS the join order, so the
         // fleet has to carry every slot up to maxPop. maxPop MUST match the
-        // phones actually present — a plan asking for N=8 with six radios
-        // silently relabels a six-phone population as eight.
-        // A FRESH id: -5 was the six-phone grid, and the recorder APPENDS, so
-        // re-using it would merge two different populations into one file and
-        // one analysis.
-        // 28 measured cells x 120 s + (90 + 6x60) converge + 35 x (5 s dark +
-        // 5 s gap) + (60 settle + 300 align + 120 placement) = 4640 s ~= 1.3 h.
-        'Dial grid N x M (8 phones, 1 rep, ~1.3h)':
-            dialGridProbe(expId: 'dial-6-n8', maxPop: 8),
+        // phones actually present — a plan asking for N=11 with eight radios
+        // silently relabels an eight-phone population as eleven.
+        // Eleven nicknamed slots: 4x Nexus 5X, Galaxy S10e, Huawei, Pixel 2,
+        // Pixel 10 Pro, then the three wireless-adb phones (Pixel 7a, Galaxy
+        // A72, Galaxy Note20) — those three keep Wi-Fi ON, since it is their
+        // only link, so the run prep must not switch it off for them.
+        // reps: 2. The single rep was a shakedown of the grid; dial-6-n8
+        // confirmed the traces carry inFlight/maxParallel/popN on every
+        // establishment and that radioUp is true, so each cell is now measured
+        // twice and a per-cell figure has a spread rather than one sample.
+        // A FRESH id: the recorder APPENDS, so re-using -6 would merge an
+        // eight-phone population with an eleven-phone one in a single analysis.
+        // 55 cells x 2 reps = 110 measured x 120 s + (90 + 9x60) converge +
+        // 120 x (5 s dark + 5 s gap) + (60 settle + 300 align + 120 placement)
+        // = 15510 s ~= 4.3 h.
+        'Dial grid N x M (11 phones, 2 reps, ~4.3h)':
+            dialGridProbe(expId: 'dial-7-n11', maxPop: 11, reps: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload. The shakedown runs live
         // under scf-desk-1; this is the measured one.

@@ -35,7 +35,11 @@ const String _grassrootsCharacteristicUuid =
 /// ~200 bytes, far over the default ATT MTU of 23 (20-byte payload). 247 is
 /// the largest most Android stacks negotiate; the actual value is whatever
 /// the peer accepts and is reported back via the `BlePath.mtu` field.
-const int _requestedAndroidMtu = 247;
+/// The ATT MTU asked for on every central link: the specification's ceiling,
+/// so the two controllers settle at whatever they can both carry rather than
+/// at a number chosen here. What they agree on is reported back per path and
+/// is what writes are sized against; this is only the opening ask.
+const int _requestedAndroidMtu = 517;
 
 /// The BLE default ATT MTU before any negotiation (20-byte usable payload).
 /// Used as the fragment-budget fallback when a device has no ready path or has

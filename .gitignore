@@ -63,3 +63,11 @@ trace_server/data/
 
 # Build-time secrets (TRACE_TOKEN). Never commit.
 .env
+
+# LaTeX build products for the standalone chapter build
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.toc

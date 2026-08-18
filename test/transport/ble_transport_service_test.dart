@@ -1667,6 +1667,43 @@ void main() {
           reason: 'one leg per role is the design, not a duplicate');
     });
 
+    test('a path stuck short of ready is reaped; a healthy one is not',
+        () async {
+      // Nothing else removes it: _paths.remove runs only from a plugin-reported
+      // failed/disconnected/stale, so a peer that vanishes without the OS
+      // saying so is counted forever — against the dial cap and against the
+      // controller slot count. dial-6-n8: 300 of 1419 paths that came up (21%)
+      // never reached ready and never dropped.
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.connected);
+      await adv(2);
+      await pushState(2, BlePathState.connecting);
+      await pushState(2, BlePathState.connected);
+      await pushState(2, BlePathState.ready);
+
+      // Not yet old enough — neither goes.
+      transport.reapStuckPathsNow();
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+
+      // Age BOTH past the timeout. Only the one still short of `ready` dies:
+      // a live link must never be reaped for being long-lived.
+      transport.ageNotReadyForTest('central:MAC1', const Duration(seconds: 121));
+      transport.ageNotReadyForTest('central:MAC2', const Duration(seconds: 121));
+      transport.reapStuckPathsNow();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls, contains('disconnect:central:MAC1'),
+          reason: 'stuck at `connected` for a full dwell — it is not coming');
+      expect(hostApi.calls, isNot(contains('disconnect:central:MAC2')),
+          reason: 'reached ready, so age is irrelevant');
+      expect(trace.records.any((r) =>
+              r['event'] == 'reaped' && r['path'] == 'central:MAC1'),
+          isTrue,
+          reason: 'a reap is a measurement fact, not a silent cleanup');
+    });
+
     test('the failed-dial cooldown still refuses a redial', () async {
       transport.setDialParallelism(maxParallel: 4, popN: 5);
       await adv(2);

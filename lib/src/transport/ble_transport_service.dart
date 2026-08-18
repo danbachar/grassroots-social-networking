@@ -223,6 +223,35 @@ class BleTransportService extends TransportService {
   /// check has to compare. Entries are dropped with their path.
   final Map<String, String> _peerHexByPath = {};
 
+  /// When a path first entered a live-but-not-`ready` state, for [_reapStuck].
+  final Map<String, DateTime> _notReadySince = {};
+
+  /// Backdates a path's not-ready stamp so a test can age it past
+  /// [_stuckPathTimeout] without 120 s of wall clock.
+  @visibleForTesting
+  void ageNotReadyForTest(String pathId, Duration by) {
+    final at = _notReadySince[pathId];
+    if (at != null) _notReadySince[pathId] = at.subtract(by);
+  }
+
+  /// How long a path may sit in connecting/connected/subscribed before it is
+  /// declared dead and dropped.
+  ///
+  /// Nothing else removes it: `_paths.remove` fires only on a plugin-reported
+  /// failed/disconnected/stale, so a path whose peer vanished without the OS
+  /// saying so lives forever — and keeps being counted by
+  /// [_inFlightCentralDials] (denying a real dial one of the M slots) and by
+  /// [_linksHoldingControllerSlot]. Measured on dial-6-n8: 300 of 1419 paths
+  /// that came up, 21%, never reached `ready` and never dropped.
+  ///
+  /// 120 s is the measured choice: `gattConnected -> ready` ran p50 1.6 s and
+  /// p90 15.5 s, so this is far above any healthy path, and it equals one
+  /// dial-grid dwell — a path stuck for a whole measurement window cannot be
+  /// part of that window's result. The p99 of that distribution is NOT used,
+  /// because pathIds are reused when an address returns and the tail is
+  /// contaminated (its mean comes out negative).
+  static const Duration _stuckPathTimeout = Duration(seconds: 120);
+
   String? _peerHexForPathId(String pathId) {
     final known = _peerHexByPath[pathId];
     if (known != null) return known;
@@ -332,6 +361,56 @@ class BleTransportService extends TransportService {
       if (staged && dialProbePopN != null) 'popN': dialProbePopN,
       ...?_peerField(path.pathId),
     }));
+  }
+
+  /// Drop paths that came up and then stopped progressing.
+  ///
+  /// `_paths.remove` runs only from a plugin-reported failed/disconnected/
+  /// stale, so a peer that goes away without the OS surfacing it leaves an
+  /// entry that is counted forever — by [_inFlightCentralDials], which then
+  /// denies a real dial one of the M slots, and by
+  /// [_linksHoldingControllerSlot].
+  ///
+  /// Disconnect first, then forget: dropping our bookkeeping alone would free
+  /// the counter while the controller still held the link, which is the
+  /// opposite of the intent.
+  /// Runs one reap sweep. The production caller is the link-snapshot timer;
+  /// tests drive it directly rather than waiting 120 s of wall clock.
+  @visibleForTesting
+  void reapStuckPathsNow() => _reapStuck();
+
+  void _reapStuck() {
+    final now = DateTime.now();
+    final dead = <String>[];
+    for (final entry in _notReadySince.entries) {
+      final path = _paths[entry.key];
+      if (path == null) continue;
+      if (_isReady(path)) continue;
+      if (now.difference(entry.value) < _stuckPathTimeout) continue;
+      dead.add(entry.key);
+    }
+    for (final pathId in dead) {
+      final path = _paths[pathId];
+      debugPrint('[ble] reaping stuck path $pathId (${path?.state.name}) '
+          'after ${_stuckPathTimeout.inSeconds}s');
+      if (_tracing && path != null) {
+        final role = _roleFromPathId(pathId);
+        unawaited(trace!.log({
+          'type': 'link',
+          't': now.millisecondsSinceEpoch,
+          'event': 'reaped',
+          'path': pathId,
+          if (role != null) 'role': role.name,
+          'state': path.state.name,
+          'stuckSec': _stuckPathTimeout.inSeconds,
+          ...?_peerField(pathId),
+        }));
+      }
+      unawaited(disconnectDevice(pathId));
+      _paths.remove(pathId);
+      _peerHexByPath.remove(pathId);
+      _notReadySince.remove(pathId);
+    }
   }
 
   /// Legs holding a controller link slot in [role], or across both roles when
@@ -622,7 +701,10 @@ class BleTransportService extends TransportService {
     _linkSnapshotTimer?.cancel();
     _linkSnapshotTimer = Timer.periodic(
       _linkSnapshotInterval,
-      (_) => unawaited(_pollLinkSnapshot()),
+      (_) {
+        _reapStuck();
+        unawaited(_pollLinkSnapshot());
+      },
     );
   }
 
@@ -1981,6 +2063,16 @@ class BleTransportService extends TransportService {
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
 
+    // Stamp when a path first became live-but-not-ready, so [_reapStuck] can
+    // tell a slow handshake from one that will never finish. FIRST moment
+    // only — re-stamping on every event would make a path that keeps emitting
+    // look perpetually fresh and never age out.
+    if (path.state == ble.BlePathState.connecting ||
+        path.state == ble.BlePathState.connected ||
+        path.state == ble.BlePathState.subscribed) {
+      _notReadySince.putIfAbsent(path.pathId, DateTime.now);
+    }
+
     final role =
         path.role == ble.BleRole.central ? BleRole.central : BleRole.peripheral;
 
@@ -2016,6 +2108,7 @@ class BleTransportService extends TransportService {
         }
         break;
       case ble.BlePathState.ready:
+        _notReadySince.remove(path.pathId);
         // A successful connect clears any dial-failure cooldown for this path.
         _centralDialFailedAt.remove(path.pathId);
         if (previous?.state != ble.BlePathState.ready) {
@@ -2080,6 +2173,7 @@ class BleTransportService extends TransportService {
         }
         _paths.remove(path.pathId);
         _peerHexByPath.remove(path.pathId);
+        _notReadySince.remove(path.pathId);
         // A dropped leg may add or clear a reverse-leg scan target.
         unawaited(_applyScanTargets());
         break;

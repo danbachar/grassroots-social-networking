@@ -235,9 +235,14 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   }
 
   /// A phone that has not joined the mesh yet: the run's step progression is
-  /// irrelevant to its operator — the one thing that matters is when to turn
-  /// Bluetooth on, so that is the whole screen.
+  /// somebody else's, and the one thing that matters is this phone's own join.
+  ///
+  /// On a scripted-radio plan the runner works the transport itself, so the
+  /// screen is a countdown to watch and asking the operator to act would ask
+  /// for something that is not theirs to do. Where a human owns the toggle,
+  /// the same screen IS the instruction.
   Widget _waitingToJoin(FieldRunner runner) {
+    final scripted = widget.plan.scriptedRadio;
     final joinAt = runner.myJoinAtMs;
     final windowAt = joinAt == null
         ? null
@@ -252,16 +257,16 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         const Icon(Icons.bluetooth_disabled,
             color: Colors.white54, size: 72),
         const SizedBox(height: 14),
-        const Text('KEEP BLUETOOTH OFF',
+        Text(scripted ? 'NOT IN THE MESH YET' : 'KEEP BLUETOOTH OFF',
             textAlign: TextAlign.center,
-            style: TextStyle(
+            style: const TextStyle(
                 color: Colors.white70,
                 fontSize: 30,
                 fontWeight: FontWeight.w800)),
         const SizedBox(height: 22),
-        const Text('you turn it ON in',
+        Text(scripted ? 'this phone joins itself in' : 'you turn it ON in',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54, fontSize: 20)),
+            style: const TextStyle(color: Colors.white54, fontSize: 20)),
         Text(_mmss(remaining < 0 ? 0 : remaining),
             textAlign: TextAlign.center,
             style: const TextStyle(
@@ -272,6 +277,12 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           Text('at ${_hhmmss(windowAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        if (scripted) ...[
+          const SizedBox(height: 10),
+          const Text('nothing to do — leave the phone alone',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white38, fontSize: 16)),
+        ],
         if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
           _orderBadge(runner.joinOrder!),
@@ -287,9 +298,11 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     );
   }
 
-  /// The between-step gap in manual mode — no taps exist. When the NEXT step
-  /// is this phone's first joined one, this gap IS the operator's window to
-  /// turn Bluetooth on, and the screen is nothing but that instruction.
+  /// The between-step gap in manual mode — no taps exist. Where the operator
+  /// owns the radio and the NEXT step is this phone's first joined one, this
+  /// gap IS their window to turn Bluetooth on, and the screen is nothing but
+  /// that instruction; `radioAction` is what decides that, and it stays null
+  /// on a scripted-radio plan.
   Widget _manualGap(FieldStep step, FieldRunner runner) {
     final action = runner.radioAction;
     if (action != null) return _radioPrompt(action, runner.remainingSec);

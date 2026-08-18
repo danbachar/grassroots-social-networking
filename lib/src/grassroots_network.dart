@@ -2247,79 +2247,6 @@ class GrassrootsNetwork {
     return false;
   }
 
-  /// Broadcast a message to all peers on all enabled transports.
-  Future<void> broadcast(Uint8List payload) async {
-    // Broadcast as individually encrypted unicast packets, one Noise session
-    // per peer per transport medium.
-    if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
-      try {
-        for (final peerId in _bleService!.connectedPeerIds) {
-          final pubkey = _bleService!.getPubkeyForPeerId(peerId);
-          if (pubkey == null) continue;
-          if (_fragmentHandler.needsFragmentation(payload)) {
-            if (!_noiseSessions.hasSession(pubkey)) continue;
-            for (final sealed in await _sealFragments(
-              payload: payload,
-              recipientPubkey: pubkey,
-              messageId: _uuid.v4(),
-            )) {
-              await _floodViaBle(sealed.serialize());
-              await Future.delayed(FragmentHandler.fragmentDelay);
-            }
-          } else {
-            // Same gate as the fragmenting branch above: no session, no
-            // packet. Relying on the sealer to return null let a packet be
-            // built for a peer we had never handshaked with.
-            if (!_noiseSessions.hasSession(pubkey)) continue;
-            final packet = _protocolHandler.createMessagePacket(
-              payload: payload,
-              recipientPubkey: pubkey,
-              messageId: _uuid.v4(),
-            );
-            final bytes = await _sealedPacketBytesForTransport(
-              packet: packet,
-              transport: PeerTransport.bleDirect,
-              recipientPubkey: pubkey,
-              peerId: peerId,
-            );
-            if (bytes != null) {
-              await _bleService!.sendToPeer(peerId, bytes);
-            }
-          }
-        }
-      } catch (e) {
-        debugPrint('BLE broadcast failed: $e');
-      }
-    }
-
-    if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
-      try {
-        for (final peer in _peersState.peersList) {
-          if (_udpService!.getPeerIdForPubkey(peer.publicKey) == null) {
-            continue;
-          }
-          // No session, no packet.
-          if (!_noiseSessions.hasSession(peer.publicKey)) continue;
-          final packet = _protocolHandler.createMessagePacket(
-            payload: payload,
-            recipientPubkey: peer.publicKey,
-            messageId: _uuid.v4(),
-          );
-          final bytes = await _sealedPacketBytesForTransport(
-            packet: packet,
-            transport: PeerTransport.udp,
-            recipientPubkey: peer.publicKey,
-            peerId: peer.pubkeyHex,
-          );
-          if (bytes != null) {
-            await _udpService!.sendToPeer(peer.pubkeyHex, bytes);
-          }
-        }
-      } catch (e) {
-        debugPrint('UDP broadcast failed: $e');
-      }
-    }
-  }
 
   // ===== Public Address Discovery =====
 
@@ -5518,18 +5445,6 @@ class GrassrootsNetwork {
       sealed.add(out);
     }
     return sealed;
-  }
-
-  /// Flood a serialized packet into the BLE mesh (managed flooding). Returns the
-  /// number of neighbors it was sent to. [excludeBlePeerId] skips the inbound
-  /// path when relaying.
-  Future<int> _floodViaBle(Uint8List bytes, {String? excludeBlePeerId}) async {
-    final service = _bleService;
-    if (service == null || !_bleAvailable) return 0;
-    return service.broadcast(
-      bytes,
-      excludePeerIds: excludeBlePeerId == null ? null : {excludeBlePeerId},
-    );
   }
 }
 

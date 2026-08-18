@@ -1835,17 +1835,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             final heard = peer.lastBleSeen != null
                 ? 'Heard ${_formatSecondsAgo(peer.lastBleSeen!)}'
                 : 'Reaching out…';
-            // Debug link-diagnostics: physical link (ACL) count to this peer
-            // from the plugin's OS-level snapshot.
+            // Debug link-diagnostics: what this pair's connection is made
+            // of, from the plugin's OS-level snapshot. Legs, not ACLs: both
+            // GATT directions normally ride one ACL, so an ACL count reads 1
+            // for a converged pair and for a half-open one alike.
             if (!appStore.state.settings.showLinkDiagnostics) {
               return Text(heard);
             }
-            final linkCount = bleLinkCountForPathIds(
+            final tally = bleLinkTallyForPathIds(
               appStore.state.transports.bleLinks,
               [peer.bleCentralDeviceId, peer.blePeripheralDeviceId],
             );
-            return Text(
-                '$heard · $linkCount link${linkCount == 1 ? '' : 's'}');
+            final legs = '${tally.legs} leg${tally.legs == 1 ? '' : 's'}';
+            // Two ACLs is the unusual shape and worth surfacing; one is the
+            // norm and would just be noise on every row.
+            final acls = tally.acls > 1 ? ' over ${tally.acls} ACLs' : '';
+            return Text('$heard · $legs$acls');
           }),
           trailing: Row(
             mainAxisSize: MainAxisSize.min,

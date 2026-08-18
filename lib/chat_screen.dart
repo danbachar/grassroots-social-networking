@@ -82,9 +82,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String get _peerHex => ChatMessage.pubkeyToHex(widget.peer.publicKey);
 
-  /// Debug link-diagnostics app-bar line ("2 links to peer · 5 total"), or
-  /// null when the toggle is off. Counts come from the plugin's OS-level
-  /// link snapshot, joined to this peer's live path IDs by address.
+  /// Debug link-diagnostics app-bar line ("2 legs · 1 ACL · 5 ACLs total"), or
+  /// null when the toggle is off. Counts come from the plugin's OS-level link
+  /// snapshot, joined to this peer's live path IDs by address. Legs first,
+  /// because whether the pair has converged to dual-role is the thing being
+  /// diagnosed; the ACL counts say what that costs the controller.
   String? get _linkDiagnosticsLine {
     final s = widget.store.state;
     if (!s.settings.showLinkDiagnostics) return null;
@@ -92,10 +94,11 @@ class _ChatScreenState extends State<ChatScreen> {
     // widget.peer is a navigation-time snapshot; read the live record for
     // current device IDs.
     final live = s.peers.getPeerByPubkey(widget.peer.publicKey) ?? widget.peer;
-    final toPeer = bleLinkCountForPathIds(
+    final tally = bleLinkTallyForPathIds(
         links, [live.bleCentralDeviceId, live.blePeripheralDeviceId]);
-    return '$toPeer link${toPeer == 1 ? '' : 's'} to peer · '
-        '${links.length} total';
+    return '${tally.legs} leg${tally.legs == 1 ? '' : 's'} · '
+        '${tally.acls} ACL${tally.acls == 1 ? '' : 's'} · '
+        '${links.length} ACLs total';
   }
   String get _myHex => ChatMessage.pubkeyToHex(widget.myPubkey);
 

@@ -52,18 +52,48 @@ class BleLinkDiagnostic {
   int get hashCode => Object.hash(address, clientRole, serverRole);
 }
 
-/// Number of live physical links whose remote address matches one of the
-/// given path IDs (`central:X` / `peripheral:X`; nulls skipped). Used by the
-/// link-diagnostics overlay to attribute OS-level links to a peer: 1 with a
-/// dual-role pair means the shared over-ACL link; 2 means dual ACLs.
-int bleLinkCountForPathIds(
+/// What a peer's live BLE connection is made of.
+@immutable
+class BleLinkTally {
+  /// GATT directions in use across the pair's links. This is the number that
+  /// says whether a pair has converged: 2 is dual-role, 1 is a half-open pair
+  /// still trying to complete.
+  final int legs;
+
+  /// Physical ACL connections the pair holds. Usually 1 even when converged,
+  /// because both GATT directions ride one ACL; 2 only when the peer presents
+  /// a different address for each direction.
+  final int acls;
+
+  const BleLinkTally({required this.legs, required this.acls});
+
+  bool get isDualRole => legs >= 2;
+}
+
+/// Split the OS-level link snapshot for one peer into legs and ACLs, matching
+/// its live path IDs (`central:X` / `peripheral:X`; nulls skipped) by address.
+///
+/// Counting entries alone cannot answer the question the diagnostics exist to
+/// answer. A pair's two GATT directions normally share one ACL and one remote
+/// address, so an address-keyed count reads 1 whether the pair has converged
+/// to dual-role or is holding a single leg — the two states it most matters to
+/// tell apart. The snapshot already distinguishes them: each entry carries the
+/// roles riding that link, so the legs are summed from those flags and the
+/// ACLs are the entries themselves.
+BleLinkTally bleLinkTallyForPathIds(
     List<BleLinkDiagnostic> links, Iterable<String?> pathIds) {
   final addrs = pathIds
       .whereType<String>()
       .map((id) => id.substring(id.indexOf(':') + 1))
       .toSet();
-  if (addrs.isEmpty) return 0;
-  return links.where((l) => addrs.contains(l.address)).length;
+  if (addrs.isEmpty) return const BleLinkTally(legs: 0, acls: 0);
+  final mine = links.where((l) => addrs.contains(l.address)).toList();
+  var legs = 0;
+  for (final l in mine) {
+    if (l.clientRole) legs++;
+    if (l.serverRole) legs++;
+  }
+  return BleLinkTally(legs: legs, acls: mine.length);
 }
 
 /// Per-transport lifecycle state for Redux store.

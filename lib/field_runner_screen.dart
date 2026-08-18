@@ -158,10 +158,15 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   /// anchor, which reads as a broken clock. In
   /// UTC, phones that agree show identical text and phones that disagree
   /// really do disagree.
+  /// A wall-clock time for the operator, in the phone's own timezone.
+  ///
+  /// The schedule is computed in UTC so every phone lands on one instant, but
+  /// nobody standing at the bench is holding a UTC clock — the time shown here
+  /// is the one they can compare against a watch.
   static String _hhmmss(int epochMs) {
-    final d = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
+    final d = DateTime.fromMillisecondsSinceEpoch(epochMs);
     String two(int v) => v.toString().padLeft(2, '0');
-    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}Z';
+    return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
   }
 
   /// "BLUETOOTH ON in 12:30 (at 14:52:30)" for a phone that joins later.
@@ -294,10 +299,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           Text('at ${_hhmmss(endAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
-        const SizedBox(height: 10),
-        const Text('nothing to do',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white38, fontSize: 16)),
         if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
           _orderBadge(runner.joinOrder!),

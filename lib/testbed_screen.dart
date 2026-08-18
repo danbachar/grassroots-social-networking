@@ -177,8 +177,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
     if (!onNetwork) return;
     if (!TraceConfig.isConfigured) return;
     if (_uploading || _uploadComplete) return;
-    if (_expFileBytes <= 0) return;
-    unawaited(_uploadExperimentFiles());
+    // Ask the disk, do not trust the cached count: this fires on a network
+    // change that can arrive long after the last refresh, and a wrong cached
+    // zero silently cancels the upload.
+    unawaited(() async {
+      final trace = widget.experimentRecorder;
+      if (trace == null) return;
+      final bytes = await trace.experimentFileSize();
+      if (!mounted || bytes <= 0) return;
+      if (_uploading || _uploadComplete) return;
+      await _uploadExperimentFiles();
+    }());
   }
 
   /// Close the runner if it is up, so the upload's own state is visible.
@@ -191,7 +200,12 @@ class _TestbedScreenState extends State<TestbedScreen> {
 
   void _refreshStatus() {
     final trace = widget.experimentRecorder;
-    if (trace != null && trace.active) {
+    // Poll the on-disk size whether or not a recording is RUNNING. Gating this
+    // on `trace.active` meant the size stopped being maintained the moment a
+    // run ended — which is precisely when the files matter, and it left the
+    // auto-upload trigger reading a stale or zero byte count and skipping the
+    // upload it exists to perform.
+    if (trace != null) {
       unawaited(trace.experimentFileSize().then((bytes) {
         if (!mounted) return;
         setState(() {

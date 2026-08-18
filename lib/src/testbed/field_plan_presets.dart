@@ -859,6 +859,51 @@ class FieldPlanPresets {
     );
   }
 
+  /// SESSION CHURN: five short windows, each starting from no sessions and no
+  /// links.
+  ///
+  /// Built to answer one question quickly — does a pair form a Noise session
+  /// and move a message — after a change to the transport. Five windows rather
+  /// than one because the failure it is aimed at is per-connection: a
+  /// peripheral leg that misses its MTU exchange is dead for that link's whole
+  /// life, so a single window either hits the case or says nothing about it.
+  /// Clearing the links as well as the sessions is what makes each window an
+  /// independent draw: sessions alone would re-handshake over legs that were
+  /// already proven good in window one.
+  ///
+  /// [sendCount] messages per window make the result end-to-end. A session
+  /// that establishes but cannot carry a payload is not a working pair, and
+  /// delivery is the only evidence that separates the two.
+  ///
+  /// ~3 minutes including settle. Run it on every phone that should be in the
+  /// clique; nothing is scripted, so the radios stay up throughout.
+  static FieldPlan sessionChurn({
+    String expId = 'session-churn-1',
+    int windows = 5,
+    int dwellSec = 30,
+    int sendCount = 10,
+    int darkSec = 3,
+  }) {
+    return FieldPlan(
+      expId: expId,
+      settleSec: 15,
+      autoAdvanceGapSec: 5,
+      resetSessions: true,
+      resetLinks: true,
+      linkResetDarkSec: darkSec,
+      resetDtnBuffer: true,
+      steps: [
+        for (var w = 1; w <= windows; w++)
+          FieldStep(
+            label: 'churn w$w',
+            dwellSec: dwellSec,
+            sendCount: sendCount,
+            autoAdvance: w > 1,
+          ),
+      ],
+    );
+  }
+
   /// Rebuild [p] under the manual running logic: wall-clock-anchored start.
   /// This is the ONE flow every experiment runs under; walk-driven plans no
   /// longer exist. The lone exception is the bounce-stress diagnostic, whose
@@ -989,6 +1034,8 @@ class FieldPlanPresets {
             storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
         'SCF desk — sender (everyone else)':
             storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
+        'Session churn (5 x 30s, sessions reset, ~3 min)':
+            manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),
         'Link-cycle check (5×1 min)': manualized(cycleCheck()),
         'Throughput (saturate 60s)': manualized(throughput()),

@@ -308,6 +308,17 @@ class FieldRunner extends ChangeNotifier {
     return null;
   }
 
+  /// When the whole plan is over: the last step's dwell end plus the settle
+  /// window. This is what a phone with nothing to do counts down to, so the
+  /// screen answers "how long until this is finished" rather than timing a
+  /// step boundary nobody has to act on. Null outside a manual run, where
+  /// there is no wall-clock schedule to read it off.
+  int? get planEndMs {
+    final plan = _plan, starts = _stepStartMs;
+    if (plan == null || starts == null || starts.isEmpty) return null;
+    return starts.last + (plan.steps.last.dwellSec + plan.settleSec) * 1000;
+  }
+
   /// Whether this phone joins after the run start (roles 4+): the ones whose
   /// Bluetooth the operator must turn on mid-run.
   bool get joinsLater =>

@@ -48,6 +48,16 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       '${(sec ~/ 60).toString().padLeft(2, '0')}:'
       '${(sec % 60).toString().padLeft(2, '0')}';
 
+  /// Hours only once there are hours: a whole run is four digits of minutes
+  /// in mm:ss, which is read as a clock time and misread as minutes.
+  String _span(int sec) {
+    if (sec < 0) sec = 0;
+    if (sec < 3600) return _mmss(sec);
+    return '${sec ~/ 3600}:'
+        '${((sec % 3600) ~/ 60).toString().padLeft(2, '0')}:'
+        '${(sec % 60).toString().padLeft(2, '0')}';
+  }
+
   Future<void> _confirmAbort() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -112,17 +122,12 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   FieldPhase.positioning => runner.manualJoin
                       ? _manualGap(step!, runner)
                       : _positioning(step!, runner),
-                  FieldPhase.dwelling => _countdown(
-                      'HOLD — ${step!.label}',
-                      runner.remainingSec,
-                      [
-                        step.bulk ? 'bulk flows running' : 'recording',
-                        if (runner.radioAction != null)
-                          'TURN BLUETOOTH '
-                              '${runner.radioAction == 'on' ? 'ON' : 'OFF'} — '
-                              'the window has already started',
-                      ].join('\n'),
-                      Colors.orangeAccent),
+                  // A dwell the operator has to act in is an instruction;
+                  // one they do not is just time left on the run.
+                  FieldPhase.dwelling => runner.radioAction != null
+                      ? _radioPrompt(runner.radioAction!, runner.remainingSec)
+                      : _untilEnd(runner,
+                          note: step!.bulk ? 'bulk flows running' : null),
                   FieldPhase.settling => _countdown(
                       'SETTLING',
                       runner.remainingSec,
@@ -234,64 +239,76 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     );
   }
 
-  /// A phone that has not joined the mesh yet: the run's step progression is
-  /// somebody else's, and the one thing that matters is this phone's own join.
-  ///
-  /// On a scripted-radio plan the runner works the transport itself, so the
-  /// screen is a countdown to watch and asking the operator to act would ask
-  /// for something that is not theirs to do. Where a human owns the toggle,
-  /// the same screen IS the instruction.
+  /// A phone that has not joined the mesh yet. On a scripted-radio plan the
+  /// runner works the transport itself, so there is nothing to ask for and
+  /// the screen counts down to the end of the run like any other idle phone.
+  /// Where the operator owns the radio, their join IS an instruction, so it
+  /// wears the same ENABLE BT face as every other radio window.
   Widget _waitingToJoin(FieldRunner runner) {
-    final scripted = widget.plan.scriptedRadio;
     final joinAt = runner.myJoinAtMs;
     final windowAt = joinAt == null
         ? null
         : joinAt - widget.plan.autoAdvanceGapSec * 1000;
+    if (widget.plan.scriptedRadio) {
+      return _untilEnd(runner,
+          note: windowAt == null
+              ? null
+              : 'joins itself at ${_hhmmss(windowAt)}');
+    }
     final remaining = windowAt == null
         ? 0
         : ((windowAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
+    return _radioPrompt('on', remaining < 0 ? 0 : remaining,
+        order: runner.joinOrder);
+  }
+
+  /// The one screen for a phone with nothing to do: how long until the whole
+  /// run is over. A step boundary nobody has to act on is not worth a number
+  /// this size, and an unattended run is read from across a room.
+  Widget _untilEnd(FieldRunner runner, {String? note}) {
+    final endAt = runner.planEndMs;
+    final remaining = endAt == null
+        ? runner.remainingSec
+        : ((endAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Icon(Icons.bluetooth_disabled,
-            color: Colors.white54, size: 72),
+        const Icon(Icons.hourglass_bottom, color: Colors.white24, size: 64),
         const SizedBox(height: 14),
-        Text(scripted ? 'NOT IN THE MESH YET' : 'KEEP BLUETOOTH OFF',
+        const Text('EXPERIMENT ENDS IN',
             textAlign: TextAlign.center,
-            style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 30,
-                fontWeight: FontWeight.w800)),
-        const SizedBox(height: 22),
-        Text(scripted ? 'this phone joins itself in' : 'you turn it ON in',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white54, fontSize: 20)),
-        Text(_mmss(remaining < 0 ? 0 : remaining),
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                color: Colors.tealAccent,
-                fontSize: 96,
-                fontWeight: FontWeight.w800)),
-        if (windowAt != null)
-          Text('at ${_hhmmss(windowAt)}',
+            style: TextStyle(
+                color: Colors.white54,
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        FittedBox(
+          child: Text(_span(remaining),
+              style: const TextStyle(
+                  color: Colors.tealAccent,
+                  fontSize: 96,
+                  fontWeight: FontWeight.w800)),
+        ),
+        if (endAt != null)
+          Text('at ${_hhmmss(endAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
-        if (scripted) ...[
-          const SizedBox(height: 10),
-          const Text('nothing to do — leave the phone alone',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white38, fontSize: 16)),
-        ],
+        const SizedBox(height: 10),
+        const Text('nothing to do',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white38, fontSize: 16)),
         if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
           _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 16),
         Text(
-            'run in progress — '
-            '${runner.currentStep?.label ?? ''} '
-            '(step ${runner.stepIndex + 1}/${widget.plan.steps.length})',
+            [
+              if (note != null) note,
+              '${runner.currentStep?.label ?? ''} '
+                  '(step ${runner.stepIndex + 1}/${widget.plan.steps.length})',
+            ].join('\n'),
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white30, fontSize: 14)),
       ],
@@ -306,21 +323,16 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   Widget _manualGap(FieldStep step, FieldRunner runner) {
     final action = runner.radioAction;
     if (action != null) return _radioPrompt(action, runner.remainingSec);
-    return _countdown(
-      'NEXT — ${step.label}',
-      runner.remainingSec,
-      [
-        'between steps',
-        if (!runner.radioSeenUp && runner.joinsLater) _joinEta(runner),
-      ].join('\n'),
-      Colors.blueGrey,
-    );
+    return _untilEnd(runner,
+        note: !runner.radioSeenUp && runner.joinsLater
+            ? _joinEta(runner)
+            : 'next — ${step.label}');
   }
 
   /// Full-screen radio instruction: the operator's window to toggle system
-  /// Bluetooth, counted down. One widget for both directions so an off-step
-  /// and a join-step can never phrase the ask differently.
-  Widget _radioPrompt(String action, int remainingSec) {
+  /// Bluetooth, counted down. One widget for both directions and for both a
+  /// mid-run window and a join, so the ask is phrased the same everywhere.
+  Widget _radioPrompt(String action, int remainingSec, {int? order}) {
     final on = action == 'on';
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -330,23 +342,28 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
             color: Colors.orangeAccent, size: 88),
         const SizedBox(height: 16),
         FittedBox(
-          child: Text(on ? 'TURN ON BLUETOOTH NOW' : 'TURN OFF BLUETOOTH NOW',
+          child: Text(on ? 'ENABLE BT IN' : 'DISABLE BT IN',
               style: const TextStyle(
                   color: Colors.orangeAccent,
                   fontSize: 44,
                   fontWeight: FontWeight.w800)),
         ),
         const SizedBox(height: 10),
-        Text(_mmss(remainingSec),
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 88,
-                fontWeight: FontWeight.w800)),
+        FittedBox(
+          child: Text(_span(remainingSec),
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 88,
+                  fontWeight: FontWeight.w800)),
+        ),
         const SizedBox(height: 10),
         const Text('in the phone\'s Settings — the step starts either way',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white54, fontSize: 16)),
+        if (order != null) ...[
+          const SizedBox(height: 18),
+          _orderBadge(order),
+        ],
       ],
     );
   }

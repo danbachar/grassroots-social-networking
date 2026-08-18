@@ -58,7 +58,7 @@ class FragmentHandler {
   /// Fired when a partial reassembly is abandoned: the 4-minute timeout swept
   /// it ('timeout') or reassembly failed despite a complete count — an
   /// out-of-range fragIndex was counted ('broken'). Both are whole-message
-  /// losses that were previously invisible; the coordinator wires this to a
+  /// losses that are otherwise invisible; the coordinator wires this to a
   /// `drop` trace record.
   void Function(String reason, String messageId, int have, int total)?
       onAbandon;

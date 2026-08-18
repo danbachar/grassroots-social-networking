@@ -5,10 +5,10 @@ import '../protocol/fragment_handler.dart';
 /// Default synthetic payload size: the largest that still fits ONE sealed
 /// packet at the BLE floor MTU. At this size one message *is* one packet, so
 /// message counts, delivery ratio and wire bytes all read per-packet with no
-/// hidden fragment multiplier. Anything above it is fragmented (a 184-byte
-/// message, the old default, was silently TWO packets — 132 + 52 — costing
-/// 392 wire bytes to move 184), which is worth measuring deliberately as a
-/// payload arm rather than baking into every experiment.
+/// hidden fragment multiplier. Anything above it is fragmented — a 184-byte
+/// message is silently TWO packets, 132 + 52, costing 392 wire bytes to move
+/// 184 — which is worth measuring deliberately as a payload arm rather than
+/// baking into every experiment.
 const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 130
 
 /// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:

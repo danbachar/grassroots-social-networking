@@ -3,11 +3,9 @@
 ///
 /// This is NOT a BloomFilter, and the difference is the whole point. A bloom
 /// cannot remove one entry, so the only way it can be bounded is a periodic
-/// WHOLESALE clear — and delivery dedup was previously a bloom that wiped
-/// itself every 10,000 items or 5 minutes. A message delivered just before
-/// such a rotation and conveyed to us again just after it looked new, and was
-/// delivered to the app a second time: `message re-delivery` came back 604 and
-/// 121 on the two arms of the relay-cap A/B, against a stated guarantee of
+/// WHOLESALE clear, say every 10,000 items or 5 minutes. A message delivered
+/// just before such a rotation and conveyed again just after it would look
+/// new and reach the app a second time, against a stated guarantee of
 /// exactly-once delivery.
 ///
 /// The lifetime that actually matters is the DTN buffer's. A copy of a message

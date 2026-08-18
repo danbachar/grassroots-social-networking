@@ -166,7 +166,7 @@ class FieldRunner extends ChangeNotifier {
 
   /// THIS phone's join order, read from its own nickname.
   ///
-  /// The join order is the nickname and nothing else. It used to ride in the
+  /// The join order is the nickname and nothing else. It does not ride in the
   /// plan as `deviceOrder`, which the presets set to the plan ROLE — so the
   /// traveller of a store-carry-forward run stamped and displayed `#1`
   /// whatever its nickname was, and the sender `#2`, seven times over. The
@@ -224,7 +224,7 @@ class FieldRunner extends ChangeNotifier {
   /// Stamped on every step marker so an analysis can segment two runs that
   /// were recorded under one id — the recorder appends, so that happens
   /// whenever an id is reused. It does NOT seed message ids: those are v4,
-  /// the same as production. Deterministic ids used to repeat across runs of
+  /// the same as production. Deterministic ids would repeat across runs of
   /// the same plan, and the receiver's packetId bloom then dropped the second
   /// run's messages as duplicates — a testbed-only id scheme that changed
   /// delivery behaviour and corrupted the measurement it was there to serve.
@@ -968,9 +968,8 @@ class FieldRunner extends ChangeNotifier {
       'dwellSec': step.dwellSec,
       'established': count(),
       // Whether the radio was actually up for this cell. Without it a zero is
-      // ambiguous: dial-3-cap-greedy-n6 recorded `established: 0` for 90 cells
-      // that had no working transport at all, which reads identically to 90
-      // cells where every dial was refused. A cell with radioUp false is not a
+      // ambiguous: `established: 0` from a cell with no working transport
+      // reads identically to a cell where every dial was refused. A cell with radioUp false is not a
       // measurement and must be discarded, not averaged in.
       'radioUp': _radioUp,
     });

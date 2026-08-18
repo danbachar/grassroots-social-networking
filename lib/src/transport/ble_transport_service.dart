@@ -241,25 +241,17 @@ class BleTransportService extends TransportService {
   /// Nothing else removes it: `_paths.remove` fires only on a plugin-reported
   /// failed/disconnected/stale, so a path whose peer vanished without the OS
   /// saying so lives forever — and keeps being counted by
-  /// [_inFlightCentralDials] (denying a real dial one of the M slots) and by
-  /// [_linksHoldingControllerSlot]. Measured on dial-6-n8: 300 of 1419 paths
-  /// that came up, 21%, never reached `ready` and never dropped.
+  /// [_inFlightCentralDials], denying a real dial one of the M slots, and by
+  /// [_linksHoldingControllerSlot].
   ///
   /// This is NOT an idle timeout. It does not look at traffic: a path that
   /// reached `ready` is never pruned, however long it then sits silent —
   /// that case belongs to the stale-peer sweep. What ages out here is an
   /// address that never became SENDABLE at all.
   ///
-  /// 120 s is the measured choice: `gattConnected -> ready` ran p50 1.6 s and
-  /// p90 15.5 s, so this is far above any healthy path, and it equals one
-  /// dial-grid dwell — a path stuck for a whole measurement window cannot be
-  /// part of that window's result. The p99 and the 442 s max of that
-  /// distribution are NOT used: 12 paths reported a NEGATIVE latency, and
-  /// reading their event streams showed why — `liveLinkSnapshot` stamps a
-  /// synthetic `connected` at recording start for links already up, and a
-  /// single address cycles up and down many times (one had 8 `connected`,
-  /// 10 `gattConnected`, 7 `drop`), so first-of-each-event pairs stages from
-  /// different incarnations. The median and p90 are unaffected.
+  /// The value has to clear a healthy handshake by a wide margin and equal at
+  /// least one dial-grid dwell, so that a path stuck for a whole measurement
+  /// window cannot be part of that window's result.
   static const Duration _stuckPathTimeout = Duration(seconds: 120);
 
   String? _peerHexForPathId(String pathId) {
@@ -339,10 +331,8 @@ class BleTransportService extends TransportService {
     // dialed. It is emphatically NOT `ready`: reaching `ready` additionally
     // requires the peer's ANNOUNCE to have identified the path, so anchoring
     // the count there conflates three independent outcomes and reports a link
-    // that demonstrably established as if the dial had failed. Measured on
-    // dial-3-cap-greedy-n6: 181 GATT links came up while the runs recorded ~0
-    // establishments, because no ANNOUNCE was flowing and not one path
-    // reached `ready`.
+    // that demonstrably established as if the dial had failed: with no
+    // ANNOUNCE flowing, no path reaches `ready` at all.
     final establishment = event == 'gattConnected' && role == BleRole.central;
     // Every stage of the same path carries the cell context, so the analyzer
     // can subtract stage timestamps per (popN, maxParallel) cell and get
@@ -662,8 +652,7 @@ class BleTransportService extends TransportService {
           debugPrint('Failed to start advertising: $e');
           // Undiscoverable: no inbound legs, no peripheral role, for as long
           // as this persists — while the transport can still report active
-          // via the scan side. Previously invisible in the trace.
-          if (_tracing) {
+              if (_tracing) {
             unawaited(trace!.log({
               'type': 'link',
               't': DateTime.now().millisecondsSinceEpoch,
@@ -1113,7 +1102,7 @@ class BleTransportService extends TransportService {
   Future<bool> sendToPeer(String peerId, Uint8List data) async {
     final path = _paths[peerId];
     if (path == null || !_isReady(path)) {
-      // Previously returned false with no log at all — the silent-est send
+      // A refused write gets a record: an unlogged false is the silent-est send
       // failure in the codebase. Sync conveyances and directed sends vanish
       // here when a path dies mid-operation.
       _traceDrop('bleSend', path == null ? 'noPath' : 'notReady',
@@ -1360,10 +1349,10 @@ class BleTransportService extends TransportService {
   /// device we already share an ACL link with attaches our GATT client over
   /// that existing link — no second ACL is created. This matters because a
   /// second ACL between the same two radios is refused by spec-conformant
-  /// stacks: measured on Pixel 10 Pro (Android 16), every dial to the peer's
-  /// advertised MAC fast-failed GATT 133 while the first link existed, while
-  /// older Android 8.1 pairs happened to tolerate dual ACLs. (The measured
-  /// iOS "cannot open the second link" wedge is plausibly the same LL rule.)
+  /// stacks: on Android 16 every dial to the peer's advertised MAC fast-fails
+  /// GATT 133 while the first link exists, though Android 8.1 pairs tolerate
+  /// dual ACLs. The iOS refusal to open a second link is plausibly the same
+  /// LL rule.
   ///
   /// Fallback: a discovered advertising MAC (a fresh ACL) for stacks where
   /// dialing the connection address fails outright.
@@ -1631,7 +1620,7 @@ class BleTransportService extends TransportService {
         androidMtu: _requestedAndroidMtu,
         // Apple's docs say CoreBluetooth's connect can legitimately take
         // 10-15s, so we stay safely above that. The election's first-mover
-        // gate should prevent the simultaneous-dial collision that used to
+        // gate should prevent the simultaneous-dial collision that would
         // wedge a connect for the full window; 20s is a safety net for any
         // collision that still slips through (e.g. during the first-mover
         // fallback) so it recovers and retries sooner.
@@ -2043,8 +2032,7 @@ class BleTransportService extends TransportService {
     // schedule: the discovery entry can be pruned while its link is still
     // up, and once it is, a live leg becomes invisible here — `centralActive`
     // reads false and the peer is dialed a second time. That is how
-    // dial-5-bounce-fixed-n6 accumulated 32 same-role duplicate legs despite
-    // this suppression already existing.
+    // same-role duplicate legs accumulate despite this suppression.
     final identityHex = identified == null
         ? null
         : identified.publicKey
@@ -2208,10 +2196,9 @@ class BleTransportService extends TransportService {
   /// the OS cannot resolve the RPA either). A rotated peer therefore looks
   /// like a brand new device: it is discovered, dialed, and `connectGatt`
   /// opens a SECOND connection to hardware we are already linked to, because a
-  /// different address is a different `BluetoothDevice`. Measured on
-  /// dial-5-bounce-fixed-n6: 32 same-role duplicate legs across six phones,
-  /// overlapping for up to 69 s, each holding a real controller slot that the
-  /// dial cap then counts against genuinely new peers.
+  /// different address is a different `BluetoothDevice`. The duplicates
+  /// overlap for as long as both survive, each holding a real controller slot
+  /// that the dial cap then counts against genuinely new peers.
   ///
   /// The pair wants exactly one leg per role. When a newly identified path
   /// duplicates a role we already hold to that peer, the NEW one goes: the

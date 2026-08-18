@@ -442,7 +442,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     debugPrint('[lifecycle] App state -> $state');
     // Lifecycle into the trace: absolute draw is screen-dominated and
     // Android changes BLE scan behaviour in background — a run where the
-    // app backgrounded mid-step was previously indistinguishable from a
+    // app backgrounded mid-step must not be indistinguishable from a
     // clean one.
     if (experimentRecorder.active) {
       unawaited(experimentRecorder.log({

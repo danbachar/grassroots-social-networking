@@ -148,9 +148,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   /// This string is the fleet's alignment CHECK — every phone must show the
   /// same one — and the anchor itself is an epoch instant, identical on every
   /// phone regardless of timezone. Rendering it in LOCAL time made the check
-  /// test the timezone instead: on 2026-08-08 a phone whose zone was two
-  /// hours out displayed a start time two hours off while computing exactly
-  /// the same anchor, which read as a broken clock and cost a restart. In
+  /// test the timezone instead: a phone whose zone is two hours out would
+  /// display a start time two hours off while computing exactly the same
+  /// anchor, which reads as a broken clock. In
   /// UTC, phones that agree show identical text and phones that disagree
   /// really do disagree.
   static String _hhmmss(int epochMs) {

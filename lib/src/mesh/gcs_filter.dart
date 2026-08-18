@@ -3,12 +3,11 @@ import 'dart:typed_data';
 /// Golomb-coded set over packetIds — the compact "here is what I already
 /// hold" advertisement the sync exchange puts on the air.
 ///
-/// It replaces an explicit id list. A packetId is a 16-byte UUID, so a list
-/// cost 16 bytes each and fit 8 per sealed BLE write; advertising a buffer of
-/// 17,116 packets (measured peak, scf-rearm-4) cost ~2,140 packets, and the
-/// offer traffic was 46-51% of all sealed air across two runs while carrying
-/// no payload at all. A GCS costs about `p + 2` bits per element, so the same
-/// buffer fits in a few hundred bytes.
+/// An explicit id list does not scale here. A packetId is a 16-byte UUID, so
+/// a list costs 16 bytes each and fits 8 per sealed BLE write: advertising a
+/// buffer of tens of thousands of packets costs thousands of packets of pure
+/// overhead, carrying no payload at all. A GCS costs about `p + 2` bits per
+/// element, so the same buffer fits in a few hundred bytes.
 ///
 /// The cost is a false positive: the peer concludes we already hold a packet
 /// we do not, and withholds it. That is bounded by [fprOneIn] and self-heals —

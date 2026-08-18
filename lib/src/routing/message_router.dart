@@ -151,7 +151,7 @@ class MessageRouter {
 
   /// Called when a verified packet arrives over UDP, providing the sender's
   /// pubkey so the coordinator can map the connection (replacing tempKey-based
-  /// identification that previously required ANNOUNCE as the first message).
+  /// identification, so a stream need not open with an ANNOUNCE).
   void Function(Uint8List senderPubkey, String udpPeerId)? onUdpPeerIdentified;
 
   /// Called when a verified BLE ANNOUNCE identifies the peer behind a path —
@@ -385,7 +385,7 @@ class MessageRouter {
 
       if (firstSeen && packet.ttl <= 0) {
         // The flood dies here: hop budget exhausted on a first sighting.
-        // Previously fully silent — the one place a multi-hop delivery
+        // Recorded here: the one place a multi-hop delivery
         // failure leaves evidence on the node that killed it.
         _traceDrop('relay', 'ttlExpired', {
           'packetId': packet.packetId,

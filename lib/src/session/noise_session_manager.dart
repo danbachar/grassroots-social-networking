@@ -306,7 +306,7 @@ class NoiseSessionManager {
   }
 
   /// A handshake or session died without producing anything — a
-  /// security-relevant or availability-relevant event that was previously
+  /// security-relevant or availability-relevant event that would otherwise be
   /// silent. `why`: 'verifyFailed' (delivered static key does not match the
   /// claimed identity — tampering or impersonation), 'timeout' (peer never
   /// answered within [handshakeTimeout]), 'reaped' (stalled handshake swept).

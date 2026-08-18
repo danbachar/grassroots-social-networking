@@ -128,9 +128,9 @@ class _TestbedScreenState extends State<TestbedScreen> {
   bool _uploadComplete = false;
 
   /// Set when an attempt finished with at least one chunk unaccepted. Drives
-  /// the red X: a failed upload used to leave the button in its neutral state
-  /// with only a transient snackbar, so a phone that failed to deliver its
-  /// recording looked exactly like one that had never been asked.
+  /// the red X. Without it a phone that failed to deliver its recording looks
+  /// exactly like one that was never asked, since a snackbar is gone by the
+  /// time you reach the next phone.
   bool _uploadFailed = false;
 
   /// Auto-upload trigger. Runs are recorded with Wi-Fi off (it starves BLE
@@ -177,10 +177,8 @@ class _TestbedScreenState extends State<TestbedScreen> {
     if (!onNetwork) return;
     if (!TraceConfig.isConfigured) return;
     // NEVER during a run. Uploading closes the runner, and closing the runner
-    // route disposes it — so a phone that regained Wi-Fi mid-run KILLED its
-    // own experiment. That is exactly what happened to dial-7-n11 on
-    // 2026-08-18: Wi-Fi came back four minutes in, this fired on eleven
-    // phones, and the run ended with ~2000 records instead of ~12000.
+    // route disposes it, so a phone that regains a network mid-run would kill
+    // its own experiment.
     //
     // Recording active is the authoritative test — it is true for the whole
     // run and independent of which screen is showing.

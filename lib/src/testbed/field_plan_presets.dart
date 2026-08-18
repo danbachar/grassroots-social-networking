@@ -604,14 +604,13 @@ class FieldPlanPresets {
         ));
       }
     }
-    // A trailing DISCARDED step, so the last arm is measured on the same terms
-    // as the others. What closes an arm's delivery window is the buffer reset
-    // at the NEXT warm step: arms before the last get `return` plus the
-    // auto-advance gap and are then wiped. The last arm had no following warm,
-    // so its window ran to the `end` marker and on into the settle — a longer
-    // drain, under quieter air, for the one arm that also carries the heaviest
-    // load. This step is that missing warm: same shape, same reset, and its
-    // label is excluded from the per-arm tables.
+    // A trailing DISCARDED step, so the last arm is measured on the same
+    // terms as the others. What closes an arm's delivery window is the buffer
+    // reset at the NEXT warm step, and without this the last arm would have no
+    // following warm: its window would run to the `end` marker and on into the
+    // settle — a longer drain under quieter air for the arm carrying the
+    // heaviest load. Same shape, same reset; its label is excluded from the
+    // per-arm tables.
     steps.add(FieldStep(
       label: 'drain',
       dwellSec: warmSec,
@@ -959,20 +958,17 @@ class FieldPlanPresets {
         // Pixel 10 Pro, then the three wireless-adb phones (Pixel 7a, Galaxy
         // A72, Galaxy Note20) — those three keep Wi-Fi ON, since it is their
         // only link, so the run prep must not switch it off for them.
-        // reps: 2. The single rep was a shakedown of the grid; dial-6-n8
-        // confirmed the traces carry inFlight/maxParallel/popN on every
-        // establishment and that radioUp is true, so each cell is now measured
-        // twice and a per-cell figure has a spread rather than one sample.
-        // A FRESH id: the recorder APPENDS, so re-using -6 would merge an
-        // eight-phone population with an eleven-phone one in a single analysis.
+        // Two reps per cell, so a per-cell figure carries a spread rather
+        // than one sample.
+        // A FRESH id per population: the recorder APPENDS, so re-using an id
+        // would merge two different populations into one analysis.
         // 55 cells x 2 reps = 110 measured x 120 s + (90 + 9x60) converge +
         // 120 x (5 s dark + 5 s gap) + (60 settle + 300 align + 120 placement)
         // = 15510 s ~= 4.3 h.
         'Dial grid N x M (11 phones, 2 reps, ~4.3h)':
             dialGridProbe(expId: 'dial-7-n11', maxPop: 11, reps: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
-        // merges runs into one file and one upload. The shakedown runs live
-        // under scf-desk-1; this is the measured one.
+        // merges runs into one file and one upload.
         'SCF desk — TRAVELLER (this phone goes dark)':
             storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
         'SCF desk — sender (everyone else)':
@@ -998,7 +994,7 @@ class FieldPlanPresets {
           legs: const ['notify'],
           sizeDeltas: const [-8, -4, 0, 1, 4],
         )),
-        // Full ladder, ~2h41. Every quantity measured on BOTH devices.
+        // Full ladder, ~2h41. Every quantity taken on BOTH devices.
         'Power baseline P1 (full, ~2h41)': manualized(powerBaseline(role: 1)),
         'Power baseline P2 (full, ~2h41)': manualized(powerBaseline(role: 2)),
         // ~1h36. Same 8 conditions, shorter steps, 3 reps instead of 2 —

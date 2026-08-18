@@ -422,13 +422,11 @@ class GrassrootsNetwork {
   /// and [_forgetBufferedPacket] applies them here, so the index holds exactly
   /// the messages with packets still in the store.
   ///
-  /// It did not always. The index drained on ACK alone while the buffer
-  /// drained on ACK, expiry AND eviction, so every non-ACK exit left a dead
-  /// entry behind. Measured on scf-rearm-3: the buffer shed 12,723 packets by
-  /// eviction against 1,958 released by ACK — six sheds per ACK — and two
-  /// phones sat pinned at the cap with 8,307 index evictions between them.
-  /// Once the index is full of dead entries the FIFO throws out LIVE ones, so
-  /// a later ACK cannot release its packets and they linger to age expiry,
+  /// Draining the index on ACK alone would not do: the buffer sheds packets
+  /// on ACK, expiry AND eviction, and every non-ACK exit would leave a dead
+  /// entry behind. Once the index fills with dead entries its FIFO throws out
+  /// LIVE ones, so a later ACK cannot release its packets and they linger to
+  /// age expiry,
   /// which keeps the buffer full. That is the same failure an earlier bound of
   /// 1000 caused (178,138 evictions on a 7-device run); raising the number
   /// only made it slower to arrive, because the number was never the problem.
@@ -523,7 +521,7 @@ class GrassrootsNetwork {
     );
     _fragmentHandler = FragmentHandler();
     // A partial reassembly abandoned (4-min timeout, or count-complete but
-    // unassemblable) is a whole-message loss — previously fully silent.
+    // unassemblable) is a whole-message loss, so it gets a drop record.
     _fragmentHandler.onAbandon = (reason, messageId, have, total) {
       _traceDrop('reassembly', reason, {
         'messageId': messageId,
@@ -720,14 +718,11 @@ class GrassrootsNetwork {
   /// [promptForPermissions] false = verify the grants we already hold and
   /// never issue a request.
   ///
-  /// A transport RESTART is not a fresh app start. Re-requesting on every
-  /// restart is what silently killed dial-4: each per-step bounce called
-  /// `requestPermissions()`, a later call stopped coming back `granted`, and
-  /// `_initializeBle` returned before it ever touched the BLE stack — leaving
-  /// `_bleService` null, so every subsequent bounce returned at its first line
-  /// and the radio never came back for the rest of the run. All six phones
-  /// recorded `initOk: false, bleState: uninitialized`, which is only
-  /// reachable through this gate.
+  /// A transport RESTART is not a fresh app start. Issuing a request on every
+  /// restart risks a call that does not come back `granted`, and this method
+  /// then returns before it ever touches the BLE stack — leaving `_bleService`
+  /// null, so every later bounce returns at its first line and the radio never
+  /// comes back. A restart already holds the grants; it only has to check.
   Future<bool> _initializeBle({bool promptForPermissions = true}) async {
     if (_bleInitInFlight) {
       debugPrint('BLE init already in flight — refusing to race it');
@@ -737,9 +732,9 @@ class GrassrootsNetwork {
     try {
       debugPrint('Initializing BLE transport');
 
-      // NOTE: this deliberately does NOT reset the transport state. It used to
-      // dispatch `uninitialized` here, which meant any call — including one
-      // that then failed or bailed — blanked a transport that was working.
+      // Deliberately does NOT reset the transport state. Blanking it here
+      // would apply to every caller, including one that then fails or bails,
+      // and would wipe a transport that is working.
       // `BleTransportService.initialize()` only proceeds from `uninitialized`,
       // so a caller that is genuinely replacing a disposed service sets that
       // state itself, next to the dispose that made it true.
@@ -1541,9 +1536,8 @@ class GrassrootsNetwork {
         } on StateError {
           // Check-then-encrypt race: the session vanished between the
           // hasSession gate and sealing (testbed reset, handshake-timeout
-          // reset, glare teardown). Previously an unhandled async error that
-          // left the message stuck in 'sending' with no evidence; now it is
-          // reported and the caller FAILS the message — nothing is held.
+          // reset, glare teardown). Reported, and the caller FAILS the
+          // message — nothing is held in 'sending' without evidence.
           _traceDrop('seal', 'sessionRace', {'messageId': messageId});
           return false;
         }
@@ -1776,9 +1770,9 @@ class GrassrootsNetwork {
         'payloadSize': payload.length,
         'degreeAtEvent': _reachablePeerCount(),
         'sentAt': atMs,
-        // Whether the flood reached at least one neighbour. aired:false is a
+        // Whether the send reached at least one neighbour. aired:false is a
         // send that exists only in this node's DTN buffer until a sync
-        // exchange — the trace previously could not tell those apart.
+        // exchange, which the trace has to be able to tell apart.
         'aired': aired,
       }));
     }
@@ -1998,17 +1992,16 @@ class GrassrootsNetwork {
     // happened, and return on time either way. A step that ran without a
     // radio is then visible as such instead of reporting honest-looking zeros.
     //
-    // dial-3-cap-greedy-n6 is why this is recorded: the transport came back as
-    // `ready` and never reached `active`, so `start()` never ran, no ANNOUNCE
-    // went out, and 20 steps of silence were indistinguishable from 20 steps
-    // of failed dials.
-    // Something else may have brought the transport up while we were dark —
-    // the step's scripted `bleOn: true` does exactly that, and on dial-4 it
-    // landed 2.8s into a 5s dark gap and left the radio scanning and
-    // advertising. Re-initializing on top of that tore down a working
-    // transport and left the state `uninitialized`, which is why every cell
-    // recorded radioUp false while links were visibly forming. If the radio
-    // is already up, the bounce has nothing left to do.
+    // The record matters because a transport that comes back as `ready` and
+    // never reaches `active` never runs `start()`, so no ANNOUNCE goes out and
+    // a silent step is indistinguishable from a step of failed dials.
+    //
+    // Something else may bring the transport up while we are dark — the step's
+    // scripted `bleOn: true` does exactly that, landing inside the dark gap
+    // and leaving the radio scanning and advertising. Re-initializing on top
+    // of that would tear down a working transport and leave the state
+    // `uninitialized`. If the radio is already up, the bounce has nothing
+    // left to do.
     if (_bleService != null && bleUsable) {
       debugPrint('[testbed] BLE bounce: transport already back up — '
           'leaving it alone');
@@ -2596,11 +2589,10 @@ class GrassrootsNetwork {
 
     // Buffered packets move ONLY through the sync exchange: advertise a
     // compact filter of what we have SEEN and let the peer answer with what
-    // that filter lacks. Never a blind push of held packets — measured on
-    // soak-night-1, the old push re-sent ~32 already-delivered packets on
-    // every reconnection (31% of all ACK bytes on the air) because the sender
-    // has no way to know what the peer already holds. The filter costs a few
-    // hundred bytes whatever the buffer size.
+    // that filter lacks. Never a blind push of held packets: the sender has
+    // no way to know what the peer already holds, so pushing re-sends packets
+    // that were already delivered on every reconnection. The filter costs a
+    // few hundred bytes whatever the buffer size.
     //
     // Both transports ask; they differ in what they may be answered with. Over
     // BLE the peer answers as a mesh relay, with anything it holds. Over UDX it
@@ -3788,7 +3780,6 @@ class GrassrootsNetwork {
     // Read receipt received
     _messageRouter.onReadReceiptReceived = (messageId) {
       debugPrint('Read receipt received for message $messageId');
-      // Read latency previously lived only in the volatile Redux store.
       final sentAt =
           store.state.messages.outgoingMessages[messageId]?.sentAt;
       _traceMessage('read', messageId, {
@@ -3802,9 +3793,9 @@ class GrassrootsNetwork {
       _dropFromDtnBufferFor(messageId);
     };
 
-    // Map incoming UDP connections from any verified packet's senderPubkey.
-    // Previously required ANNOUNCE as the first message on a stream; now any
-    // verified packet identifies the sender via its header.
+    // Map incoming UDP connections from any verified packet's senderPubkey:
+    // any verified packet identifies the sender via its header, so a stream
+    // does not have to open with an ANNOUNCE.
     _messageRouter.onUdpPeerIdentified = (senderPubkey, udpPeerId) {
       final pubkeyHex =
           senderPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -4063,13 +4054,11 @@ class GrassrootsNetwork {
         // away and came back. Ask it what we are missing, so anything it holds
         // for us comes back on this encounter.
         //
-        // Sync-on-connect used to hang off session establishment alone, and
-        // sessions outlive the link that formed them: a neighbour whose radio
-        // cycles returns with its session intact, so no establishment fires
-        // and the buffer it left behind is never offered. That is precisely
-        // the case store-carry-forward exists to serve, and it was the one
-        // case that could not work — measured on the desk 2026-08-10, where
-        // every one of three return windows delivered nothing at all.
+        // Hanging the sync off session establishment alone would miss this:
+        // sessions outlive the link that formed them, so a neighbour whose
+        // radio cycles returns with its session intact, no establishment
+        // fires, and the buffer it left behind is never offered. That is
+        // precisely the case store-carry-forward exists to serve.
         //
         // ANNOUNCE is the "recipient appears" signal. It repeats every ~10 s;
         // the send carries its own per-(transport, peer) debounce, and one
@@ -4099,7 +4088,7 @@ class GrassrootsNetwork {
       if (!_noiseSessions.hasSession(senderPubkey)) {
         // Race: session torn down between decrypt and ACK. The message was
         // delivered and traced 'recv', but no ACK ever goes out — the sender
-        // keeps the packets buffered. Previously invisible on this side.
+        // keeps the packets buffered, so this side has to say so.
         _traceDrop('ackTx', 'noSession', {'messageId': messageId});
         return;
       }
@@ -4129,7 +4118,7 @@ class GrassrootsNetwork {
         if (!ok) {
           // A failed UDP ACK is NOT buffered (the DTN buffer is BLE-only):
           // it is simply gone, and the sender redelivers until a BLE
-          // encounter ACKs it. Previously the result was discarded.
+          // encounter ACKs it, so the failure is recorded here.
           _traceDrop('ackTx', 'udpSendFailed', {
             'messageId': messageId,
             'packetId': sealed.packetId,
@@ -4401,8 +4390,8 @@ class GrassrootsNetwork {
 
     // Listen to connection events — update Redux state and log
     _udpService!.connectionStream.listen((event) {
-      // The UDP transport previously emitted no trace records at all — BLE
-      // link stages had full coverage while an entire transport was dark.
+      // UDP connection events get the same trace coverage as BLE link
+      // stages, so no transport is dark to analysis.
       if (trace?.active ?? false) {
         unawaited(trace!.log({
           'type': 'link',
@@ -5025,7 +5014,7 @@ class GrassrootsNetwork {
   ///
   /// Each connected device is targeted individually so friend/non-friend
   /// address inclusion is decided using the current mapping for that exact BLE
-  /// device ID. This avoids the old exclude-list logic that broke when BLE IDs
+  /// device ID, rather than an exclude list keyed on BLE IDs that
   /// rotated or when a peer had separate central/peripheral connections.
   Future<void> _broadcastAnnounce() async {
     if (_bleService == null || !_bleAvailable) return;

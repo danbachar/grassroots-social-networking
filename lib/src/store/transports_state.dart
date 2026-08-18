@@ -68,8 +68,8 @@ int bleLinkCountForPathIds(
 
 /// Per-transport lifecycle state for Redux store.
 ///
-/// Tracks the lifecycle state of each transport independently,
-/// replacing the old single global `TransportConnectionStatus`.
+/// Tracks the lifecycle state of each transport independently, rather than
+/// through one global connection status.
 @immutable
 class TransportsState {
   /// BLE transport lifecycle state

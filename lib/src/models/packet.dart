@@ -85,12 +85,12 @@ class GrassrootsPacket {
   /// field fixes both — expiry becomes absolute, and a filter can name the
   /// window it covers.
   ///
-  /// Milliseconds, in 6 bytes, not the 4-byte seconds it used to be. The sync
+  /// Milliseconds, in 6 bytes rather than 4-byte seconds. The sync
   /// sweep bounds a window by `[from, to]` where `to` is the creation stamp of
   /// the last packet that fit the filter, and the responder answers from that
   /// window — so every packet sharing the boundary stamp must either be inside
-  /// the filter or outside the window. At second resolution and a measured
-  /// 127 msg/s (scf-rearm-5) against a 106-element filter, a single second
+  /// the filter or outside the window. At second resolution and a saturating
+  /// send rate against a 106-element filter, a single second
   /// routinely holds more packets than the filter can carry: the boundary
   /// would cut mid-second, the responder would re-send what it could not know
   /// was advertised, and the cursor could never advance past that second at

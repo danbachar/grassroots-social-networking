@@ -602,14 +602,10 @@ class ExperimentRecorder {
   /// ids would interleave with the next arm's records in one upload, and every
   /// reader downstream would have to know to cut them out.
   ///
-  /// This USED to rename the file to `<id>-aborted-<n>` and keep it, on the
-  /// grounds that an aborted run still recorded something real — on 2026-08-08
-  /// an aborted arm held the only uncontended-medium measurement of that day.
-  /// Dan's call on 2026-08-18 reverses that: a failed run is deleted. The
-  /// reason is that the aborted files had stopped being evidence and started
-  /// being noise — they upload alongside real runs, carry the same experiment
-  /// id prefix, and every analysis has to filter them out. If an aborted run
-  /// ever needs keeping again, this is the one place to change.
+  /// A failed run is deleted rather than kept under a separate id: the file
+  /// would upload alongside real runs, carry the same experiment id prefix,
+  /// and every analysis would have to filter it out. This is the one place to
+  /// change if an aborted recording ever needs keeping.
   ///
   /// Returns the path it deleted, or null if there was nothing to delete.
   Future<String?> discardAbortedExperiment(String id) async {

@@ -398,21 +398,43 @@ class MessageRouter {
         // same arrival a second time on the way out.
         final hopped = packet.decrementTtl();
 
-        // NO FLOOD. A transit packet is taken into custody and leaves only
-        // when a neighbour asks for it by packetId in a sync exchange. The
-        // node does not push it at anyone.
+        // A transit packet is taken into custody UNCONDITIONALLY: with nothing
+        // pushed at other relays, a packet this node did not keep is one it
+        // can never offer onward, so it would die here. Custody is the only
+        // path to every node except one.
         //
-        // Which is why this stores UNCONDITIONALLY, where the flooding design
-        // stored only when the recipient was out of reach: back then the
-        // flood covered the reachable case and the buffer was the exception
-        // path. With nothing pushing, a packet this node did not keep is a
-        // packet it can never offer onward — it would die here — so the
-        // buffer is now the ONLY path and every transit packet with TTL left
-        // belongs in it.
+        // That one is the RECIPIENT. Holding a packet back from the node it
+        // is addressed to, while a live link to that node is open, buys
+        // nothing: the destination is the single peer that cannot be sent a
+        // copy it did not want, because it either lacks the packet or drops
+        // it on its own seen-set. So a relay delivers to a directly connected
+        // recipient the same way an originator does — immediately — and the
+        // sync exchange remains the only way a packet reaches a peer that is
+        // NOT the recipient. Custody is kept either way: a write that reports
+        // success is still not an end-to-end ACK, and the packet has to stay
+        // conveyable if this hop turns out to have been the wrong one.
         final recipientHex = _recipientHex(packet);
         final carried = recipientHex != null;
         if (carried) {
           _dtnStore.store(recipientHex, hopped);
+        }
+        var handedToRecipient = false;
+        final deliverNow = directSend;
+        final recipientKey = packet.recipientPubkey;
+        if (carried && deliverNow != null && recipientKey != null) {
+          handedToRecipient = await deliverNow(recipientKey, hopped);
+          if (handedToRecipient && (trace?.active ?? false)) {
+            // Distinct from the originator's `direct`: this is a CARRIER
+            // completing the last hop, which is what separates a mesh
+            // delivery that waited for a sync round from one that did not.
+            unawaited(trace!.log({
+              'type': 'custody',
+              't': DateTime.now().millisecondsSinceEpoch,
+              'event': 'relayDirect',
+              'packetId': packet.packetId,
+              'recipient': recipientHex,
+            }));
+          }
         }
         if (trace?.active ?? false) {
           // The relay's own view: this node took someone else's sealed packet
@@ -437,6 +459,9 @@ class MessageRouter {
             // back to time ordering for that hop and says so.
             'fromPeer': _peerHexForBleDevice(bleDeviceId),
             'carried': carried, // entered the DTN memory buffer
+            // Delivered straight to the recipient on a live link, rather than
+            // waiting for that peer's next sync filter.
+            'toRecipient': handedToRecipient,
             // Time this node held the packet, receipt to forward, on ONE
             // clock. End-to-end latency is the sum of these plus the carry
             // times (custody store->convey) plus the radio time between

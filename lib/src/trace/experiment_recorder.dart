@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:device_info_plus/device_info_plus.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -543,6 +545,25 @@ class ExperimentRecorder {
   }
 
   /// POST one batch. Returns whether the server accepted (or already had) it.
+  /// The handset model (`Build.MODEL` / the iOS machine name), or null where
+  /// the platform channel is unavailable. An upload is never worth failing
+  /// over a label, so every error here is swallowed.
+  static Future<String?> _deviceModel() async {
+    try {
+      final info = DeviceInfoPlugin();
+      if (Platform.isAndroid) {
+        final a = await info.androidInfo;
+        return '${a.manufacturer} ${a.model}'.trim();
+      }
+      if (Platform.isIOS) {
+        return (await info.iosInfo).utsname.machine;
+      }
+    } catch (_) {
+      // No channel (unit tests, desktop) — the field is simply absent.
+    }
+    return null;
+  }
+
   Future<bool> _postChunk({
     required String url,
     required String token,
@@ -558,6 +579,13 @@ class ExperimentRecorder {
         'schemaVersion': 1,
         'generatedAt': DateTime.now().toUtc().toIso8601String(),
         'platform': Platform.isIOS ? 'ios' : 'android',
+        // The hardware behind the pubkey. A trace identifies a device by its
+        // key, which is stable but says nothing about which handset it is,
+        // and a run's nicknames are renumbered between campaigns so they do
+        // not carry that across runs either. Naming the model here is what
+        // lets a per-device result — a radio that never negotiates an MTU, a
+        // leg that never reaches a session — be attributed to real hardware.
+        if (await _deviceModel() case final String model) 'model': model,
         'experiment': name,
         'consent': true,
         'records': records,

@@ -117,6 +117,7 @@ class Store:
                 schema_version INTEGER,
                 app_version    TEXT,
                 platform       TEXT,
+                model          TEXT,            -- handset, e.g. 'Google Pixel 7a'
                 remote_addr    TEXT,
                 archive_path   TEXT NOT NULL
             );
@@ -200,6 +201,12 @@ class Store:
             );
             """
         )
+        # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a
+        # column added after a database was created has to be applied here or
+        # every insert fails against the deployed db.
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(uploads)")}
+        if "model" not in have:
+            self._conn.execute("ALTER TABLE uploads ADD COLUMN model TEXT")
         self._conn.commit()
 
     def upload_exists(self, upload_id: str) -> bool:
@@ -214,12 +221,13 @@ class Store:
             self._conn.execute(
                 """INSERT INTO uploads
                    (upload_id, device_id, received_at, generated_at, record_count,
-                    schema_version, app_version, platform, remote_addr, archive_path)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    schema_version, app_version, platform, model, remote_addr,
+                    archive_path)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     meta["upload_id"], meta["device_id"], meta["received_at"],
                     meta.get("generated_at"), len(records), meta.get("schema_version"),
-                    meta.get("app_version"), meta.get("platform"),
+                    meta.get("app_version"), meta.get("platform"), meta.get("model"),
                     meta.get("remote_addr"), archive_path,
                 ),
             )
@@ -624,6 +632,7 @@ class TraceUpload(BaseModel):
     generatedAt: Optional[str] = None     # ISO-8601 on the client
     appVersion: Optional[str] = None
     platform: Optional[str] = None        # 'android' | 'ios'
+    model: Optional[str] = None           # handset, e.g. 'Google Pixel 7a'
     consent: Optional[bool] = None        # client asserts consent was given
 
     model_config = {"extra": "allow"}     # tolerate unknown envelope fields
@@ -831,6 +840,7 @@ async def upload_traces(
         "schema_version": upload.schemaVersion,
         "app_version": upload.appVersion,
         "platform": upload.platform,
+        "model": upload.model,
         "remote_addr": request.client.host if request.client else None,
     }
 

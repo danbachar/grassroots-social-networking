@@ -63,6 +63,13 @@ class BleLinkTally {
   /// Physical ACL connections the pair holds. Usually 1 even when converged,
   /// because both GATT directions ride one ACL; 2 only when the peer presents
   /// a different address for each direction.
+  ///
+  /// This rests on the snapshot's mapping of one remote address to one live
+  /// link, which holds because the LE link layer allows a single connection
+  /// per peer address — two ACLs to one peer therefore appear under two
+  /// addresses. That is the specification's guarantee rather than something
+  /// the traces have shown, so a pair reporting more legs than an ACL can
+  /// carry would be evidence against it, not a counting error here.
   final int acls;
 
   const BleLinkTally({required this.legs, required this.acls});

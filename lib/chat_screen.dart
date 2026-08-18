@@ -82,11 +82,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
   String get _peerHex => ChatMessage.pubkeyToHex(widget.peer.publicKey);
 
-  /// Debug link-diagnostics app-bar line ("2 legs · 1 ACL · 5 ACLs total"), or
-  /// null when the toggle is off. Counts come from the plugin's OS-level link
-  /// snapshot, joined to this peer's live path IDs by address. Legs first,
-  /// because whether the pair has converged to dual-role is the thing being
-  /// diagnosed; the ACL counts say what that costs the controller.
+  /// Debug link-diagnostics app-bar line ("2 legs · 1 ACL"), or null when the
+  /// toggle is off. Counts come from the plugin's OS-level link snapshot,
+  /// joined to this peer's live path IDs by address. Legs first, because
+  /// whether the pair has converged to dual-role is what is being diagnosed;
+  /// the ACL count says what that costs the controller.
+  ///
+  /// This peer only. The device's total sits with the diagnostics toggle in
+  /// settings, where it describes the device — printed here it would repeat
+  /// the same figure on every conversation.
   String? get _linkDiagnosticsLine {
     final s = widget.store.state;
     if (!s.settings.showLinkDiagnostics) return null;
@@ -97,8 +101,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final tally = bleLinkTallyForPathIds(
         links, [live.bleCentralDeviceId, live.blePeripheralDeviceId]);
     return '${tally.legs} leg${tally.legs == 1 ? '' : 's'} · '
-        '${tally.acls} ACL${tally.acls == 1 ? '' : 's'} · '
-        '${links.length} ACLs total';
+        '${tally.acls} ACL${tally.acls == 1 ? '' : 's'}';
   }
   String get _myHex => ChatMessage.pubkeyToHex(widget.myPubkey);
 

@@ -523,10 +523,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(
                   fontSize: GlType.textSm, fontWeight: FontWeight.w600),
             ),
-            subtitle: const Text(
-              'Show physical BLE link (ACL) counts: total in the chat '
-              'screen, per-peer on peer rows. Ground truth from the OS.',
-              style: TextStyle(
+            subtitle: Text(
+              'Show what each pair\'s connection is made of: legs on peer rows '
+              'and in chat, where 2 legs means the pair converged to dual-role. '
+              'Ground truth from the OS. This device holds '
+              '${widget.store.state.transports.bleLinks.length} ACL'
+              '${widget.store.state.transports.bleLinks.length == 1 ? '' : 's'} '
+              'right now.',
+              style: const TextStyle(
                   fontSize: GlType.textXs, color: GlColors.textMuted),
             ),
           ),

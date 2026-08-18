@@ -966,7 +966,7 @@ class FieldPlanPresets {
         // 120 x (5 s dark + 5 s gap) + (60 settle + 300 align + 120 placement)
         // = 15510 s ~= 4.3 h.
         'Dial grid N x M (11 phones, 2 reps, ~4.3h)':
-            dialGridProbe(expId: 'dial-7-n11', maxPop: 11, reps: 2),
+            dialGridProbe(expId: 'dial-8-n11', maxPop: 11, reps: 2),
         // A FRESH id per campaign: the recorder appends, so reusing an id
         // merges runs into one file and one upload.
         'SCF desk — TRAVELLER (this phone goes dark)':

@@ -890,7 +890,7 @@ void main() {
       final entry = FieldPlanPresets.presets[names.single]!;
       // A FRESH id per campaign: the recorder appends, so re-using the
       // six-phone -5 id would merge two populations into one file.
-      expect(entry.expId, 'dial-7-n11');
+      expect(entry.expId, 'dial-8-n11');
       // sum(N=2..11) of (N-1) = 55 cells x 2 reps = 110 measured, + 10
       // converge. The population ceiling must match the phones on the bench
       // or a step lies about its N.

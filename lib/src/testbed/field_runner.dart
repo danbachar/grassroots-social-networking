@@ -241,6 +241,11 @@ class FieldRunner extends ChangeNotifier {
   Timer? _tick;
   final List<Timer> _sendTimers = [];
   int _sentCount = 0;
+
+  /// Sends not attempted because the target pair was not settled yet. Reported
+  /// so a step that fired few messages is distinguishable from one whose
+  /// messages failed.
+  int _skippedSends = 0;
   bool _resetting = false;
   /// Saturating mode: outstanding messageIds and the next sequence number.
   final Set<String> _outstanding = {};
@@ -267,6 +272,9 @@ class FieldRunner extends ChangeNotifier {
 
   /// Messages fired by the plan so far (all steps).
   int get sentCount => _sentCount;
+
+  /// Sends held back because the target pair had no session yet.
+  int get skippedSends => _skippedSends;
 
   /// Why the run aborted itself, or null if it did not. The screen shows this
   /// instead of a finished state, because an abort that looks like a normal
@@ -586,6 +594,9 @@ class FieldRunner extends ChangeNotifier {
       if (sessionTableCount != null)
         'sessionTable': sessionTableCount!(),
       if (_runId != null) 'run': _runId,
+      // Sends held back for want of a session, so a window that fired little
+      // traffic is distinguishable from one whose traffic failed.
+      if (_skippedSends > 0) 'skippedSends': _skippedSends,
       // Dial-grid cell, on the marker that OPENS the window, so the analyzer
       // reads M / N / rep off the segment instead of re-parsing the label.
       if (step.maxParallelDials != null) 'maxParallel': step.maxParallelDials,
@@ -935,7 +946,20 @@ class FieldRunner extends ChangeNotifier {
       // count is therefore a rate PER DESTINATION: at 1/s with seven peers a
       // device puts seven messages a second on the air, which is the load
       // model these experiments mean by "rate".
+      final settled = linkSettled;
       for (final (_, pubkey) in _sendTargets()) {
+        // Only at a target that can actually receive. The send path refuses a
+        // peer with no session and records the refusal, which is correct for
+        // it and wrong to provoke: a message aimed at a pair that has not
+        // finished handshaking measures the runner's own timing, and lands in
+        // the results as a delivery failure indistinguishable from one the
+        // transport caused. The step waits for A target to settle before
+        // sending, but settling is per pair — the rest of the clique can still
+        // be mid-handshake when the first one is ready.
+        if (settled != null && !settled(pubkey)) {
+          _skippedSends++;
+          continue;
+        }
         final messageId = _uuid.v4();
         final payload = Uint8List(step.sendBytes);
         for (var i = 0; i < payload.length; i++) {

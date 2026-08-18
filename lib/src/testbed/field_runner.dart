@@ -109,10 +109,14 @@ class FieldRunner extends ChangeNotifier {
       required int seq,
       int sizeDelta})? sendRaw;
 
-  /// Currently identified peers (pubkeys), consulted when the plan has NO
-  /// roster: every known peer becomes a send target and labels are the 8-hex
-  /// pubkey prefixes — the two-device case needs no manual pubkey entry.
-  /// Resolved lazily at each send so a peer discovered mid-run still counts.
+  /// Peers a message can be addressed to — those with a live session —
+  /// consulted when the plan has NO roster. Labels are the 8-hex pubkey
+  /// prefixes, so the two-device case needs no manual pubkey entry.
+  ///
+  /// Sessioned rather than merely identified: the two sets differ, and the
+  /// gap between them is a real window in which a peer is known and cannot be
+  /// sent to. Resolved lazily at each send, so a peer whose session forms
+  /// mid-step is picked up as soon as it can receive.
   final List<Uint8List> Function()? knownPeers;
 
   /// Whether the pair with a peer is settled for data (session + converged

@@ -417,6 +417,18 @@ class PeersState {
   /// All identified peers as list
   List<PeerState> get peersList => peers.values.toList();
 
+  /// Peers a message can actually be addressed to: those with a live Noise
+  /// session.
+  ///
+  /// Being known and being reachable are different facts and arrive at
+  /// different times — a verified ANNOUNCE puts a peer in [peersList] while
+  /// the handshake with it is still ahead, so there is a real window where
+  /// its identity is established and nothing can be sent to it. A session is
+  /// keyed by identity rather than by any link, so this survives a transport
+  /// dropping underneath it.
+  List<PeerState> get sessionPeers =>
+      peers.values.where((p) => p.hasNoiseSession).toList();
+
   /// Connected peers only
   List<PeerState> get connectedPeers =>
       peers.values.where((p) => p.isConnected).toList();

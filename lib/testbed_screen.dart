@@ -403,9 +403,12 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onSetDialParallelism: widget.onSetDialParallelism,
       establishmentCount: widget.establishmentCount,
       onResetEstablishmentCount: widget.onResetEstablishmentCount,
-      // Rosterless plans (the two-device default) target every peer the
-      // store currently knows.
-      knownPeers: () => widget.store.state.peers.peersList
+      // Rosterless plans target every peer a message can be addressed to —
+      // those with a live session — not every peer the store has identified.
+      // The two are different sets: a verified ANNOUNCE makes a peer known
+      // while its handshake is still ahead, and addressing it then produces a
+      // refusal that the run would otherwise record as a delivery failure.
+      knownPeers: () => widget.store.state.peers.sessionPeers
           .map((p) => p.publicKey)
           .where((pk) => pk.length == 32)
           .toList(),

@@ -595,32 +595,34 @@ class ExperimentRecorder {
   /// Move an abandoned recording aside, so the next arm under the same id
   /// starts a clean file.
   ///
-  /// [startExperiment] APPENDS to an existing file of the same id, which is
-  /// right for resuming but wrong after an abort: the dead run's records —
-  /// its own step labels, and message ids re-minted identically by the next
-  /// arm — end up interleaved with the real run in one upload, and every
-  /// reader downstream has to know to cut them out. Renaming makes the
-  /// abandoned run a separate experiment (`<id>-aborted-<n>`) that uploads on
-  /// its own and can be read, or ignored, on its own.
+  /// Delete the recording of a run that aborted.
   ///
-  /// Renamed, never deleted: an aborted run is still a recording of something
-  /// that happened, and on 2026-08-08 the aborted arm turned out to hold the
-  /// only uncontended-medium measurement of the day.
-  Future<String?> archiveAbortedExperiment(String id) async {
+  /// [startExperiment] APPENDS to an existing file of the same id, so the dead
+  /// run cannot simply be left in place: its step labels and re-minted message
+  /// ids would interleave with the next arm's records in one upload, and every
+  /// reader downstream would have to know to cut them out.
+  ///
+  /// This USED to rename the file to `<id>-aborted-<n>` and keep it, on the
+  /// grounds that an aborted run still recorded something real — on 2026-08-08
+  /// an aborted arm held the only uncontended-medium measurement of that day.
+  /// Dan's call on 2026-08-18 reverses that: a failed run is deleted. The
+  /// reason is that the aborted files had stopped being evidence and started
+  /// being noise — they upload alongside real runs, carry the same experiment
+  /// id prefix, and every analysis has to filter them out. If an aborted run
+  /// ever needs keeping again, this is the one place to change.
+  ///
+  /// Returns the path it deleted, or null if there was nothing to delete.
+  Future<String?> discardAbortedExperiment(String id) async {
     final src = await _file(_expFileName(sanitizeExperimentId(id)));
     if (!await src.exists()) return null;
-    for (var n = 1; n < 1000; n++) {
-      final dst = await _file(_expFileName('${sanitizeExperimentId(id)}-aborted-$n'));
-      if (await dst.exists()) continue;
-      try {
-        await src.rename(dst.path);
-        return dst.path;
-      } catch (e) {
-        debugPrint('[exp] could not set aside aborted $id: $e');
-        return null;
-      }
+    final path = src.path;
+    try {
+      await src.delete();
+      return path;
+    } catch (e) {
+      debugPrint('[exp] could not delete aborted $id: $e');
+      return null;
     }
-    return null;
   }
 
   /// Delete all experiment files (after a successful share/upload).

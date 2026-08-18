@@ -176,6 +176,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
         results.contains(ConnectivityResult.ethernet);
     if (!onNetwork) return;
     if (!TraceConfig.isConfigured) return;
+    // NEVER during a run. Uploading closes the runner, and closing the runner
+    // route disposes it — so a phone that regained Wi-Fi mid-run KILLED its
+    // own experiment. That is exactly what happened to dial-7-n11 on
+    // 2026-08-18: Wi-Fi came back four minutes in, this fired on eleven
+    // phones, and the run ended with ~2000 records instead of ~12000.
+    //
+    // Recording active is the authoritative test — it is true for the whole
+    // run and independent of which screen is showing.
+    final recorder = widget.experimentRecorder;
+    if (recorder != null && recorder.active) return;
+    if (_runnerRoute?.isActive ?? false) return;
     if (_uploading || _uploadComplete) return;
     // Ask the disk rather than the cached count. Not because the cache is
     // wrong — the status poll keeps it current — but because this fires on a

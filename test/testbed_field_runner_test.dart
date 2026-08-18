@@ -37,9 +37,9 @@ class _FakeRecorder extends ExperimentRecorder {
   }
 
   @override
-  Future<String?> archiveAbortedExperiment(String id) async {
+  Future<String?> discardAbortedExperiment(String id) async {
     archived.add(id);
-    return 'exp_$id-aborted-1.jsonl';
+    return 'exp_$id.jsonl';
   }
 
   /// Label and extras are recorded separately: `events` stays the plain

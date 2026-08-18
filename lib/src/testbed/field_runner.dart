@@ -1200,13 +1200,13 @@ class FieldRunner extends ChangeNotifier {
     }
     recorder.onBatteryFloor = null;
     await recorder.logMarker('aborted');
-    // Captured BEFORE the stop clears it: the abandoned file has to be set
-    // aside under its own id, or the next arm appends the real run to it.
+    // Captured BEFORE the stop clears it: the abandoned file has to go, or
+    // the next arm APPENDS the real run to the dead one's records.
     final abandoned = recorder.experimentId;
     await recorder.stopExperiment();
     if (abandoned != null) {
-      final moved = await recorder.archiveAbortedExperiment(abandoned);
-      if (moved != null) debugPrint('[field] aborted run set aside: $moved');
+      final gone = await recorder.discardAbortedExperiment(abandoned);
+      if (gone != null) debugPrint('[field] aborted run deleted: $gone');
     }
     _phase = FieldPhase.finished;
     _running = false;

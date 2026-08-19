@@ -1129,6 +1129,12 @@ class FieldRunner extends ChangeNotifier {
 
   Future<void> _endDwell() async {
     _cancelSends();
+    // The run's own end, stamped before anything is torn down. A step's
+    // segment runs to the NEXT step marker and so carries the reset that
+    // follows, which makes the span the wrong place to read the dwell from;
+    // this is the right one, and it does not depend on a plan resetting
+    // anything.
+    await recorder.logMarker('run-end');
     if (currentStep?.rawLeg != null) {
       await recorder.log({
         'type': 'flow',

@@ -125,6 +125,9 @@ FRAGMENT_THRESHOLD_B = 138  # 247 - 3 - (60 hdr + 25 noise + 21 frame)
 CONTROL_MARKERS = {"links-reset", "sessions-reset", "custody-reset",
                    "link-settled", "saturate-start", "raw-start", "end",
                    "aborted",
+                   # The dwell's own end, stamped before the reset that
+                   # follows it. A boundary inside a step, not a step.
+                   "run-end",
                    # Manual-join lifecycle stamps: the shared-anchor proof,
                    # the radio transitions, and the battery stop. Events on
                    # the timeline, not dwell windows — as segments they were
@@ -2162,23 +2165,32 @@ def line_experiment_tables(steps: pd.DataFrame,
 _CONTROL_PLANE_TX = ["announce", "handshake", "secure:sync", "secure:ack"]
 
 
-RESET_MARKERS = {"custody-reset", "links-reset", "sessions-reset"}
+# `run-end` is the dwell's own end. The reset markers are the fallback for a
+# recording made before the runner stamped it, where the first reset after a
+# step marker is the closest thing to the same instant.
+DWELL_END_MARKERS = ("run-end", "custody-reset", "links-reset",
+                     "sessions-reset")
+RESET_MARKERS = set(DWELL_END_MARKERS[1:])
 
 
 def _dwell_from_resets(line: pd.DataFrame, df: pd.DataFrame) -> float:
-    """The declared dwell: step marker -> the first reset marker after it.
+    """The declared dwell: step marker -> the marker that ends its run.
 
-    Every run is bracketed by a reset, and the reset that ENDS a run is stamped
-    inside that run's segment, so this is the dwell itself rather than the
-    dwell plus whatever followed it. NaN when the run carries no reset markers,
-    which is the caller's signal to fall back to the span.
+    A step's segment runs to the next step marker, so it carries the reset that
+    follows the dwell and is the wrong span to read the dwell from. NaN when
+    the run carries no end marker at all, which is the caller's signal to fall
+    back to the span.
     """
     if df is None or "_type" not in df.columns:
         return float("nan")
     mk = df[df["_type"] == "marker"]
     if mk.empty or "label" not in mk.columns:
         return float("nan")
-    resets = mk[mk["label"].isin(RESET_MARKERS)]
+    # Prefer the explicit run end; fall back to the reset that follows it.
+    for label_set in (("run-end",), RESET_MARKERS):
+        resets = mk[mk["label"].isin(label_set)]
+        if not resets.empty:
+            break
     if resets.empty:
         return float("nan")
     rt = pd.to_numeric(resets["_t"], errors="coerce").dropna().sort_values()

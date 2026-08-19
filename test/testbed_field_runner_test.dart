@@ -123,7 +123,9 @@ void main() {
       expect(recorder.events, [
         'start:cp-line-1',
         'marker:d=40',
+        'marker:run-end',
         'marker:d=20',
+        'marker:run-end',
         'marker:end',
         'stop',
       ]);
@@ -1038,7 +1040,8 @@ void main() {
       async.elapse(const Duration(seconds: 1)); // settle → finished
       expect(runner.phase, FieldPhase.finished);
       expect(recorder.events,
-          ['start:auto', 'marker:s1', 'marker:s2', 'marker:end', 'stop']);
+          ['start:auto', 'marker:s1', 'marker:run-end', 'marker:s2',
+            'marker:run-end', 'marker:end', 'stop']);
       runner.dispose();
     });
   });

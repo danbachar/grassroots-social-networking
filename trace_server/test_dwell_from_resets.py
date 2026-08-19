@@ -25,8 +25,8 @@ def marker(t: int, label: str) -> dict:
     return {"_device": "a", "_t": t, "_type": "marker", "label": label}
 
 
-def build(dwell_ms: int, reset_ms: int, steps: int):
-    """A bracketed run: reset, marker, dwell, reset, marker, ... , reset, end."""
+def build(dwell_ms: int, reset_ms: int, steps: int, run_end: bool = False):
+    """A bracketed run: reset, marker, dwell, [run-end], reset, marker, ..."""
     rows, segs, t = [], [], 0
     for i in range(steps):
         rows += [marker(t, "custody-reset"), marker(t + 1, "links-reset")]
@@ -34,6 +34,8 @@ def build(dwell_ms: int, reset_ms: int, steps: int):
         rows.append(marker(t, f"d=10 t{i + 1}"))
         segs.append({"t0": t, "d": 10.0})
         t += dwell_ms
+        if run_end:
+            rows.append(marker(t, "run-end"))
     rows += [marker(t, "custody-reset"), marker(t + 1, "links-reset")]
     t += reset_ms
     rows.append(marker(t, "end"))
@@ -52,8 +54,20 @@ def check(name: str, got, want) -> bool:
 def main() -> int:
     ok = True
 
+    line, df = build(dwell_ms=30_000, reset_ms=5_000, steps=10, run_end=True)
+    ok &= check("run-end marks the dwell exactly",
+                analyze._dwell_from_resets(line, df), 30.0)
+
+    # A recording made before the runner stamped `run-end`: the reset that
+    # follows the dwell is the closest instant to it.
     line, df = build(dwell_ms=30_000, reset_ms=5_000, steps=10)
-    ok &= check("bracketed run reports the dwell, not dwell+reset",
+    ok &= check("without run-end, the following reset stands in",
+                analyze._dwell_from_resets(line, df), 30.0)
+
+    # A late reset must not be read as a longer dwell when run-end is there.
+    line, df = build(dwell_ms=30_000, reset_ms=5_000, steps=10, run_end=True)
+    df.loc[df["label"].eq("custody-reset"), "_t"] += 2_000
+    ok &= check("run-end wins over a reset stamped late",
                 analyze._dwell_from_resets(line, df), 30.0)
 
     spans = ((line["t1"] - line["t0"]) / 1000.0)

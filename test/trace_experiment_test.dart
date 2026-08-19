@@ -47,6 +47,50 @@ void main() {
       .map((l) => jsonDecode(l) as Map<String, dynamic>)
       .toList();
 
+  group('a run never writes into another run\'s file', () {
+    test('a trailing counter steps on when the file exists', () {
+      expect(ExperimentRecorder.nextExperimentId('line-1'), 'line-2');
+      expect(ExperimentRecorder.nextExperimentId('session-churn-9'),
+          'session-churn-10');
+    });
+
+    test('digits that are not a run counter are left alone', () {
+      // The 11 in dial-8-n11 is the node count. Counting it up would claim a
+      // twelve-phone run that never happened.
+      expect(ExperimentRecorder.nextExperimentId('dial-8-n11'),
+          'dial-8-n11-2');
+      expect(ExperimentRecorder.nextExperimentId('soak'), 'soak-2');
+    });
+
+    test('re-running the same id records under the next free one', () async {
+      await recorder.startExperiment('churn-1');
+      await recorder.logMarker('first run');
+      expect(recorder.experimentId, 'churn-1');
+      await recorder.stopExperiment();
+
+      await recorder.startExperiment('churn-1');
+      expect(recorder.experimentId, 'churn-2',
+          reason: 'churn-1 is on disk, so this run is churn-2');
+      await recorder.logMarker('second run');
+      await recorder.stopExperiment();
+
+      await recorder.startExperiment('churn-1');
+      expect(recorder.experimentId, 'churn-3');
+      await recorder.stopExperiment();
+
+      // The first run's file still holds only the first run.
+      final paths = await recorder.experimentFilePaths();
+      expect(paths, hasLength(3));
+      final first = readJsonl(
+          paths.singleWhere((p) => p.endsWith('/exp_churn-1.jsonl')));
+      expect(first.where((r) => r['label'] == 'second run'), isEmpty,
+          reason: 'the whole point: no run appends to an earlier run');
+      expect(first.where((r) => r['label'] == 'first run'), hasLength(1));
+      expect(paths.where((p) => p.endsWith('/exp_churn-2.jsonl')),
+          hasLength(1));
+    });
+  });
+
   test('records land in the experiment file while recording', () async {
     expect(recorder.active, isFalse);
     await recorder.startExperiment('cp-line-1');
@@ -178,7 +222,7 @@ void main() {
             'nothing logged outside an active experiment');
   });
 
-  test('restarting the same id appends (resume) instead of truncating',
+  test('restarting the same id opens a new file, never resumes the old one',
       () async {
     await recorder.startExperiment('resume');
     await recorder.log({'type': 'rssi', 't': 1});
@@ -187,13 +231,15 @@ void main() {
     await recorder.stopExperiment();
 
     final paths = await recorder.experimentFilePaths();
-    expect(paths, hasLength(1));
-    final events = readJsonl(paths.single)
+    expect(paths, hasLength(2), reason: 'one file per run');
+    List<Object?> eventsOf(String name) => readJsonl(
+            paths.singleWhere((p) => p.endsWith('/exp_$name.jsonl')))
         .where((r) => r['type'] != 'buf')
         .map((r) => r['event'] ?? r['type'])
         .toList();
-    expect(events,
-        ['expStart', 'rssi', 'expStop', 'expStart', 'expStop']);
+    expect(eventsOf('resume'), ['expStart', 'rssi', 'expStop'],
+        reason: 'the first run keeps exactly its own records');
+    expect(eventsOf('resume-2'), ['expStart', 'expStop']);
   });
 
   test('experiment ids are sanitized to safe filenames', () async {

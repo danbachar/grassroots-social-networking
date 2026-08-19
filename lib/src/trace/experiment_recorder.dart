@@ -172,6 +172,36 @@ class ExperimentRecorder {
     return cleaned.isEmpty ? 'exp' : cleaned;
   }
 
+  /// The id one step on from [id]: a trailing `-<n>` counts up, and an id
+  /// without one gains `-2`. `line-1` -> `line-2`, `dial-8-n11` -> the
+  /// digits there belong to the node count, not to a run counter, so it
+  /// becomes `dial-8-n11-2` rather than silently claiming to be twelve nodes.
+  static String nextExperimentId(String id) {
+    final m = RegExp(r'^(.*)-(\d+)$').firstMatch(id);
+    if (m == null) return '$id-2';
+    return '${m.group(1)}-${int.parse(m.group(2)!) + 1}';
+  }
+
+  /// [id], or the first id after it whose file does not exist yet.
+  ///
+  /// A run must never write into a file another run already filled. The
+  /// upload sends the whole file, so an id reused across runs re-sends every
+  /// earlier run inside it, and the server ingests those records a second
+  /// time under a new upload — silently doubling every count that is not
+  /// keyed on something unique.
+  Future<String> _freeExperimentId(String id) async {
+    var candidate = id;
+    // The fleet is eleven phones and a field day is tens of runs; the bound
+    // is only here so a directory that cannot be written to ends the loop.
+    for (var i = 0; i < 1000; i++) {
+      if (!await (await _file(_expFileName(candidate))).exists()) {
+        return candidate;
+      }
+      candidate = nextExperimentId(candidate);
+    }
+    return candidate;
+  }
+
   /// Append one record to the active experiment's in-memory buffer. No-op
   /// when inactive; never throws. Purely synchronous — ordered, no I/O, no
   /// possibility of a dropped record.
@@ -186,8 +216,9 @@ class ExperimentRecorder {
     }
   }
 
-  /// Begin (or resume — the eventual write appends to an existing file of
-  /// the same id) an experiment recording. Marks the boundary with an
+  /// Begin an experiment recording under [id], or under the first id after it
+  /// that has no file yet — a run never writes into another run's file.
+  /// Marks the boundary with an
   /// `expStart` marker.
   Future<void> startExperiment(String id) async {
     if (_experimentId != null) await _writeBufferToDisk();
@@ -199,7 +230,10 @@ class ExperimentRecorder {
     _bufTimer = null;
     _lastFlushLevel = null;
     _floorReported = false;
-    final clean = sanitizeExperimentId(id);
+    final clean = await _freeExperimentId(sanitizeExperimentId(id));
+    if (clean != sanitizeExperimentId(id)) {
+      debugPrint('[exp] $id already has a file; recording as $clean');
+    }
     _experimentId = clean;
     await log({
       'type': 'marker',

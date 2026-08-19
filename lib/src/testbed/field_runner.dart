@@ -1273,8 +1273,9 @@ class FieldRunner extends ChangeNotifier {
     }
     recorder.onBatteryFloor = null;
     await recorder.logMarker('aborted');
-    // Captured BEFORE the stop clears it: the abandoned file has to go, or
-    // the next arm APPENDS the real run to the dead one's records.
+    // Captured BEFORE the stop clears it, and it is the id the recorder
+    // actually used rather than the plan's: the abandoned file has to go or
+    // it uploads alongside real runs under the same id prefix.
     final abandoned = recorder.experimentId;
     await recorder.stopExperiment();
     if (abandoned != null) {

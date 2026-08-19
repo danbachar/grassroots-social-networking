@@ -566,6 +566,13 @@ class FieldRunner extends ChangeNotifier {
       _resetting = false;
       _notify();
     }
+    // The buffer goes first, so nothing is conveyable the instant the radio
+    // comes back.
+    if ((step.resetDtnBuffer ?? _plan!.resetDtnBuffer) &&
+        onResetDtnBuffer != null) {
+      onResetDtnBuffer!.call();
+      await recorder.logMarker('custody-reset');
+    }
     if (_plan!.resetLinks && onResetLinks != null) {
       _resetting = true;
       _notify();
@@ -582,15 +589,14 @@ class FieldRunner extends ChangeNotifier {
     onSetDialParallelism?.call(
         maxParallel: step.maxParallelDials, popN: step.cliqueN);
     onResetEstablishmentCount?.call();
+    // Sessions go LAST, closest to the marker. The radio is back up by now and
+    // pairing is eager, so a handshake can complete during recovery; clearing
+    // before the bounce would hand the dwell a session that already exists,
+    // and the ladder times ANNOUNCE -> handshake -> session from zero.
     if ((step.resetSessions ?? _plan!.resetSessions) &&
         onResetSessions != null) {
       onResetSessions!.call();
       await recorder.logMarker('sessions-reset');
-    }
-    if ((step.resetDtnBuffer ?? _plan!.resetDtnBuffer) &&
-        onResetDtnBuffer != null) {
-      onResetDtnBuffer!.call();
-      await recorder.logMarker('custody-reset');
     }
     // The resets ran in the slot reserved ahead of the step. Hold here until
     // the step's own instant so the marker opens a full dwell and every phone

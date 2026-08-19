@@ -240,6 +240,32 @@ class BleTransportService extends TransportService {
   /// enough that a peer which never negotiates still gets a handshake.
   static const Duration _mtuWait = Duration(seconds: 3);
 
+  /// Rate-limit for `dialSkip` records: one per (path, reason) per second.
+  /// A sighting arrives many times a second, and the interesting fact is
+  /// WHICH gate refused the dial across a window, not every refusal.
+  final Map<String, int> _lastDialSkipTraceMs = {};
+
+  /// Why a sighting did not become a dial, on the trace. The sighting-to-dial
+  /// gap is where establishment time now lives, and every gate in that path
+  /// returns a bare false — a run could not tell WHICH said no.
+  void _traceDialSkip(String pathId, String reason) {
+    if (!_tracing) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final key = '$pathId|$reason';
+    final last = _lastDialSkipTraceMs[key];
+    if (last != null && now - last < 1000) return;
+    if (_lastDialSkipTraceMs.length > 256) _lastDialSkipTraceMs.clear();
+    _lastDialSkipTraceMs[key] = now;
+    unawaited(trace!.log({
+      'type': 'link',
+      't': now,
+      'event': 'dialSkip',
+      'transport': 'ble',
+      'path': pathId,
+      'reason': reason,
+    }));
+  }
+
   /// Rate-limit for per-peer `rssi` trace records (adv sightings can arrive
   /// many times per second).
   final Map<String, int> _lastRssiTraceMs = {};
@@ -1735,6 +1761,7 @@ class BleTransportService extends TransportService {
     // rotations. Dialing a freshly-rotated MAC while another is up is the
     // GATT-status-133 storm.
     if (pair.liveCentralPathId != null || pair.centralInFlight) {
+      _traceDialSkip(pathId, 'pairHasCentral');
       return false;
     }
     // EXPERIMENT: the iOS "cannot open the second link toward a non-iOS peer"
@@ -1752,6 +1779,7 @@ class BleTransportService extends TransportService {
     // dial grid's independent variable (see [maxInFlightCentralDials]) — no
     // dial is ever exempt from it.
     if (_inFlightCentralDials() >= maxInFlightCentralDials) {
+      _traceDialSkip(pathId, 'dialCap');
       return false;
     }
     // Rate-limit redials of an address that just failed: the peer's next
@@ -1759,6 +1787,7 @@ class BleTransportService extends TransportService {
     final failedAt = _centralDialFailedAt[pathId];
     if (failedAt != null) {
       if (DateTime.now().difference(failedAt) < _centralDialCooldown) {
+        _traceDialSkip(pathId, 'cooldown');
         return false;
       }
       _centralDialFailedAt.remove(pathId);
@@ -2001,9 +2030,11 @@ class BleTransportService extends TransportService {
     }
 
     if (centralActive) {
+      _traceDialSkip(pathId, 'centralActive');
       return;
     }
     if (!_shouldDialNow(pair, serviceUuid, existing)) {
+      _traceDialSkip(pathId, 'notFirstMover');
       return;
     }
 

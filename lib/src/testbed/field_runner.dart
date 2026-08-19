@@ -442,7 +442,7 @@ class FieldRunner extends ChangeNotifier {
       // must exceed that spread.
       final alignMs = plan.alignSec * 1000;
       final resetMs = plan.resetBudgetSec * 1000;
-      final minStart = nowMs() + plan.placementSec * 1000 + resetMs;
+      final minStart = nowMs() + plan.placementSec * 1000;
       final anchor = ((minStart + alignMs - 1) ~/ alignMs) * alignMs;
       _anchorMs = anchor;
       // Every phone computes the same anchor, so it also gives every phone the

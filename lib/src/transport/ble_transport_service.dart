@@ -224,6 +224,23 @@ class BleTransportService extends TransportService {
   /// enough that a peer which never negotiates still gets a handshake.
   static const Duration _mtuWait = Duration(seconds: 3);
 
+  /// How long the higher-sorting peer holds its first dial toward an
+  /// identity, giving the deterministic initiator its uncontested window.
+  ///
+  /// This is a stagger, not a wait: a connect lands in ~0.3 s, so 1.5 s is a
+  /// few connect-latencies and the initiator has either succeeded (we take
+  /// the inbound leg, no dial needed) or failed (we dial, ~2.2 s to session)
+  /// well inside it. The predecessor was FIVE seconds, a thousand
+  /// connect-latencies of politeness, and that constant — not the ordering —
+  /// was what held pairs apart for 4-8 s.
+  static const Duration _initiatorGrace = Duration(milliseconds: 1500);
+
+  /// When this identity was first sighted in the current discovery epoch,
+  /// keyed by service UUID. The grace above is measured from here, and a
+  /// local teardown re-arms it so a re-forming pair gives the initiator its
+  /// window again instead of both sides dialing into each other.
+  final Map<String, DateTime> _firstSightingAt = {};
+
   /// Central dials being torn down because they provably lost the race —
   /// our inbound leg from the same identity became ready while they were
   /// still in `connecting`. Excluded from every in-flight view so the
@@ -1851,6 +1868,8 @@ class BleTransportService extends TransportService {
   }
 
   Future<void> disconnectDevice(String pathId, {bool forget = true}) async {
+    final uuid = _peersState.getDiscoveredBlePeer(pathId)?.serviceUuid;
+    if (uuid != null) _firstSightingAt[uuid.toLowerCase()] = DateTime.now();
     try {
       await _ble.disconnect(pathId, forget: forget);
     } catch (e) {
@@ -2021,14 +2040,16 @@ class BleTransportService extends TransportService {
       _traceDialSkip(pathId, 'centralActive');
       return;
     }
-    // Every sighting without a central leg dials. There is no leg-order
-    // election: the measured cost of one was a pair held apart for seconds
-    // while the designated waiter sat out its fallback behind a designated
-    // initiator whose dial had failed. Both sides dialing resolves itself —
-    // one ACL wins, the loser's dial fails once into the cooldown, and the
-    // loser converges over the winner's ACL via [onPeerIdentified]. Session
-    // glare, if both handshakes fire, is settled by the Noise msg1 pubkey
-    // tie-break.
+    // Only the deterministic initiator dials on sight; the other holds for
+    // [_initiatorGrace] so the pair never has two dials in flight at once.
+    // A mutual wedge cannot be signalled away — both stacks are deaf while
+    // connecting — so it is prevented here rather than recovered from by
+    // timeout downstream.
+    if (!_isBleDialInitiator(serviceUuid) && !_graceElapsed(serviceUuid)) {
+      _traceDialSkip(pathId, 'awaitingInitiator');
+      return;
+    }
+
     
 
     // Reverse leg with a live inbound link: dial the link's own remote
@@ -2070,6 +2091,45 @@ class BleTransportService extends TransportService {
     if (rssi == null) return const Duration(seconds: 20);
     final frac = ((-40 - rssi) / 45).clamp(0.0, 1.0);
     return Duration(milliseconds: 2000 + (18000 * frac).round());
+  }
+
+  /// Which of the two peers dials first.
+  ///
+  /// "Central" is not a role either side can claim up front — it is what a
+  /// peer BECOMES by dialing. Before any link exists the two are symmetric:
+  /// both advertising, both scanning. So the pair needs a rule computable by
+  /// both from what they already share, that returns opposite answers: the
+  /// lower derived service UUID dials, the higher takes the inbound leg and
+  /// reverse-dials over that ACL for its own central leg. Mirrors the UDP
+  /// "smaller pubkey initiates" convention.
+  ///
+  /// Without it both sides dial on sight and collide, and a collision cannot
+  /// be signalled away: two in-flight connectGatts leave the pair deaf, so
+  /// the only exit is a timeout — measured at ~30% of windows costing 20 s
+  /// each. Ordering prevents what no recovery can undo cheaply.
+  bool _isBleDialInitiator(String peerServiceUuid) {
+    return identity.bleServiceUuid.toLowerCase().compareTo(
+              peerServiceUuid.toLowerCase(),
+            ) <
+        0;
+  }
+
+  /// Whether the initiator's uncontested window has passed, so the higher
+  /// peer may dial anyway. Covers the initiator that never comes: a muted
+  /// scanner, a failed dial, a peer that is only advertising.
+  bool _graceElapsed(String serviceUuid) {
+    final key = serviceUuid.toLowerCase();
+    final since = _firstSightingAt[key];
+    if (since == null) {
+      _firstSightingAt[key] = DateTime.now();
+      // Bound: entries only matter for one grace window.
+      if (_firstSightingAt.length > 128) {
+        final cutoff = DateTime.now().subtract(_initiatorGrace * 8);
+        _firstSightingAt.removeWhere((_, t) => t.isBefore(cutoff));
+      }
+      return false;
+    }
+    return DateTime.now().difference(since) >= _initiatorGrace;
   }
 
   /// Cap on simultaneous in-flight central dials (paths `connecting` /

@@ -1404,10 +1404,11 @@ void main() {
     });
   });
 
-  group('BleTransportService — every sighting without a central leg dials',
-      () {
-    // Identities at both ends of the UUID sort order: with the leg-order
-    // election gone, the ordering must not matter — both dial on sight.
+  group('BleTransportService — one deterministic initiator per pair', () {
+    // "Central" is not a role a peer can claim before a link exists — it is
+    // what one BECOMES by dialing. These identities sit at opposite ends of
+    // the UUID sort order, which is the rule both sides compute to reach
+    // opposite verdicts about who dials.
     const lowPeerUuid = '84c40316-0871-e5ad-0000-000000000001';
     const highPeerUuid = '84c40316-0871-e5ad-ffff-fffffffffffe';
 
@@ -1434,60 +1435,87 @@ void main() {
       return (hostApi, callbacks, store, transport);
     }
 
-    test('a low-sorting identity dials a higher-sorting peer on sight',
-        () async {
-      final (hostApi, callbacks, _, _) =
-          await build(await _makeLowIdentity('A'));
+    void sight(FakeGrassrootsBluetoothCallbacks callbacks, String uuid,
+        {int rssi = -55}) {
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: 'PEER',
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
+        serviceUuids: [uuid],
+        rssi: rssi,
         connectable: true,
       ));
+    }
+
+    test('the initiator — lower service UUID — dials on sight', () async {
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeLowIdentity('Initiator'));
+      sight(callbacks, highPeerUuid);
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1));
     });
 
-    test('a high-sorting identity dials a lower-sorting peer on sight too',
+    test('the higher peer holds its dial, so the pair is never both-dialing',
         () async {
-      // The case the election used to hold back. The measured cost of the
-      // wait was a pair kept apart for seconds behind a designated initiator
-      // whose dial had failed; both-dial resolves by ACL outcome instead.
+      // The property that matters: two in-flight connectGatts leave both
+      // stacks deaf, and a deadlock nothing can signal away costs a full
+      // connect timeout — measured at ~30% of windows at 20 s each.
       final (hostApi, callbacks, _, _) =
-          await build(await _makeHighIdentity('B'));
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
+          await build(await _makeHighIdentity('Waiter'));
+      sight(callbacks, lowPeerUuid);
       await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'no leg-order election: the sighting itself is the trigger');
+      sight(callbacks, lowPeerUuid, rssi: -54);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'inside the grace the initiator dials uncontested');
     });
 
-    test('a second sighting of the same identity does not double-dial',
-        () async {
+    test('the higher peer dials once the grace passes — an initiator that '
+        'never comes must not strand the pair', () async {
       final (hostApi, callbacks, _, _) =
-          await build(await _makeHighIdentity('B'));
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
+          await build(await _makeHighIdentity('Waiter'));
+      sight(callbacks, lowPeerUuid);
       await Future<void>.delayed(Duration.zero);
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -54,
-        connectable: true,
-      ));
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty);
+
+      // 1.5 s of grace — a few connect-latencies, not the five seconds that
+      // made the ordering look like the culprit.
+      await Future<void>.delayed(const Duration(milliseconds: 1600));
+      sight(callbacks, lowPeerUuid, rssi: -54);
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'the in-flight dial suppresses re-dialing the identity');
+          reason: 'the fallback still exists; only its constant changed');
+    });
+
+    test('an inbound leg needs no grace: the reverse dial goes at once',
+        () async {
+      // Holding here would be waiting for a race already lost — the peer's
+      // link is up, and this dial attaches over its ACL rather than racing.
+      const connectionMac = '99:88:77:66:55:42';
+      final (hostApi, callbacks, store, transport) =
+          await build(await _makeHighIdentity('Waiter'));
+      final peer = await _makeIdentity('Remote');
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
+          hasLength(1));
     });
   });
+
 
 
   group('BleTransportService — testbed dial cap', () {

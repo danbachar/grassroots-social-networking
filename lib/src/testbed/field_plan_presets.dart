@@ -1125,6 +1125,8 @@ class FieldPlanPresets {
         // in. The placement window covers the initial walk out to 120 m.
         'Line sweep 10..120 m x10 (2 phones, ~1h35)':
             manualized(lineSweep(), placementSec: 120),
+        'Session churn LONG (12 x 30s, ~8 min)': sessionChurn(
+            expId: 'churn-long-1', windows: 12),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),

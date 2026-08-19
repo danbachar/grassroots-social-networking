@@ -373,15 +373,15 @@ void main() {
     });
   });
 
-  test('linkSettled gates sends: nothing until settled, then spread', () {
+  test('sessionUp gates sends: nothing until the session, then spread', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       final sent = <String>[];
-      var settled = false;
+      var session = false;
       final runner = FieldRunner(
         recorder: recorder,
         myPubkeyHex: hexOf(0),
-        linkSettled: (_) => settled,
+        sessionUp: (_) => session,
         send: (r, p, {String? messageId}) async {
           sent.add(messageId!);
           return messageId;
@@ -392,28 +392,28 @@ void main() {
       runner.inPosition();
       async.flushMicrotasks();
 
-      // Link not settled: no sends, no matter how long into the dwell.
+      // No session: no sends, no matter how long into the dwell.
       async.elapse(const Duration(seconds: 4));
-      expect(sent, isEmpty, reason: 'must not race a re-forming link');
+      expect(sent, isEmpty, reason: 'a sessionless peer refuses the send');
 
-      settled = true; // pair converges mid-dwell
+      session = true; // handshake completes mid-dwell
       async.elapse(const Duration(seconds: 6)); // rest of the dwell
       expect(sent, hasLength(3),
           reason: 'all sends spread across the remaining dwell');
-      expect(recorder.events, contains('marker:link-settled'));
+      expect(recorder.events, contains('marker:session-up'));
       async.elapse(const Duration(seconds: 5));
       runner.dispose();
     });
   });
 
-  test('linkSettled never true: the step sends nothing (out of range)', () {
+  test('sessionUp never true: the step sends nothing (out of range)', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       var sends = 0;
       final runner = FieldRunner(
         recorder: recorder,
         myPubkeyHex: hexOf(0),
-        linkSettled: (_) => false,
+        sessionUp: (_) => false,
         send: (r, p, {String? messageId}) async {
           sends++;
           return messageId;
@@ -425,7 +425,61 @@ void main() {
       async.flushMicrotasks();
       async.elapse(const Duration(seconds: 20)); // dwell + settle
       expect(sends, 0);
+      expect(recorder.events.where((e) => e == 'marker:session-up'), isEmpty);
+      runner.dispose();
+    });
+  });
+
+  test('a session sends even where the pair never converges to two legs', () {
+    // The line sweep's far end: one leg plus a session is a link that can
+    // carry a message, and gating on convergence there would record a runner
+    // that declined to send as a distance the radio could not reach.
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      var sends = 0;
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        linkSettled: (_) => false, // never converges
+        sessionUp: (_) => true,
+        send: (r, p, {String? messageId}) async {
+          sends++;
+          return messageId;
+        },
+      );
+      runner.start(sendPlan());
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 20));
+      expect(sends, 3, reason: 'the session is the whole requirement');
+      expect(recorder.events.where((e) => e == 'marker:link-settled'), isEmpty,
+          reason: 'convergence is marked only when it happens');
+      runner.dispose();
+    });
+  });
+
+  test('convergence is marked even though it gates nothing', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      var converged = false;
+      final runner = FieldRunner(
+        recorder: recorder,
+        myPubkeyHex: hexOf(0),
+        linkSettled: (_) => converged,
+        sessionUp: (_) => true,
+        send: (r, p, {String? messageId}) async => messageId,
+      );
+      runner.start(sendPlan());
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      async.elapse(const Duration(seconds: 2));
       expect(recorder.events.where((e) => e == 'marker:link-settled'), isEmpty);
+      converged = true;
+      async.elapse(const Duration(seconds: 3));
+      expect(recorder.events, contains('marker:link-settled'));
+      async.elapse(const Duration(seconds: 15));
       runner.dispose();
     });
   });

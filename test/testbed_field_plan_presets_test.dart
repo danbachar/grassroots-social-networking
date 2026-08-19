@@ -951,4 +951,51 @@ void main() {
           reason: 'the label must state the duration the plan actually runs');
     });
   });
+
+  group('lineSweep (two phones, 120 m in to 10 m)', () {
+    test('one pass inward: no distance is visited twice', () {
+      final p = FieldPlanPresets.lineSweep();
+      final order = <double>[];
+      for (final s in p.steps) {
+        final d = double.parse(
+            RegExp(r'd=(\d+(?:\.\d+)?)').firstMatch(s.label)!.group(1)!);
+        if (order.isEmpty || order.last != d) order.add(d);
+      }
+      expect(order, equals(List.of(order)..sort((a, b) => b.compareTo(a))),
+          reason: 'strictly inward; the retreat leg is not part of this test');
+      expect(order.toSet(), hasLength(order.length),
+          reason: 'a distance revisited later would be a retreat by stealth');
+      expect(order.first, 120);
+      expect(order.last, 10);
+    });
+
+    test('every step is a cold trial with the buffer cleared', () {
+      final p = FieldPlanPresets.lineSweep();
+      expect(p.resetLinks, isTrue);
+      expect(p.resetSessions, isTrue);
+      expect(p.resetDtnBuffer, isTrue);
+    });
+
+    test('sends are minimal: enough to stamp usable, not a load test', () {
+      final p = FieldPlanPresets.lineSweep();
+      for (final s in p.steps) {
+        expect(s.sendCount, lessThanOrEqualTo(2));
+        expect(s.saturate, isFalse);
+        expect(s.sendCount, greaterThan(0),
+            reason: 'a step that sends nothing can never stamp usable');
+      }
+    });
+
+    test('only the first trial at a distance waits for the operator', () {
+      final p = FieldPlanPresets.lineSweep(distances: [50, 20], trials: 3);
+      final flags = p.steps.map((s) => s.autoAdvance).toList();
+      expect(flags, [false, true, true, false, true, true]);
+    });
+
+    test('the distance survives the JSON round-trip in the label', () {
+      final p = FieldPlanPresets.lineSweep(distances: [30], trials: 1);
+      final back = FieldPlan.fromJson(p.toJson());
+      expect(back.steps.single.label, 'd=30 t1');
+    });
+  });
 }

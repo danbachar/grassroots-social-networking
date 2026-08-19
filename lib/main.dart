@@ -2545,6 +2545,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
+          sessionUp: _grassroots == null
+              ? null
+              : (peer) => _grassroots!.hasNoiseSessionWith(peer),
           onSetDialParallelism: _grassroots == null
               ? null
               : ({int? maxParallel, int? popN}) =>

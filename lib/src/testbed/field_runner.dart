@@ -126,6 +126,14 @@ class FieldRunner extends ChangeNotifier {
   /// (correct at an out-of-range step). Null: legacy fixed-offset schedule.
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Whether a Noise session with this peer exists. This is what a send is
+  /// gated on — a session is the whole requirement for addressing a peer, and
+  /// [linkSettled] additionally wants both GATT legs, which a pair at the far
+  /// end of a line sweep may never get. Gating sends on convergence there
+  /// records a runner that declined to send as a range the radio could not
+  /// reach.
+  final bool Function(Uint8List peer)? sessionUp;
+
   /// Dial grid: cap the transport's in-flight central dials at [maxParallel]
   /// (null restores the production cap) and stamp [popN] on the
   /// establishments that follow, so each one is attributable to its cell.
@@ -214,6 +222,7 @@ class FieldRunner extends ChangeNotifier {
     this.sendRaw,
     this.knownPeers,
     this.linkSettled,
+    this.sessionUp,
     this.onSetDialParallelism,
     this.establishmentCount,
     this.onResetEstablishmentCount,
@@ -742,12 +751,15 @@ class FieldRunner extends ChangeNotifier {
 
 
   /// Schedule [FieldStep.sendCount] messages for this step. With a
-  /// [linkSettled] predicate: poll until some target's pair is settled
-  /// (session + converged dual-leg), stamp a `link-settled` marker, then
-  /// spread the sends across the REMAINING dwell — data never races a
-  /// re-forming link, and an out-of-range step sends nothing. Without the
-  /// predicate: legacy fixed offsets from dwell start. Targets resolve at
-  /// fire time; message ids are v4, matching production.
+  /// [sessionUp] predicate: poll until some target has a session, then spread
+  /// the sends across the REMAINING dwell — data never races a re-forming
+  /// link, and an out-of-range step sends nothing. Without the predicate:
+  /// fixed offsets from dwell start. Targets resolve at fire time; message
+  /// ids are v4, matching production.
+  ///
+  /// Convergence is watched separately and marked when it happens, so the
+  /// trace still carries when the pair got both legs without that being what
+  /// holds the sends back.
   void _scheduleSends(FieldStep step) {
     // A step whose radio THIS phone holds down sends nothing — in a resolved
     // diluting plan every step carries the full send config and membership
@@ -768,8 +780,9 @@ class FieldRunner extends ChangeNotifier {
       return;
     }
     if (step.sendCount <= 0) return;
-    final settled = linkSettled;
-    if (settled == null) {
+    _watchConvergence();
+    final ready0 = sessionUp;
+    if (ready0 == null) {
       final windowSec = step.dwellSec > 2 ? step.dwellSec - 2 : step.dwellSec;
       for (var seq = 0; seq < step.sendCount; seq++) {
         _queueSend(step, seq, 1 + (seq * windowSec) ~/ step.sendCount);
@@ -782,16 +795,37 @@ class FieldRunner extends ChangeNotifier {
         return;
       }
       final ready =
-          _sendTargets().any((target) => settled(target.$2));
+          _sendTargets().any((target) => ready0(target.$2));
       if (!ready) return;
       t.cancel();
-      unawaited(recorder.logMarker('link-settled'));
+      unawaited(recorder.logMarker('session-up'));
       // Spread the step's sends across what remains of the dwell.
       final windowSec = _remainingSec > 2 ? _remainingSec - 2 : _remainingSec;
       for (var seq = 0; seq < step.sendCount; seq++) {
         _queueSend(step, seq, (seq * windowSec) ~/ step.sendCount);
       }
       _notify();
+    });
+    _sendTimers.add(poll);
+  }
+
+  /// Mark the moment a target's pair converges to both GATT legs.
+  ///
+  /// Convergence no longer gates anything — sends go out on the session — but
+  /// it is still the fact the establishment ladder calls "established", so it
+  /// has to reach the trace on its own. The watcher stops at the first
+  /// converged target: one marker per step is what the analysis reads.
+  void _watchConvergence() {
+    final settled = linkSettled;
+    if (settled == null) return;
+    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
+      if (!_running || _phase != FieldPhase.dwelling) {
+        t.cancel();
+        return;
+      }
+      if (!_sendTargets().any((target) => settled(target.$2))) return;
+      t.cancel();
+      unawaited(recorder.logMarker('link-settled'));
     });
     _sendTimers.add(poll);
   }
@@ -809,7 +843,8 @@ class FieldRunner extends ChangeNotifier {
     _outstanding.clear();
     _satSeq = 0;
     _ackedCount = 0;
-    final settled = linkSettled;
+    _watchConvergence();
+    final settled = sessionUp;
     void begin() {
       unawaited(recorder.logMarker('saturate-start'));
       final lanes = step.sendLanes < 1 ? 1 : step.sendLanes;
@@ -830,7 +865,7 @@ class FieldRunner extends ChangeNotifier {
       }
       if (!_sendTargets().any((target) => settled(target.$2))) return;
       t.cancel();
-      unawaited(recorder.logMarker('link-settled'));
+      unawaited(recorder.logMarker('session-up'));
       begin();
     });
     _sendTimers.add(poll);
@@ -950,7 +985,7 @@ class FieldRunner extends ChangeNotifier {
       // count is therefore a rate PER DESTINATION: at 1/s with seven peers a
       // device puts seven messages a second on the air, which is the load
       // model these experiments mean by "rate".
-      final settled = linkSettled;
+      final settled = sessionUp;
       for (final (_, pubkey) in _sendTargets()) {
         // Only at a target that can actually receive. The send path refuses a
         // peer with no session and records the refusal, which is correct for

@@ -62,6 +62,9 @@ class SettingsScreen extends StatefulWidget {
   final Future<void> Function(int? darkSec)? onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Whether a Noise session exists with this peer — what a send is gated on.
+  final bool Function(Uint8List peer)? sessionUp;
+
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
   final int Function()? establishmentCount;
@@ -96,6 +99,7 @@ class SettingsScreen extends StatefulWidget {
     this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
+    this.sessionUp,
     this.onSetDialParallelism,
     this.establishmentCount,
     this.onResetEstablishmentCount,
@@ -340,6 +344,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
+                      sessionUp: widget.sessionUp,
                       onSetDialParallelism: widget.onSetDialParallelism,
                       establishmentCount: widget.establishmentCount,
                       onResetEstablishmentCount:

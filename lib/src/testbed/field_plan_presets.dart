@@ -904,6 +904,53 @@ class FieldPlanPresets {
     );
   }
 
+  /// Two nodes on stands in an open field, walked from out of range in to
+  /// touching distance. Answers what signal strength a link needs to be
+  /// discovered, established and usable, and what the control plane costs in
+  /// bytes to build a link and then to hold one.
+  ///
+  /// Every step is a COLD trial: links, sessions and the DTN buffer are all
+  /// reset before it, so each dwell is a full ANNOUNCE -> handshake -> session
+  /// ladder measured from the step marker. The sweep runs one way only, from
+  /// [distances] first entry inward — the hysteresis between the strength that
+  /// forms a link and the strength that keeps one is not what this asks.
+  ///
+  /// Sends are deliberately minimal: enough to stamp the link usable and
+  /// nothing more. The measurement is the control plane, and application
+  /// traffic would bury the ANNOUNCE and sync bytes it is trying to weigh.
+  static FieldPlan lineSweep({
+    String expId = 'line-1',
+    List<int> distances = const [120, 100, 80, 60, 45, 30, 20, 15, 10],
+    int trials = 2,
+    int dwellSec = 180,
+    int sendCount = 2,
+    int darkSec = 3,
+  }) {
+    return FieldPlan(
+      expId: expId,
+      settleSec: 20,
+      autoAdvanceGapSec: 5,
+      resetSessions: true,
+      resetLinks: true,
+      linkResetDarkSec: darkSec,
+      resetDtnBuffer: true,
+      steps: [
+        for (final d in distances)
+          for (var t = 1; t <= trials; t++)
+            FieldStep(
+              // `d=<n>` is what the analyzer reads the distance out of; the
+              // trial suffix keeps repeat dwells at one position distinct.
+              label: 'd=$d t$t',
+              dwellSec: dwellSec,
+              sendCount: sendCount,
+              // Only the first trial at a distance waits for the operator —
+              // the repeats have nothing to walk to.
+              autoAdvance: t > 1,
+            ),
+      ],
+    );
+  }
+
   /// Rebuild [p] under the manual running logic: wall-clock-anchored start.
   /// This is the ONE flow every experiment runs under; walk-driven plans no
   /// longer exist. The lone exception is the bounce-stress diagnostic, whose
@@ -1034,6 +1081,7 @@ class FieldPlanPresets {
             storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
         'SCF desk — sender (everyone else)':
             storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
+        'Line sweep 120..10 m (2 phones, cold trials)': lineSweep(),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),

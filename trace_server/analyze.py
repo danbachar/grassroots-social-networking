@@ -2153,6 +2153,15 @@ def line_experiment_tables(steps: pd.DataFrame,
     return out
 
 
+# The control plane as the wire ledger names it. ANNOUNCE and the handshake
+# travel in the clear; the buffer-reconciliation filter is sealed like any
+# other content, so it is only separable on the SENDING side, which is why
+# these are all tx keys. `secure:ack` is here because an end-to-end ACK is
+# what makes a link usable, and its bytes are as much a cost of having a
+# working link as the handshake's are.
+_CONTROL_PLANE_TX = ["announce", "handshake", "secure:sync", "secure:ack"]
+
+
 def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
                      df: pd.DataFrame) -> pd.DataFrame:
     """Control-plane bytes per trial, per distance.
@@ -2175,7 +2184,7 @@ def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
 
     rows = []
     for d, g in line.groupby("d"):
-        totals = {"announce": 0.0, "handshake": 0.0}
+        totals = {k: 0.0 for k in _CONTROL_PLANE_TX}
         for _, s in g.iterrows():
             in_step = wire[(wire._t >= s["t0"]) & (wire._t < s["t1"])]
             for _, w in in_step.iterrows():
@@ -2183,16 +2192,19 @@ def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
                 for key in totals:
                     totals[key] += float(tx.get(key, 0))
         n = len(g)
-        rows.append({
+        row = {
             "d": float(d),
             "os_adv": os_adv,
-            "announce": totals["announce"] / n,
-            "handshake": totals["handshake"] / n,
+            **{k.replace(":", "_"): totals[k] / n for k in _CONTROL_PLANE_TX},
             "dwell_s": dwell_s,
             "usable_n": int((pd.to_numeric(g.get("usable"), errors="coerce")
                              .fillna(0) > 0).sum()),
             "trials": n,
-        })
+        }
+        # What the pair spends on the air per trial to have a link at all,
+        # which is the figure the establishment argument quotes.
+        row["control_total"] = sum(totals[k] / n for k in _CONTROL_PLANE_TX)
+        rows.append(row)
     return pd.DataFrame(rows).sort_values("d")
 
 
@@ -2333,21 +2345,34 @@ def _plot_establish_time(t: pd.DataFrame | None, b: pd.DataFrame | None,
 
 
 def _plot_establish_bytes(b: pd.DataFrame | None, out: Path) -> None:
-    """What one establishment trial costs the pair on the air, in kB: ANNOUNCE
-    stacked under the Noise handshake. The bar shrinking with distance is not
-    a saving — it is trials that never got far enough to spend the bytes."""
+    """What one establishment trial costs the pair on the air, in kB, split by
+    what the bytes are for. The bar shrinking with distance is not a saving —
+    it is trials that never got far enough to spend the bytes."""
     if b is None or b.empty:
         return
     fig, ax = plt.subplots(figsize=(11.5, 6.4))
     _field_axes(fig, [ax])
     width = (float(b["d"].diff().dropna().min()) * 0.55
              if len(b) > 1 else 0.8)
-    ann = b["announce"] / 1000.0
-    hs = b["handshake"] / 1000.0
-    ax.bar(b["d"], ann, width=width, color=_C_USABLE, label="ANNOUNCE",
-           zorder=3)
-    ax.bar(b["d"], hs, width=width, bottom=ann, color=_C_DELIVERY,
-           label="Noise handshake", zorder=3)
+    layers = [
+        ("announce", "ANNOUNCE", _C_SESSION),
+        ("handshake", "Noise handshake", _C_USABLE),
+        ("secure_sync", "Buffer sync filter", _C_DELIVERY),
+        # A neutral, not a fourth hue: the ACK layer is a thin residual and
+        # inventing a categorical colour for it would spend a slot the
+        # validated palette has not cleared for adjacency here.
+        ("secure_ack", "End-to-end ACK", _INK_MUTED),
+    ]
+    bottom = pd.Series(0.0, index=b.index)
+    for col, label, colour in layers:
+        if col not in b.columns:
+            continue
+        vals = b[col] / 1000.0
+        if not (vals > 0).any():
+            continue
+        ax.bar(b["d"], vals, width=width, bottom=bottom, color=colour,
+               label=label, zorder=3)
+        bottom = bottom + vals
     ax.set_xlabel("Distance (m)", fontsize=12, color=_INK_2, labelpad=9)
     ax.set_ylabel("kB per trial (both devices)", fontsize=12, color=_INK_2,
                   labelpad=9)
@@ -2357,7 +2382,7 @@ def _plot_establish_bytes(b: pd.DataFrame | None, out: Path) -> None:
                    [int(n) for n in b["trials"]])
     ax.set_title("Control plane costs", fontsize=15, color=_INK,
                  loc="left", pad=34)
-    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2,
+    leg = ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=4,
                     frameon=False, fontsize=11.5)
     for txt in leg.get_texts():
         txt.set_color(_INK_2)

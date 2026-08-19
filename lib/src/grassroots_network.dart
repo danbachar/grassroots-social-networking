@@ -1936,6 +1936,11 @@ class GrassrootsNetwork {
   /// this so messages only travel over a link that is really ready — the
   /// establishment ladder itself is measured by the link events, not by
   /// racing data into a half-formed pair.
+  /// Whether a Noise session with [pubkey] exists — the whole requirement for
+  /// addressing a peer, and what the testbed gates a send on.
+  bool hasNoiseSessionWith(Uint8List pubkey) =>
+      _noiseSessions.hasSession(pubkey);
+
   bool isPeerLinkSettled(Uint8List pubkey) {
     if (!_noiseSessions.hasSession(pubkey)) return false;
     final peer = _peersState.getPeerByPubkey(pubkey);

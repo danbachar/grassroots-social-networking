@@ -918,6 +918,27 @@ class FieldPlanPresets {
   /// Sends are deliberately minimal: enough to stamp the link usable and
   /// nothing more. The measurement is the control plane, and application
   /// traffic would bury the ANNOUNCE and sync bytes it is trying to weigh.
+  ///
+  /// Running it:
+  ///
+  ///  1. Sync both clocks, turn Wi-Fi off on both, and check each nickname
+  ///     parses as an integer — the testbed reads it as the join order and a
+  ///     non-numeric one silently becomes node 1.
+  ///  2. Mark the twelve positions along the line before starting. Stand both
+  ///     phones at the 10 m pair; only the far one ever moves.
+  ///  3. Load this preset on both and confirm the expId in the JSON preview
+  ///     rather than the dropdown label.
+  ///  4. Launch both inside one alignment interval, then check that both
+  ///     screens show the SAME `starts at` time. They compute it independently,
+  ///     so two different times mean two different schedules — and the run
+  ///     gives no other sign of it until the traces are read.
+  ///  5. Step well clear of both phones before that instant. A body at 2.4 GHz
+  ///     is worth several dB, and it lands straight in the RSSI this measures.
+  ///  6. Each segment ends with a walk window: move the far phone to the next
+  ///     mark and step away again before the next segment opens. The phones
+  ///     advance on the clock and wait for nobody.
+  ///  7. After the last distance let it settle and upload, then turn Wi-Fi
+  ///     back on.
   static FieldPlan lineSweep({
     String expId = 'line-1',
     List<int> distances = const [

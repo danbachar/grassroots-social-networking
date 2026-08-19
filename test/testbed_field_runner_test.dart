@@ -1809,8 +1809,9 @@ void main() {
           expId: 'align-t',
           settleSec: 1,
           alignSec: 120,
-          autoAdvanceGapSec: 5,
+          autoAdvanceGapSec: 0,
           resetBudgetSec: 5,
+          walkBudgetSec: 120,
           steps: [
             for (final d in [20, 10])
               for (var t = 1; t <= 2; t++)
@@ -1824,11 +1825,14 @@ void main() {
       final starts = FieldRunner.stepStarts(plan, 0);
 
       expect(starts[0] % 120000, 0, reason: 'd=20 t1 opens on a boundary');
-      expect(starts[1] - starts[0], 40000,
-          reason: 'a repeat follows at reset + dwell + gap, no rounding');
+      expect(starts[1] - starts[0], 35000,
+          reason: 'a repeat follows at reset + dwell, no rounding');
       expect(starts[2] % 120000, 0, reason: 'd=10 t1 opens on a boundary');
-      expect(starts[2] - starts[1], greaterThan(40000),
-          reason: 'the walk gap is the slack up to that boundary');
+      // The walk runs from the previous dwell ending to the next resets
+      // opening, and is reserved rather than left over.
+      expect(starts[2] - 5000 - (starts[1] + 30000),
+          greaterThanOrEqualTo(120000),
+          reason: 'the walk is at least its budget');
     });
 
     test('the resets are reserved BEFORE the step, not taken out of it', () {

@@ -646,17 +646,25 @@ class FieldRunner extends ChangeNotifier {
   /// what lets a pair advance together with nobody tapping anything.
   ///
   /// A step that does not auto-advance opens a new position the operator has to
-  /// walk a device to, so it is rounded up to the next alignment boundary: the
-  /// walk gets a whole boundary interval rather than the settle gap, and the
-  /// phones re-converge on the boundary instead of carrying the previous
-  /// position's remainder forward. Repeats at one position follow immediately.
+  /// walk a device to, so it lands on the first alignment boundary at least
+  /// [FieldPlan.walkBudgetSec] past the previous dwell — the walk is a
+  /// reservation, and the phones re-converge on the boundary instead of
+  /// carrying the previous position's remainder forward. Repeats at one
+  /// position follow immediately.
   static List<int> stepStarts(FieldPlan plan, int anchor) {
     final alignMs = plan.alignSec * 1000;
     final resetMs = plan.resetBudgetSec * 1000;
+    final walkMs = plan.walkBudgetSec * 1000;
     final starts = <int>[];
     var t = anchor;
-    for (final st in plan.steps) {
-      if (!st.autoAdvance) t = ((t + alignMs - 1) ~/ alignMs) * alignMs;
+    for (var i = 0; i < plan.steps.length; i++) {
+      final st = plan.steps[i];
+      if (!st.autoAdvance) {
+        // The walk runs until the next step's RESETS open, not until its
+        // dwell does, so the reservation is measured to that instant.
+        final earliest = i == 0 ? t : t + walkMs;
+        t = ((earliest + alignMs - 1) ~/ alignMs) * alignMs;
+      }
       starts.add(t);
       t += resetMs + (st.dwellSec + plan.autoAdvanceGapSec) * 1000;
     }

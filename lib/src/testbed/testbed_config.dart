@@ -404,6 +404,15 @@ class FieldPlan {
   /// measure — the value is a property of what the plan resets, not a global.
   final int resetBudgetSec;
 
+  /// Seconds the operator is guaranteed to walk a device to the next position
+  /// in, under [manualJoin]. A step that opens a new position lands on the
+  /// first alignment boundary at least this far past the previous dwell.
+  ///
+  /// Without it the walk is whatever the lattice leaves over — a remainder
+  /// that shrinks to seconds whenever the trials happen to fill a boundary
+  /// interval, which is not a budget anyone chose.
+  final int walkBudgetSec;
+
   /// Manual-join mode: system Bluetooth is toggled BY THE OPERATOR in the
   /// phone's settings, never by the app. The run is anchored to a shared
   /// wall-clock instant (the next 10-minute boundary at least [placementSec]
@@ -451,6 +460,7 @@ class FieldPlan {
     this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
     this.resetBudgetSec = 0,
+    this.walkBudgetSec = 0,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
@@ -500,6 +510,7 @@ class FieldPlan {
       resetDtnBuffer: resetDtnBuffer,
       autoAdvanceGapSec: autoAdvanceGapSec,
       resetBudgetSec: resetBudgetSec,
+      walkBudgetSec: walkBudgetSec,
       manualJoin: manualJoin,
       placementSec: placementSec,
       alignSec: alignSec,
@@ -519,6 +530,7 @@ class FieldPlan {
         'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
         if (manualJoin) 'resetBudgetSec': resetBudgetSec,
+        if (manualJoin) 'walkBudgetSec': walkBudgetSec,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
@@ -542,6 +554,7 @@ class FieldPlan {
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
         resetBudgetSec: json['resetBudgetSec'] as int? ?? 0,
+        walkBudgetSec: json['walkBudgetSec'] as int? ?? 0,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
@@ -561,6 +574,7 @@ class FieldPlan {
       other.resetDtnBuffer == resetDtnBuffer &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
       other.resetBudgetSec == resetBudgetSec &&
+      other.walkBudgetSec == walkBudgetSec &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
@@ -569,6 +583,6 @@ class FieldPlan {
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
       Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
-      resetDtnBuffer, autoAdvanceGapSec, resetBudgetSec, manualJoin,
-      placementSec, alignSec, scriptedRadio);
+      resetDtnBuffer, autoAdvanceGapSec, resetBudgetSec, walkBudgetSec,
+      manualJoin, placementSec, alignSec, scriptedRadio);
 }

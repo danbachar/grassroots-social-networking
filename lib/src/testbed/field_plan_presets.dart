@@ -928,11 +928,15 @@ class FieldPlanPresets {
     int sendCount = 2,
     int darkSec = 3,
     int resetBudgetSec = 5,
+    int walkBudgetSec = 120,
   }) {
     return FieldPlan(
       expId: expId,
       settleSec: 20,
-      autoAdvanceGapSec: 5,
+      // No settle gap: the wall-clock schedule counts down to each step's own
+      // instant, so a gap between steps is dead time rather than a settle.
+      autoAdvanceGapSec: 0,
+      walkBudgetSec: walkBudgetSec,
       // The measured links-reset on both run phones is 3.1 s, worst case 3.15
       // over 30 resets each; 5 s reserves that with headroom so the dwell
       // opens on its instant at a full length.
@@ -984,6 +988,7 @@ class FieldPlanPresets {
       resetDtnBuffer: p.resetDtnBuffer,
       autoAdvanceGapSec: p.autoAdvanceGapSec,
       resetBudgetSec: p.resetBudgetSec,
+      walkBudgetSec: p.walkBudgetSec,
       manualJoin: true,
       scriptedRadio: p.scriptedRadio,
       placementSec: placementSec,

@@ -1767,6 +1767,7 @@ class BleTransportService extends TransportService {
   Future<bool> connectToDevice(
     String pathId, {
     String? serviceUuidOverride,
+    int? sightingRssi,
   }) async {
     if (!pathId.startsWith('central:')) {
       // Peripheral-side paths are inbound — we don't dial them.
@@ -1831,13 +1832,11 @@ class BleTransportService extends TransportService {
         serviceUuid: serviceUuid,
         characteristicUuid: _grassrootsCharacteristicUuid,
         androidMtu: _requestedAndroidMtu,
-        // Apple's docs say CoreBluetooth's connect can legitimately take
-        // 10-15s, so we stay safely above that. The election's first-mover
-        // gate should prevent the simultaneous-dial collision that would
-        // wedge a connect for the full window; 20s is a safety net for any
-        // collision that still slips through (e.g. during the first-mover
-        // fallback) so it recovers and retries sooner.
-        timeout: const Duration(seconds: 20),
+        // Sized to the sighting's signal strength (see
+        // [connectTimeoutForRssi]): the strong-signal deadlock breaks in
+        // ~2 s, the weak-signal connect keeps its 20 s of legitimate
+        // link-layer patience, and a dial with no reading stays patient.
+        timeout: connectTimeoutForRssi(sightingRssi),
       );
       return true;
     } catch (e) {
@@ -2046,7 +2045,31 @@ class BleTransportService extends TransportService {
       return;
     }
 
-    unawaited(connectToDevice(pathId));
+    unawaited(connectToDevice(pathId, sightingRssi: adv.rssi));
+  }
+
+  /// Connect leash for a dial triggered by a sighting at [rssi] dBm.
+  ///
+  /// The timeout's job is to tell a slowly-progressing connect from one that
+  /// will never land, and the sighting's signal strength is the best prior
+  /// there is: at −40 dBm a real connect lands in ~0.3 s and twenty seconds
+  /// of patience is pure deadlock exposure (two phones dialing each other
+  /// suspend their own inbound acceptance — measured as both sides burning
+  /// the full leash in lockstep), while at −85 dBm seconds of link-layer
+  /// retransmission are legitimate and an eager cut would censor exactly the
+  /// marginal-range establishment the line experiment measures. Linear in dB
+  /// between those anchors. The two directions of a pair read several dB
+  /// apart and every sighting re-samples, so the two sides get different
+  /// leashes for free — a symmetric deadlock breaks on the shorter one and
+  /// cannot re-synchronize.
+  ///
+  /// Null (no reading — and every iOS dial, where CoreBluetooth may take
+  /// 10–15 s legitimately) keeps the full leash.
+  @visibleForTesting
+  static Duration connectTimeoutForRssi(int? rssi) {
+    if (rssi == null) return const Duration(seconds: 20);
+    final frac = ((-40 - rssi) / 45).clamp(0.0, 1.0);
+    return Duration(milliseconds: 2000 + (18000 * frac).round());
   }
 
   /// Cap on simultaneous in-flight central dials (paths `connecting` /

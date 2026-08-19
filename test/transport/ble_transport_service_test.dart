@@ -1124,6 +1124,37 @@ void main() {
           reason: 'the pair still has its one central in flight');
     });
 
+    test('the connect leash scales with the sighting RSSI', () {
+      // Anchors from the field path-loss fit (RSSI = -30 - 32.3 log d):
+      // touching distance gets ~2 s, the 45 m fringe keeps the full 20 s.
+      expect(BleTransportService.connectTimeoutForRssi(-30),
+          const Duration(seconds: 2));
+      expect(BleTransportService.connectTimeoutForRssi(-40),
+          const Duration(seconds: 2));
+      expect(BleTransportService.connectTimeoutForRssi(-85),
+          const Duration(seconds: 20));
+      expect(BleTransportService.connectTimeoutForRssi(-100),
+          const Duration(seconds: 20));
+      // Midpoint: linear in dB.
+      expect(
+          BleTransportService.connectTimeoutForRssi(-62).inMilliseconds, 10800);
+      // No reading — and every iOS dial — stays patient: CoreBluetooth can
+      // legitimately take 10-15 s.
+      expect(BleTransportService.connectTimeoutForRssi(null),
+          const Duration(seconds: 20));
+    });
+
+    test('two sides of one pair get different leashes from their own readings',
+        () {
+      // Directional asymmetry is measured at several dB on every pair; the
+      // deadlock's fix is exactly that the shorter leash frees its advertiser
+      // first, so equal leashes would be the failure mode.
+      final a = BleTransportService.connectTimeoutForRssi(-44);
+      final b = BleTransportService.connectTimeoutForRssi(-52);
+      expect(a, isNot(b));
+      expect(b - a, const Duration(milliseconds: 3200));
+    });
+
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
       const pathId = 'central:DEADBEEF';
 

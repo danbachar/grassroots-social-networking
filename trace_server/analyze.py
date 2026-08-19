@@ -696,8 +696,10 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
                         "goodput_Bps": None, "airB_per_msg": None,
                         "air_overhead": None})
         for src in ("adv", "conn"):
-            vals = _col(in_seg_rssi[_col(in_seg_rssi, "src") == src],
-                        "rssi").dropna()
+            sub = in_seg_rssi[_col(in_seg_rssi, "src") == src]
+            vals = _valid_rssi(
+                sub, seg["t0"],
+                settle=(src == "conn"))
             row[f"rssi_{src}_mean"] = round(vals.mean(), 1) if len(vals) else None
             row[f"rssi_{src}_std"] = round(vals.std(), 1) if len(vals) > 1 else None
         # Establishment LATENCY, not just whether the stage happened: seconds
@@ -715,6 +717,34 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
             row[stage] = int((_col(in_seg_link, "event") == stage).sum())
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+
+# The connection-RSSI stream reads 8-11 dB high for this long after a BLE
+# restart before converging; measured on a matched stationary pair, where the
+# settled value was flat to 0.5 dB. Advertisement samples carry no such
+# transient and are never excluded on time.
+CONN_RSSI_SETTLE_MS = 15_000
+
+
+def _valid_rssi(sub: pd.DataFrame, t0: float, *,
+                settle: bool) -> pd.Series:
+    """RSSI samples fit to aggregate, from one step's slice of one source.
+
+    Two contaminations are removed, both measured rather than assumed:
+    sentinel readings (0 / -1, emitted for the first discovery cycles after a
+    restart while the peer record has no real sample yet — physically
+    impossible as signal), and for the connection stream the post-restart
+    settle window, during which every reading is high. Averaging either into
+    a per-step mean invents several dB of step-to-step scatter on a link that
+    is actually flat.
+    """
+    if sub.empty:
+        return pd.Series(dtype=float)
+    if settle and "_t" in sub.columns:
+        sub = sub[sub._t >= t0 + CONN_RSSI_SETTLE_MS]
+    vals = pd.to_numeric(_col(sub, "rssi"), errors="coerce").dropna()
+    return vals[vals <= -10]
 
 
 def pathloss_coeffs(steps: pd.DataFrame) -> tuple[float, float, float, int] | None:

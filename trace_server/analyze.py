@@ -2162,6 +2162,42 @@ def line_experiment_tables(steps: pd.DataFrame,
 _CONTROL_PLANE_TX = ["announce", "handshake", "secure:sync", "secure:ack"]
 
 
+RESET_MARKERS = {"custody-reset", "links-reset", "sessions-reset"}
+
+
+def _dwell_from_resets(line: pd.DataFrame, df: pd.DataFrame) -> float:
+    """The declared dwell: step marker -> the first reset marker after it.
+
+    Every run is bracketed by a reset, and the reset that ENDS a run is stamped
+    inside that run's segment, so this is the dwell itself rather than the
+    dwell plus whatever followed it. NaN when the run carries no reset markers,
+    which is the caller's signal to fall back to the span.
+    """
+    if df is None or "_type" not in df.columns:
+        return float("nan")
+    mk = df[df["_type"] == "marker"]
+    if mk.empty or "label" not in mk.columns:
+        return float("nan")
+    resets = mk[mk["label"].isin(RESET_MARKERS)]
+    if resets.empty:
+        return float("nan")
+    rt = pd.to_numeric(resets["_t"], errors="coerce").dropna().sort_values()
+    dwells = []
+    for _, seg in line.iterrows():
+        t0 = pd.to_numeric(seg["t0"], errors="coerce")
+        t1 = pd.to_numeric(seg["t1"], errors="coerce")
+        if pd.isna(t0) or pd.isna(t1):
+            continue
+        inside = rt[(rt > t0) & (rt <= t1)]
+        if not inside.empty:
+            dwells.append((float(inside.iloc[0]) - float(t0)) / 1000.0)
+    if not dwells:
+        return float("nan")
+    # Median, not min: one step whose reset was stamped early should not set
+    # the dwell for the whole run.
+    return round(float(np.median(dwells)), 1)
+
+
 def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
                      df: pd.DataFrame) -> pd.DataFrame:
     """Control-plane bytes per trial, per distance.
@@ -2170,14 +2206,19 @@ def _establish_bytes(line: pd.DataFrame, wire: pd.DataFrame,
     step's marker span and divided by the distance's trial count — the cost of
     one trial to the pair, which is what the establishment argument is about.
 
-    `dwell_s` is the plan's declared dwell, recovered as the SHORTEST step span
-    in the run: every other span is inflated by the inter-step link bounce and
-    the settle window that follow the dwell, so the minimum is the only span
-    that is close to what the plan asked for.
+    `dwell_s` is the plan's declared dwell, measured as the step marker to the
+    first reset marker inside its span. A step's span is NOT the dwell: it runs
+    to the next step marker, so it carries the reset that follows the dwell,
+    and every step is bracketed by one — including the last, whose trailing
+    reset lands before `end`. Taking the shortest span instead would report the
+    dwell plus a reset for every step in the run.
     """
     spans = (pd.to_numeric(line["t1"], errors="coerce")
              - pd.to_numeric(line["t0"], errors="coerce")) / 1000.0
-    dwell_s = round(float(spans.min()), 1) if spans.notna().any() else float("nan")
+    dwell_s = _dwell_from_resets(line, df)
+    if dwell_s != dwell_s:  # no reset markers: the span IS the dwell
+        dwell_s = (round(float(spans.min()), 1)
+                   if spans.notna().any() else float("nan"))
     # Devices that ever advertised, which for a two-phone line sweep is both.
     n_adv = int(df["_device"].nunique()) if "_device" in df.columns else 0
     os_adv = dwell_s * n_adv * ADV_CHANNELS * ADV_PDU_B / ADV_INTERVAL_S

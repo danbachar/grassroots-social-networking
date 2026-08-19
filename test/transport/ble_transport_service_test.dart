@@ -932,6 +932,78 @@ void main() {
               'inbound link is live.');
     });
 
+    test(
+        'a reverse dial that starts and dies before ready retries ONCE at '
+        'the freshly advertised MAC', () async {
+      // The measured failure mode: the over-ACL dial to the peer's
+      // connection address connects and drops in milliseconds. Before this
+      // retry existed, nothing fired until the next advertisement election
+      // — which is where the pair's convergence time was going.
+      const advertisingMac = 'AA:BB:CC:DD:EE:11';
+      const connectionMac = '99:88:77:66:55:12';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
+          hasLength(1));
+
+      // The over-ACL dial dies before ready.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$connectionMac',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          hasLength(1),
+          reason: 'the death of the over-ACL dial must immediately retry at '
+              'the advertised MAC, not wait for the next election');
+
+      // And only once: a second death of the SAME pathId retries nothing.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$connectionMac',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          hasLength(1),
+          reason: 'one retry per registered reverse dial — the advertisement '
+              'election owns everything after');
+    });
+
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
       const pathId = 'central:DEADBEEF';
 

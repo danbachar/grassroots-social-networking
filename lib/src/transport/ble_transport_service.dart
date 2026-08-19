@@ -212,6 +212,15 @@ class BleTransportService extends TransportService {
       _wireLedger.secureContentFor = resolver;
   Timer? _wireLedgerTimer;
 
+  /// Reverse (central) dials in flight toward a peer's inbound connection
+  /// address, keyed by the dial's pathId. A dial that starts and then dies
+  /// before ready — the observed mode is a 6 ms connect-then-drop on the
+  /// peer's rotated address — otherwise triggers nothing until the next
+  /// advertisement election, which is where the pair's convergence time was
+  /// going. The entry lets the terminal-state handler retry once, at the
+  /// peer's freshly advertised MAC.
+  final Map<String, Uint8List> _reverseDialPending = {};
+
   /// Writes held back because their only leg had not negotiated an MTU yet,
   /// keyed by pathId. Released by [_onPathChanged] the moment that leg
   /// reports a bigger MTU, or by their own timer if it never does.
@@ -1486,22 +1495,21 @@ class BleTransportService extends TransportService {
       'inbound link (attaches to the live ACL; a second ACL to the same '
       'peer is refused by modern stacks).',
     );
+    _traceReverseDial('overAcl', 'central:$remoteId');
     if (await connectToDevice('central:$remoteId',
         serviceUuidOverride: gattUuid)) {
+      // Started is not survived: if this dial dies before ready, the
+      // terminal-state handler retries once at a fresh advertised MAC.
+      _reverseDialPending
+          .removeWhere((pathId, _) => !_paths.containsKey(pathId));
+      _reverseDialPending['central:$remoteId'] = pubkey;
       return;
     }
 
     // The over-ACL dial did not start (choke-point guard or a stack that
     // cannot connect to a connection address) — fall back to a fresh ACL
     // toward the scanned advertising MAC.
-    if (scanned != null) {
-      debugPrint(
-        '[ble] reverse leg: over-ACL dial did not start; dialing advertised '
-        '${scanned.transportId} instead.',
-      );
-      unawaited(connectToDevice(scanned.transportId));
-      return;
-    }
+    if (_dialAdvertisedFallback(pubkey)) return;
 
     // Loud on purpose: a peripheral-attached peer with no dialable target is
     // the signature of a muted scanner (the pair then silently stays
@@ -1515,6 +1523,41 @@ class BleTransportService extends TransportService {
     // Add this identity to the hardware scan filter so Android reliably
     // surfaces its advertisement (the unfiltered scan is what got muted).
     unawaited(_applyScanTargets());
+  }
+
+  /// Dial the peer's freshest scanned advertising MAC, looked up at call
+  /// time — under address rotation the entry that existed when the reverse
+  /// leg was first attempted may already name a dead address. True when a
+  /// dial was started.
+  bool _dialAdvertisedFallback(Uint8List pubkey) {
+    for (final uuid in GrassrootsIdentity.candidateServiceUuids(pubkey)) {
+      for (final dp in _peersState.getDiscoveredBlePeersByServiceUuid(uuid)) {
+        if (dp.isConnected || dp.isConnecting) continue;
+        debugPrint('[ble] reverse leg: dialing advertised '
+            '${dp.transportId} instead.');
+        _traceReverseDial('advertised', dp.transportId);
+        unawaited(connectToDevice(dp.transportId));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// One `reverseDial` link record per attempt: which method carried it —
+  /// `overAcl` (attach to the inbound link's address) or `advertised` (fresh
+  /// ACL to a scanned MAC). The run's convergence story is unreadable
+  /// without these: a pair that settled fast over the ACL and one that
+  /// burned an election cycle both end at `connected`.
+  void _traceReverseDial(String method, String pathId) {
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'link',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'event': 'reverseDial',
+      'transport': 'ble',
+      'method': method,
+      'path': pathId,
+    }));
   }
 
   @override
@@ -2287,6 +2330,7 @@ class BleTransportService extends TransportService {
           // may need targeted scanning to find its MAC, and a completed
           // central leg lets us drop a target and fall back to a broad scan.
           unawaited(_applyScanTargets());
+          _reverseDialPending.remove(path.pathId);
         } else if (path.rssi != null) {
           // ready → ready re-emit: the plugin's periodic connected-RSSI poll
           // (or an MTU update). Sample it for the evaluation trace.
@@ -2296,6 +2340,16 @@ class BleTransportService extends TransportService {
       case ble.BlePathState.failed:
       case ble.BlePathState.disconnected:
       case ble.BlePathState.stale:
+        // A reverse dial that started and died before ready: retry ONCE at
+        // the peer's freshly advertised MAC. Without this the pair waits for
+        // the next advertisement election, and that wait — not GATT setup,
+        // not the handshake — was where convergence time went.
+        final reversePeer = _reverseDialPending.remove(path.pathId);
+        if (reversePeer != null && !_stopped) {
+          if (!_dialAdvertisedFallback(reversePeer)) {
+            unawaited(_applyScanTargets());
+          }
+        }
         if (path.state == ble.BlePathState.failed &&
             path.role == ble.BleRole.central) {
           // Rate-limit the redial instead of evicting the address. A failed

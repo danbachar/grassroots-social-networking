@@ -904,16 +904,16 @@ class FieldPlanPresets {
     );
   }
 
-  /// Two nodes on stands in an open field, walked from out of range in to
-  /// touching distance. Answers what signal strength a link needs to be
+  /// Two nodes on stands in an open field, one walked out from touching
+  /// distance to out of range. Answers what signal strength a link needs to be
   /// discovered, established and usable, and what the control plane costs in
   /// bytes to build a link and then to hold one.
   ///
   /// Every step is a COLD trial: links, sessions and the DTN buffer are all
   /// reset before it, so each dwell is a full ANNOUNCE -> handshake -> session
-  /// ladder measured from the step marker. The sweep runs one way only, from
-  /// [distances] first entry inward — the hysteresis between the strength that
-  /// forms a link and the strength that keeps one is not what this asks.
+  /// ladder measured from the step marker. Nothing survives a trial to bias
+  /// the next, which is what makes the direction free — it runs outward
+  /// because the pair starts together, where placing them is easiest.
   ///
   /// Sends are deliberately minimal: enough to stamp the link usable and
   /// nothing more. The measurement is the control plane, and application
@@ -921,7 +921,7 @@ class FieldPlanPresets {
   static FieldPlan lineSweep({
     String expId = 'line-1',
     List<int> distances = const [
-      120, 110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10
+      10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120
     ],
     int trials = 10,
     int dwellSec = 30,
@@ -1099,7 +1099,7 @@ class FieldPlanPresets {
         // with no taps. Each distance opens on an alignment boundary, which
         // is the window the operator walks one device to the next position
         // in. The placement window covers the initial walk out to 120 m.
-        'Line sweep 120..10 m x10 (2 phones, ~1h35)':
+        'Line sweep 10..120 m x10 (2 phones, ~1h35)':
             manualized(lineSweep(), placementSec: 120),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),

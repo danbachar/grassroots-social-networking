@@ -952,8 +952,8 @@ void main() {
     });
   });
 
-  group('lineSweep (two phones, 120 m in to 10 m)', () {
-    test('one pass inward: no distance is visited twice', () {
+  group('lineSweep (two phones, 10 m out to 120 m)', () {
+    test('one pass outward: no distance is visited twice', () {
       final p = FieldPlanPresets.lineSweep();
       final order = <double>[];
       for (final s in p.steps) {
@@ -961,13 +961,13 @@ void main() {
             RegExp(r'd=(\d+(?:\.\d+)?)').firstMatch(s.label)!.group(1)!);
         if (order.isEmpty || order.last != d) order.add(d);
       }
-      expect(order, equals(List.of(order)..sort((a, b) => b.compareTo(a))),
-          reason: 'strictly inward; the retreat leg is not part of this test');
+      expect(order, equals(List.of(order)..sort()),
+          reason: 'strictly outward; the return leg is not part of this test');
       expect(order.toSet(), hasLength(order.length),
-          reason: 'a distance revisited later would be a retreat by stealth');
-      expect(order.first, 120);
-      expect(order.last, 10);
-      expect(order, hasLength(12), reason: 'every 10 m from 120 down to 10');
+          reason: 'a distance revisited later would be a return by stealth');
+      expect(order.first, 10);
+      expect(order.last, 120);
+      expect(order, hasLength(12), reason: 'every 10 m from 10 up to 120');
       expect(FieldPlanPresets.lineSweep().steps, hasLength(120),
           reason: '12 distances x 10 trials');
     });

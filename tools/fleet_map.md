@@ -38,7 +38,9 @@ Detached, not in the clique:
 |---|---|---|---|---|
 | `00de4b24f89021e4` | Nexus 5X | 8.1 | `b7d04acb…` | was 5, dropped off adb |
 | `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` | was 3, OFF ADB (pairing lost) |
-| `31311JEHN12328` | Pixel 7a | — | `6b819f64…` | ninth handset, not attached since 2026-08-11 |
+| `31311JEHN12328` | Pixel 7a | 15 | `6b819f64…` | wireless adb only, USB port damaged |
+| `RF8NB0TYWJM` | Galaxy Note20 | — | `4fecd00f…` | wireless adb only |
+| `R58RB4ED7GM` | Galaxy A72 | — | `dbac04ef…` | wireless adb only |
 
 **The traveller is the Pixel 10 Pro, now node 3** (`f5aee069…`) — the phone that
 goes dark in a store-carry-forward run. It carries the role because it is the

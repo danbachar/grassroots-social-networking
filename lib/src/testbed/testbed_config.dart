@@ -389,6 +389,21 @@ class FieldPlan {
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
 
+  /// Seconds reserved BEFORE a step's start instant for the resets to run in,
+  /// under [manualJoin]. The step's own window then holds nothing but the
+  /// dwell: the marker is stamped at the start instant, not after a reset of
+  /// unpredictable length, so a step measures a full [FieldStep.dwellSec].
+  ///
+  /// It has to be a reservation rather than however long the resets happen to
+  /// take, because the schedule is an absolute lattice shared by every phone.
+  /// A phone that finished resetting early waits for the instant; one that
+  /// overruns stamps late, which the trace shows rather than hides.
+  ///
+  /// Zero puts the resets inside the step window, where they cost the dwell
+  /// whatever they take. A plan opts in by reserving the time its own resets
+  /// measure — the value is a property of what the plan resets, not a global.
+  final int resetBudgetSec;
+
   /// Manual-join mode: system Bluetooth is toggled BY THE OPERATOR in the
   /// phone's settings, never by the app. The run is anchored to a shared
   /// wall-clock instant (the next 10-minute boundary at least [placementSec]
@@ -435,6 +450,7 @@ class FieldPlan {
     this.linkResetDarkSec,
     this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
+    this.resetBudgetSec = 0,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
@@ -483,6 +499,7 @@ class FieldPlan {
       linkResetDarkSec: linkResetDarkSec,
       resetDtnBuffer: resetDtnBuffer,
       autoAdvanceGapSec: autoAdvanceGapSec,
+      resetBudgetSec: resetBudgetSec,
       manualJoin: manualJoin,
       placementSec: placementSec,
       alignSec: alignSec,
@@ -501,6 +518,7 @@ class FieldPlan {
         if (linkResetDarkSec != null) 'linkResetDarkSec': linkResetDarkSec,
         'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
+        if (manualJoin) 'resetBudgetSec': resetBudgetSec,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
@@ -523,6 +541,7 @@ class FieldPlan {
         linkResetDarkSec: json['linkResetDarkSec'] as int?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
+        resetBudgetSec: json['resetBudgetSec'] as int? ?? 0,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
@@ -541,6 +560,7 @@ class FieldPlan {
       other.linkResetDarkSec == linkResetDarkSec &&
       other.resetDtnBuffer == resetDtnBuffer &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
+      other.resetBudgetSec == resetBudgetSec &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
@@ -549,6 +569,6 @@ class FieldPlan {
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
       Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
-      resetDtnBuffer, autoAdvanceGapSec, manualJoin, placementSec, alignSec,
-      scriptedRadio);
+      resetDtnBuffer, autoAdvanceGapSec, resetBudgetSec, manualJoin,
+      placementSec, alignSec, scriptedRadio);
 }

@@ -1798,6 +1798,86 @@ void main() {
       expect(p.manualJoin, isTrue);
       expect(FieldPlan.fromJson(p.toJson()), p);
     });
+
+    test('a new position opens on an alignment boundary; the repeats do not',
+        () {
+      // Two positions of two trials each. The first trial at a position waits
+      // for the operator to walk there, so it opens on a boundary; its repeat
+      // has nothing to walk to and follows immediately.
+      final plan = FieldPlanPresets.manualized(
+        FieldPlan(
+          expId: 'align-t',
+          settleSec: 1,
+          alignSec: 120,
+          autoAdvanceGapSec: 5,
+          resetBudgetSec: 5,
+          steps: [
+            for (final d in [20, 10])
+              for (var t = 1; t <= 2; t++)
+                FieldStep(
+                    label: 'd=$d t$t', dwellSec: 30, autoAdvance: t > 1),
+          ],
+        ),
+        alignSec: 120,
+        placementSec: 120,
+      );
+      final starts = FieldRunner.stepStarts(plan, 0);
+
+      expect(starts[0] % 120000, 0, reason: 'd=20 t1 opens on a boundary');
+      expect(starts[1] - starts[0], 40000,
+          reason: 'a repeat follows at reset + dwell + gap, no rounding');
+      expect(starts[2] % 120000, 0, reason: 'd=10 t1 opens on a boundary');
+      expect(starts[2] - starts[1], greaterThan(40000),
+          reason: 'the walk gap is the slack up to that boundary');
+    });
+
+    test('the resets are reserved BEFORE the step, not taken out of it', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => base + async.elapsed.inMilliseconds,
+          onResetLinks: (dark) =>
+              Future<void>.delayed(Duration(seconds: dark ?? 0)),
+          upload: () async => 'ok',
+        );
+        runner.start(FieldPlanPresets.manualized(
+          const FieldPlan(
+            expId: 'budget-t',
+            settleSec: 1,
+            alignSec: 120,
+            resetLinks: true,
+            linkResetDarkSec: 3,
+            resetBudgetSec: 5,
+            steps: [FieldStep(label: 'd=10 t1', dwellSec: 30)],
+          ),
+          alignSec: 120,
+          placementSec: 120,
+        ));
+        async.flushMicrotasks();
+        final target = runner.startTargetMs!;
+
+        // The resets open a whole budget ahead of the step's instant.
+        async.elapse(Duration(milliseconds: target - 5000 - base));
+        async.flushMicrotasks();
+        expect(recorder.events, isNot(contains('marker:links-reset')),
+            reason: 'the 3 s bounce has only just started');
+
+        // The 3 s bounce lands inside the 5 s reservation, with 2 s to spare.
+        async.elapse(const Duration(seconds: 3));
+        async.flushMicrotasks();
+        expect(recorder.events, contains('marker:links-reset'));
+        expect(recorder.events, isNot(contains('marker:d=10 t1')),
+            reason: 'the reset is done, but the step has not opened yet');
+
+        // The marker lands on the instant itself, so the dwell is full length.
+        async.elapse(const Duration(seconds: 2));
+        async.flushMicrotasks();
+        expect(recorder.events, contains('marker:d=10 t1'));
+        expect(runner.phase, FieldPhase.dwelling);
+        runner.dispose();
+      });
+    });
   });
 
   group('dial grid', () {

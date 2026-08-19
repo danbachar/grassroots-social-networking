@@ -437,23 +437,18 @@ class FieldRunner extends ChangeNotifier {
     await recorder.startExperiment(plan.expId);
     if (plan.manualJoin) {
       // Anchor on the wall clock, not the tap: every phone rounds up to the
-      // same 10-minute boundary, so the start skew collapses to clock-sync
-      // error instead of the spread of eight taps. The boundary granularity
-      // must exceed the tap spread — 10 min covers taps a few minutes apart.
+      // same alignment boundary, so the start skew collapses to clock-sync
+      // error instead of the spread of the taps. The boundary granularity
+      // must exceed that spread.
       final alignMs = plan.alignSec * 1000;
-      final minStart = nowMs() + plan.placementSec * 1000;
+      final resetMs = plan.resetBudgetSec * 1000;
+      final minStart = nowMs() + plan.placementSec * 1000 + resetMs;
       final anchor = ((minStart + alignMs - 1) ~/ alignMs) * alignMs;
       _anchorMs = anchor;
       // Every phone computes the same anchor, so it also gives every phone the
       // same run id — ids stay comparable across the fleet, as they must be.
       _runId = anchor;
-      final starts = <int>[];
-      var t = anchor;
-      for (final st in plan.steps) {
-        starts.add(t);
-        t += (st.dwellSec + plan.autoAdvanceGapSec) * 1000;
-      }
-      _stepStartMs = starts;
+      _stepStartMs = stepStarts(plan, anchor);
       // The target in the trace is the alignment proof: after the run, one
       // query shows whether all phones computed the same instant.
       await recorder.logMarker('placement', extra: {
@@ -463,7 +458,7 @@ class FieldRunner extends ChangeNotifier {
       });
       _startRadioObserver();
       _phase = FieldPhase.placement;
-      _countdownToMs(anchor, () => inPosition());
+      _countdownToMs(anchor - resetMs, () => inPosition());
       _notify();
       return;
     }
@@ -531,10 +526,12 @@ class FieldRunner extends ChangeNotifier {
   void _enterPositioning() {
     _phase = FieldPhase.positioning;
     if (manualJoin && _stepStartMs != null) {
-      // The gap counts down to the next step's ABSOLUTE start. This gap is
-      // also the join window: the phone whose first joined step is next
-      // shows TURN ON BLUETOOTH for exactly this long.
-      _countdownToMs(_stepStartMs![_stepIndex], () => inPosition());
+      // The gap counts down to the instant the next step's resets open, which
+      // is its absolute start less the reset reservation. This gap is also the
+      // join window: the phone whose first joined step is next shows TURN ON
+      // BLUETOOTH for exactly this long.
+      _countdownToMs(_stepStartMs![_stepIndex] - _plan!.resetBudgetSec * 1000,
+          () => inPosition());
     } else if (currentStep?.autoAdvance ?? false) {
       _startCountdown(_plan!.autoAdvanceGapSec, () => inPosition());
     }
@@ -595,6 +592,17 @@ class FieldRunner extends ChangeNotifier {
       onResetDtnBuffer!.call();
       await recorder.logMarker('custody-reset');
     }
+    // The resets ran in the slot reserved ahead of the step. Hold here until
+    // the step's own instant so the marker opens a full dwell and every phone
+    // opens it together; a phone whose resets overran is already past it and
+    // falls through, stamping late rather than silently shortening the run.
+    if (manualJoin && _stepStartMs != null) {
+      final wait = _stepStartMs![_stepIndex] - nowMs();
+      if (wait > 0) {
+        await Future<void>.delayed(Duration(milliseconds: wait));
+        if (!_running || currentStep != step) return;
+      }
+    }
     // The step marker carries this phone's CONFIGURED intent, not just the
     // step name: which join slot it was assigned and whether it believed it
     // was in the mesh for this step. Analysis can then tell a misconfigured
@@ -631,6 +639,28 @@ class FieldRunner extends ChangeNotifier {
       _startCountdown(step.dwellSec, _endDwell);
     }
     _notify();
+  }
+
+  /// The absolute instant each step's DWELL opens, under [FieldPlan.manualJoin].
+  /// Every phone computes this from the same anchor and the same plan, which is
+  /// what lets a pair advance together with nobody tapping anything.
+  ///
+  /// A step that does not auto-advance opens a new position the operator has to
+  /// walk a device to, so it is rounded up to the next alignment boundary: the
+  /// walk gets a whole boundary interval rather than the settle gap, and the
+  /// phones re-converge on the boundary instead of carrying the previous
+  /// position's remainder forward. Repeats at one position follow immediately.
+  static List<int> stepStarts(FieldPlan plan, int anchor) {
+    final alignMs = plan.alignSec * 1000;
+    final resetMs = plan.resetBudgetSec * 1000;
+    final starts = <int>[];
+    var t = anchor;
+    for (final st in plan.steps) {
+      if (!st.autoAdvance) t = ((t + alignMs - 1) ~/ alignMs) * alignMs;
+      starts.add(t);
+      t += resetMs + (st.dwellSec + plan.autoAdvanceGapSec) * 1000;
+    }
+    return starts;
   }
 
   /// Countdown to an ABSOLUTE instant: the display ticks once a second, the

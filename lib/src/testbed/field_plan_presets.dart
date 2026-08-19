@@ -924,14 +924,19 @@ class FieldPlanPresets {
       120, 110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10
     ],
     int trials = 10,
-    int dwellSec = 60,
+    int dwellSec = 30,
     int sendCount = 2,
     int darkSec = 3,
+    int resetBudgetSec = 5,
   }) {
     return FieldPlan(
       expId: expId,
       settleSec: 20,
       autoAdvanceGapSec: 5,
+      // The measured links-reset on both run phones is 3.1 s, worst case 3.15
+      // over 30 resets each; 5 s reserves that with headroom so the dwell
+      // opens on its instant at a full length.
+      resetBudgetSec: resetBudgetSec,
       resetSessions: true,
       resetLinks: true,
       linkResetDarkSec: darkSec,
@@ -978,6 +983,7 @@ class FieldPlanPresets {
       linkResetDarkSec: p.linkResetDarkSec,
       resetDtnBuffer: p.resetDtnBuffer,
       autoAdvanceGapSec: p.autoAdvanceGapSec,
+      resetBudgetSec: p.resetBudgetSec,
       manualJoin: true,
       scriptedRadio: p.scriptedRadio,
       placementSec: placementSec,
@@ -1083,7 +1089,13 @@ class FieldPlanPresets {
             storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
         'SCF desk — sender (everyone else)':
             storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
-        'Line sweep 120..10 m x10 (2 phones, ~2h20 + walking)': lineSweep(),
+        // Wall-clock anchored: both phones compute the same step start
+        // times from their synced clocks, so the pair advances in lockstep
+        // with no taps. Each distance opens on an alignment boundary, which
+        // is the window the operator walks one device to the next position
+        // in. The placement window covers the initial walk out to 120 m.
+        'Line sweep 120..10 m x10 (2 phones, ~1h35)':
+            manualized(lineSweep(), placementSec: 120),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),

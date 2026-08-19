@@ -224,6 +224,14 @@ class BleTransportService extends TransportService {
   /// enough that a peer which never negotiates still gets a handshake.
   static const Duration _mtuWait = Duration(seconds: 3);
 
+  /// Central dials being torn down because they provably lost the race —
+  /// our inbound leg from the same identity became ready while they were
+  /// still in `connecting`. Excluded from every in-flight view so the
+  /// reverse leg can open at once instead of waiting out the loser's 20 s
+  /// connect timeout; each entry leaves when its path's terminal event
+  /// arrives.
+  final Set<String> _cancellingDials = {};
+
   /// Dials handed to the plugin whose `connecting` path event has not come
   /// back yet. The pair-view suppression reads [_paths], which only learns of
   /// a dial from that event — so in the round-trip window a re-sighting of
@@ -1467,7 +1475,30 @@ class BleTransportService extends TransportService {
     // of a healthy dual-role pair would re-run the reverse-leg attempt.
     final pair = _pairViewFor(GrassrootsIdentity.deriveServiceUuidForSlot(
         pubkey, GrassrootsIdentity.currentBleSlot()));
-    if (pair.liveCentralPathId != null || pair.centralInFlight) return;
+    if (pair.liveCentralPathId != null) return;
+    if (pair.centralInFlight) {
+      // Our inbound leg from this identity is READY, so if our own dial
+      // toward them is still stuck in `connecting`, it has provably lost the
+      // race — the measured wedge holds `connectGatt` for its full 20 s
+      // timeout, and the one-central-per-identity rule then keeps the
+      // reverse leg shut the whole time. Tear the loser down and open the
+      // reverse leg over the ACL that won. A dial past `connecting` is
+      // 140 ms of GATT setup from ready and is left to finish.
+      final wedged = pair.inFlightConnectingPathId;
+      if (wedged == null) return;
+      _cancellingDials.add(wedged);
+      if (_tracing) {
+        unawaited(trace!.log({
+          'type': 'link',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'wedgeCancel',
+          'transport': 'ble',
+          'path': wedged,
+          'via': pathId,
+        }));
+      }
+      unawaited(disconnectDevice(wedged, forget: false));
+    }
 
     unawaited(_openReverseLeg(pathId, pubkey));
   }
@@ -2064,6 +2095,7 @@ class BleTransportService extends TransportService {
     var count = 0;
     for (final p in _paths.values) {
       if (p.role != ble.BleRole.central) continue;
+      if (_cancellingDials.contains(p.pathId)) continue;
       if (p.state == ble.BlePathState.connecting ||
           p.state == ble.BlePathState.connected ||
           p.state == ble.BlePathState.subscribed) {
@@ -2152,8 +2184,12 @@ class BleTransportService extends TransportService {
             .map((b) => b.toRadixString(16).padLeft(2, '0'))
             .join();
     var inFlight = false;
+    String? inFlightConnecting;
     for (final p in _paths.values) {
       if (p.role != ble.BleRole.central) continue;
+      // A dial being cancelled is already lost: counting it would hold the
+      // reverse leg shut for exactly the window the cancel exists to skip.
+      if (_cancellingDials.contains(p.pathId)) continue;
       final du = _peersState
           .getDiscoveredBlePeer(p.pathId)
           ?.serviceUuid
@@ -2166,8 +2202,10 @@ class BleTransportService extends TransportService {
       if (!matchesByUuid && !matchesByRemoteId && !matchesByIdentity) continue;
       if (_isReady(p)) {
         liveCentral ??= p.pathId;
-      } else if (p.state == ble.BlePathState.connecting ||
-          p.state == ble.BlePathState.connected ||
+      } else if (p.state == ble.BlePathState.connecting) {
+        inFlight = true;
+        inFlightConnecting ??= p.pathId;
+      } else if (p.state == ble.BlePathState.connected ||
           p.state == ble.BlePathState.subscribed) {
         inFlight = true;
       }
@@ -2176,12 +2214,18 @@ class BleTransportService extends TransportService {
     return _PairView(
       liveCentralPathId: liveCentral,
       centralInFlight: inFlight,
+      inFlightConnectingPathId: inFlightConnecting,
       livePeripheralPathId: livePeripheralPathId,
     );
   }
 
   void _onPathChanged(ble.BlePath path) {
     _dialingNow.remove(path.pathId);
+    if (path.state == ble.BlePathState.failed ||
+        path.state == ble.BlePathState.disconnected ||
+        path.state == ble.BlePathState.stale) {
+      _cancellingDials.remove(path.pathId);
+    }
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
     _releaseOnMtu(path);
@@ -2500,6 +2544,11 @@ class _PairView {
   /// (connecting/connected/subscribed — not yet ready).
   final bool centralInFlight;
 
+  /// The in-flight central dial's pathId while it is still in `connecting` —
+  /// the only state a wedge-cancel may target. A dial at `connected` or
+  /// `subscribed` is 140 ms of GATT setup from ready and is left to finish.
+  final String? inFlightConnectingPathId;
+
   /// The ready inbound peripheral leg from this identity, if one exists.
   /// Its remote address is the preferred reverse-leg dial target: connecting
   /// to it attaches our GATT client OVER the existing ACL link instead of
@@ -2513,6 +2562,7 @@ class _PairView {
   const _PairView({
     required this.liveCentralPathId,
     required this.centralInFlight,
+    this.inFlightConnectingPathId,
     required this.livePeripheralPathId,
   });
 }

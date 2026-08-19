@@ -1016,6 +1016,114 @@ void main() {
               'election owns everything after');
     });
 
+    test(
+        'a dial wedged in connecting is cancelled when the inbound leg wins, '
+        'and the reverse leg opens at once', () async {
+      // The measured wedge: our dial sits in `connecting` for its full 20 s
+      // timeout while the peer's dial has already landed. The inbound READY
+      // leg is proof the race is lost; waiting out the timeout kept
+      // dual-role convergence at ~21 s on a link whose session was up in
+      // under 3 s.
+      const advertisingMac = 'AA:BB:CC:DD:EE:21';
+      const connectionMac = '99:88:77:66:55:22';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // The sighting dialed; the plugin reports it stuck in `connecting`.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.connecting,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The peer's dial wins: our peripheral leg comes up and identifies.
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:central:')),
+          ['disconnect:central:$advertisingMac'],
+          reason: 'the wedged dial is torn down, not waited out');
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
+          hasLength(1),
+          reason: 'the reverse leg opens over the winning ACL immediately — '
+              'the cancelled dial no longer counts as the pair\'s central');
+    });
+
+    test('a dial past connecting is left to finish, not cancelled', () async {
+      const advertisingMac = 'AA:BB:CC:DD:EE:31';
+      const connectionMac = '99:88:77:66:55:32';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // The dial has already CONNECTED — 140 ms of GATT setup from ready.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.connected,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'a progressing dial is never sacrificed');
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'the pair still has its one central in flight');
+    });
+
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
       const pathId = 'central:DEADBEEF';
 

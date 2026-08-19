@@ -72,11 +72,6 @@ class BleTransportService extends TransportService {
   /// Redux store
   final Store<AppState> store;
 
-  /// Cold-start grace period a non-initiator waits for the deterministic
-  /// initiator (the peer with the lower service UUID) to open the first leg
-  /// before it dials anyway. Injectable so tests can exercise the fallback
-  /// without a real delay.
-  final Duration firstMoverFallback;
 
   /// Restart the continuous scan when no advertisement has reached us for
   /// this long while we are in a scanning role. The transport's discovery
@@ -108,16 +103,6 @@ class BleTransportService extends TransportService {
   /// True while a `start()` call is in flight. Prevents re-entrant `start()`
   /// from `_onAdapterStateChanged` running concurrently with the original.
   bool _starting = false;
-
-  /// When we last locally tore down a leg to an identity (reform, stale
-  /// sweep), keyed by `pk:<pubkeyHex>` and `uuid:<serviceUuid>`. Resets the
-  /// first-mover fallback clock ([_fallbackElapsed]): `discoveredAt` never
-  /// refreshes, so without this every yield branch would be permanently
-  /// escaped ~[firstMoverFallback] after first sighting, and a reform
-  /// teardown would be followed by an instant wrong-order redial racing the
-  /// iPhone's dial-on-sight. Entries are pruned on write; only the fallback
-  /// window matters.
-  final Map<String, DateTime> _lastLocalTeardownAt = {};
 
   /// Scan-liveness watchdog (see [scanSilenceRestart]). Armed whenever the
   /// continuous scan is started; cancelled on stop/dispose or when the role
@@ -186,7 +171,6 @@ class BleTransportService extends TransportService {
     required this.identity,
     required this.store,
     this.localName,
-    this.firstMoverFallback = const Duration(seconds: 5),
     this.scanSilenceRestart = const Duration(seconds: 30),
     this.trace,
     ble.GrassrootsBluetooth? grassrootsBluetooth,
@@ -239,6 +223,14 @@ class BleTransportService extends TransportService {
   /// anyway. Long enough to cover a negotiation that is merely slow, short
   /// enough that a peer which never negotiates still gets a handshake.
   static const Duration _mtuWait = Duration(seconds: 3);
+
+  /// Dials handed to the plugin whose `connecting` path event has not come
+  /// back yet. The pair-view suppression reads [_paths], which only learns of
+  /// a dial from that event — so in the round-trip window a re-sighting of
+  /// the same address would dial again. The election used to mask this by
+  /// keeping one side silent; with every sighting dialing, the mark has to
+  /// be synchronous.
+  final Set<String> _dialingNow = {};
 
   /// Rate-limit for `dialSkip` records: one per (path, reason) per second.
   /// A sighting arrives many times a second, and the interesting fact is
@@ -1793,7 +1785,12 @@ class BleTransportService extends TransportService {
       _centralDialFailedAt.remove(pathId);
     }
 
+    if (_dialingNow.contains(pathId)) {
+      _traceDialSkip(pathId, 'dialing');
+      return false;
+    }
     final remoteId = pathId.substring('central:'.length);
+    _dialingNow.add(pathId);
     try {
       await _ble.connect(
         remoteId: remoteId,
@@ -1817,57 +1814,18 @@ class BleTransportService extends TransportService {
       // No path event will fire, so dispatch a failure action ourselves so
       // Redux doesn't show the peer stuck in `isConnecting` (which the
       // plugin would otherwise correct via a `failed` event).
+      _dialingNow.remove(pathId);
       store.dispatch(BleDeviceConnectionFailedAction(pathId));
       return false;
     }
   }
 
   Future<void> disconnectDevice(String pathId, {bool forget = true}) async {
-    _recordLocalTeardown(pathId);
     try {
       await _ble.disconnect(pathId, forget: forget);
     } catch (e) {
       debugPrint('disconnect() failed for $pathId: $e');
     }
-  }
-
-  /// Reset the first-mover fallback clock for the identity behind [pathId]
-  /// (see [_lastLocalTeardownAt]). Written under both the discovered
-  /// service-UUID key and — when the path is attached to an identified peer —
-  /// the pubkey key, so [_lastTeardownFor] finds it from either direction.
-  void _recordLocalTeardown(String pathId) {
-    final now = DateTime.now();
-    final uuid = _peersState.getDiscoveredBlePeer(pathId)?.serviceUuid;
-    if (uuid != null) {
-      _lastLocalTeardownAt['uuid:${uuid.toLowerCase()}'] = now;
-    }
-    for (final peer in _peersState.peersList) {
-      if (peer.bleCentralDeviceId == pathId ||
-          peer.blePeripheralDeviceId == pathId) {
-        _lastLocalTeardownAt['pk:${peer.pubkeyHex}'] = now;
-        break;
-      }
-    }
-    // Bounded: entries only matter within the fallback window.
-    _lastLocalTeardownAt.removeWhere(
-      (_, t) => now.difference(t) > firstMoverFallback * 4,
-    );
-  }
-
-  /// The most recent local teardown for the identity behind [serviceUuid],
-  /// or null if none is recorded.
-  DateTime? _lastTeardownFor(String serviceUuid) {
-    final uuid = serviceUuid.toLowerCase();
-    var best = _lastLocalTeardownAt['uuid:$uuid'];
-    for (final peer in _peersState.peersList) {
-      if (!GrassrootsIdentity.serviceUuidMatchesPubkey(uuid, peer.publicKey)) {
-        continue;
-      }
-      final t = _lastLocalTeardownAt['pk:${peer.pubkeyHex}'];
-      if (t != null && (best == null || t.isAfter(best))) best = t;
-      break;
-    }
-    return best;
   }
 
   /// Process an incoming raw BLE packet. Deserializes and forwards to the
@@ -2033,10 +1991,15 @@ class BleTransportService extends TransportService {
       _traceDialSkip(pathId, 'centralActive');
       return;
     }
-    if (!_shouldDialNow(pair, serviceUuid, existing)) {
-      _traceDialSkip(pathId, 'notFirstMover');
-      return;
-    }
+    // Every sighting without a central leg dials. There is no leg-order
+    // election: the measured cost of one was a pair held apart for seconds
+    // while the designated waiter sat out its fallback behind a designated
+    // initiator whose dial had failed. Both sides dialing resolves itself —
+    // one ACL wins, the loser's dial fails once into the cooldown, and the
+    // loser converges over the winner's ACL via [onPeerIdentified]. Session
+    // glare, if both handshakes fire, is settled by the Noise msg1 pubkey
+    // tie-break.
+    
 
     // Reverse leg with a live inbound link: dial the link's own remote
     // address so the GATT client attaches over the existing ACL. Dialing the
@@ -2125,75 +2088,6 @@ class BleTransportService extends TransportService {
   /// stops advertising and ages out of discovery, taking its cooldown with it.
   static const Duration _centralDialCooldown = Duration(seconds: 3);
   final Map<String, DateTime> _centralDialFailedAt = {};
-
-  /// Central-dial election: decides whether this advertisement should
-  /// trigger an outbound (central) dial right now. All *validity* guards
-  /// (identity dedup, trust, in-flight cap) live in [connectToDevice] — this
-  /// is purely the leg-ORDER arbitration for `auto` mode.
-  ///
-  /// Dual-role (two legs per pair, each device central on one) is mandatory —
-  /// see CLAUDE.md, "Dual-Role BLE Is Mandatory".
-  ///
-  /// EXPERIMENT: all iOS-specific leg-order arbitration has been removed. The
-  /// election is now platform-neutral for every pair:
-  ///
-  ///  - If we already hold the inbound peripheral leg, dial the reverse
-  ///    (central) leg unconditionally — including when we are iOS and the
-  ///    peer is not. This is the case that tests whether an iOS central can
-  ///    actually open a second link toward a peer it is already linked with.
-  ///  - Otherwise pick the first link by the deterministic service-UUID
-  ///    tiebreaker (mirroring the UDP "smaller pubkey initiates" convention),
-  ///    backstopped by [firstMoverFallback] so the non-initiator still opens
-  ///    a link if the expected initiator never shows.
-  ///
-  /// Auto-only: a central-only device never advertises, so it can never be
-  /// dialed and must always first-move.
-  bool _shouldDialNow(
-    _PairView pair,
-    String serviceUuid,
-    DiscoveredPeerState? existing,
-  ) {
-    if (store.state.settings.bleRoleMode != BleRoleMode.auto) return true;
-
-    // We already hold the inbound leg: this dial is our reverse leg, which
-    // completes the dual-role pair. Attempt it for every pair regardless of
-    // platform.
-    if (pair.livePeripheral) return true;
-
-    // No leg yet: deterministic first-mover, non-initiator dials on fallback.
-    return _isBleDialInitiator(serviceUuid) ||
-        _fallbackElapsed(existing, serviceUuid);
-  }
-
-  /// Cold-start tie-breaker between same-platform peers: the one whose
-  /// derived service UUID sorts lower is the initiator and opens the first
-  /// (central) leg; the higher one waits for that inbound leg and then opens
-  /// its reverse central leg via [onPeerIdentified]. Mirrors the UDP
-  /// "smaller pubkey initiates" convention, adapted to what we have at
-  /// advertisement time: the service UUID is a stable, deterministic function
-  /// of the pubkey, so both peers compute the same comparison and reach
-  /// opposite verdicts. Without it, both peers dial on discovery and collide.
-  bool _isBleDialInitiator(String peerServiceUuid) {
-    return identity.bleServiceUuid.toLowerCase().compareTo(
-              peerServiceUuid.toLowerCase(),
-            ) <
-        0;
-  }
-
-  /// Whether we've been seeing [existing] long enough that the expected
-  /// initiator has had its chance and we should fall back to dialing. A
-  /// just-discovered (or absent) entry is never elapsed — the initiator gets
-  /// the first move.
-  ///
-  /// The clock starts at the LATER of first discovery and our last local
-  /// teardown of a leg to this identity (see [_lastLocalTeardownAt]).
-  bool _fallbackElapsed(DiscoveredPeerState? existing, String serviceUuid) {
-    if (existing == null) return false;
-    var since = existing.discoveredAt;
-    final teardown = _lastTeardownFor(serviceUuid);
-    if (teardown != null && teardown.isAfter(since)) since = teardown;
-    return DateTime.now().difference(since) >= firstMoverFallback;
-  }
 
   /// One identity-keyed answer to every pair-state question the arbitration
   /// asks about the peer behind [serviceUuid]. Computed from plugin path
@@ -2287,6 +2181,7 @@ class BleTransportService extends TransportService {
   }
 
   void _onPathChanged(ble.BlePath path) {
+    _dialingNow.remove(path.pathId);
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
     _releaseOnMtu(path);

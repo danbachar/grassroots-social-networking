@@ -950,6 +950,18 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
+      // The sighting itself dials now (no leg-order election). Settle that
+      // dial as gone — a plain disconnect, not `failed`, so no cooldown is
+      // armed against the advertised address — before the scenario begins.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.disconnected,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -1253,13 +1265,11 @@ void main() {
     });
   });
 
-  group('BleTransportService — deterministic first-mover (collision avoidance)',
+  group('BleTransportService — every sighting without a central leg dials',
       () {
-    // A peer UUID below the threshold → a high-sorting local identity is the
-    // non-initiator (waiter) against it.
+    // Identities at both ends of the UUID sort order: with the leg-order
+    // election gone, the ordering must not matter — both dial on sight.
     const lowPeerUuid = '84c40316-0871-e5ad-0000-000000000001';
-    // A peer UUID above the threshold → a low-sorting local identity is the
-    // initiator against it.
     const highPeerUuid = '84c40316-0871-e5ad-ffff-fffffffffffe';
 
     Future<
@@ -1268,10 +1278,7 @@ void main() {
           FakeGrassrootsBluetoothCallbacks,
           Store<AppState>,
           BleTransportService,
-        )> build(
-      GrassrootsIdentity identity, {
-      Duration firstMoverFallback = const Duration(hours: 1),
-    }) async {
+        )> build(GrassrootsIdentity identity) async {
       final hostApi = _RecordingHostApi();
       final callbacks = FakeGrassrootsBluetoothCallbacks();
       final ble =
@@ -1281,7 +1288,6 @@ void main() {
       final transport = BleTransportService(
         identity: identity,
         store: store,
-        firstMoverFallback: firstMoverFallback,
         grassrootsBluetooth: ble,
       );
       await transport.initialize();
@@ -1289,10 +1295,10 @@ void main() {
       return (hostApi, callbacks, store, transport);
     }
 
-    test('the initiator (lower service UUID) dials on discovery', () async {
+    test('a low-sorting identity dials a higher-sorting peer on sight',
+        () async {
       final (hostApi, callbacks, _, _) =
-          await build(await _makeLowIdentity('Initiator'));
-
+          await build(await _makeLowIdentity('A'));
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: 'PEER',
         serviceUuids: [highPeerUuid],
@@ -1300,18 +1306,16 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'The lower service UUID is the initiator and opens the first '
-              'leg immediately.');
+      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1));
     });
 
-    test(
-        'the non-initiator (higher service UUID) holds off the first-mover dial',
+    test('a high-sorting identity dials a lower-sorting peer on sight too',
         () async {
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeHighIdentity('Waiter'));
-
+      // The case the election used to hold back. The measured cost of the
+      // wait was a pair kept apart for seconds behind a designated initiator
+      // whose dial had failed; both-dial resolves by ACL outcome instead.
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeHighIdentity('B'));
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: 'PEER',
         serviceUuids: [lowPeerUuid],
@@ -1319,75 +1323,14 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), isEmpty,
-          reason: 'The higher-keyed peer waits for the initiator to dial first '
-              'so the two legs form sequentially instead of colliding.');
-      expect(store.state.peers.discoveredBlePeers.containsKey('central:PEER'),
-          true,
-          reason: 'Discovery is still recorded while waiting, so the reverse '
-              'leg has a dial candidate later.');
+      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
+          reason: 'no leg-order election: the sighting itself is the trigger');
     });
 
-    test(
-        'the non-initiator opens its reverse leg once the inbound peripheral '
-        'leg is up', () async {
-      final peer = await _makeLowIdentity('Peer'); // lower → the initiator
-      final (hostApi, callbacks, store, transport) =
-          await build(await _makeHighIdentity('Waiter'));
-
-      const advertisingMac = 'AA:BB:CC:DD:EE:01';
-      const connectionMac = '99:88:77:66:55:02';
-
-      // Peer advertises; we (non-initiator) hold off.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: advertisingMac,
-        serviceUuids: [peer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'Non-initiator must not first-mover-dial.');
-
-      // The initiator dials us → inbound peripheral leg, then ANNOUNCE
-      // identifies it. (The path event must deliver first — in production
-      // the ANNOUNCE payload is only forwarded once the path is ready.)
-      callbacks.pushPath(BlePath(
-        pathId: 'peripheral:$connectionMac',
-        role: BleRole.peripheral,
-        state: BlePathState.ready,
-        rssi: null,
-        mtu: 517,
-        canSend: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      store.dispatch(PeerAnnounceReceivedAction(
-        publicKey: peer.publicKey,
-        nickname: 'Peer',
-        transport: PeerTransport.bleDirect,
-        blePeripheralDeviceId: 'peripheral:$connectionMac',
-      ));
-      transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
-          hasLength(1),
-          reason: 'Once the inbound leg is up, the non-initiator opens its '
-              'reverse central leg over the existing ACL (the inbound '
-              'connection MAC), not via a second ACL to the advertised MAC.');
-    });
-
-    test(
-        'the non-initiator falls back to dialing if the initiator never '
-        'connects', () async {
-      // Zero fallback: any re-sighting after the first is already "elapsed".
-      final (hostApi, callbacks, _, _) = await build(
-        await _makeHighIdentity('Waiter'),
-        firstMoverFallback: Duration.zero,
-      );
-
-      // First sighting: just discovered, fallback not yet elapsed → hold off.
+    test('a second sighting of the same identity does not double-dial',
+        () async {
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeHighIdentity('B'));
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: 'PEER',
         serviceUuids: [lowPeerUuid],
@@ -1395,9 +1338,6 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), isEmpty);
-
-      // Re-sighting: discoveredAt is now in the past → fallback elapsed → dial.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: 'PEER',
         serviceUuids: [lowPeerUuid],
@@ -1406,30 +1346,10 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'If the initiator never dials, the non-initiator eventually '
-              'first-moves anyway so the handshake cannot deadlock.');
-    });
-
-    test(
-        'central-only mode dials even as the non-initiator (gate is auto-only)',
-        () async {
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeHighIdentity('CentralOnly'));
-      store.dispatch(SetBleRoleModeAction(BleRoleMode.centralOnly));
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'A central-only device never advertises, so it can never be '
-              'dialed — it must always first-move regardless of the tie-break.');
+          reason: 'the in-flight dial suppresses re-dialing the identity');
     });
   });
+
 
   group('BleTransportService — testbed dial cap', () {
     // Fixed peer UUIDs above the initiator threshold: the transport under

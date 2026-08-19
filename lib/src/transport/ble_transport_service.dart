@@ -2399,6 +2399,20 @@ class BleTransportService extends TransportService {
           _centralDialFailedAt
               .removeWhere((_, at) => now.difference(at) > _centralDialCooldown * 4);
           _centralDialFailedAt[path.pathId] = now;
+          // The dial that arms the cooldown leaves no other mark: `drop` is
+          // emitted only for a path that was READY, so one dying in
+          // `connecting` is invisible and the cooldown that follows looks
+          // unprovoked. Record it with whatever the stack said.
+          if (_tracing) {
+            unawaited(trace!.log({
+              'type': 'link',
+              't': now.millisecondsSinceEpoch,
+              'event': 'dialFailed',
+              'transport': 'ble',
+              'path': path.pathId,
+              if (path.error != null) 'error': path.error,
+            }));
+          }
         }
         // Mirror the connect emit at the `ready` case: surface a disconnect
         // to the upper layer only on a true transition out of `ready`.

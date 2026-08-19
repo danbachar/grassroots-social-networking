@@ -920,9 +920,11 @@ class FieldPlanPresets {
   /// traffic would bury the ANNOUNCE and sync bytes it is trying to weigh.
   static FieldPlan lineSweep({
     String expId = 'line-1',
-    List<int> distances = const [120, 100, 80, 60, 45, 30, 20, 15, 10],
-    int trials = 2,
-    int dwellSec = 180,
+    List<int> distances = const [
+      120, 110, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10
+    ],
+    int trials = 10,
+    int dwellSec = 60,
     int sendCount = 2,
     int darkSec = 3,
   }) {
@@ -1081,7 +1083,7 @@ class FieldPlanPresets {
             storeCarryForward(expId: 'scf-desk-2', role: 1, repeat: 10),
         'SCF desk — sender (everyone else)':
             storeCarryForward(expId: 'scf-desk-2', role: 2, repeat: 10),
-        'Line sweep 120..10 m (2 phones, cold trials)': lineSweep(),
+        'Line sweep 120..10 m x10 (2 phones, ~2h20 + walking)': lineSweep(),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),

@@ -967,6 +967,9 @@ void main() {
           reason: 'a distance revisited later would be a retreat by stealth');
       expect(order.first, 120);
       expect(order.last, 10);
+      expect(order, hasLength(12), reason: 'every 10 m from 120 down to 10');
+      expect(FieldPlanPresets.lineSweep().steps, hasLength(120),
+          reason: '12 distances x 10 trials');
     });
 
     test('every step is a cold trial with the buffer cleared', () {

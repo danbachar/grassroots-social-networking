@@ -112,8 +112,22 @@ MARKER_LANES_RE = re.compile(r"\blanes\s*=\s*(\d+)", re.I)
 # A raw-link marker: `leg=<notify|write|stripe>` — which GATT leg the raw
 # blobs rode.
 MARKER_LEG_RE = re.compile(r"\bleg\s*=\s*(\w+)", re.I)
-LINK_STAGES = ["discovered", "gattConnected", "identified", "connected",
-               "session", "usable", "drop"]
+# What ONE occurrence of each link stage counts. The app emits four of them
+# per GATT leg and three per peer, so a converged dual-role pair produces TWO
+# `connected` events and ONE `session`. A ratio between stages of different
+# cardinality therefore has a ceiling of 50%, not 100% -- reading 42% as "half
+# the links fail to become addressable" is the error this mapping exists to
+# stop. Compare stages only within a cardinality, or normalise first.
+LINK_STAGE_COUNTS = {
+    "discovered": "peer",       # a verified ANNOUNCE from that peer
+    "gattConnected": "leg",
+    "identified": "leg",
+    "connected": "leg",
+    "session": "peer",          # one Noise session, however many legs carry it
+    "usable": "peer",           # first end-to-end ACK from that peer
+    "drop": "leg",
+}
+LINK_STAGES = list(LINK_STAGE_COUNTS)
 # FragmentHandler.fragmentThreshold: payloads above this are split, and each
 # fragment gets a RANDOM packetId — so relay records can no longer be joined
 # to the messageId and hop counts for such messages are not trustworthy.
@@ -1311,6 +1325,9 @@ def ladder_table(steps: pd.DataFrame) -> pd.DataFrame:
             continue
         rows.append({
             "stage": stage,
+            # Printed beside every stage so a per-leg count is never read
+            # against a per-peer one without noticing.
+            "counts": LINK_STAGE_COUNTS[stage],
             "trials": trials,
             "reached": len(v),
             "reach_rate": round(len(v) / trials, 3) if trials else None,

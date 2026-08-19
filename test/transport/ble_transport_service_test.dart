@@ -2041,4 +2041,110 @@ void main() {
     });
 
   });
+
+  group('BleTransportService — a write outruns its leg\'s MTU', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Sender'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      addTearDown(transport.dispose);
+    });
+
+    /// The measured field state this group pins: the peer has dialed us, so
+    /// the pair holds ONE leg — our peripheral — still at the 23-byte ATT
+    /// default, with the MTU request racing the first writes.
+    Future<void> singleLegAtDefault() async {
+      final peer = await _makeIdentity('PairPeer');
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:PAIR',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 23,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:PAIR',
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+    }
+
+    test('held until the MTU lands, then written — nothing refused', () async {
+      await singleLegAtDefault();
+
+      // 113 bytes is the first Noise handshake message that was refused four
+      // times per reconnection in the field: too big for 20 usable bytes,
+      // nowhere else to go.
+      final write = transport.broadcast(Uint8List(113));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls, isEmpty,
+          reason: 'the write must wait for the leg, not die on it');
+
+      // The MTU arrives ~95 ms later on hardware; deliver it now.
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:PAIR',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 185,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(await write, 1,
+          reason: 'the held write goes out the moment the leg can carry it');
+      expect(hostApi.calls, ['send:peripheral:PAIR:113']);
+    });
+
+    test('a leg that never negotiates gets the write anyway, once', () async {
+      await singleLegAtDefault();
+
+      final write = transport.broadcast(Uint8List(113));
+
+      // No MTU ever arrives. The deadline sends rather than holding forever;
+      // at 20 usable bytes the attempt is refused, which is the pre-deferral
+      // outcome — deferral may only ever turn a certain loss into a chance.
+      expect(await write.timeout(const Duration(seconds: 5)), 0);
+      expect(hostApi.calls, isEmpty,
+          reason: 'refused by the size check before reaching the stack');
+    });
+
+    test('disposal resolves a held write as failed instead of hanging it',
+        () async {
+      await singleLegAtDefault();
+
+      final write = transport.broadcast(Uint8List(113));
+      await Future<void>.delayed(Duration.zero);
+      await transport.dispose();
+
+      expect(await write.timeout(const Duration(seconds: 1)), 0,
+          reason: 'a disposed transport cannot deliver; the caller must not '
+              'be left awaiting a future nobody will complete');
+    });
+
+    test('a small write is unaffected by the default MTU', () async {
+      await singleLegAtDefault();
+      expect(await transport.broadcast(Uint8List(16)), 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:16']);
+    });
+  });
 }

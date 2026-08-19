@@ -212,6 +212,25 @@ class BleTransportService extends TransportService {
       _wireLedger.secureContentFor = resolver;
   Timer? _wireLedgerTimer;
 
+  /// Writes held back because their only leg had not negotiated an MTU yet,
+  /// keyed by pathId. Released by [_onPathChanged] the moment that leg
+  /// reports a bigger MTU, or by their own timer if it never does.
+  ///
+  /// A leg starts at the 23-byte ATT default and the peer's central side is
+  /// what raises it, so a peripheral leg cannot make that happen. The Noise
+  /// handshake is dispatched as soon as an ANNOUNCE is verified, which is
+  /// routinely before the MTU lands, and a handshake message does not fit in
+  /// 20 bytes. Refusing it outright cost three wasted writes and a whole
+  /// re-handshake per encounter; waiting forever would cost the pairing
+  /// entirely, which is why every deferral carries a deadline and then goes
+  /// out regardless.
+  final Map<String, List<_DeferredWrite>> _awaitingMtu = {};
+
+  /// How long a write waits for its leg to report an MTU before being sent
+  /// anyway. Long enough to cover a negotiation that is merely slow, short
+  /// enough that a peer which never negotiates still gets a handshake.
+  static const Duration _mtuWait = Duration(seconds: 3);
+
   /// Rate-limit for per-peer `rssi` trace records (adv sightings can arrive
   /// many times per second).
   final Map<String, int> _lastRssiTraceMs = {};
@@ -1156,10 +1175,69 @@ class BleTransportService extends TransportService {
       pubkeyFor: getPubkeyForPeerId,
       bytes: data.length,
     );
+    // Nothing else to try, and the leg we have is still at the ATT default:
+    // the write is not too big for the link, only for the link SO FAR. Hold
+    // it until the MTU lands rather than spending the packet on a leg that
+    // cannot carry it.
+    if (other == null && path.mtu <= _defaultAttMtu) {
+      return _deferUntilMtu(path, data, site);
+    }
     if (other == null) return false;
     if (!await _writeLeg(other, data, '$site:otherLeg')) return false;
     _traceRetry(site, {'path': path.pathId, 'via': other.pathId});
     return true;
+  }
+
+  /// Hold [data] until [path] reports a bigger MTU, then write it.
+  ///
+  /// Returns whether the write eventually got in. The deadline is the safety
+  /// valve: a leg whose peer never negotiates still gets its packet, refused
+  /// by [_checkWritable] exactly as before, so this can only turn a certain
+  /// loss into a chance of delivery.
+  Future<bool> _deferUntilMtu(
+      ble.BlePath path, Uint8List data, String site) {
+    final pending = _DeferredWrite(data, site);
+    _awaitingMtu.putIfAbsent(path.pathId, () => []).add(pending);
+    _traceDrop(site, 'awaitingMtu', {
+      'path': path.pathId,
+      'bytes': data.length,
+      'mtu': path.mtu,
+    });
+    pending.deadline = Timer(_mtuWait, () {
+      if (_awaitingMtu[path.pathId]?.remove(pending) ?? false) {
+        unawaited(_flushDeferred(path.pathId, [pending], timedOut: true));
+      }
+    });
+    return pending.done.future;
+  }
+
+  /// Send everything that was waiting on [pathId] now that its leg can carry
+  /// it. A path that dropped instead of negotiating resolves them false —
+  /// the caller's packet is gone either way, and pretending otherwise would
+  /// report a delivery that never happened.
+  Future<void> _flushDeferred(String pathId, List<_DeferredWrite> waiting,
+      {bool timedOut = false}) async {
+    final path = _paths[pathId];
+    for (final w in waiting) {
+      w.deadline?.cancel();
+      if (path == null || !_isReady(path)) {
+        w.done.complete(false);
+        continue;
+      }
+      if (timedOut) {
+        debugPrint('[ble-mtu] ${w.site} waited ${_mtuWait.inSeconds}s on '
+            '$pathId without an MTU — sending anyway');
+      }
+      w.done.complete(await _writeLeg(path, w.data, w.site));
+    }
+  }
+
+  /// Release anything held for [path] once its MTU rises above the default.
+  void _releaseOnMtu(ble.BlePath path) {
+    if (path.mtu <= _defaultAttMtu) return;
+    final waiting = _awaitingMtu.remove(path.pathId);
+    if (waiting == null || waiting.isEmpty) return;
+    unawaited(_flushDeferred(path.pathId, waiting));
   }
 
   /// One write attempt on one leg. False means the bytes did not get in.
@@ -1550,6 +1628,16 @@ class BleTransportService extends TransportService {
   @override
   Future<void> dispose() async {
     await stop();
+    // Resolve every held write as failed before anything closes: their
+    // callers are awaiting these futures, and a disposed transport can no
+    // longer deliver the bytes or the MTU they were waiting for.
+    for (final waiting in _awaitingMtu.values) {
+      for (final w in waiting) {
+        w.deadline?.cancel();
+        if (!w.done.isCompleted) w.done.complete(false);
+      }
+    }
+    _awaitingMtu.clear();
     _wireLedgerTimer?.cancel();
     _wireLedgerTimer = null;
     await _adapterSub?.cancel();
@@ -2127,6 +2215,7 @@ class BleTransportService extends TransportService {
   void _onPathChanged(ble.BlePath path) {
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
+    _releaseOnMtu(path);
 
     // Stamp when a path first became live-but-not-ready, so [_reapStuck] can
     // tell a slow handshake from one that will never finish. FIRST moment
@@ -2432,4 +2521,16 @@ class _PairView {
     required this.centralInFlight,
     required this.livePeripheralPathId,
   });
+}
+
+/// One write held back until its leg negotiates an MTU: the bytes, the trace
+/// site they belong to, the timer that sends them anyway if no MTU ever
+/// arrives, and the completer the caller is awaiting.
+class _DeferredWrite {
+  final Uint8List data;
+  final String site;
+  final Completer<bool> done = Completer<bool>();
+  Timer? deadline;
+
+  _DeferredWrite(this.data, this.site);
 }

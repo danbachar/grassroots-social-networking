@@ -1793,8 +1793,9 @@ class BleTransportService extends TransportService {
   void _onAdvertisingStateChanged(ble.BleAdvertisingState advertising) {
     final reason = advertising.reason;
     final failure = advertising.failure;
+    final txPower = advertising.txPowerLevel;
     debugPrint(advertising.active
-        ? 'BLE advertising active'
+        ? 'BLE advertising active (tx level ${txPower ?? '?'})'
         : 'BLE advertising stopped'
             '${failure == null ? '' : ' (${failure.name}: $reason)'}');
     if (!_tracing) return;
@@ -1804,6 +1805,11 @@ class BleTransportService extends TransportService {
       'event': 'advertisingState',
       'transport': 'ble',
       'active': advertising.active,
+      // The power the radio GRANTED, not the one we asked for. Every RSSI a
+      // peer reports for us is measured against this, so a trace that records
+      // the signal without it cannot tell a quiet transmitter from a distant
+      // one.
+      if (txPower != null) 'txPowerLevel': txPower,
       if (failure != null) 'failure': failure.name,
       if (reason != null) 'reason': reason,
     }));

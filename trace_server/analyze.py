@@ -299,6 +299,7 @@ def load_db(path: Path, exp: str | None = None,
         for upload_id, device_id, rtype, t, body in rows:
             rec = json.loads(body)
             rec["_exp"] = _exp_from_upload_id(upload_id)
+            rec["_upload"] = upload_id
             rec["_device"] = device_id
             rec["_type"] = rtype
             rec["_t"] = t
@@ -307,7 +308,39 @@ def load_db(path: Path, exp: str | None = None,
     if not out and (exp or types):
         print(f"  no records matched (exp={exp}, types={types})",
               file=sys.stderr)
-    return pd.DataFrame(out)
+    return _newest_upload_only(pd.DataFrame(out))
+
+
+def _newest_upload_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep one generation of every uploaded file.
+
+    An upload sends the WHOLE file, so uploading the same file twice puts
+    every record in the database twice under a second `upload_id`. Nothing
+    downstream notices: delivery is keyed on messageId and survives, while
+    every link-stage count silently doubles.
+
+    The id is `exp_<name>.jsonl:<filelen>[:<chunk>]`, and a later upload of a
+    longer file is a superset of the earlier one, so the largest length is the
+    complete generation and the rest are prefixes of it. Dropping whole
+    generations is what makes this safe: two identical records inside ONE file
+    are a real pair of events -- two fragments refused on the same path in the
+    same millisecond -- and deduplicating on their contents would delete one of
+    them.
+    """
+    if df.empty or "_upload" not in df.columns:
+        return df
+    gen = df["_upload"].str.extract(r"^(?P<file>[^:]+):(?P<blen>\d+)")
+    if gen["file"].isna().all():
+        return df
+    keep = gen.groupby("file")["blen"].transform(
+        lambda s: s.astype(float).max())
+    live = gen["blen"].astype(float).eq(keep) | gen["file"].isna()
+    dropped = int((~live).sum())
+    if dropped:
+        stale = sorted(set(gen.loc[~live, "file"]))
+        print(f"  re-ingested upload: dropped {dropped} duplicate record(s) "
+              f"from an earlier upload of {', '.join(stale)}", file=sys.stderr)
+    return df[live].reset_index(drop=True)
 
 
 def load_jsonl(paths: list[Path]) -> pd.DataFrame:

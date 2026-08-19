@@ -2088,16 +2088,19 @@ void main() {
       hostApi.calls.clear();
     }
 
-    test('held until the MTU lands, then written — nothing refused', () async {
+    test('the caller is answered at once; the write goes out on the MTU',
+        () async {
       await singleLegAtDefault();
 
       // 113 bytes is the first Noise handshake message that was refused four
       // times per reconnection in the field: too big for 20 usable bytes,
-      // nowhere else to go.
-      final write = transport.broadcast(Uint8List(113));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls, isEmpty,
-          reason: 'the write must wait for the leg, not die on it');
+      // nowhere else to go. The caller must NOT be held while the leg
+      // negotiates — the announce loop and the flood iterate peers serially,
+      // and one cold leg awaiting its MTU would stall every peer behind it.
+      final aired = await transport.broadcast(Uint8List(113))
+          .timeout(const Duration(milliseconds: 500));
+      expect(aired, 0, reason: 'same immediate answer a refusal always gave');
+      expect(hostApi.calls, isEmpty);
 
       // The MTU arrives ~95 ms later on hardware; deliver it now.
       callbacks.pushPath(BlePath(
@@ -2110,35 +2113,35 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      expect(await write, 1,
+      expect(hostApi.calls, ['send:peripheral:PAIR:113'],
           reason: 'the held write goes out the moment the leg can carry it');
-      expect(hostApi.calls, ['send:peripheral:PAIR:113']);
     });
 
     test('a leg that never negotiates gets the write anyway, once', () async {
       await singleLegAtDefault();
 
-      final write = transport.broadcast(Uint8List(113));
+      expect(await transport.broadcast(Uint8List(113)), 0);
 
       // No MTU ever arrives. The deadline sends rather than holding forever;
       // at 20 usable bytes the attempt is refused, which is the pre-deferral
       // outcome — deferral may only ever turn a certain loss into a chance.
-      expect(await write.timeout(const Duration(seconds: 5)), 0);
+      await Future<void>.delayed(const Duration(milliseconds: 3400));
       expect(hostApi.calls, isEmpty,
           reason: 'refused by the size check before reaching the stack');
     });
 
-    test('disposal resolves a held write as failed instead of hanging it',
+    test('disposal cancels a held write instead of leaking its timer',
         () async {
       await singleLegAtDefault();
 
-      final write = transport.broadcast(Uint8List(113));
-      await Future<void>.delayed(Duration.zero);
+      expect(await transport.broadcast(Uint8List(113)), 0);
       await transport.dispose();
-
-      expect(await write.timeout(const Duration(seconds: 1)), 0,
-          reason: 'a disposed transport cannot deliver; the caller must not '
-              'be left awaiting a future nobody will complete');
+      // The deadline would fire at 3 s; nothing may reach the stack after
+      // dispose, and no timer may be left running.
+      await Future<void>.delayed(const Duration(milliseconds: 3400));
+      expect(hostApi.calls.where((c) => c.startsWith('send:')), isEmpty,
+          reason: 'teardown calls are dispose\'s own; a send would mean the '
+              'deadline timer outlived the transport');
     });
 
     test('a small write is unaffected by the default MTU', () async {

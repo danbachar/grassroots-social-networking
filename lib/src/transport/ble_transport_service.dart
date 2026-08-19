@@ -1190,12 +1190,16 @@ class BleTransportService extends TransportService {
 
   /// Hold [data] until [path] reports a bigger MTU, then write it.
   ///
-  /// Returns whether the write eventually got in. The deadline is the safety
-  /// valve: a leg whose peer never negotiates still gets its packet, refused
-  /// by [_checkWritable] exactly as before, so this can only turn a certain
-  /// loss into a chance of delivery.
-  Future<bool> _deferUntilMtu(
-      ble.BlePath path, Uint8List data, String site) {
+  /// Reports failure to the caller IMMEDIATELY -- the same answer a refused
+  /// write gave before deferral existed -- and flushes in the background when
+  /// the MTU lands. Callers iterate peers serially (the announce loop, the
+  /// flood), so awaiting the MTU here would let one cold leg hold up every
+  /// peer behind it for the full deadline; nothing upstream acts on the
+  /// success either, since a buffered packet leaves custody only on ACK. The
+  /// deadline is the safety valve: a leg whose peer never negotiates still
+  /// gets the attempt, refused exactly as before, so deferral can only turn
+  /// a certain loss into a chance of delivery.
+  bool _deferUntilMtu(ble.BlePath path, Uint8List data, String site) {
     final pending = _DeferredWrite(data, site);
     _awaitingMtu.putIfAbsent(path.pathId, () => []).add(pending);
     _traceDrop(site, 'awaitingMtu', {
@@ -1208,27 +1212,24 @@ class BleTransportService extends TransportService {
         unawaited(_flushDeferred(path.pathId, [pending], timedOut: true));
       }
     });
-    return pending.done.future;
+    return false;
   }
 
   /// Send everything that was waiting on [pathId] now that its leg can carry
-  /// it. A path that dropped instead of negotiating resolves them false —
-  /// the caller's packet is gone either way, and pretending otherwise would
-  /// report a delivery that never happened.
+  /// it. A path that dropped instead of negotiating loses its writes — the
+  /// caller was already told they failed, and the DTN buffer is what carries
+  /// a packet past a dead leg, not this queue.
   Future<void> _flushDeferred(String pathId, List<_DeferredWrite> waiting,
       {bool timedOut = false}) async {
     final path = _paths[pathId];
     for (final w in waiting) {
       w.deadline?.cancel();
-      if (path == null || !_isReady(path)) {
-        w.done.complete(false);
-        continue;
-      }
+      if (path == null || !_isReady(path)) continue;
       if (timedOut) {
         debugPrint('[ble-mtu] ${w.site} waited ${_mtuWait.inSeconds}s on '
             '$pathId without an MTU — sending anyway');
       }
-      w.done.complete(await _writeLeg(path, w.data, w.site));
+      await _writeLeg(path, w.data, w.site);
     }
   }
 
@@ -1628,13 +1629,12 @@ class BleTransportService extends TransportService {
   @override
   Future<void> dispose() async {
     await stop();
-    // Resolve every held write as failed before anything closes: their
-    // callers are awaiting these futures, and a disposed transport can no
-    // longer deliver the bytes or the MTU they were waiting for.
+    // Cancel every held write's deadline before anything closes: a timer
+    // firing after dispose would flush into a transport that no longer
+    // exists.
     for (final waiting in _awaitingMtu.values) {
       for (final w in waiting) {
         w.deadline?.cancel();
-        if (!w.done.isCompleted) w.done.complete(false);
       }
     }
     _awaitingMtu.clear();
@@ -2524,12 +2524,11 @@ class _PairView {
 }
 
 /// One write held back until its leg negotiates an MTU: the bytes, the trace
-/// site they belong to, the timer that sends them anyway if no MTU ever
-/// arrives, and the completer the caller is awaiting.
+/// site they belong to, and the timer that sends them anyway if no MTU ever
+/// arrives.
 class _DeferredWrite {
   final Uint8List data;
   final String site;
-  final Completer<bool> done = Completer<bool>();
   Timer? deadline;
 
   _DeferredWrite(this.data, this.site);

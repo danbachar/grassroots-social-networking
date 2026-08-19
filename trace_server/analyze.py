@@ -346,14 +346,33 @@ def _newest_upload_only(df: pd.DataFrame) -> pd.DataFrame:
     gen = df["_upload"].str.extract(r"^(?P<file>[^:]+):(?P<blen>\d+)")
     if gen["file"].isna().all():
         return df
-    keep = gen.groupby("file")["blen"].transform(
-        lambda s: s.astype(float).max())
-    live = gen["blen"].astype(float).eq(keep) | gen["file"].isna()
-    dropped = int((~live).sum())
-    if dropped:
-        stale = sorted(set(gen.loc[~live, "file"]))
-        print(f"  re-ingested upload: dropped {dropped} duplicate record(s) "
-              f"from an earlier upload of {', '.join(stale)}", file=sys.stderr)
+    live = pd.Series(True, index=df.index)
+    for fname, idx in gen.groupby("file").groups.items():
+        sub = gen.loc[idx]
+        if sub["blen"].nunique() < 2:
+            continue
+        # Two generations of one filename are either the same run uploaded
+        # twice (the later file is a superset of the earlier -- distinct
+        # records match the largest generation) or two DIFFERENT runs that
+        # happened to reuse the name after the device's files were cleared
+        # (distinct records match the total). Only the first is duplication;
+        # collapsing the second would silently delete a whole run.
+        rows = df.loc[idx]
+        distinct = len(rows.drop_duplicates(
+            subset=[c for c in ("_device", "_t") if c in rows.columns]
+            + (["t"] if "t" in rows.columns else [])))
+        biggest = sub["blen"].astype(float).max()
+        big_rows = int((sub["blen"].astype(float) == biggest).sum())
+        if distinct <= big_rows * 1.05:
+            live.loc[idx] = sub["blen"].astype(float).eq(biggest)
+            print(f"  re-ingested upload: dropped "
+                  f"{int((~live.loc[idx]).sum())} duplicate record(s) from "
+                  f"an earlier upload of {fname}", file=sys.stderr)
+        else:
+            print(f"  NOTE: {fname} holds {sub['blen'].nunique()} distinct "
+                  f"runs under one name (files cleared between runs?) -- "
+                  f"keeping all; separate them by their markers",
+                  file=sys.stderr)
     return df[live].reset_index(drop=True)
 
 

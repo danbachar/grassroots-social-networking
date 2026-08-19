@@ -872,7 +872,7 @@ void main() {
     });
   });
 
-  test('resetDtnBuffer empties the store at each step start', () {
+  test('resetDtnBuffer empties the store on both sides of every step', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       var clears = 0;
@@ -892,9 +892,11 @@ void main() {
       async.flushMicrotasks();
       runner.inPosition();
       async.elapse(const Duration(seconds: 30));
-      expect(clears, 2, reason: 'once per step');
+      expect(clears, 3,
+          reason: 'once ahead of each step, and once more after the last so '
+              'its tail is cut like every other step\'s');
       expect(recorder.events.where((e) => e == 'marker:custody-reset'),
-          hasLength(2));
+          hasLength(3));
       runner.dispose();
     });
   });
@@ -959,6 +961,7 @@ void main() {
           order,
           [
             'buffer', 'ble-down', 'sessions', 'ble-up', //
+            'buffer', 'ble-down', 'sessions', 'ble-up', //
             'buffer', 'ble-down', 'sessions', 'ble-up',
           ],
           reason: 'the buffer empties while the radio is still up, and the '
@@ -977,6 +980,10 @@ void main() {
             'marker:sessions-reset',
             'marker:links-reset',
             'marker:s2',
+            'marker:custody-reset',
+            'marker:sessions-reset',
+            'marker:links-reset',
+            'marker:end',
           ]));
       runner.dispose();
     });

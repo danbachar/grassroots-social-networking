@@ -539,34 +539,15 @@ class FieldRunner extends ChangeNotifier {
     _notify();
   }
 
-  /// The experimenter reached the current step's position: drop sessions
-  /// (when the plan asks), stamp the ground-truth marker, hold the dwell,
-  /// and run the step's sends spread through it.
-  Future<void> inPosition() async {
-    final step = currentStep;
-    if (!_running ||
-        (_phase != FieldPhase.positioning && _phase != FieldPhase.placement) ||
-        step == null) {
-      return;
-    }
-    _tick?.cancel(); // a manual tap pre-empts any auto-advance gap countdown
-    _tick = null;
-    _absFire?.cancel();
-    _absFire = null;
-    // Manual-join mode never touches the radio: system Bluetooth belongs to
-    // the operator, and bleOn is intent for the marker, not a command.
-    // Wall-clock anchored AND hands-free: `scriptedRadio` says the plan, not
-    // an operator, works the radio, so the anchor and the toggling stop being
-    // one decision.
-    if (step.bleOn != null &&
-        onSetBle != null &&
-        (!manualJoin || _plan!.scriptedRadio)) {
-      _resetting = true;
-      _notify();
-      await onSetBle!.call(step.bleOn!);
-      _resetting = false;
-      _notify();
-    }
+  /// Empty the buffer, bounce the radio with the session purge inside the dark
+  /// window, and restore the step's dial context.
+  ///
+  /// A run is bracketed by these on both sides: one ahead of it, so it opens
+  /// cold, and one behind it, so whatever the run left cannot be counted. The
+  /// trailing one is what makes the LAST run of a plan like every other — a
+  /// segment ends at the next step marker, so every run but the last already
+  /// had its tail cut by the following reset.
+  Future<void> _runResets(FieldStep step) async {
     // The buffer goes first, with the radio still up: emptying it is what
     // stops this phone generating anything new, and it has to happen before
     // the link goes away rather than after.
@@ -610,6 +591,37 @@ class FieldRunner extends ChangeNotifier {
       onResetSessions!.call();
       await recorder.logMarker('sessions-reset');
     }
+  }
+
+  /// The experimenter reached the current step's position: drop sessions
+  /// (when the plan asks), stamp the ground-truth marker, hold the dwell,
+  /// and run the step's sends spread through it.
+  Future<void> inPosition() async {
+    final step = currentStep;
+    if (!_running ||
+        (_phase != FieldPhase.positioning && _phase != FieldPhase.placement) ||
+        step == null) {
+      return;
+    }
+    _tick?.cancel(); // a manual tap pre-empts any auto-advance gap countdown
+    _tick = null;
+    _absFire?.cancel();
+    _absFire = null;
+    // Manual-join mode never touches the radio: system Bluetooth belongs to
+    // the operator, and bleOn is intent for the marker, not a command.
+    // Wall-clock anchored AND hands-free: `scriptedRadio` says the plan, not
+    // an operator, works the radio, so the anchor and the toggling stop being
+    // one decision.
+    if (step.bleOn != null &&
+        onSetBle != null &&
+        (!manualJoin || _plan!.scriptedRadio)) {
+      _resetting = true;
+      _notify();
+      await onSetBle!.call(step.bleOn!);
+      _resetting = false;
+      _notify();
+    }
+    await _runResets(step);
     // The resets ran in the slot reserved ahead of the step. Hold here until
     // the step's own instant so the marker opens a full dwell and every phone
     // opens it together; a phone whose resets overran is already past it and
@@ -1165,7 +1177,11 @@ class FieldRunner extends ChangeNotifier {
       _enterPositioning();
       return;
     }
-    // Last step done — settle, then stop + upload.
+    // Last step done. Reset once more BEFORE stamping `end`: the segment a
+    // step marker opens runs to the next marker, so every other run's tail was
+    // already cut by the following reset, and closing this one without the
+    // same cut would leave the last run the only one whose tail still counted.
+    await _runResets(plan.steps.last);
     await recorder.logMarker('end');
     _phase = FieldPhase.settling;
     _startCountdown(plan.settleSec, _finish);

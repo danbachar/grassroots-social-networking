@@ -953,7 +953,10 @@ class FieldPlanPresets {
   }) {
     return FieldPlan(
       expId: expId,
-      settleSec: 20,
+      // Nothing survives a run to drain: the buffer, the sessions and the
+      // radio are all reset on both sides of every one, including the last.
+      // A settle window would only record events belonging to no segment.
+      settleSec: 0,
       // No settle gap: the wall-clock schedule counts down to each step's own
       // instant, so a gap between steps is dead time rather than a settle.
       autoAdvanceGapSec: 0,

@@ -96,6 +96,7 @@ class BleTransportService extends TransportService {
   // Subscriptions to plugin event streams
   StreamSubscription<ble.BleAdapterState>? _adapterSub;
   StreamSubscription<ble.BleAdvertisement>? _advertisementSub;
+  StreamSubscription<ble.BleAdvertisingState>? _advertisingStateSub;
   StreamSubscription<ble.BlePath>? _pathSub;
   StreamSubscription<ble.BlePayload>? _payloadSub;
   StreamSubscription<String>? _logSub;
@@ -599,6 +600,8 @@ class BleTransportService extends TransportService {
         _onAdapterStateChanged(s);
       });
       _advertisementSub = _ble.advertisements.listen(_onAdvertisement);
+      _advertisingStateSub =
+          _ble.advertisingStateChanges.listen(_onAdvertisingStateChanged);
       _pathSub = _ble.pathChanges.listen(_onPathChanged);
       _payloadSub = _ble.payloads.listen(_onPayload);
       _logSub = _ble.logs.listen(
@@ -665,8 +668,9 @@ class BleTransportService extends TransportService {
         } catch (e) {
           debugPrint('Failed to start advertising: $e');
           // Undiscoverable: no inbound legs, no peripheral role, for as long
-          // as this persists — while the transport can still report active
-              if (_tracing) {
+          // as this persists — while the transport still reports active
+          // because the scan side came up.
+          if (_tracing) {
             unawaited(trace!.log({
               'type': 'link',
               't': DateTime.now().millisecondsSinceEpoch,
@@ -1550,6 +1554,7 @@ class BleTransportService extends TransportService {
     _wireLedgerTimer = null;
     await _adapterSub?.cancel();
     await _advertisementSub?.cancel();
+    await _advertisingStateSub?.cancel();
     await _pathSub?.cancel();
     await _payloadSub?.cancel();
     await _logSub?.cancel();
@@ -1776,6 +1781,32 @@ class BleTransportService extends TransportService {
     if (state == TransportState.ready && !_stopped) {
       unawaited(start());
     }
+  }
+
+  /// The plugin reports whether the radio is broadcasting our advertisement.
+  ///
+  /// A device that is not advertising still scans, still dials, and still
+  /// reports the transport active, while no peer can discover it and no
+  /// inbound peripheral leg can form. The scan side says nothing about it, so
+  /// this is the only record that a run's missing links are a silent radio
+  /// rather than an empty room.
+  void _onAdvertisingStateChanged(ble.BleAdvertisingState advertising) {
+    final reason = advertising.reason;
+    final failure = advertising.failure;
+    debugPrint(advertising.active
+        ? 'BLE advertising active'
+        : 'BLE advertising stopped'
+            '${failure == null ? '' : ' (${failure.name}: $reason)'}');
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'link',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'event': 'advertisingState',
+      'transport': 'ble',
+      'active': advertising.active,
+      if (failure != null) 'failure': failure.name,
+      if (reason != null) 'reason': reason,
+    }));
   }
 
   void _onAdvertisement(ble.BleAdvertisement adv) {

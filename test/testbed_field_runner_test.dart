@@ -922,15 +922,21 @@ void main() {
     });
   });
 
-  test('resetLinks tears down links before sessions at each step', () {
+  test('the buffer empties first and the sessions purge inside the dark window',
+      () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();
       final order = <String>[];
       final runner = FieldRunner(
         recorder: recorder,
         myPubkeyHex: hexOf(0),
-        onResetLinks: (_) async => order.add('links'),
+        onResetLinks: (_, {whileDark}) async {
+          order.add('ble-down');
+          whileDark?.call();
+          order.add('ble-up');
+        },
         onResetSessions: () => order.add('sessions'),
+        onResetDtnBuffer: () => order.add('buffer'),
       );
       runner.start(const FieldPlan(
         expId: 'e',
@@ -949,18 +955,27 @@ void main() {
       async.flushMicrotasks();
       async.elapse(const Duration(seconds: 5));
 
-      expect(order, ['links', 'sessions', 'links', 'sessions'],
-          reason: 'links torn down before sessions, once per step');
+      expect(
+          order,
+          [
+            'buffer', 'ble-down', 'sessions', 'ble-up', //
+            'buffer', 'ble-down', 'sessions', 'ble-up',
+          ],
+          reason: 'the buffer empties while the radio is still up, and the '
+              'sessions purge with it down — pairing is eager, so a purge '
+              'after the radio returns is a purge a handshake outran');
       final markers =
           recorder.events.where((e) => e.startsWith('marker:')).toList();
       expect(
           markers,
           containsAllInOrder([
-            'marker:links-reset',
+            'marker:custody-reset',
             'marker:sessions-reset',
+            'marker:links-reset',
             'marker:s1',
-            'marker:links-reset',
+            'marker:custody-reset',
             'marker:sessions-reset',
+            'marker:links-reset',
             'marker:s2',
           ]));
       runner.dispose();
@@ -973,7 +988,7 @@ void main() {
       var links = 0;
       final runner = FieldRunner(
         recorder: recorder,
-        onResetLinks: (_) async => links++,
+        onResetLinks: (_, {whileDark}) async => links++,
       );
       runner.start(plan());
       async.flushMicrotasks();
@@ -1841,7 +1856,7 @@ void main() {
         final runner = FieldRunner(
           recorder: recorder,
           nowMs: () => base + async.elapsed.inMilliseconds,
-          onResetLinks: (dark) =>
+          onResetLinks: (dark, {whileDark}) =>
               Future<void>.delayed(Duration(seconds: dark ?? 0)),
           upload: () async => 'ok',
         );
@@ -1928,7 +1943,8 @@ void main() {
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '1',
-          onResetLinks: (darkSec) async => calls.add('bounce:$darkSec'),
+          onResetLinks: (darkSec, {whileDark}) async =>
+              calls.add('bounce:$darkSec'),
           onSetDialParallelism: ({int? maxParallel, int? popN}) =>
               calls.add('cap:$maxParallel/$popN'),
           onResetEstablishmentCount: () => calls.add('reset'),
@@ -1993,7 +2009,7 @@ void main() {
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '2',
-          onResetLinks: (_) async {},
+          onResetLinks: (_, {whileDark}) async {},
           onSetDialParallelism: ({int? maxParallel, int? popN}) {},
           onResetEstablishmentCount: () => established = 0,
           establishmentCount: () => established,

@@ -59,7 +59,8 @@ class SettingsScreen extends StatefulWidget {
   final Future<int?> Function(Uint8List peer,
       {required String leg, required int seq, int sizeDelta})? sendRaw;
   final Future<void> Function(bool on)? onSetBle;
-  final Future<void> Function(int? darkSec)? onResetLinks;
+  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+      onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
   /// Whether a Noise session exists with this peer — what a send is gated on.

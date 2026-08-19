@@ -2524,7 +2524,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
           onResetLinks: _grassroots == null
               ? null
-              : (darkSec) => _grassroots!.resetAllBleLinks(darkSec: darkSec),
+              : (darkSec, {whileDark}) => _grassroots!
+                  .resetAllBleLinks(darkSec: darkSec, whileDark: whileDark),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
           onCryptoBench:

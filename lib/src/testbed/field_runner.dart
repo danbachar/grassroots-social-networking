@@ -67,7 +67,8 @@ class FieldRunner extends ChangeNotifier {
   /// marker and sends wait until the transport is back up. [darkSec] is the
   /// plan's [FieldPlan.linkResetDarkSec] — null leaves the coordinator's
   /// default gap.
-  final Future<void> Function(int? darkSec)? onResetLinks;
+  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+      onResetLinks;
 
   /// Empties the DTN memory buffer (per-step, when the plan asks) so a prior
   /// step's undelivered backlog cannot drain into this step's window.
@@ -566,20 +567,34 @@ class FieldRunner extends ChangeNotifier {
       _resetting = false;
       _notify();
     }
-    // The buffer goes first, so nothing is conveyable the instant the radio
-    // comes back.
+    // The buffer goes first, with the radio still up: emptying it is what
+    // stops this phone generating anything new, and it has to happen before
+    // the link goes away rather than after.
     if ((step.resetDtnBuffer ?? _plan!.resetDtnBuffer) &&
         onResetDtnBuffer != null) {
       onResetDtnBuffer!.call();
       await recorder.logMarker('custody-reset');
     }
+    final wantSessionReset =
+        (step.resetSessions ?? _plan!.resetSessions) && onResetSessions != null;
+    var sessionsResetWhileDark = false;
     if (_plan!.resetLinks && onResetLinks != null) {
       _resetting = true;
       _notify();
-      // BLE bounce; wait for the transport back up.
-      await onResetLinks!.call(_plan!.linkResetDarkSec);
+      // BLE bounce; wait for the transport back up. The session purge rides
+      // INSIDE the dark window: pairing is eager, so a handshake completes on
+      // its own the moment the radio returns, and purging after that hands the
+      // step a session it was supposed to start without.
+      await onResetLinks!.call(_plan!.linkResetDarkSec, whileDark: () {
+        if (!wantSessionReset) return;
+        onResetSessions!.call();
+        sessionsResetWhileDark = true;
+      });
       _resetting = false;
       _notify();
+      if (sessionsResetWhileDark) {
+        await recorder.logMarker('sessions-reset');
+      }
       await recorder.logMarker('links-reset');
     }
     // AFTER the bounce, which builds a fresh transport: the cap and the step
@@ -589,12 +604,9 @@ class FieldRunner extends ChangeNotifier {
     onSetDialParallelism?.call(
         maxParallel: step.maxParallelDials, popN: step.cliqueN);
     onResetEstablishmentCount?.call();
-    // Sessions go LAST, closest to the marker. The radio is back up by now and
-    // pairing is eager, so a handshake can complete during recovery; clearing
-    // before the bounce would hand the dwell a session that already exists,
-    // and the ladder times ANNOUNCE -> handshake -> session from zero.
-    if ((step.resetSessions ?? _plan!.resetSessions) &&
-        onResetSessions != null) {
+    // Only when the bounce did not already carry the purge — a plan that does
+    // not reset links has no dark window to put it in.
+    if (wantSessionReset && !sessionsResetWhileDark) {
       onResetSessions!.call();
       await recorder.logMarker('sessions-reset');
     }

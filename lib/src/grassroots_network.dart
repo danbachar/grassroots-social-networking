@@ -1961,7 +1961,12 @@ class GrassrootsNetwork {
   /// [darkSec] overrides the dark gap (see below). Supply it only when EVERY
   /// device bounces at the same instant — then both sides dispose together,
   /// no stale path can survive on either, and there is nothing to wait for.
-  Future<void> resetAllBleLinks({int? darkSec}) async {
+  /// Bounce the BLE transport: dispose it, stay dark for [darkSec], bring it
+  /// back. [whileDark] runs in the dark window, with the radio down and the
+  /// transport gone — the only moment at which state can be cleared with no
+  /// chance of a peer re-establishing it, since pairing is eager and a
+  /// handshake completes on its own as soon as the radio is back.
+  Future<void> resetAllBleLinks({int? darkSec, void Function()? whileDark}) async {
     if (_bleService == null) return;
     debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
     await _bleService!.dispose();
@@ -1986,6 +1991,7 @@ class GrassrootsNetwork {
         : config.announceInterval * 2 + const Duration(seconds: 10);
     debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
     await Future<void>.delayed(darkGap);
+    whileDark?.call();
     if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
     debugPrint('[testbed] BLE bounce: re-initializing transport');
 

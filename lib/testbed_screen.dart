@@ -44,7 +44,8 @@ class TestbedScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final Future<void> Function(int? darkSec)? onResetLinks;
+  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+      onResetLinks;
   final VoidCallback? onResetDtnBuffer;
 
   /// Runs the on-device crypto bench (failed-AEAD and handshake cost).

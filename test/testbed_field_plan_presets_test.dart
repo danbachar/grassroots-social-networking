@@ -1031,6 +1031,28 @@ void main() {
       expect(plan.steps.map((s) => s.label), ['d=40 t1', 'd=50 t1', 'd=60 t1']);
     });
 
+    test('a single position is a whole plan, with nothing to walk to', () {
+      // Testing the pipeline on a desk: launch, resets, establishment, sends
+      // and upload all exercised, but no second position means no walk.
+      final plan = FieldPlanPresets.lineSweepUpTo(
+          startDistance: 1, maxDistance: 1, stepMetres: 5, trials: 3);
+      expect(plan.steps.map((s) => s.label),
+          ['d=1 t1', 'd=1 t2', 'd=1 t3']);
+      expect(plan.steps.where((s) => !s.autoAdvance), hasLength(1),
+          reason: 'only the first dwell is a position; nothing follows it');
+    });
+
+    test('any step spacing the ground calls for, not a fixed set', () {
+      for (final step in [1, 3, 7, 250]) {
+        final plan = FieldPlanPresets.lineSweepUpTo(
+            startDistance: 1, maxDistance: 1 + step, stepMetres: step,
+            trials: 1);
+        expect(plan.steps.map((s) => s.label),
+            ['d=1 t1', 'd=${1 + step} t1'],
+            reason: 'step of $step m');
+      }
+    });
+
     test('the step size sets how finely the range is sampled', () {
       final coarse = FieldPlanPresets.lineSweepUpTo(
           maxDistance: 100, stepMetres: 50, trials: 1);

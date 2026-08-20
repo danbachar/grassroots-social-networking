@@ -257,6 +257,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
     _expIdController.dispose();
     _markerController.dispose();
     _planController.dispose();
+    _sweepStepController.dispose();
     super.dispose();
   }
 
@@ -771,11 +772,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
         const SizedBox(height: 8),
         Row(children: [
           Expanded(
-            child: _sweepPicker(
-              label: 'Step (m)',
-              value: _sweepStepMetres,
-              options: const [5, 10, 15, 20, 25, 50],
-              onPick: (m) {
+            child: TextField(
+              controller: _sweepStepController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Step (m)',
+              ),
+              onChanged: (text) {
+                // Any spacing the ground calls for. A half-typed or cleared
+                // field keeps the last usable step rather than rebuilding the
+                // plan around a number that is not there yet.
+                final m = int.tryParse(text.trim());
+                if (m == null || m < 1) return;
                 setState(() => _sweepStepMetres = m);
                 _applySweep();
               },
@@ -835,6 +845,9 @@ class _TestbedScreenState extends State<TestbedScreen> {
   /// Held on the screen rather than in the plan JSON: changing either has to
   /// rebuild the plan, and the JSON is the output of that choice, not its
   /// home.
+  late final TextEditingController _sweepStepController =
+      TextEditingController(text: '$_sweepStepMetres');
+
   int _sweepStartDistance = 10;
   int _sweepMaxDistance = 120;
   int _sweepStepMetres = 10;

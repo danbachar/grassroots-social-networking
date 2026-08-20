@@ -124,6 +124,47 @@ void main() {
     });
   });
 
+  test('a convergence event stamps link-settled without waiting out a poll',
+      () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final peer = Uint8List.fromList(List<int>.filled(32, 9));
+      final settledEvents = StreamController<Uint8List>.broadcast();
+      var converged = false;
+
+      final runner = FieldRunner(
+        recorder: recorder,
+        knownPeers: () => [peer],
+        linkSettled: (_) => converged,
+        linkSettledEvents: settledEvents.stream,
+        sessionUp: (_) => true,
+        send: (recipient, payload, {String? messageId}) async => messageId,
+      );
+
+      runner.start(const FieldPlan(
+        expId: 'evt-2',
+        settleSec: 0,
+        steps: [FieldStep(label: 'w1', dwellSec: 30, sendCount: 1)],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      expect(recorder.events, isNot(contains('marker:link-settled')));
+
+      // Converge 140 ms in, off any poll grid.
+      async.elapse(const Duration(milliseconds: 140));
+      converged = true;
+      settledEvents.add(peer);
+      async.flushMicrotasks();
+
+      expect(recorder.events, contains('marker:link-settled'),
+          reason: 'convergence is stamped on its event, not on a poll tick');
+
+      runner.dispose();
+      settledEvents.close();
+    });
+  });
+
   test('walks the whole plan: markers, dwell, bulk, settle, upload', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

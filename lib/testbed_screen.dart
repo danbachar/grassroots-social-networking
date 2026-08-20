@@ -69,6 +69,7 @@ class TestbedScreen extends StatefulWidget {
   /// Whether a Noise session exists with this peer — what a send is gated on.
   final bool Function(Uint8List peer)? sessionUp;
   final Stream<Uint8List>? sessionEvents;
+  final Stream<Uint8List>? linkSettledEvents;
 
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
@@ -106,6 +107,7 @@ class TestbedScreen extends StatefulWidget {
     this.linkSettled,
     this.sessionUp,
     this.sessionEvents,
+    this.linkSettledEvents,
     this.onSetDialParallelism,
     this.establishmentCount,
     this.onResetEstablishmentCount,
@@ -409,6 +411,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       linkSettled: widget.linkSettled,
       sessionUp: widget.sessionUp,
       sessionEvents: widget.sessionEvents,
+      linkSettledEvents: widget.linkSettledEvents,
       onSetDialParallelism: widget.onSetDialParallelism,
       establishmentCount: widget.establishmentCount,
       onResetEstablishmentCount: widget.onResetEstablishmentCount,

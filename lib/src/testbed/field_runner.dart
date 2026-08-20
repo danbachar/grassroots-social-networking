@@ -127,6 +127,12 @@ class FieldRunner extends ChangeNotifier {
   /// (correct at an out-of-range step). Null: legacy fixed-offset schedule.
   final bool Function(Uint8List peer)? linkSettled;
 
+  /// Fires the instant a peer's pair becomes settled. Completes
+  /// [linkSettled] the way [sessionEvents] completes [sessionUp]: without it
+  /// the `link-settled` stamp carries the poll period rather than the
+  /// convergence. Null falls back to polling.
+  final Stream<Uint8List>? linkSettledEvents;
+
   /// Whether a Noise session with this peer exists. This is what a send is
   /// gated on — a session is the whole requirement for addressing a peer, and
   /// [linkSettled] additionally wants both GATT legs, which a pair at the far
@@ -234,6 +240,7 @@ class FieldRunner extends ChangeNotifier {
     this.linkSettled,
     this.sessionUp,
     this.sessionEvents,
+    this.linkSettledEvents,
     this.onSetDialParallelism,
     this.establishmentCount,
     this.onResetEstablishmentCount,
@@ -868,7 +875,7 @@ class FieldRunner extends ChangeNotifier {
       }
       return;
     }
-    _whenSessionUp(ready0, () {
+    _whenReady(ready0, sessionEvents, () {
       unawaited(recorder.logMarker('session-up'));
       // Spread the step's sends across what remains of the dwell.
       final windowSec = _remainingSec > 2 ? _remainingSec - 2 : _remainingSec;
@@ -879,17 +886,18 @@ class FieldRunner extends ChangeNotifier {
     });
   }
 
-  /// Run [then] the moment any send target has a Noise session.
+  /// Run [then] the moment [ready] holds for any send target.
   ///
-  /// Prefers [sessionEvents]; polls only for a runner wired without it.
-  void _whenSessionUp(
-      bool Function(Uint8List peer) ready, void Function() then) {
+  /// Waits on [events] when one is supplied and polls only without it. Every
+  /// gate the runner has is a predicate plus the stream that announces its
+  /// edge, so nothing on the step's critical path is discovered a tick late.
+  void _whenReady(bool Function(Uint8List peer) ready,
+      Stream<Uint8List>? events, void Function() then) {
     bool anyReady() => _sendTargets().any((target) => ready(target.$2));
     if (anyReady()) {
       then();
       return;
     }
-    final events = sessionEvents;
     if (events == null) {
       final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
         if (!_running || _phase != FieldPhase.dwelling) {
@@ -925,16 +933,9 @@ class FieldRunner extends ChangeNotifier {
   void _watchConvergence() {
     final settled = linkSettled;
     if (settled == null) return;
-    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
-      if (!_running || _phase != FieldPhase.dwelling) {
-        t.cancel();
-        return;
-      }
-      if (!_sendTargets().any((target) => settled(target.$2))) return;
-      t.cancel();
+    _whenReady(settled, linkSettledEvents, () {
       unawaited(recorder.logMarker('link-settled'));
     });
-    _sendTimers.add(poll);
   }
 
   /// Saturating throughput mode: wait for the link to settle, then push for
@@ -965,7 +966,7 @@ class FieldRunner extends ChangeNotifier {
       begin();
       return;
     }
-    _whenSessionUp(settled, () {
+    _whenReady(settled, sessionEvents, () {
       unawaited(recorder.logMarker('session-up'));
       begin();
     });
@@ -990,17 +991,10 @@ class FieldRunner extends ChangeNotifier {
       begin();
       return;
     }
-    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
-      if (!_running || _phase != FieldPhase.dwelling) {
-        t.cancel();
-        return;
-      }
-      if (!_sendTargets().any((target) => settled(target.$2))) return;
-      t.cancel();
+    _whenReady(settled, linkSettledEvents, () {
       unawaited(recorder.logMarker('link-settled'));
       begin();
     });
-    _sendTimers.add(poll);
   }
 
   Future<void> _pushRaw(FieldStep step) async {

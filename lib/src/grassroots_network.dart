@@ -578,6 +578,7 @@ class GrassrootsNetwork {
         store.dispatch(action);
       }
       _processReachabilityTransitions(state.peers);
+      _emitLinkSettledTransitions(state.peers);
     });
   }
 
@@ -1951,6 +1952,32 @@ class GrassrootsNetwork {
       _noiseSessionEstablished.stream;
   final StreamController<Uint8List> _noiseSessionEstablished =
       StreamController<Uint8List>.broadcast();
+
+  /// Fires the instant a peer's pair becomes settled — session plus both GATT
+  /// legs — and again on each later false→true edge.
+  ///
+  /// Derived from [isPeerLinkSettled] itself rather than from the leg events
+  /// underneath it, so the event and the predicate cannot drift apart. Both
+  /// its inputs are store-visible, which is why the edge is detected where
+  /// every other projection is: on the store's own change notification.
+  Stream<Uint8List> get peerLinkSettled => _peerLinkSettled.stream;
+  final StreamController<Uint8List> _peerLinkSettled =
+      StreamController<Uint8List>.broadcast();
+
+  /// Peers currently settled, so the stream reports edges and not levels.
+  /// Bounded by the peers that are settled right now: an entry leaves the set
+  /// as soon as the pair stops being settled.
+  final Set<String> _settledPeers = {};
+
+  void _emitLinkSettledTransitions(PeersState peersState) {
+    if (_peerLinkSettled.isClosed) return;
+    processLinkSettledTransitions(
+      peersState: peersState,
+      isSettled: isPeerLinkSettled,
+      settled: _settledPeers,
+      onSettled: _peerLinkSettled.add,
+    );
+  }
 
   bool isPeerLinkSettled(Uint8List pubkey) {
     if (!_noiseSessions.hasSession(pubkey)) return false;
@@ -4871,6 +4898,7 @@ class GrassrootsNetwork {
   /// Clean up resources
   Future<void> dispose() async {
     unawaited(_noiseSessionEstablished.close());
+    unawaited(_peerLinkSettled.close());
     _connectivitySubscription?.cancel();
     _connectivitySubscription = null;
     _storeSubscription?.cancel();
@@ -5492,6 +5520,35 @@ class GrassrootsNetwork {
 ///   - state unchanged or one-of-two transports flipping while the other
 ///     stays live: no fire.
 @visibleForTesting
+/// Report each peer whose pair has just become settled.
+///
+/// [settled] is the running set of peers settled as of the previous call and
+/// is updated in place; [onSettled] fires only on a false→true edge, so a
+/// store change that leaves settledness alone reports nothing. A peer that
+/// stops being settled leaves the set and can report again later, which is
+/// what a per-step reset needs — it is the same pair settling anew, not a
+/// duplicate of the first time.
+void processLinkSettledTransitions({
+  required PeersState peersState,
+  required bool Function(Uint8List pubkey) isSettled,
+  required Set<String> settled,
+  required void Function(Uint8List pubkey) onSettled,
+}) {
+  final seen = <String>{};
+  for (final peer in peersState.peersList) {
+    final pk = peer.pubkeyHex;
+    seen.add(pk);
+    if (isSettled(peer.publicKey)) {
+      if (settled.add(pk)) onSettled(peer.publicKey);
+    } else {
+      settled.remove(pk);
+    }
+  }
+  // A peer dropped from the store is no longer settled; keeping it would
+  // suppress the edge when it comes back.
+  settled.removeWhere((pk) => !seen.contains(pk));
+}
+
 void processReachabilityTransitions({
   required PeersState peersState,
   required Map<String, bool> lastKnownReachability,

@@ -1161,8 +1161,11 @@ class FieldPlanPresets {
         // around -- how far the site allows, and how long the daylight does.
         // The testbed picks them; this entry is what the defaults look like.
         lineSweepPresetName: lineSweepUpTo(),
+        // 1000 messages per phone per run: the establishment windows double
+        // as a load test, and delivery under churn is measured against real
+        // traffic rather than a trickle. 84 x 12 = 1008 sends a run.
         'Session churn LONG (12 x 30s, ~8 min)': manualized(sessionChurn(
-            expId: 'churn-long-1', windows: 12)),
+            expId: 'churn-long-1', windows: 12, sendCount: 84)),
         'Session churn (5 x 30s, sessions reset, ~3 min)':
             manualized(sessionChurn()),
         'Home soak (stationary, 40 min)': manualized(homeSoak()),

@@ -1304,6 +1304,48 @@ class BleTransportService extends TransportService {
     unawaited(_flushDeferred(path.pathId, waiting));
   }
 
+  /// Evict a dead address and dial the identity's newest other sighting now.
+  ///
+  /// The measured cause of a fast-failing dial is an address that no longer
+  /// exists: every advertising restart gives the peer a fresh random address,
+  /// and the first post-bounce sighting can still be the dying pre-restart
+  /// advertisement — the CONNECT_IND goes out and nobody on the air owns the
+  /// address (HCI 0x3E under the opaque 133). The cooldown answers an
+  /// alive-and-refusing address; a dead one deserves the opposite. Drop the
+  /// entry and dial the same identity's newest OTHER sighting immediately —
+  /// newest strictly after the failed entry's last sighting, so the chase
+  /// only ever moves toward information that arrived after the address we
+  /// just proved dead. The cooldown record for the failed address stays
+  /// armed: if it re-advertises (alive after all), its re-added entry is
+  /// still rate-limited, so nothing hammers a refusing peer.
+  void _chaseNewerAddress(String failedPathId) {
+    if (_stopped) return;
+    final failed = _peersState.discoveredBlePeers[failedPathId];
+    if (failed == null) return;
+    store.dispatch(BleDeviceRemovedAction(failedPathId));
+    final uuid = failed.serviceUuid;
+    if (uuid == null) return;
+    DiscoveredPeerState? newest;
+    for (final e in _peersState.discoveredBlePeersList) {
+      if (e.transportId == failedPathId) continue;
+      if (e.serviceUuid != uuid) continue;
+      if (!e.lastSeen.isAfter(failed.lastSeen)) continue;
+      if (newest == null || e.lastSeen.isAfter(newest.lastSeen)) newest = e;
+    }
+    if (newest == null) return;
+    if (_tracing) {
+      unawaited(trace!.log({
+        'type': 'link',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'dialChase',
+        'transport': 'ble',
+        'path': failedPathId,
+        'to': newest.transportId,
+      }));
+    }
+    unawaited(connectToDevice(newest.transportId));
+  }
+
   /// One write attempt on one leg. False means the bytes did not get in.
   Future<bool> _writeLeg(
       ble.BlePath path, Uint8List data, String site) async {
@@ -2330,10 +2372,11 @@ class BleTransportService extends TransportService {
 
   void _onPathChanged(ble.BlePath path) {
     _dialingNow.remove(path.pathId);
+    var wasCancelledDial = false;
     if (path.state == ble.BlePathState.failed ||
         path.state == ble.BlePathState.disconnected ||
         path.state == ble.BlePathState.stale) {
-      _cancellingDials.remove(path.pathId);
+      wasCancelledDial = _cancellingDials.remove(path.pathId);
     }
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
@@ -2461,6 +2504,9 @@ class BleTransportService extends TransportService {
               if (path.error != null) 'error': path.error,
             }));
           }
+          // A cancelled dial failed because WE cancelled it — the inbound leg
+          // won and the pair is forming; chasing would dial the peer again.
+          if (!wasCancelledDial) _chaseNewerAddress(path.pathId);
         }
         // Mirror the connect emit at the `ready` case: surface a disconnect
         // to the upper layer only on a true transition out of `ready`.

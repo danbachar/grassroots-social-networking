@@ -460,14 +460,17 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      // The address is NOT evicted — the peer keeps advertising it and it stays
-      // dialable; eviction only churned the discovery entry without stopping
-      // the redials (the scanner runs allowDuplicates).
-      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
-          reason: 'A failed dial cools the address down, it does not evict it.');
+      // The failed address is EVICTED — the measured cause of a fast failure
+      // is an address nobody on the air owns any more, and a dead entry
+      // lingering in discovery would be dialed ahead of the peer's live one.
+      // The cooldown record survives the eviction; the rest of this test is
+      // the alive case.
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), false,
+          reason: 'A failed dial evicts the dead address.');
 
-      // A fresh advertisement inside the cooldown must NOT redial — that is the
-      // rate limit that keeps a failing address off the GATT slot table.
+      // An address that re-advertises after failing is ALIVE: it re-enters
+      // discovery, and the cooldown is what keeps it off the GATT slot table
+      // until it elapses.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: remoteId,
         serviceUuids: [serviceUuid],
@@ -475,11 +478,85 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'Re-advertising proves the address is alive; it re-enters.');
       final dialsAfterCooldownAd =
           hostApi.calls.where((c) => c == 'connect:$remoteId').length;
       expect(dialsAfterCooldownAd, dialsAfterFirst,
           reason: 'Within the cooldown, a re-advertisement of the same address '
               'is not redialed.');
+    });
+
+    test('a dead address is evicted and the newest sighting dialed at once',
+        () async {
+      const uuid = '84c40316-0871-e5ad-1111-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'OLDRPA',
+        serviceUuids: [uuid],
+        rssi: -40,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:OLDRPA'), hasLength(1));
+
+      // The peer's fresh address arrives while the doomed dial is in flight.
+      // Strictly newer information than the sighting that produced the dial.
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'NEWRPA',
+        serviceUuids: [uuid],
+        rssi: -41,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      callbacks.pushPath(BlePath(
+        pathId: 'central:OLDRPA',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -40,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT status 133 (GATT_ERROR generic)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The dead address leaves; the chase dials the live one without
+      // waiting out any cooldown — the cooldown belongs to addresses that
+      // answer, and this one demonstrably does not.
+      expect(store.state.peers.discoveredBlePeers.containsKey('central:OLDRPA'),
+          isFalse,
+          reason: 'nobody on the air owns the failed address any more');
+      // Exactly one dial at the live address — the chase fired without any
+      // cooldown wait, and it never double-dials one already in flight.
+      expect(hostApi.calls.where((c) => c == 'connect:NEWRPA'), hasLength(1),
+          reason: 'the identity is still here, under its new address');
+    });
+
+    test('a failed dial with no newer sighting waits, as before', () async {
+      const uuid = '84c40316-0871-e5ad-3333-000000000000';
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'ONLYRPA',
+        serviceUuids: [uuid],
+        rssi: -50,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      final dials = hostApi.calls.where((c) => c.startsWith('connect:')).length;
+
+      callbacks.pushPath(BlePath(
+        pathId: 'central:ONLYRPA',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -50,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT status 133 (GATT_ERROR generic)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')).length, dials,
+          reason: 'nothing newer to chase; the next advertisement decides');
     });
 
     test('a failed peripheral path does NOT drop a discovered address',

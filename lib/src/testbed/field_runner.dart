@@ -90,6 +90,11 @@ class FieldRunner extends ChangeNotifier {
   /// bring-up: a ladder step can legitimately bring the radio up ALONE.
   final bool Function()? bleUsable;
 
+  /// Whether the radio is up but not on the air. Surfaced on the runner
+  /// screen: a phone nobody can find looks identical to a phone out of range
+  /// until the files come back, and by then the run is spent.
+  final bool Function()? bleUndiscoverable;
+
   /// BLE-usability TRANSITIONS, emitted at the transport-state change
   /// itself. The `bt-on`/`bt-off` markers are stamped exclusively from this
   /// stream: a marker timestamp is the instant the BLE service became
@@ -233,6 +238,7 @@ class FieldRunner extends ChangeNotifier {
     this.onSetBle,
     this.bleWireBytes,
     this.bleUsable,
+    this.bleUndiscoverable,
     this.bleUsableChanges,
     this.bleWatchdogSec = 30,
     this.sendRaw,

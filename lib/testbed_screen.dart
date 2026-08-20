@@ -57,6 +57,7 @@ class TestbedScreen extends StatefulWidget {
   /// Whether the BLE transport is up — the watchdog's primary signal, valid
   /// even when the radio is deliberately alone.
   final bool Function()? bleUsable;
+  final bool Function()? bleUndiscoverable;
 
   /// BLE-usability transitions, delivered at the state change itself — the
   /// runner's bt-on/bt-off stamps come from this, never from a poll.
@@ -101,6 +102,7 @@ class TestbedScreen extends StatefulWidget {
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
+    this.bleUndiscoverable,
     this.bleUsableChanges,
     this.sendRaw,
     this.onSetBle,
@@ -407,6 +409,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onSetBle: widget.onSetBle,
       bleWireBytes: widget.bleWireBytes,
       bleUsable: widget.bleUsable,
+      bleUndiscoverable: widget.bleUndiscoverable,
       bleUsableChanges: widget.bleUsableChanges,
       linkSettled: widget.linkSettled,
       sessionUp: widget.sessionUp,

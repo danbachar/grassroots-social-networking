@@ -2534,6 +2534,9 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.bleWireBytes,
           bleUsable:
               _grassroots == null ? null : () => _grassroots!.bleUsable,
+          bleUndiscoverable: _grassroots == null
+              ? null
+              : () => _grassroots!.bleUndiscoverable,
           bleUsableChanges: _grassroots?.bleUsableChanges,
           sendRaw: _grassroots == null
               ? null

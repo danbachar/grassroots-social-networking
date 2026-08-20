@@ -1123,6 +1123,13 @@ class FieldPlanPresets {
         // with no taps. Each distance opens on an alignment boundary, which
         // is the window the operator walks one device to the next position
         // in. The placement window covers the initial walk out to 120 m.
+        // Three trials instead of ten: a distance is still repeated enough to
+        // separate a refused dial from a range limit, and the whole sweep
+        // fits in one stretch rather than an afternoon. The walk window is
+        // unchanged, so the operator's pace is the same either way.
+        'Line sweep 10..120 m x3 (2 phones, ~48 min)': manualized(
+            lineSweep(expId: 'line3-1', trials: 3),
+            placementSec: 120),
         'Line sweep 10..120 m x10 (2 phones, ~1h35)':
             manualized(lineSweep(), placementSec: 120),
         'Session churn LONG (12 x 30s, ~8 min)': manualized(sessionChurn(

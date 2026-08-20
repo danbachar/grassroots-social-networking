@@ -4,6 +4,7 @@ import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer.dart'
     as ble;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:redux/redux.dart';
 
 import '../models/identity.dart';
@@ -743,12 +744,20 @@ class BleTransportService extends TransportService {
           // Undiscoverable: no inbound legs, no peripheral role, for as long
           // as this persists — while the transport still reports active
           // because the scan side came up.
+          //
+          // The reason is the whole value of this record. A run that ends
+          // with nothing on the air is diagnosed from here or not at all,
+          // and "the advertiser refused" without saying what it said leaves
+          // the one question that matters unanswered.
           if (_tracing) {
             unawaited(trace!.log({
               'type': 'link',
               't': DateTime.now().millisecondsSinceEpoch,
               'event': 'advertiseFailed',
               'transport': 'ble',
+              'reason': e is PlatformException
+                  ? '${e.code}: ${e.message ?? ''}'.trim()
+                  : e.toString(),
             }));
           }
         }

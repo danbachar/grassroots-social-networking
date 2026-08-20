@@ -1957,6 +1957,25 @@ class GrassrootsNetwork {
   final StreamController<Uint8List> _noiseSessionEstablished =
       StreamController<Uint8List>.broadcast();
 
+  /// We are running but nobody can find us.
+  ///
+  /// True while the transport is up and the role mode asks us to advertise,
+  /// yet the controller says we are not on the air. In that state the phone
+  /// still scans and still dials outward, so nothing about its own view looks
+  /// wrong — but no peer can open a leg to it, and a run recorded from it
+  /// reads as a range limit rather than a radio that never started. It is
+  /// worth putting in front of the operator, which is the one thing knowing
+  /// it in the trace cannot do.
+  bool get bleUndiscoverable => bleUndiscoverableFrom(
+        hasService: _bleService != null,
+        bleState: store.state.transports.bleState,
+        roleMode: store.state.settings.bleRoleMode,
+        advertising: store.state.transports.bleAdvertising,
+      );
+
+  Stream<bool> get bleUndiscoverableChanges =>
+      store.onChange.map((_) => bleUndiscoverable).distinct();
+
   /// Fires the instant a peer's pair becomes settled — session plus both GATT
   /// legs — and again on each later false→true edge.
   ///
@@ -5545,6 +5564,26 @@ class GrassrootsNetwork {
 ///
 /// A mode that never asks to advertise is not undiscoverable by fault, so it
 /// is radio-up on the scan alone.
+/// See [GrassrootsNetwork.bleUndiscoverable].
+///
+/// Not simply the negation of [bleRadioUp]: a transport that is down, or a
+/// role mode that never advertises, is not on the air either but is not a
+/// fault to put in front of anyone. This names only the case where the phone
+/// believes it is running and is nonetheless invisible.
+bool bleUndiscoverableFrom({
+  required bool hasService,
+  required TransportState bleState,
+  required BleRoleMode roleMode,
+  required bool advertising,
+}) {
+  if (!hasService) return false;
+  // The dark window of a per-step reset disposes the transport; warning
+  // through every reset would train the operator to ignore the warning.
+  if (bleState != TransportState.active) return false;
+  if (roleMode == BleRoleMode.centralOnly) return false;
+  return !advertising;
+}
+
 bool bleRadioUp({
   required bool hasService,
   required TransportState bleState,

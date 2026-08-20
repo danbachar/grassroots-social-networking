@@ -109,7 +109,33 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         // than the viewport, centre it when it is not, so nothing is ever
         // unreachable and the common case still looks deliberate.
         body: SafeArea(
-          child: LayoutBuilder(
+          child: Column(children: [
+            // A phone nobody can find still scans, still dials, still counts
+            // down — nothing in the normal display contradicts it. This is the
+            // only thing between that and an hour of empty trace, so it sits
+            // above every phase rather than inside one.
+            if (widget.runner.bleUndiscoverable?.call() ?? false)
+              Container(
+                width: double.infinity,
+                color: Colors.red.shade900,
+                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                child: const Row(children: [
+                  Icon(Icons.wifi_tethering_off, color: Colors.white, size: 30),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'NOT ADVERTISING — no peer can find this phone.\n'
+                      'Check aeroplane mode and Bluetooth.',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ]),
+              ),
+            Expanded(
+              child: LayoutBuilder(
             builder: (context, constraints) => SingleChildScrollView(
               padding: const EdgeInsets.all(24),
               child: ConstrainedBox(
@@ -148,6 +174,8 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               ),
             ),
           ),
+            ),
+          ]),
         ),
       ),
     );

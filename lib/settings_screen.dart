@@ -51,6 +51,7 @@ class SettingsScreen extends StatefulWidget {
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
   final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
+  final bool Function()? bleUndiscoverable;
   final Stream<bool>? bleUsableChanges;
   final int Function()? sessionPeerCount;
 
@@ -95,6 +96,7 @@ class SettingsScreen extends StatefulWidget {
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
+    this.bleUndiscoverable,
     this.bleUsableChanges,
     this.sessionPeerCount,
     this.sessionTableCount,
@@ -342,6 +344,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onCryptoBench: widget.onCryptoBench,
                       bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,
+      bleUndiscoverable: widget.bleUndiscoverable,
                       bleUsableChanges: widget.bleUsableChanges,
                       sessionPeerCount: widget.sessionPeerCount,
                       sessionTableCount: widget.sessionTableCount,

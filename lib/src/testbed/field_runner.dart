@@ -135,6 +135,15 @@ class FieldRunner extends ChangeNotifier {
   /// reach.
   final bool Function(Uint8List peer)? sessionUp;
 
+  /// Fires the instant a Noise session is established with any peer.
+  ///
+  /// [sessionUp] answers "does a session exist now?"; this says when one
+  /// starts existing. Without it a waiter has to poll, which costs the step
+  /// up to a poll period of send time and — worse — puts that period into
+  /// the `session-up` stamp, so establishment latency reads back quantised
+  /// to the poll grid instead of measured. Null falls back to polling.
+  final Stream<Uint8List>? sessionEvents;
+
   /// Dial grid: cap the transport's in-flight central dials at [maxParallel]
   /// (null restores the production cap) and stamp [popN] on the
   /// establishments that follow, so each one is attributable to its cell.
@@ -224,6 +233,7 @@ class FieldRunner extends ChangeNotifier {
     this.knownPeers,
     this.linkSettled,
     this.sessionUp,
+    this.sessionEvents,
     this.onSetDialParallelism,
     this.establishmentCount,
     this.onResetEstablishmentCount,
@@ -254,6 +264,7 @@ class FieldRunner extends ChangeNotifier {
   String? _uploadResult;
   Timer? _tick;
   final List<Timer> _sendTimers = [];
+  final List<StreamSubscription<Uint8List>> _sessionWaits = [];
   int _sentCount = 0;
 
   /// Sends not attempted because the target pair was not settled yet. Reported
@@ -857,15 +868,7 @@ class FieldRunner extends ChangeNotifier {
       }
       return;
     }
-    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
-      if (!_running || _phase != FieldPhase.dwelling) {
-        t.cancel();
-        return;
-      }
-      final ready =
-          _sendTargets().any((target) => ready0(target.$2));
-      if (!ready) return;
-      t.cancel();
+    _whenSessionUp(ready0, () {
       unawaited(recorder.logMarker('session-up'));
       // Spread the step's sends across what remains of the dwell.
       final windowSec = _remainingSec > 2 ? _remainingSec - 2 : _remainingSec;
@@ -874,7 +877,43 @@ class FieldRunner extends ChangeNotifier {
       }
       _notify();
     });
-    _sendTimers.add(poll);
+  }
+
+  /// Run [then] the moment any send target has a Noise session.
+  ///
+  /// Prefers [sessionEvents]; polls only for a runner wired without it.
+  void _whenSessionUp(
+      bool Function(Uint8List peer) ready, void Function() then) {
+    bool anyReady() => _sendTargets().any((target) => ready(target.$2));
+    if (anyReady()) {
+      then();
+      return;
+    }
+    final events = sessionEvents;
+    if (events == null) {
+      final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
+        if (!_running || _phase != FieldPhase.dwelling) {
+          t.cancel();
+          return;
+        }
+        if (!anyReady()) return;
+        t.cancel();
+        then();
+      });
+      _sendTimers.add(poll);
+      return;
+    }
+    late final StreamSubscription<Uint8List> sub;
+    sub = events.listen((_) {
+      if (!_running || _phase != FieldPhase.dwelling) {
+        unawaited(sub.cancel());
+        return;
+      }
+      if (!anyReady()) return;
+      unawaited(sub.cancel());
+      then();
+    });
+    _sessionWaits.add(sub);
   }
 
   /// Mark the moment a target's pair converges to both GATT legs.
@@ -926,17 +965,10 @@ class FieldRunner extends ChangeNotifier {
       begin();
       return;
     }
-    final poll = Timer.periodic(const Duration(milliseconds: 500), (t) {
-      if (!_running || _phase != FieldPhase.dwelling) {
-        t.cancel();
-        return;
-      }
-      if (!_sendTargets().any((target) => settled(target.$2))) return;
-      t.cancel();
+    _whenSessionUp(settled, () {
       unawaited(recorder.logMarker('session-up'));
       begin();
     });
-    _sendTimers.add(poll);
   }
 
   /// Raw-throughput mode: wait for the link to settle, then push MTU-sized
@@ -1125,6 +1157,10 @@ class FieldRunner extends ChangeNotifier {
       t.cancel();
     }
     _sendTimers.clear();
+    for (final sub in _sessionWaits) {
+      unawaited(sub.cancel());
+    }
+    _sessionWaits.clear();
   }
 
   Future<void> _endDwell() async {

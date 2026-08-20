@@ -74,6 +74,56 @@ void main() {
         ],
       );
 
+  test('a session event releases the step\'s sends without waiting out a poll',
+      () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final peer = Uint8List.fromList(List<int>.filled(32, 7));
+      final sessions = StreamController<Uint8List>.broadcast();
+      var hasSession = false;
+      final sent = <int>[];
+
+      final runner = FieldRunner(
+        recorder: recorder,
+        knownPeers: () => [peer],
+        sessionUp: (_) => hasSession,
+        sessionEvents: sessions.stream,
+        send: (recipient, payload, {String? messageId}) async {
+          sent.add(payload.length);
+          return messageId;
+        },
+      );
+
+      runner.start(const FieldPlan(
+        expId: 'evt-1',
+        settleSec: 0,
+        steps: [FieldStep(label: 'w1', dwellSec: 30, sendCount: 2)],
+      ));
+      async.flushMicrotasks();
+      runner.inPosition();
+      async.flushMicrotasks();
+      expect(sent, isEmpty, reason: 'no session yet, so nothing is scheduled');
+
+      // The session forms 120 ms in — off any poll grid. The step must react
+      // to the event itself: a poll would hold the sends until its next tick
+      // and stamp `session-up` there, which is latency in the field and bias
+      // in the trace.
+      async.elapse(const Duration(milliseconds: 120));
+      hasSession = true;
+      sessions.add(peer);
+      async.flushMicrotasks();
+
+      expect(recorder.events, contains('marker:session-up'));
+      async.elapse(const Duration(seconds: 1));
+      async.flushMicrotasks();
+      expect(sent, isNotEmpty,
+          reason: 'sends begin on the event, not on a poll tick');
+
+      runner.dispose();
+      sessions.close();
+    });
+  });
+
   test('walks the whole plan: markers, dwell, bulk, settle, upload', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

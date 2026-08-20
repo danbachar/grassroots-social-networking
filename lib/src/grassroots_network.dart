@@ -1941,6 +1941,17 @@ class GrassrootsNetwork {
   bool hasNoiseSessionWith(Uint8List pubkey) =>
       _noiseSessions.hasSession(pubkey);
 
+  /// Fires the instant a Noise session is established with any peer.
+  ///
+  /// Pairs with [hasNoiseSessionWith]: the predicate answers "now?", this
+  /// says "now". A waiter that only has the predicate has to poll, and its
+  /// stamps then carry the poll period rather than the establishment — which
+  /// is both a delay before it can act and a bias in anything it records.
+  Stream<Uint8List> get noiseSessionEstablished =>
+      _noiseSessionEstablished.stream;
+  final StreamController<Uint8List> _noiseSessionEstablished =
+      StreamController<Uint8List>.broadcast();
+
   bool isPeerLinkSettled(Uint8List pubkey) {
     if (!_noiseSessions.hasSession(pubkey)) return false;
     final peer = _peersState.getPeerByPubkey(pubkey);
@@ -2510,6 +2521,9 @@ class GrassrootsNetwork {
     // is what lets the UI enable composing for a peer that has since walked out
     // of range — the store-carry-forward case.
     store.dispatch(PeerNoiseSessionEstablishedAction(pubkey));
+    if (!_noiseSessionEstablished.isClosed) {
+      _noiseSessionEstablished.add(pubkey);
+    }
 
     switch (transport) {
       case PeerTransport.udp:
@@ -4856,6 +4870,7 @@ class GrassrootsNetwork {
 
   /// Clean up resources
   Future<void> dispose() async {
+    unawaited(_noiseSessionEstablished.close());
     _connectivitySubscription?.cancel();
     _connectivitySubscription = null;
     _storeSubscription?.cancel();

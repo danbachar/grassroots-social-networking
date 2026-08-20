@@ -2549,6 +2549,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           sessionUp: _grassroots == null
               ? null
               : (peer) => _grassroots!.hasNoiseSessionWith(peer),
+          sessionEvents: _grassroots?.noiseSessionEstablished,
           onSetDialParallelism: _grassroots == null
               ? null
               : ({int? maxParallel, int? popN}) =>

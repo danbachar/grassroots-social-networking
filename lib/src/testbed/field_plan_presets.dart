@@ -1161,6 +1161,12 @@ class FieldPlanPresets {
         // around -- how far the site allows, and how long the daylight does.
         // The testbed picks them; this entry is what the defaults look like.
         lineSweepPresetName: lineSweepUpTo(),
+        // Ten one-minute windows for reset-recovery measurement: the harness
+        // kills the OS Bluetooth stack in each window's dark gap, and the
+        // question is how fast the service is back and established from a
+        // genuinely cold controller.
+        'Session churn RESET (10 x 60s, ~11 min)': manualized(sessionChurn(
+            expId: 'reset-min-1', windows: 10, dwellSec: 60)),
         // 1000 messages per phone per run: the establishment windows double
         // as a load test, and delivery under churn is measured against real
         // traffic rather than a trickle. 84 x 12 = 1008 sends a run.

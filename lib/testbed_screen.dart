@@ -731,7 +731,12 @@ class _TestbedScreenState extends State<TestbedScreen> {
             ],
             onChanged: (name) {
               if (name == null) return;
-              _setPlan(FieldPlanPresets.presets[name]!);
+              setState(() => _selectedPreset = name);
+              if (name == FieldPlanPresets.lineSweepPresetName) {
+                _applySweep();
+              } else {
+                _setPlan(FieldPlanPresets.presets[name]!);
+              }
             },
           ),
         ),
@@ -742,6 +747,58 @@ class _TestbedScreenState extends State<TestbedScreen> {
           label: const Text('Wizard'),
         ),
       ]),
+      if (_selectedPreset == FieldPlanPresets.lineSweepPresetName) ...[
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              isExpanded: true,
+              initialValue: _sweepMaxDistance,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Reach (m)',
+              ),
+              items: [
+                for (var d = 20; d <= 200; d += 10)
+                  DropdownMenuItem(value: d, child: Text('10 … $d m')),
+              ],
+              onChanged: (d) {
+                if (d == null) return;
+                setState(() => _sweepMaxDistance = d);
+                _applySweep();
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: DropdownButtonFormField<int>(
+              isExpanded: true,
+              initialValue: _sweepTrials,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Repeats per distance',
+              ),
+              items: [
+                for (var t = 1; t <= 10; t++)
+                  DropdownMenuItem(value: t, child: Text('$t')),
+              ],
+              onChanged: (t) {
+                if (t == null) return;
+                setState(() => _sweepTrials = t);
+                _applySweep();
+              },
+            ),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Text(
+          '${_sweepMaxDistance ~/ 10} positions x $_sweepTrials — '
+          '${_sweepDuration()}, walking included',
+          style: const TextStyle(fontSize: 13, color: Colors.grey),
+        ),
+      ],
       const SizedBox(height: 8),
       TextField(
         controller: _planController,
@@ -766,6 +823,40 @@ class _TestbedScreenState extends State<TestbedScreen> {
         ),
       ]),
     ];
+  }
+
+  /// Reach and repeats for the line sweep, and the entry they belong to.
+  ///
+  /// Held on the screen rather than in the plan JSON: changing either has to
+  /// rebuild the plan, and the JSON is the output of that choice, not its
+  /// home.
+  int _sweepMaxDistance = 120;
+  int _sweepTrials = 3;
+  String? _selectedPreset;
+
+  void _applySweep() {
+    _setPlan(FieldPlanPresets.lineSweepUpTo(
+      maxDistance: _sweepMaxDistance,
+      trials: _sweepTrials,
+    ));
+  }
+
+  /// How long the chosen sweep runs, walking included.
+  ///
+  /// Read off the plan's own wall-clock schedule rather than multiplied out
+  /// by hand: each new position is rounded up to an alignment boundary, so
+  /// the arithmetic is not steps x dwell.
+  String _sweepDuration() {
+    final plan = FieldPlanPresets.lineSweepUpTo(
+      maxDistance: _sweepMaxDistance,
+      trials: _sweepTrials,
+    );
+    final starts = FieldRunner.stepStarts(plan, 0);
+    final ms = starts.last +
+        (plan.steps.last.dwellSec + plan.settleSec) * 1000 +
+        plan.placementSec * 1000;
+    final m = ms ~/ 60000;
+    return m >= 60 ? '${m ~/ 60} h ${m % 60} min' : '$m min';
   }
 
   void _setPlan(FieldPlan plan) {

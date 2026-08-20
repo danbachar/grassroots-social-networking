@@ -939,6 +939,22 @@ class FieldPlanPresets {
   ///     advance on the clock and wait for nobody.
   ///  7. After the last distance let it settle and upload, then turn Wi-Fi
   ///     back on.
+  /// The dropdown entry whose reach and repeat count the testbed chooses.
+  static const String lineSweepPresetName = 'Line sweep (2 phones — pick '
+      'reach and repeats below)';
+
+  /// A sweep out to [maxDistance] in 10 m steps, [trials] dwells at each.
+  ///
+  /// Reach is bounded by the site and repeats by the daylight, so both are
+  /// chosen per outing rather than baked into a preset.
+  static FieldPlan lineSweepUpTo({int maxDistance = 120, int trials = 3}) =>
+      manualized(
+          lineSweep(
+            distances: [for (var d = 10; d <= maxDistance; d += 10) d],
+            trials: trials,
+          ),
+          placementSec: 120);
+
   static FieldPlan lineSweep({
     String expId = 'line-1',
     List<int> distances = const [
@@ -1123,15 +1139,10 @@ class FieldPlanPresets {
         // with no taps. Each distance opens on an alignment boundary, which
         // is the window the operator walks one device to the next position
         // in. The placement window covers the initial walk out to 120 m.
-        // Three trials instead of ten: a distance is still repeated enough to
-        // separate a refused dial from a range limit, and the whole sweep
-        // fits in one stretch rather than an afternoon. The walk window is
-        // unchanged, so the operator's pace is the same either way.
-        'Line sweep 10..120 m x3 (2 phones, ~48 min)': manualized(
-            lineSweep(expId: 'line3-1', trials: 3),
-            placementSec: 120),
-        'Line sweep 10..120 m x10 (2 phones, ~1h35)':
-            manualized(lineSweep(), placementSec: 120),
+        // Reach and repeat count are the two things a sweep is planned
+        // around -- how far the site allows, and how long the daylight does.
+        // The testbed picks them; this entry is what the defaults look like.
+        lineSweepPresetName: lineSweepUpTo(),
         'Session churn LONG (12 x 30s, ~8 min)': manualized(sessionChurn(
             expId: 'churn-long-1', windows: 12)),
         'Session churn (5 x 30s, sessions reset, ~3 min)':

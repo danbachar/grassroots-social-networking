@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
+import 'package:grassroots_networking/src/testbed/field_runner.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
 
 void main() {
@@ -999,6 +1000,41 @@ void main() {
       final p = FieldPlanPresets.lineSweep(distances: [30], trials: 1);
       final back = FieldPlan.fromJson(p.toJson());
       expect(back.steps.single.label, 'd=30 t1');
+    });
+  });
+
+  group('lineSweepUpTo (reach and repeats chosen per outing)', () {
+    test('reach sets the positions, repeats set the dwells at each', () {
+      final plan = FieldPlanPresets.lineSweepUpTo(maxDistance: 40, trials: 2);
+      expect(plan.steps.map((s) => s.label).toList(),
+          ['d=10 t1', 'd=10 t2', 'd=20 t1', 'd=20 t2',
+           'd=30 t1', 'd=30 t2', 'd=40 t1', 'd=40 t2']);
+    });
+
+    test('only the first dwell at a position is somewhere to walk to', () {
+      final plan = FieldPlanPresets.lineSweepUpTo(maxDistance: 30, trials: 3);
+      final walkTo = plan.steps.where((s) => !s.autoAdvance).map((s) => s.label);
+      expect(walkTo, ['d=10 t1', 'd=20 t1', 'd=30 t1']);
+    });
+
+    test('a longer reach or more repeats only ever costs more time', () {
+      int mins(FieldPlan p) {
+        final starts = FieldRunner.stepStarts(p, 0);
+        return starts.last + (p.steps.last.dwellSec + p.settleSec) * 1000;
+      }
+      final base = FieldPlanPresets.lineSweepUpTo(maxDistance: 60, trials: 3);
+      expect(mins(FieldPlanPresets.lineSweepUpTo(maxDistance: 120, trials: 3)),
+          greaterThan(mins(base)));
+      expect(mins(FieldPlanPresets.lineSweepUpTo(maxDistance: 60, trials: 6)),
+          greaterThan(mins(base)));
+    });
+
+    test('the dropdown entry carries the defaults', () {
+      final preset =
+          FieldPlanPresets.presets[FieldPlanPresets.lineSweepPresetName]!;
+      expect(preset.steps.last.label, 'd=120 t3');
+      expect(preset.manualJoin, isTrue,
+          reason: 'the sweep runs on the clock, with no taps');
     });
   });
 }

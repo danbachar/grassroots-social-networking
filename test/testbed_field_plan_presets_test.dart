@@ -1017,12 +1017,15 @@ void main() {
       // against, and it is not reachable by starting at 5.
       final plan = FieldPlanPresets.lineSweepUpTo(
           startDistance: 0, maxDistance: 20, stepMetres: 10, trials: 1);
-      expect(plan.steps.map((s) => s.label), ['d=0 t1', 'd=10 t1', 'd=20 t1']);
+      // Written as the limit, not the singularity: analysis that takes a log
+      // distance would otherwise drop the position or divide by it.
+      expect(plan.steps.map((s) => s.label),
+          ['d=0.00001 t1', 'd=10 t1', 'd=20 t1']);
 
       // The label is what the analyser reads the distance out of, so it has
       // to survive the JSON the phones actually launch from.
       final back = FieldPlan.fromJson(plan.toJson());
-      expect(back.steps.first.label, 'd=0 t1');
+      expect(back.steps.first.label, 'd=0.00001 t1');
     });
 
     test('the sweep starts where the site allows, not always at 10 m', () {

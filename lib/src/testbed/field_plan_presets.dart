@@ -973,6 +973,16 @@ class FieldPlanPresets {
         placementSec: 120);
   }
 
+  /// How a position is written into the step label the analysis reads.
+  ///
+  /// Side by side is recorded as a hair above zero rather than as zero. The
+  /// phones are centimetres apart there, not coincident, so the reading is
+  /// real -- but log distance is undefined at zero, and analysis that takes
+  /// one either drops the position or divides by it. Writing the limit
+  /// instead of the singularity keeps the point in the data.
+  static String _distanceLabel(int metres) =>
+      metres == 0 ? '0.00001' : '$metres';
+
   static FieldPlan lineSweep({
     String expId = 'line-1',
     List<int> distances = const [
@@ -1009,7 +1019,7 @@ class FieldPlanPresets {
             FieldStep(
               // `d=<n>` is what the analyzer reads the distance out of; the
               // trial suffix keeps repeat dwells at one position distinct.
-              label: 'd=$d t$t',
+              label: 'd=${_distanceLabel(d)} t$t',
               dwellSec: dwellSec,
               sendCount: sendCount,
               // Only the first trial at a distance waits for the operator —

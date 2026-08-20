@@ -1831,16 +1831,10 @@ class BleTransportService extends TransportService {
     final failedAt = _centralDialFailedAt[pathId];
     if (failedAt != null) {
       if (DateTime.now().difference(failedAt) < _centralDialCooldown) {
-        // One strike is not evidence against the address — see
-        // [_centralDialCooldown]. Throttle only what has failed twice.
-        if ((_centralDialFailures[pathId] ?? 0) > 1) {
-          _traceDialSkip(pathId, 'cooldown');
-          return false;
-        }
-      } else {
-        _centralDialFailedAt.remove(pathId);
-        _centralDialFailures.remove(pathId);
+        _traceDialSkip(pathId, 'cooldown');
+        return false;
       }
+      _centralDialFailedAt.remove(pathId);
     }
 
     if (_dialingNow.contains(pathId)) {
@@ -2221,21 +2215,11 @@ class BleTransportService extends TransportService {
   /// nearby-list flicker) and, with each redial holding a native GATT slot for
   /// its full connect timeout, exhausted the table into a GATT-133 storm. An
   /// advertisement is proof the peer still answers at that address, so we DO
-  /// retry the same address — and the FIRST failure is retried at once, before
-  /// the cooldown engages. A peer whose radio just restarted advertises under
-  /// a fresh random address while its GATT server is still coming up, and the
-  /// dial that lands in that gap fails with status 133 through no fault of the
-  /// address. Cooling such an address for three seconds strands the pair: the
-  /// nominated dialer is the only side allowed to dial, so while it waits out
-  /// a cooldown nobody is dialing at all. Throttling starts from the second
-  /// consecutive failure, which is what a genuinely bad address produces.
-  /// Every address is therefore dialed at most twice before it must wait, and
-  /// never more than [maxInFlightCentralDials] at once. A peer that is truly
-  /// gone stops advertising and ages out of discovery, taking its cooldown
-  /// with it.
+  /// retry the same address — but no faster than once per cooldown, and never
+  /// more than [maxInFlightCentralDials] at once. A peer that is truly gone
+  /// stops advertising and ages out of discovery, taking its cooldown with it.
   static const Duration _centralDialCooldown = Duration(seconds: 3);
   final Map<String, DateTime> _centralDialFailedAt = {};
-  final Map<String, int> _centralDialFailures = {};
 
   /// One identity-keyed answer to every pair-state question the arbitration
   /// asks about the peer behind [serviceUuid]. Computed from plugin path
@@ -2394,7 +2378,6 @@ class BleTransportService extends TransportService {
         _notReadySince.remove(path.pathId);
         // A successful connect clears any dial-failure cooldown for this path.
         _centralDialFailedAt.remove(path.pathId);
-        _centralDialFailures.remove(path.pathId);
         if (previous?.state != ble.BlePathState.ready) {
           store.dispatch(BleDeviceConnectedAction(path.pathId));
           // `ready` is its OWN stage (GATT-usable: identified, MTU negotiated,
@@ -2454,10 +2437,6 @@ class BleTransportService extends TransportService {
           // Bound the map: a rotated-away address that stops failing ages out.
           _centralDialFailedAt
               .removeWhere((_, at) => now.difference(at) > _centralDialCooldown * 4);
-          _centralDialFailures
-              .removeWhere((id, _) => !_centralDialFailedAt.containsKey(id));
-          _centralDialFailures[path.pathId] =
-              (_centralDialFailures[path.pathId] ?? 0) + 1;
           _centralDialFailedAt[path.pathId] = now;
           // The dial that arms the cooldown leaves no other mark: `drop` is
           // emitted only for a path that was READY, so one dying in

@@ -388,8 +388,8 @@ void main() {
     });
 
     test(
-        'the first failed dial is retried at once, the second is cooled down',
-        () async {
+        'a fresh advertisement inside the cooldown after a failed dial does '
+        'not redial', () async {
       const remoteId = 'AABBCC';
       const pathId = 'central:$remoteId';
       const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
@@ -416,10 +416,10 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      // A peer whose radio just restarted advertises before its GATT server
-      // answers, so the first 133 says nothing about the address. The pair
-      // cannot recover from it on its own — only the nominated dialer may
-      // dial — so the next advertisement redials immediately.
+      // The next ad inside the cooldown must NOT re-fire the dial: a failed
+      // connectGatt holds a native GATT slot for its full timeout, so
+      // redialing on every scan tick (the scanner runs allowDuplicates)
+      // exhausts the table. The address is retried once the cooldown elapses.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: remoteId,
         serviceUuids: [serviceUuid],
@@ -428,34 +428,8 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      expect(hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(2),
-          reason: 'The first failure is retried at once.');
-
-      callbacks.pushPath(BlePath(
-        pathId: pathId,
-        role: BleRole.central,
-        state: BlePathState.failed,
-        rssi: -55,
-        mtu: 23,
-        canSend: false,
-        error: 'Connection timed out.',
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      // Twice-failed is what a genuinely bad address looks like. Now the
-      // cooldown engages: a failed connectGatt holds a native GATT slot for
-      // its full timeout, so redialing on every scan tick (the scanner runs
-      // allowDuplicates) would exhaust the table.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: remoteId,
-        serviceUuids: [serviceUuid],
-        rssi: -53,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(2),
-          reason: 'The second failure cools the address down.');
+      expect(
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
     });
 
     test('a failed central dial keeps the address but cools down the redial',
@@ -492,8 +466,8 @@ void main() {
       expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
           reason: 'A failed dial cools the address down, it does not evict it.');
 
-      // The first failure is retried at once — it is as likely to be a peer
-      // whose GATT server has not finished coming up as a bad address.
+      // A fresh advertisement inside the cooldown must NOT redial — that is the
+      // rate limit that keeps a failing address off the GATT slot table.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: remoteId,
         serviceUuids: [serviceUuid],
@@ -501,32 +475,9 @@ void main() {
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:$remoteId').length,
-          dialsAfterFirst + 1,
-          reason: 'The first failure is retried immediately.');
-
-      callbacks.pushPath(BlePath(
-        pathId: pathId,
-        role: BleRole.central,
-        state: BlePathState.failed,
-        rssi: -55,
-        mtu: 23,
-        canSend: false,
-        error: 'GATT_ERROR(133)',
-      ));
-      await Future<void>.delayed(Duration.zero);
-
-      // A second failure is the rate limit that keeps a failing address off
-      // the GATT slot table.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: remoteId,
-        serviceUuids: [serviceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:$remoteId').length,
-          dialsAfterFirst + 1,
+      final dialsAfterCooldownAd =
+          hostApi.calls.where((c) => c == 'connect:$remoteId').length;
+      expect(dialsAfterCooldownAd, dialsAfterFirst,
           reason: 'Within the cooldown, a re-advertisement of the same address '
               'is not redialed.');
     });
@@ -1917,19 +1868,13 @@ void main() {
     test('the failed-dial cooldown still refuses a redial', () async {
       transport.setDialParallelism(maxParallel: 4, popN: 5);
       await adv(2);
-      await pushState(2, BlePathState.failed);
-
-      // One strike is retried at once — the cooldown answers the address that
-      // keeps failing, so it takes a second strike to arm.
-      expect(await transport.connectToDevice('central:MAC2'), isTrue,
-          reason: 'The first failure is retried immediately.');
-      final afterRetry = dials(2);
+      final afterDial = dials(2);
       await pushState(2, BlePathState.failed);
 
       expect(await transport.connectToDevice('central:MAC2'), isFalse,
           reason: 'The cooldown is production behaviour and the grid leaves '
               'it exactly as it is — only the cap is the variable.');
-      expect(dials(2), afterRetry);
+      expect(dials(2), afterDial);
     });
   });
 

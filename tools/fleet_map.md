@@ -27,7 +27,7 @@ recover their identity the moment they re-attach.
 |---|---|---|---|---|---|
 | 1 | `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` | 2 |
 | 2 | `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` | 3 |
-| 3 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `a2b11ef1…` | 1 |
+| 3 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `f5aee069…` | 1 |
 | 4 | `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` | 4 |
 | 5 | `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` | 6 |
 | 6 | `00d98aa1795bc454` | Nexus 5X | 8.1 | `d5aedd63…` | 7 |
@@ -41,7 +41,6 @@ Detached, not in the clique:
 | `31311JEHN12328` | Pixel 7a | 15 | `6b819f64…` | wireless adb only, USB port damaged |
 | `RF8NB0TYWJM` | Galaxy Note20 | — | `4fecd00f…` | wireless adb only |
 | `R58RB4ED7GM` | Galaxy A72 | — | `dbac04ef…` | wireless adb only |
-| `55281FDCH002QK` | Pixel 10 Pro | 16 | `366dca50…` | second Pixel 10 Pro, matched pair for the line sweep |
 
 **The traveller is the Pixel 10 Pro, now node 3** (`f5aee069…`) — the phone that
 goes dark in a store-carry-forward run. It carries the role because it is the

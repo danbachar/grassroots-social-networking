@@ -150,15 +150,13 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                       : _positioning(step!, runner),
                   // A dwell the operator has to act in is an instruction;
                   // one they do not is just time left on the run.
-                  FieldPhase.dwelling => switch ((
-                      runner.radioAction,
-                      runner.nextMove
-                    )) {
-                      (final a?, _) => _radioPrompt(a, runner.remainingSec),
-                      (_, final m?) => _untilMove(runner, m),
-                      _ => _untilEnd(runner,
-                          note: step!.bulk ? 'bulk flows running' : null),
-                    },
+                  // Measuring and walking are different instructions — one
+                  // means stand still, the other means go — so they cannot
+                  // share a headline. The dwell names itself; the walk window
+                  // (positioning) carries the big MOVE countdown.
+                  FieldPhase.dwelling => runner.radioAction != null
+                      ? _radioPrompt(runner.radioAction!, runner.remainingSec)
+                      : _measuring(step!, runner),
                   FieldPhase.settling => _countdown(
                       'SETTLING',
                       runner.remainingSec,
@@ -298,6 +296,51 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         : ((windowAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
     return _radioPrompt('on', remaining < 0 ? 0 : remaining,
         order: runner.joinOrder);
+  }
+
+  /// The dwell, named: the phones are measuring and must not move.
+  ///
+  /// The next position rides along as a footnote so the operator knows where
+  /// they are headed, but the instruction to GO is the walk window's alone —
+  /// a headline that says MOVE while the trial is still running reads as an
+  /// instruction to move.
+  Widget _measuring(FieldStep step, FieldRunner runner) {
+    final move = runner.nextMove;
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Icon(Icons.wifi_tethering, color: Colors.tealAccent, size: 64),
+        const SizedBox(height: 14),
+        const Text('MEASURING — HOLD POSITION',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Colors.white54,
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        FittedBox(
+          child: Text(step.label,
+              style: const TextStyle(
+                  color: Colors.tealAccent,
+                  fontSize: 96,
+                  fontWeight: FontWeight.w800)),
+        ),
+        Text('${_mmss(runner.remainingSec)} left in this trial',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        if (move != null) ...[
+          const SizedBox(height: 18),
+          Text('then walk to ${move.label} — be there ${_hhmmss(move.atMs)}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.orangeAccent, fontSize: 20)),
+        ],
+        if (step.bulk)
+          const Text('bulk flows running',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white38, fontSize: 16)),
+      ],
+    );
   }
 
   /// The operator's next walk, counted down.

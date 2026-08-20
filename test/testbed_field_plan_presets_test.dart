@@ -1011,6 +1011,39 @@ void main() {
            'd=30 t1', 'd=30 t2', 'd=40 t1', 'd=40 t2']);
     });
 
+    test('the sweep starts where the site allows, not always at 10 m', () {
+      final plan = FieldPlanPresets.lineSweepUpTo(
+          startDistance: 40, maxDistance: 60, trials: 1);
+      expect(plan.steps.map((s) => s.label), ['d=40 t1', 'd=50 t1', 'd=60 t1']);
+    });
+
+    test('the step size sets how finely the range is sampled', () {
+      final coarse = FieldPlanPresets.lineSweepUpTo(
+          maxDistance: 100, stepMetres: 50, trials: 1);
+      expect(coarse.steps.map((s) => s.label), ['d=10 t1', 'd=60 t1']);
+
+      final fine = FieldPlanPresets.lineSweepUpTo(
+          startDistance: 10, maxDistance: 25, stepMetres: 5, trials: 1);
+      expect(fine.steps.map((s) => s.label),
+          ['d=10 t1', 'd=15 t1', 'd=20 t1', 'd=25 t1']);
+    });
+
+    test('a reach short of the start still yields the one position', () {
+      // A sweep of a single distance is a legitimate ask; a plan with no
+      // steps is not, and would launch into nothing.
+      final plan = FieldPlanPresets.lineSweepUpTo(
+          startDistance: 80, maxDistance: 20, trials: 2);
+      expect(plan.steps.map((s) => s.label), ['d=80 t1', 'd=80 t2']);
+    });
+
+    test('a step that cannot advance does not hang the builder', () {
+      final plan = FieldPlanPresets.lineSweepUpTo(
+          startDistance: 10, maxDistance: 30, stepMetres: 0, trials: 1);
+      expect(plan.steps.map((s) => s.label),
+          ['d=10 t1', 'd=11 t1', 'd=12 t1'].followedBy(
+              [for (var d = 13; d <= 30; d++) 'd=$d t1']));
+    });
+
     test('only the first dwell at a position is somewhere to walk to', () {
       final plan = FieldPlanPresets.lineSweepUpTo(maxDistance: 30, trials: 3);
       final walkTo = plan.steps.where((s) => !s.autoAdvance).map((s) => s.label);

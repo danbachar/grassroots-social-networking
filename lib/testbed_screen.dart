@@ -751,41 +751,44 @@ class _TestbedScreenState extends State<TestbedScreen> {
         const SizedBox(height: 8),
         Row(children: [
           Expanded(
-            child: DropdownButtonFormField<int>(
-              isExpanded: true,
-              initialValue: _sweepMaxDistance,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                isDense: true,
-                labelText: 'Reach (m)',
-              ),
-              items: [
-                for (var d = 20; d <= 200; d += 10)
-                  DropdownMenuItem(value: d, child: Text('10 … $d m')),
-              ],
-              onChanged: (d) {
-                if (d == null) return;
-                setState(() => _sweepMaxDistance = d);
+            child: _sweepPicker(
+              label: 'Start (m)',
+              value: _sweepStartDistance,
+              options: [for (var d = 5; d <= 200; d += 5) d],
+              onPick: _setSweepStart,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _sweepPicker(
+              label: 'Reach (m)',
+              value: _sweepMaxDistance,
+              options: [for (var d = 5; d <= 200; d += 5) d],
+              onPick: _setSweepMax,
+            ),
+          ),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: _sweepPicker(
+              label: 'Step (m)',
+              value: _sweepStepMetres,
+              options: const [5, 10, 15, 20, 25, 50],
+              onPick: (m) {
+                setState(() => _sweepStepMetres = m);
                 _applySweep();
               },
             ),
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: DropdownButtonFormField<int>(
-              isExpanded: true,
-              initialValue: _sweepTrials,
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                isDense: true,
-                labelText: 'Repeats per distance',
-              ),
-              items: [
-                for (var t = 1; t <= 10; t++)
-                  DropdownMenuItem(value: t, child: Text('$t')),
-              ],
-              onChanged: (t) {
-                if (t == null) return;
+            child: _sweepPicker(
+              label: 'Repeats',
+              value: _sweepTrials,
+              options: [for (var t = 1; t <= 10; t++) t],
+              suffix: '',
+              onPick: (t) {
                 setState(() => _sweepTrials = t);
                 _applySweep();
               },
@@ -794,7 +797,9 @@ class _TestbedScreenState extends State<TestbedScreen> {
         ]),
         const SizedBox(height: 6),
         Text(
-          '${_sweepMaxDistance ~/ 10} positions x $_sweepTrials — '
+          '$_sweepPositions positions '
+          '($_sweepStartDistance–$_sweepMaxDistance m every '
+          '$_sweepStepMetres m) x $_sweepTrials — '
           '${_sweepDuration()}, walking included',
           style: const TextStyle(fontSize: 13, color: Colors.grey),
         ),
@@ -830,27 +835,75 @@ class _TestbedScreenState extends State<TestbedScreen> {
   /// Held on the screen rather than in the plan JSON: changing either has to
   /// rebuild the plan, and the JSON is the output of that choice, not its
   /// home.
+  int _sweepStartDistance = 10;
   int _sweepMaxDistance = 120;
+  int _sweepStepMetres = 10;
   int _sweepTrials = 3;
   String? _selectedPreset;
 
-  void _applySweep() {
-    _setPlan(FieldPlanPresets.lineSweepUpTo(
-      maxDistance: _sweepMaxDistance,
-      trials: _sweepTrials,
-    ));
+  FieldPlan get _sweepPlan => FieldPlanPresets.lineSweepUpTo(
+        startDistance: _sweepStartDistance,
+        maxDistance: _sweepMaxDistance,
+        stepMetres: _sweepStepMetres,
+        trials: _sweepTrials,
+      );
+
+  void _applySweep() => _setPlan(_sweepPlan);
+
+  /// Keep the start at or below the reach as either is picked, so the pair
+  /// on screen is always a sweep the operator could actually walk.
+  void _setSweepStart(int m) {
+    setState(() {
+      _sweepStartDistance = m;
+      if (_sweepMaxDistance < m) _sweepMaxDistance = m;
+    });
+    _applySweep();
   }
+
+  void _setSweepMax(int m) {
+    setState(() {
+      _sweepMaxDistance = m;
+      if (_sweepStartDistance > m) _sweepStartDistance = m;
+    });
+    _applySweep();
+  }
+
+  /// The positions the current pickers produce — the number the operator is
+  /// really choosing, since reach alone does not give it.
+  int get _sweepPositions =>
+      _sweepPlan.steps.where((s) => !s.autoAdvance).length;
 
   /// How long the chosen sweep runs, walking included.
   ///
   /// Read off the plan's own wall-clock schedule rather than multiplied out
   /// by hand: each new position is rounded up to an alignment boundary, so
   /// the arithmetic is not steps x dwell.
+  Widget _sweepPicker({
+    required String label,
+    required int value,
+    required List<int> options,
+    required void Function(int) onPick,
+    String suffix = ' m',
+  }) =>
+      DropdownButtonFormField<int>(
+        isExpanded: true,
+        initialValue: options.contains(value) ? value : options.first,
+        decoration: InputDecoration(
+          border: const OutlineInputBorder(),
+          isDense: true,
+          labelText: label,
+        ),
+        items: [
+          for (final o in options)
+            DropdownMenuItem(value: o, child: Text('$o$suffix')),
+        ],
+        onChanged: (v) {
+          if (v != null) onPick(v);
+        },
+      );
+
   String _sweepDuration() {
-    final plan = FieldPlanPresets.lineSweepUpTo(
-      maxDistance: _sweepMaxDistance,
-      trials: _sweepTrials,
-    );
+    final plan = _sweepPlan;
     final starts = FieldRunner.stepStarts(plan, 0);
     final ms = starts.last +
         (plan.steps.last.dwellSec + plan.settleSec) * 1000 +

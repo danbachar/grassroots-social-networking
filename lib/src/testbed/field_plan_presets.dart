@@ -943,17 +943,35 @@ class FieldPlanPresets {
   static const String lineSweepPresetName = 'Line sweep (2 phones — pick '
       'reach and repeats below)';
 
-  /// A sweep out to [maxDistance] in 10 m steps, [trials] dwells at each.
+  /// A sweep from [startDistance] out to [maxDistance] in [stepMetres]
+  /// steps, [trials] dwells at each.
   ///
-  /// Reach is bounded by the site and repeats by the daylight, so both are
-  /// chosen per outing rather than baked into a preset.
-  static FieldPlan lineSweepUpTo({int maxDistance = 120, int trials = 3}) =>
-      manualized(
-          lineSweep(
-            distances: [for (var d = 10; d <= maxDistance; d += 10) d],
-            trials: trials,
-          ),
-          placementSec: 120);
+  /// Where the sweep starts, how far it reaches and how finely it samples are
+  /// all properties of the site, not of the experiment: a corridor may only
+  /// allow 60 m, an open field may not be worth sampling below 40, and a
+  /// range where the link is about to fail deserves closer steps than one
+  /// where it plainly holds. Repeats trade against daylight.
+  ///
+  /// A start past the reach still yields one position rather than an empty
+  /// plan — a sweep of one distance is a legitimate thing to ask for, and a
+  /// plan with no steps is not.
+  static FieldPlan lineSweepUpTo({
+    int startDistance = 10,
+    int maxDistance = 120,
+    int stepMetres = 10,
+    int trials = 3,
+  }) {
+    final step = stepMetres < 1 ? 1 : stepMetres;
+    final distances = <int>[
+      for (var d = startDistance; d <= maxDistance; d += step) d,
+    ];
+    return manualized(
+        lineSweep(
+          distances: distances.isEmpty ? [startDistance] : distances,
+          trials: trials,
+        ),
+        placementSec: 120);
+  }
 
   static FieldPlan lineSweep({
     String expId = 'line-1',

@@ -94,6 +94,27 @@ class BleTransportService extends TransportService {
   StreamSubscription<ble.BleAdvertisement>? _advertisementSub;
   StreamSubscription<ble.BleAdvertisingState>? _advertisingStateSub;
   StreamSubscription<ble.BleScanState>? _scanStateSub;
+
+  /// Which roles the current start asked for, and which the controller has
+  /// CONFIRMED running. `active` means the service finished booting: every
+  /// requested role confirmed on the air — advertising by the advertiser
+  /// callback, scanning by the scan-state event. The calls returning mean
+  /// only that the requests were accepted, and a stamp anchored there
+  /// reports intent; every establishment measurement anchors on the
+  /// `active` transition, so it has to report the fact.
+  bool _wantAdvertise = false;
+  bool _wantScan = false;
+  bool _advertisingConfirmed = false;
+  bool _scanConfirmed = false;
+
+  void _promoteIfBooted() {
+    if (_stopped) return;
+    if (state != TransportState.ready) return;
+    if (_wantAdvertise && !_advertisingConfirmed) return;
+    if (_wantScan && !_scanConfirmed) return;
+    if (!_wantAdvertise && !_wantScan) return;
+    _setState(TransportState.active);
+  }
   StreamSubscription<ble.BlePath>? _pathSub;
   StreamSubscription<ble.BlePayload>? _payloadSub;
   StreamSubscription<String>? _logSub;
@@ -718,6 +739,10 @@ class BleTransportService extends TransportService {
     final mode = store.state.settings.bleRoleMode;
     final shouldAdvertise = mode != BleRoleMode.centralOnly;
     final shouldScan = mode != BleRoleMode.peripheralOnly;
+    _wantAdvertise = shouldAdvertise;
+    _wantScan = shouldScan;
+    _advertisingConfirmed = false;
+    _scanConfirmed = false;
     debugPrint('BLE start: roleMode=$mode '
         'advertise=$shouldAdvertise scan=$shouldScan');
 
@@ -725,7 +750,6 @@ class BleTransportService extends TransportService {
     // prevent the other. Track whether at least one succeeded — if both
     // fail (e.g. adapter still off), stay in `ready` so the next
     // adapter-on event re-invokes `start()`.
-    var anyStarted = false;
     try {
       if (shouldAdvertise) {
         try {
@@ -735,7 +759,6 @@ class BleTransportService extends TransportService {
             localName: localName,
             bondless: true,
           );
-          anyStarted = true;
           _advertisedSlot = GrassrootsIdentity.currentBleSlot();
           _advertiseLocalName = localName;
           _startSlotTimer();
@@ -774,7 +797,6 @@ class BleTransportService extends TransportService {
       if (shouldScan) {
         _scanTargetUuids = _scanTargets();
         if (await _startContinuousScan()) {
-          anyStarted = true;
           _lastAdvertisementAt = DateTime.now();
           _armScanWatchdog();
         }
@@ -790,9 +812,10 @@ class BleTransportService extends TransportService {
       // a no-op unless the settings toggle is on.
       _armLinkSnapshotPoll();
 
-      if (anyStarted) {
-        _setState(TransportState.active);
-      }
+      // No promotion here: the calls above returning means the requests were
+      // accepted. `active` is stamped by the confirmation handlers once the
+      // controller says the requested roles are on the air.
+      _promoteIfBooted();
     } finally {
       _starting = false;
     }
@@ -1103,6 +1126,8 @@ class BleTransportService extends TransportService {
   @override
   Future<void> stop() async {
     _stopped = true;
+    _advertisingConfirmed = false;
+    _scanConfirmed = false;
     _scanWatchdog?.cancel();
     _scanWatchdog = null;
     _linkSnapshotTimer?.cancel();
@@ -1988,6 +2013,8 @@ class BleTransportService extends TransportService {
       // The plugin already stops scan/advertising and tears down paths on
       // adapter-off; mirror that into Redux by dropping back to `ready` so
       // the next adapter-on triggers a fresh `start()`.
+      _advertisingConfirmed = false;
+      _scanConfirmed = false;
       if (state == TransportState.active) {
         _setState(TransportState.ready);
       }
@@ -2013,6 +2040,14 @@ class BleTransportService extends TransportService {
   /// rather than an empty room.
   void _onScanStateChanged(ble.BleScanState scan) {
     store.dispatch(BleScanningChangedAction(scan.active));
+    // A deliberate stop (no reason) is the watchdog's own restart or a mode
+    // change — not a boot regression. Only a refused scan un-confirms.
+    if (scan.active) {
+      _scanConfirmed = true;
+      _promoteIfBooted();
+    } else if (scan.reason != null) {
+      _scanConfirmed = false;
+    }
     if (!_tracing) return;
     unawaited(trace!.log({
       'type': 'link',
@@ -2029,6 +2064,12 @@ class BleTransportService extends TransportService {
     final failure = advertising.failure;
     final txPower = advertising.txPowerLevel;
     store.dispatch(BleAdvertisingChangedAction(advertising.active));
+    if (advertising.active) {
+      _advertisingConfirmed = true;
+      _promoteIfBooted();
+    } else if (advertising.failure != null) {
+      _advertisingConfirmed = false;
+    }
     debugPrint(advertising.active
         ? 'BLE advertising active (tx level ${txPower ?? '?'})'
         : 'BLE advertising stopped'

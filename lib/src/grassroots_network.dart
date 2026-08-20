@@ -1878,8 +1878,6 @@ class GrassrootsNetwork {
     return bleRadioUp(
       hasService: _bleService != null,
       bleState: store.state.transports.bleState,
-      roleMode: store.state.settings.bleRoleMode,
-      advertising: store.state.transports.bleAdvertising,
     );
   }
 
@@ -1968,8 +1966,8 @@ class GrassrootsNetwork {
   /// it in the trace cannot do.
   bool get bleUndiscoverable => bleUndiscoverableFrom(
         hasService: _bleService != null,
-        bleState: store.state.transports.bleState,
         roleMode: store.state.settings.bleRoleMode,
+        scanning: store.state.transports.bleScanning,
         advertising: store.state.transports.bleAdvertising,
       );
 
@@ -5563,50 +5561,35 @@ class GrassrootsNetwork {
 /// stops being settled leaves the set and can report again later, which is
 /// what a per-step reset needs — it is the same pair settling anew, not a
 /// duplicate of the first time.
-/// Whether the BLE radio is participating, which is what the `bt-on` marker
-/// every establishment measurement is anchored on has to mean.
+/// Whether the BLE radio is participating.
 ///
-/// Being `active` is not enough. Advertising can be refused on its own — the
-/// slots are taken, the stack faulted — while the scan comes up fine and
-/// carries the transport to `active` by itself. That phone finds peers and
-/// dials outward, but no peer can find it: it is undiscoverable and half its
-/// legs can never form. Calling it radio-up records a healthy `bt-on` for a
-/// device that is not participating, and a session that then never forms at
-/// distance reads as range rather than as an advertiser that never started.
-///
-/// A mode that never asks to advertise is not undiscoverable by fault, so it
-/// is radio-up on the scan alone.
-/// See [GrassrootsNetwork.bleUndiscoverable].
-///
-/// Not simply the negation of [bleRadioUp]: a transport that is down, or a
-/// role mode that never advertises, is not on the air either but is not a
-/// fault to put in front of anyone. This names only the case where the phone
-/// believes it is running and is nonetheless invisible.
-bool bleUndiscoverableFrom({
-  required bool hasService,
-  required TransportState bleState,
-  required BleRoleMode roleMode,
-  required bool advertising,
-}) {
-  if (!hasService) return false;
-  // The dark window of a per-step reset disposes the transport; warning
-  // through every reset would train the operator to ignore the warning.
-  if (bleState != TransportState.active) return false;
-  if (roleMode == BleRoleMode.centralOnly) return false;
-  return !advertising;
-}
-
+/// `active` now MEANS the service finished booting — every role the mode
+/// asked for confirmed on the air by the controller (advertising by the
+/// advertiser callback, scanning by the scan-state event) — so this is a
+/// plain state read. `ready` is where the transport parks when the adapter
+/// is off or a requested role has not confirmed yet.
 bool bleRadioUp({
   required bool hasService,
   required TransportState bleState,
+}) =>
+    hasService && bleState == TransportState.active;
+
+/// See [GrassrootsNetwork.bleUndiscoverable].
+///
+/// The half-booted phone: its scanner is confirmed running, its advertiser
+/// is not, and the mode wants both. It finds peers and dials outward while
+/// no peer can find it — and because `active` requires every requested role,
+/// it never reads radio-up. This names the state so the runner can put it in
+/// front of the operator while the run is still salvageable.
+bool bleUndiscoverableFrom({
+  required bool hasService,
   required BleRoleMode roleMode,
+  required bool scanning,
   required bool advertising,
 }) {
   if (!hasService) return false;
-  // `ready` is where the transport parks when the adapter is off.
-  if (bleState != TransportState.active) return false;
-  if (roleMode == BleRoleMode.centralOnly) return true;
-  return advertising;
+  if (roleMode == BleRoleMode.centralOnly) return false;
+  return scanning && !advertising;
 }
 
 void processLinkSettledTransitions({

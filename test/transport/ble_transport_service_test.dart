@@ -1430,6 +1430,11 @@ void main() {
       final friend = await _makeIdentity('Friend');
       store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
       await transport.start();
+      // Boot completes when the controller confirms the requested roles —
+      // `active` is the booted state, and the trust re-filter gates on it.
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
       hostApi.scanRequests.clear();
 
       store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
@@ -1952,6 +1957,93 @@ void main() {
           reason: 'The cooldown is production behaviour and the grid leaves '
               'it exactly as it is — only the cap is the variable.');
       expect(dials(2), afterDial);
+    });
+  });
+
+  group('BleTransportService — active means booted', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    Future<void> build(BleRoleMode mode) async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetBleRoleModeAction(mode));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Boot'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      await transport.start();
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    tearDown(() async => transport.dispose());
+
+    TransportState st() => store.state.transports.bleState;
+
+    test('the requests returning does not boot the service', () async {
+      await build(BleRoleMode.auto);
+      expect(st(), TransportState.ready,
+          reason: 'accepted requests are intent; active reports the fact');
+
+      callbacks.pushScanState(BleScanState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.ready,
+          reason: 'the mode asked for both roles; one confirmation is half '
+              'a boot');
+
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'every requested role confirmed on the air — booted');
+    });
+
+    test('central-only boots on the scanner alone', () async {
+      await build(BleRoleMode.centralOnly);
+      callbacks.pushScanState(BleScanState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'a mode that never advertises has nothing else to confirm');
+    });
+
+    test('a refused advertiser keeps the service un-booted', () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(
+          active: false,
+          failure: BleAdvertiseFailure.transient,
+          reason: 'slots taken'));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.ready,
+          reason: 'scanning alone is the half-booted phone nobody can find');
+
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'the retry landing completes the boot');
+    });
+
+    test('the watchdog restarting the scan does not un-boot the service',
+        () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active);
+
+      // A deliberate stop carries no reason — the watchdog's own restart, a
+      // mode change. Boot regressions carry the controller's refusal.
+      callbacks.pushScanState(BleScanState(active: false));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'a deliberate stop is not a boot regression, and a marker '
+              'flicker here would poison every establishment anchor');
     });
   });
 

@@ -754,7 +754,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
             child: _sweepPicker(
               label: 'Start (m)',
               value: _sweepStartDistance,
-              options: [for (var d = 0; d <= 200; d += 5) d],
+              options: [1, for (var d = 5; d <= 200; d += 5) d],
               onPick: _setSweepStart,
             ),
           ),
@@ -763,7 +763,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
             child: _sweepPicker(
               label: 'Reach (m)',
               value: _sweepMaxDistance,
-              options: [for (var d = 0; d <= 200; d += 5) d],
+              options: [1, for (var d = 5; d <= 200; d += 5) d],
               onPick: _setSweepMax,
             ),
           ),

@@ -1875,8 +1875,12 @@ class GrassrootsNetwork {
     // BLUETOOTH to an operator whose Bluetooth was already off, and its
     // bt-on/bt-off markers — the anchors of every establishment
     // measurement — were fiction.
-    return _bleService != null &&
-        store.state.transports.bleState == TransportState.active;
+    return bleRadioUp(
+      hasService: _bleService != null,
+      bleState: store.state.transports.bleState,
+      roleMode: store.state.settings.bleRoleMode,
+      advertising: store.state.transports.bleAdvertising,
+    );
   }
 
   /// [bleUsable] transitions, emitted at the store dispatch that changes the
@@ -5528,6 +5532,32 @@ class GrassrootsNetwork {
 /// stops being settled leaves the set and can report again later, which is
 /// what a per-step reset needs — it is the same pair settling anew, not a
 /// duplicate of the first time.
+/// Whether the BLE radio is participating, which is what the `bt-on` marker
+/// every establishment measurement is anchored on has to mean.
+///
+/// Being `active` is not enough. Advertising can be refused on its own — the
+/// slots are taken, the stack faulted — while the scan comes up fine and
+/// carries the transport to `active` by itself. That phone finds peers and
+/// dials outward, but no peer can find it: it is undiscoverable and half its
+/// legs can never form. Calling it radio-up records a healthy `bt-on` for a
+/// device that is not participating, and a session that then never forms at
+/// distance reads as range rather than as an advertiser that never started.
+///
+/// A mode that never asks to advertise is not undiscoverable by fault, so it
+/// is radio-up on the scan alone.
+bool bleRadioUp({
+  required bool hasService,
+  required TransportState bleState,
+  required BleRoleMode roleMode,
+  required bool advertising,
+}) {
+  if (!hasService) return false;
+  // `ready` is where the transport parks when the adapter is off.
+  if (bleState != TransportState.active) return false;
+  if (roleMode == BleRoleMode.centralOnly) return true;
+  return advertising;
+}
+
 void processLinkSettledTransitions({
   required PeersState peersState,
   required bool Function(Uint8List pubkey) isSettled,

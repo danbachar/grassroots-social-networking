@@ -92,6 +92,7 @@ class BleTransportService extends TransportService {
   StreamSubscription<ble.BleAdapterState>? _adapterSub;
   StreamSubscription<ble.BleAdvertisement>? _advertisementSub;
   StreamSubscription<ble.BleAdvertisingState>? _advertisingStateSub;
+  StreamSubscription<ble.BleScanState>? _scanStateSub;
   StreamSubscription<ble.BlePath>? _pathSub;
   StreamSubscription<ble.BlePayload>? _payloadSub;
   StreamSubscription<String>? _logSub;
@@ -673,6 +674,7 @@ class BleTransportService extends TransportService {
       _advertisementSub = _ble.advertisements.listen(_onAdvertisement);
       _advertisingStateSub =
           _ble.advertisingStateChanges.listen(_onAdvertisingStateChanged);
+      _scanStateSub = _ble.scanStateChanges.listen(_onScanStateChanged);
       _pathSub = _ble.pathChanges.listen(_onPathChanged);
       _payloadSub = _ble.payloads.listen(_onPayload);
       _logSub = _ble.logs.listen(
@@ -1752,6 +1754,7 @@ class BleTransportService extends TransportService {
     await _adapterSub?.cancel();
     await _advertisementSub?.cancel();
     await _advertisingStateSub?.cancel();
+    await _scanStateSub?.cancel();
     await _pathSub?.cancel();
     await _payloadSub?.cancel();
     await _logSub?.cancel();
@@ -1963,10 +1966,24 @@ class BleTransportService extends TransportService {
   /// inbound peripheral leg can form. The scan side says nothing about it, so
   /// this is the only record that a run's missing links are a silent radio
   /// rather than an empty room.
+  void _onScanStateChanged(ble.BleScanState scan) {
+    store.dispatch(BleScanningChangedAction(scan.active));
+    if (!_tracing) return;
+    unawaited(trace!.log({
+      'type': 'link',
+      't': DateTime.now().millisecondsSinceEpoch,
+      'event': 'scanState',
+      'transport': 'ble',
+      'active': scan.active,
+      if (scan.reason != null) 'reason': scan.reason,
+    }));
+  }
+
   void _onAdvertisingStateChanged(ble.BleAdvertisingState advertising) {
     final reason = advertising.reason;
     final failure = advertising.failure;
     final txPower = advertising.txPowerLevel;
+    store.dispatch(BleAdvertisingChangedAction(advertising.active));
     debugPrint(advertising.active
         ? 'BLE advertising active (tx level ${txPower ?? '?'})'
         : 'BLE advertising stopped'

@@ -17,6 +17,10 @@ TransportsState transportsReducer(
     return state.copyWith(bleScanning: action.scanning);
   }
 
+  if (action is BleAdvertisingChangedAction) {
+    return state.copyWith(bleAdvertising: action.advertising);
+  }
+
   if (action is PublicAddressUpdatedAction) {
     if (action.publicAddress == null) {
       return state.clearPublicAddress();

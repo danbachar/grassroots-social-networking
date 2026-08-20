@@ -121,8 +121,19 @@ class TransportsState {
   /// Error message for UDP transport (if in error state)
   final String? udpError;
 
-  /// Whether BLE is currently scanning
+  /// Whether BLE is currently scanning — the controller's own answer, not
+  /// the fact that a scan was requested.
   final bool bleScanning;
+
+  /// Whether the BLE controller is actually broadcasting our advertisement.
+  ///
+  /// A device that is not advertising is UNDISCOVERABLE: peers cannot see it
+  /// and no inbound peripheral leg can form, while the scan side keeps
+  /// finding peers and nothing about it says so. Advertising can be refused
+  /// on its own (the slots are taken, the stack faulted) with the scan coming
+  /// up fine, so this is projected separately rather than folded into
+  /// [bleState].
+  final bool bleAdvertising;
 
   /// Our discovered public UDP address (ip:port), null if not yet discovered
   final String? publicAddress;
@@ -159,6 +170,7 @@ class TransportsState {
     this.bleError,
     this.udpError,
     this.bleScanning = false,
+    this.bleAdvertising = false,
     this.publicAddress,
     this.publicIp,
     this.networkConnectionType = NetworkConnectionType.offline,
@@ -209,6 +221,7 @@ class TransportsState {
     String? bleError,
     String? udpError,
     bool? bleScanning,
+    bool? bleAdvertising,
     String? publicAddress,
     String? publicIp,
     NetworkConnectionType? networkConnectionType,
@@ -222,6 +235,7 @@ class TransportsState {
       bleError: bleError ?? this.bleError,
       udpError: udpError ?? this.udpError,
       bleScanning: bleScanning ?? this.bleScanning,
+      bleAdvertising: bleAdvertising ?? this.bleAdvertising,
       publicAddress: publicAddress ?? this.publicAddress,
       publicIp: publicIp ?? this.publicIp,
       networkConnectionType:
@@ -244,6 +258,7 @@ class TransportsState {
       bleError: bleError,
       udpError: udpError,
       bleScanning: bleScanning,
+      bleAdvertising: bleAdvertising,
       publicAddress: null,
       publicIp: publicIp,
       networkConnectionType: networkConnectionType,
@@ -262,6 +277,7 @@ class TransportsState {
       bleError: bleError,
       udpError: udpError,
       bleScanning: bleScanning,
+      bleAdvertising: bleAdvertising,
       publicAddress: null,
       publicIp: null,
       networkConnectionType: networkConnectionType,
@@ -281,6 +297,7 @@ class TransportsState {
       bleError: bleError,
       udpError: udpError,
       bleScanning: bleScanning,
+      bleAdvertising: bleAdvertising,
       publicAddress: address,
       publicIp: publicIp,
       networkConnectionType: networkConnectionType,
@@ -300,6 +317,7 @@ class TransportsState {
           bleError == other.bleError &&
           udpError == other.udpError &&
           bleScanning == other.bleScanning &&
+          bleAdvertising == other.bleAdvertising &&
           publicAddress == other.publicAddress &&
           publicIp == other.publicIp &&
           networkConnectionType == other.networkConnectionType &&
@@ -314,6 +332,7 @@ class TransportsState {
     bleError,
     udpError,
     bleScanning,
+    bleAdvertising,
     publicAddress,
     publicIp,
     networkConnectionType,

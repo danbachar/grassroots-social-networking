@@ -1166,9 +1166,9 @@ class BleTransportService extends TransportService {
   bool _checkWritable(Uint8List data, ble.BlePath path, String site) {
     final usable = path.mtu - 3;
     if (data.length <= usable) return true;
-    debugPrint('[ble-mtu] OVERSIZED $site ${data.length}B > ${usable}B usable '
-        '(mtu ${path.mtu}) on ${path.pathId} — the stack will truncate this '
-        'write and the peer cannot parse it');
+    debugPrint('[ble-mtu] REFUSED $site ${data.length}B > ${usable}B usable '
+        '(mtu ${path.mtu}) on ${path.pathId} — not written; the caller falls '
+        'back to the pair\'s other leg');
     _traceDrop(site, 'oversized', {
       'path': path.pathId,
       'bytes': data.length,

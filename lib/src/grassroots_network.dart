@@ -3855,7 +3855,12 @@ class GrassrootsNetwork {
       final deviceId = _connectedBleDeviceIdForPeer(
           _peersState.getPeerByPubkey(recipientPubkey));
       if (deviceId == null) return false;
-      return ble.sendToPeer(deviceId, sealed.serialize());
+      final ok = await ble.sendToPeer(deviceId, sealed.serialize());
+      // Which leg carried it. A pair that never converged holds one leg the
+      // transport still calls connected, and a write that goes there and is
+      // refused looks the same from here as one that was never attempted.
+      if (!ok) debugPrint('direct send refused on $deviceId');
+      return ok;
     };
 
     // Sync-on-connect: directed (never flooded) send of an offer/request/
@@ -4091,6 +4096,7 @@ class GrassrootsNetwork {
         // Race: session torn down between decrypt and ACK. The message was
         // delivered and traced 'recv', but no ACK ever goes out — the sender
         // keeps the packets buffered, so this side has to say so.
+        debugPrint('ACK for $messageId NOT sent — no session with sender');
         _traceDrop('ackTx', 'noSession', {'messageId': messageId});
         return;
       }
@@ -4132,7 +4138,13 @@ class GrassrootsNetwork {
         // neighbour (a direct-delivered message is confirmed in milliseconds,
         // not at the next sync round), and buffers it otherwise (nothing ACKs
         // an ACK, so a buffered entry leaves only by age expiry).
-        await _messageRouter.dispatchOutbound(senderPubkey, sealed);
+        final direct =
+            await _messageRouter.dispatchOutbound(senderPubkey, sealed);
+        // The receiving side says "ACK received"; without its counterpart a
+        // confirmation that never arrives cannot be told apart from one that
+        // was never sent, and only the trace knew the difference.
+        debugPrint('ACK sent for message $messageId over ble '
+            '(${direct ? 'direct' : 'buffered — no live path'})');
       }
     };
 

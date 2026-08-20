@@ -359,6 +359,29 @@ class FieldRunner extends ChangeNotifier {
     return starts.last + (plan.steps.last.dwellSec + plan.settleSec) * 1000;
   }
 
+  /// When the operator has to be standing somewhere new, and where.
+  ///
+  /// A step the plan does not auto-advance is one it considers a new
+  /// position, so the next of those is the next thing to walk to. The walk
+  /// has to be finished before that step's resets open, not when its dwell
+  /// does, which is the instant [_enterPositioning] counts down to.
+  ///
+  /// Null once nothing is left to walk to. A plan whose steps all
+  /// auto-advance never asks the operator to move and returns null
+  /// throughout.
+  ({int atMs, String label})? get nextMove {
+    final plan = _plan, starts = _stepStartMs;
+    if (plan == null || starts == null) return null;
+    for (var i = _stepIndex + 1; i < plan.steps.length; i++) {
+      if (plan.steps[i].autoAdvance) continue;
+      return (
+        atMs: starts[i] - plan.resetBudgetSec * 1000,
+        label: plan.steps[i].label,
+      );
+    }
+    return null;
+  }
+
   /// Whether this phone joins after the run start (roles 4+): the ones whose
   /// Bluetooth the operator must turn on mid-run.
   bool get joinsLater =>

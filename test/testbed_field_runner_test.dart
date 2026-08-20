@@ -165,6 +165,64 @@ void main() {
     });
   });
 
+  test('nextMove names the next position and when to be there', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final runner = FieldRunner(recorder: recorder, myNickname: '1');
+
+      // Two positions, three dwells each: only the first dwell at a position
+      // is something to walk to, exactly as the line sweep is built.
+      runner.start(FieldPlan(
+        expId: 'move-1',
+        settleSec: 0,
+        manualJoin: true,
+        placementSec: 60,
+        alignSec: 60,
+        resetBudgetSec: 5,
+        walkBudgetSec: 120,
+        steps: const [
+          FieldStep(label: 'd=10 t1', dwellSec: 30),
+          FieldStep(label: 'd=10 t2', dwellSec: 30, autoAdvance: true),
+          FieldStep(label: 'd=10 t3', dwellSec: 30, autoAdvance: true),
+          FieldStep(label: 'd=20 t1', dwellSec: 30),
+          FieldStep(label: 'd=20 t2', dwellSec: 30, autoAdvance: true),
+        ],
+      ));
+      async.flushMicrotasks();
+
+      final move = runner.nextMove;
+      expect(move, isNotNull);
+      expect(move!.label, 'd=20 t1',
+          reason: 'the repeats at d=10 are not somewhere to walk to');
+      // The walk must be done before that step's resets open, not its dwell.
+      expect(move.atMs, lessThan(runner.planEndMs!));
+
+      runner.dispose();
+    });
+  });
+
+  test('nextMove is null once there is nothing left to walk to', () {
+    fakeAsync((async) {
+      final recorder = _FakeRecorder();
+      final runner = FieldRunner(recorder: recorder, myNickname: '1');
+      runner.start(FieldPlan(
+        expId: 'move-2',
+        settleSec: 0,
+        manualJoin: true,
+        placementSec: 60,
+        alignSec: 60,
+        steps: const [
+          FieldStep(label: 'only', dwellSec: 30),
+          FieldStep(label: 'only t2', dwellSec: 30, autoAdvance: true),
+        ],
+      ));
+      async.flushMicrotasks();
+      expect(runner.nextMove, isNull,
+          reason: 'every later step auto-advances, so nobody has to move');
+      runner.dispose();
+    });
+  });
+
   test('walks the whole plan: markers, dwell, bulk, settle, upload', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

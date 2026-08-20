@@ -124,10 +124,15 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                       : _positioning(step!, runner),
                   // A dwell the operator has to act in is an instruction;
                   // one they do not is just time left on the run.
-                  FieldPhase.dwelling => runner.radioAction != null
-                      ? _radioPrompt(runner.radioAction!, runner.remainingSec)
-                      : _untilEnd(runner,
+                  FieldPhase.dwelling => switch ((
+                      runner.radioAction,
+                      runner.nextMove
+                    )) {
+                      (final a?, _) => _radioPrompt(a, runner.remainingSec),
+                      (_, final m?) => _untilMove(runner, m),
+                      _ => _untilEnd(runner,
                           note: step!.bulk ? 'bulk flows running' : null),
+                    },
                   FieldPhase.settling => _countdown(
                       'SETTLING',
                       runner.remainingSec,
@@ -267,6 +272,58 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         order: runner.joinOrder);
   }
 
+  /// The operator's next walk, counted down.
+  ///
+  /// On a plan that asks nobody to move, time-to-end is the only number worth
+  /// this size. On a sweep it is the wrong one: the run ends in an hour and
+  /// the next position is due in two minutes, and missing that instant
+  /// measures a distance the trace will still label as the one intended.
+  Widget _untilMove(FieldRunner runner, ({int atMs, String label}) move) {
+    final remaining =
+        ((move.atMs - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
+    final late = remaining <= 0;
+    final urgent = remaining <= 30;
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Icon(late ? Icons.directions_run : Icons.directions_walk,
+            color: late ? Colors.redAccent : Colors.orangeAccent, size: 64),
+        const SizedBox(height: 14),
+        FittedBox(
+          child: Text(late ? 'BE AT ${move.label} NOW' : 'MOVE TO ${move.label} IN',
+              style: TextStyle(
+                  color: late ? Colors.redAccent : Colors.orangeAccent,
+                  fontSize: 34,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.1)),
+        ),
+        if (!late)
+          FittedBox(
+            child: Text(_span(remaining),
+                style: TextStyle(
+                    color: urgent ? Colors.redAccent : Colors.tealAccent,
+                    fontSize: 96,
+                    fontWeight: FontWeight.w800)),
+          ),
+        Text('at ${_hhmmss(move.atMs)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        const SizedBox(height: 18),
+        Text(
+            runner.planEndMs == null
+                ? ''
+                : 'run ends ${_hhmmss(runner.planEndMs!)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white38, fontSize: 18)),
+        if (runner.joinOrder != null) ...[
+          const SizedBox(height: 14),
+          _orderBadge(runner.joinOrder!),
+        ],
+      ],
+    );
+  }
+
   /// The one screen for a phone with nothing to do: how long until the whole
   /// run is over. A step boundary nobody has to act on is not worth a number
   /// this size, and an unattended run is read from across a room.
@@ -324,6 +381,8 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   Widget _manualGap(FieldStep step, FieldRunner runner) {
     final action = runner.radioAction;
     if (action != null) return _radioPrompt(action, runner.remainingSec);
+    final move = runner.nextMove;
+    if (move != null && runner.radioSeenUp) return _untilMove(runner, move);
     return _untilEnd(runner,
         note: !runner.radioSeenUp && runner.joinsLater
             ? _joinEta(runner)

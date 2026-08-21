@@ -119,8 +119,8 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   Future<List<BleLinkInfo?>> linkSnapshot() async => [];
 
   @override
-  Future<void> dispose() async {
-    calls.add('dispose');
+  Future<void> dispose(bool keepAdvertiser) async {
+    calls.add('dispose:keep=$keepAdvertiser');
   }
 }
 

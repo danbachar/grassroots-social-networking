@@ -2028,7 +2028,11 @@ class GrassrootsNetwork {
   Future<void> resetAllBleLinks({int? darkSec, void Function()? whileDark}) async {
     if (_bleService == null) return;
     debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
-    await _bleService!.dispose();
+    // The advertising set survives the bounce: links, sessions and the GATT
+    // server die — the reset the churn means — while the device stays
+    // discoverable at the SAME controller-generated address, so a peer's
+    // in-flight dial does not race an address rotation it cannot see.
+    await _bleService!.dispose(keepAdvertiser: true);
     _bleService = null;
     store.dispatch(
         BleTransportStateChangedAction(TransportState.uninitialized));

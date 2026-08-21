@@ -1124,28 +1124,22 @@ class BleTransportService extends TransportService {
   }
 
   @override
-  Future<void> stop({bool keepAdvertiser = false}) async {
+  Future<void> stop() async {
     _stopped = true;
-    // A kept advertiser stays confirmed: its set is still on the air and the
-    // plugin re-emits the state on the next start.
-    if (!keepAdvertiser) _advertisingConfirmed = false;
+    _advertisingConfirmed = false;
     _scanConfirmed = false;
     _scanWatchdog?.cancel();
     _scanWatchdog = null;
     _linkSnapshotTimer?.cancel();
     _linkSnapshotTimer = null;
-    if (!keepAdvertiser) {
-      _stopSlotTimer();
-      _advertisedSlot = null;
-    }
+    _stopSlotTimer();
+    _advertisedSlot = null;
     try {
       await _ble.stopScan();
     } catch (_) {}
-    if (!keepAdvertiser) {
-      try {
-        await _ble.stopAdvertising();
-      } catch (_) {}
-    }
+    try {
+      await _ble.stopAdvertising();
+    } catch (_) {}
 
     // Disconnect every known path. Order doesn't matter — the plugin emits
     // disconnected events that we project into Redux.
@@ -1356,18 +1350,11 @@ class BleTransportService extends TransportService {
     store.dispatch(BleDeviceRemovedAction(failedPathId));
     final uuid = failed.serviceUuid;
     if (uuid == null) return;
-    // The identity's freshest OTHER sighting, full stop. The original
-    // strictly-newer-than-the-failure requirement assumed the dead address
-    // predated the live one; under mid-window rotation the peer retires
-    // addresses repeatedly and the freshest sighting is simply the best
-    // information there is. Eviction plus the cooldown still bound the
-    // chain: every failure removes an address, so the chase always makes
-    // progress toward the live one.
     DiscoveredPeerState? newest;
     for (final e in _peersState.discoveredBlePeersList) {
       if (e.transportId == failedPathId) continue;
       if (e.serviceUuid != uuid) continue;
-      if (e.isConnected || e.isConnecting) continue;
+      if (!e.lastSeen.isAfter(failed.lastSeen)) continue;
       if (newest == null || e.lastSeen.isAfter(newest.lastSeen)) newest = e;
     }
     if (newest == null) return;
@@ -1827,8 +1814,8 @@ class BleTransportService extends TransportService {
   }
 
   @override
-  Future<void> dispose({bool keepAdvertiser = false}) async {
-    await stop(keepAdvertiser: keepAdvertiser);
+  Future<void> dispose() async {
+    await stop();
     // Cancel every held write's deadline before anything closes: a timer
     // firing after dispose would flush into a transport that no longer
     // exists.
@@ -1848,7 +1835,7 @@ class BleTransportService extends TransportService {
     await _payloadSub?.cancel();
     await _logSub?.cancel();
     try {
-      await _ble.dispose(keepAdvertiser: keepAdvertiser);
+      await _ble.dispose();
     } catch (_) {}
 
     _setState(TransportState.disposed);

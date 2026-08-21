@@ -1368,7 +1368,7 @@ class BleTransportService extends TransportService {
         'to': newest.transportId,
       }));
     }
-    unawaited(connectToDevice(newest.transportId));
+    unawaited(connectToDevice(newest.transportId, via: 'chase'));
   }
 
   /// One write attempt on one leg. False means the bytes did not get in.
@@ -1641,7 +1641,7 @@ class BleTransportService extends TransportService {
     );
     _traceReverseDial('overAcl', 'central:$remoteId');
     if (await connectToDevice('central:$remoteId',
-        serviceUuidOverride: gattUuid)) {
+        serviceUuidOverride: gattUuid, via: 'reverseAcl')) {
       // Started is not survived: if this dial dies before ready, the
       // terminal-state handler retries once at a fresh advertised MAC.
       _reverseDialPending
@@ -1680,7 +1680,7 @@ class BleTransportService extends TransportService {
         debugPrint('[ble] reverse leg: dialing advertised '
             '${dp.transportId} instead.');
         _traceReverseDial('advertised', dp.transportId);
-        unawaited(connectToDevice(dp.transportId));
+        unawaited(connectToDevice(dp.transportId, via: 'reverseAdv'));
         return true;
       }
     }
@@ -1864,6 +1864,7 @@ class BleTransportService extends TransportService {
     String pathId, {
     String? serviceUuidOverride,
     int? sightingRssi,
+    String via = 'sighting',
   }) async {
     if (!pathId.startsWith('central:')) {
       // Peripheral-side paths are inbound — we don't dial them.
@@ -1920,6 +1921,31 @@ class BleTransportService extends TransportService {
     final remoteId = pathId.substring('central:'.length);
     _dialingNow.add(pathId);
     try {
+      // Provenance: what evidence produced this dial. Every 133 postmortem
+      // so far had to infer where the address came from; this states it —
+      // the issuing path, the sighting's signal, and how old the discovery
+      // entry was at the instant of dialing. An entry that is minutes old
+      // or absent names the suspect outright.
+      if (_tracing) {
+        final now = DateTime.now();
+        unawaited(trace!.log({
+          'type': 'link',
+          't': now.millisecondsSinceEpoch,
+          'event': 'dialIssued',
+          'transport': 'ble',
+          'path': pathId,
+          'via': via,
+          if (sightingRssi != null) 'rssi': sightingRssi,
+          if (discovered != null) ...{
+            'entryAgeMs': now.difference(discovered.lastSeen).inMilliseconds,
+            'firstSeenAgeMs':
+                now.difference(discovered.discoveredAt).inMilliseconds,
+            if (sightingRssi == null) 'rssi': discovered.rssi,
+          } else
+            'entry': 'absent',
+        }));
+      }
+
       await _ble.connect(
         remoteId: remoteId,
         // The peer's GATT service carries the same derived UUID it
@@ -2171,7 +2197,7 @@ class BleTransportService extends TransportService {
       final remoteId =
           livePeripheralPathId.substring('peripheral:'.length);
       unawaited(connectToDevice('central:$remoteId',
-          serviceUuidOverride: serviceUuid));
+          serviceUuidOverride: serviceUuid, via: 'reverseAcl'));
       return;
     }
 

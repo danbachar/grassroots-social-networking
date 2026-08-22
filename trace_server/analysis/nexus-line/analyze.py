@@ -41,6 +41,9 @@ CACHE = os.path.join(HERE, ".cache")
 STEP = re.compile(r"^d=(\d+) t(\d+)$")
 PIXEL_FIT = (-36.6, -18.2)      # July Pixel comparator (line-field/README.md)
 CTRL_ORDER = ["announce", "handshake", "secure:sync", "secure:ack"]
+BIN = 3          # dB, width of an RSSI bin in fig_delivery_vs_rssi
+MIN_N = 5        # messages a bin needs before its proportion is plotted
+BOX_MIN_SENDS = 10   # messages a trial needs before per-trial rates are boxed
 DATA_CLASS = "secure"
 
 
@@ -151,7 +154,7 @@ def main():
 
     for s in sides:
         other = next(x["dev"] for x in sides if x["dev"] != s["dev"])
-        sent, ack, recv = {}, {}, []
+        sent, ack, recv, recv_ids = {}, {}, [], set()
         for t, ty, b in s["ev"]:
             if ty != "message":
                 continue
@@ -164,7 +167,8 @@ def main():
                 ack[b["messageId"]] = t
             elif d == "recv":
                 recv.append(t)
-        s.update(sent=sent, ack=ack, recv=recv)
+                recv_ids.add(b["messageId"])
+        s.update(sent=sent, ack=ack, recv=recv, recv_ids=recv_ids)
         s["rssi"] = [(t, b["rssi"]) for t, ty, b in s["ev"]
                      if ty == "rssi" and b.get("src") == "conn" and b.get("peer") == other]
         s["wire"] = [(t, b.get("txBytes") or {}) for t, ty, b in s["ev"] if ty == "wire"]
@@ -201,6 +205,39 @@ def main():
                     st[n] = (t - w["bt"]) / 1000
             w["stages"] = st
 
+    # Per-message outcome against the RSSI at the moment it was sent.
+    # acked  = the originator saw the end-to-end ACK come back
+    # arrived = the RECEIVER's file logs that message id (cross-file, so it
+    #           exists only where the receiver's recording survived)
+    for s in sides:
+        # What span of wall-clock this side's recording actually covers. A
+        # message sent outside the PEER's coverage has no arrival evidence
+        # either way — a phone that crashed logs nothing, which must read as
+        # unknown and never as "did not arrive".
+        s["cover"] = (s["ev"][0][0], s["ev"][-1][0]) if s["ev"] else (1, 0)
+    for s in sides:
+        peer = next(x for x in sides if x["dev"] != s["dev"])
+        lo, hi = peer["cover"]
+        # RSSI samples are far sparser than messages, so a send takes the
+        # nearest sample measured at the SAME position rather than only one
+        # inside its own trial — the phone has not moved between trials.
+        by_d = collections.defaultdict(list)
+        for w in s["tw"]:
+            for t, v in s["rssi"]:
+                if w["t0"] <= t < w["end"]:
+                    by_d[w["d"]].append((t, v))
+        s["msgs"] = []
+        for w in s["tw"]:
+            band = by_d.get(w["d"]) or []
+            for mid, t in s["sent"].items():
+                if not (w["t0"] <= t < w["end"]) or not band:
+                    continue
+                s["msgs"].append(dict(
+                    d=w["d"], trial=(s["dev"], w["tr"]),
+                    rssi=min(band, key=lambda x: abs(x[0] - t))[1],
+                    acked=mid in s["ack"],
+                    arrived=(mid in peer["recv_ids"]) if lo <= t <= hi else None))
+
     ds = sorted({w["d"] for s in sides for w in s["tw"]})
 
     def at(s, dist):
@@ -217,6 +254,18 @@ def main():
         if not rw or not rate:
             return None, None, True
         return got, round(statistics.median(rate)) * len(rw), True
+
+    def wilson(k, n, z=1.96):
+        """95% CI for a binomial proportion — the right error bar for a
+        yes/no outcome. A per-trial percentage box plot is not: at two
+        messages a trial it can only take the values 0, 50 and 100."""
+        if not n:
+            return 0.0, 0.0, 0.0
+        p = k / n
+        d = 1 + z * z / n
+        c = (p + z * z / (2 * n)) / d
+        h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+        return 100 * p, 100 * max(0.0, c - h), 100 * min(1.0, c + h)
 
     import matplotlib
     matplotlib.use("Agg")
@@ -393,6 +442,107 @@ def main():
     ax.grid(alpha=0.25, which="both")
     ax.legend(fontsize=9)
     save(fig, "fig_path_loss")
+
+    # 7 — data-plane outcome against RSSI, and how RSSI groups by distance
+    allm = [m for s in sides for m in s["msgs"]]
+    if allm:
+        fig, (axb, axp) = plt.subplots(2, 1, figsize=(8.0, 7.4),
+                                       gridspec_kw={"height_ratios": [1, 1.25]})
+        # (a) RSSI per distance — the overlap question, answered visually
+        data = [[x for s in sides for w in at(s, d) for x in w["rssi"]] for d in ds]
+        keep = [(d, v) for d, v in zip(ds, data) if v]
+        bp = axb.boxplot([v for _, v in keep], positions=[d for d, _ in keep],
+                         widths=(span / len(ds)) * 0.55, patch_artist=True,
+                         medianprops=dict(color="#c53030", lw=1.6))
+        for b_ in bp["boxes"]:
+            b_.set(facecolor="#bee3f8", edgecolor="#2b6cb0", alpha=0.9)
+        pairs = [(a, b_) for i, a in enumerate(keep) for b_ in keep[i + 1:]]
+        def iqr(v):
+            q = statistics.quantiles(sorted(v), n=4)
+            return q[0], q[2]
+        nov = sum(1 for (_, va), (_, vb) in pairs
+                  if iqr(va)[0] <= iqr(vb)[1] and iqr(vb)[0] <= iqr(va)[1])
+        axb.set_xlabel("distance (m)")
+        axb.set_ylabel("conn-RSSI (dBm)")
+        axb.set_title(f"RSSI by distance — {nov} of {len(pairs)} distance pairs "
+                      f"overlap in IQR")
+        axb.set_xticks([d for d, _ in keep])
+        axb.set_xticklabels([d for d, _ in keep])
+        axb.grid(alpha=0.25, axis="y")
+
+        # (b) delivered / acked against RSSI, Wilson 95% CI
+        lo = int(math.floor(min(m["rssi"] for m in allm) / BIN) * BIN)
+        hi = int(math.ceil(max(m["rssi"] for m in allm) / BIN) * BIN)
+        bins = list(range(lo, hi + BIN, BIN))
+        series = (("arrived", "arrived at the receiver", "#2b6cb0", -BIN * 0.16),
+                  ("acked", "end-to-end ACK returned", "#dd6b20", BIN * 0.16))
+        # With a handful of messages a trial, a per-trial percentage can only
+        # be 0, 50 or 100 and a box plot of it says nothing. Box plots are
+        # drawn once a trial carries enough messages for its own rate to mean
+        # something; below that the pooled proportion with a Wilson interval
+        # is the honest summary.
+        per_trial = statistics.median([w["sent"] for s in sides for w in s["tw"]
+                                       if w["sent"]] or [0])
+        boxes = per_trial >= BOX_MIN_SENDS
+        for key, name, col, off in series:
+            xs, ys, el, eh, ns, rates = [], [], [], [], [], []
+            for b0 in bins:
+                sel = [m for m in allm if b0 <= m["rssi"] < b0 + BIN
+                       and m[key] is not None]
+                if len(sel) < MIN_N:
+                    continue
+                k = sum(1 for m in sel if m[key])
+                p, l, h = wilson(k, len(sel))
+                xs.append(b0 + BIN / 2 + off)
+                ys.append(p)
+                # The Wilson interval is not centred on p, so an arm can come
+                # out negative at p = 0 or 100; the bar is clipped there.
+                el.append(max(0.0, p - l))
+                eh.append(max(0.0, h - p))
+                ns.append(len(sel))
+                if boxes:
+                    by_trial = collections.defaultdict(list)
+                    for m in sel:
+                        by_trial[(m["d"], m["trial"])].append(m[key])
+                    rates.append([100 * sum(v) / len(v) for v in by_trial.values()])
+            if not xs:
+                continue
+            if boxes and any(len(r) > 2 for r in rates):
+                bp2 = axp.boxplot(rates, positions=xs, widths=BIN * 0.26,
+                                  patch_artist=True, manage_ticks=False,
+                                  medianprops=dict(color="#1a202c", lw=1.3))
+                for b_ in bp2["boxes"]:
+                    b_.set(facecolor=col, alpha=0.35, edgecolor=col)
+            axp.errorbar(xs, ys, yerr=[el, eh], fmt="o", color=col, ms=6,
+                         capsize=4, lw=1.4, label=name)
+            ytxt = 2.0 if key == "arrived" else 7.0
+            for x, nn in zip(xs, ns):
+                axp.annotate(f"{nn}", (x, ytxt), ha="center", fontsize=7,
+                             color=col)
+        axp.set_xlabel("conn-RSSI at the moment of sending (dBm, "
+                       f"{BIN} dB bins)")
+        axp.set_ylabel("data-plane messages (%)")
+        axp.set_title("Delivery and acknowledgement against signal strength")
+        axp.text(0.015, 0.09,
+                 "small figures are message counts per bin.\n"
+                 "An ACK implies arrival, but the two series rest on different\n"
+                 "evidence: ACKs come from the sender's own file, arrival needs\n"
+                 "the receiver's — so their bins need not hold the same messages.",
+                 transform=axp.transAxes, ha="left", va="bottom", fontsize=7.5,
+                 color="#4a5568")
+        axp.set_ylim(0, 106)
+        axp.grid(alpha=0.25)
+        axp.legend(fontsize=9, loc="lower right")
+        save(fig, "fig_delivery_vs_rssi")
+        for key, name, _, _ in series:
+            have = [m for m in allm if m[key] is not None]
+            if have:
+                k = sum(1 for m in have if m[key])
+                p, l, h = wilson(k, len(have))
+                print(f"{name:28s} {k}/{len(have)} = {p:.1f}%  "
+                      f"[{l:.1f}, {h:.1f}] 95% CI")
+            else:
+                print(f"{name:28s} no cross-file evidence in this pair")
 
     # summary
     A_, B_ = sides[0]["dev"][:8], sides[1]["dev"][:8]

@@ -52,3 +52,32 @@ Delivery: **233/238 forward, 230/234 reverse**.
 seen at several distances. That is real and not a clock artefact: a GATT link
 exists before identity does, so the leg the peer dials lands before we have
 seen anything from it.
+
+## `fig_delivery_vs_rssi` — outcome against signal strength
+
+Top panel: conn-RSSI per distance as a box plot, with the count of
+IQR-overlapping distance pairs in the title. Bottom panel: the share of
+data-plane messages that **arrived** and that came back **acknowledged**,
+binned by the RSSI measured closest in time to each send.
+
+**Yes, the RSSI groups overlap, badly.** On 2026-08-22, **13 of 66** distance
+pairs overlap in interquartile range, all of them inside the 30–90 m band, and
+RSSI is **not monotone in distance** — 50 m read 4 dB *stronger* than 30 m, and
+80 m stronger than 70 m. Distance is therefore the wrong independent variable
+for a delivery curve at this site, and binning by RSSI is the right call.
+
+Two things about how the percentages are drawn:
+
+* The error bar is a **Wilson 95 % interval on the binomial proportion**, not a
+  spread of per-trial rates. With two messages a trial a per-trial percentage
+  can only be 0, 50 or 100, so a box plot of it would be an artefact of the
+  load. Once a trial carries `BOX_MIN_SENDS` (10) messages or more, the script
+  *also* draws the per-trial box plot behind the interval — so the rerun at 100
+  messages a trial gets the box-and-whisker version automatically.
+* **arrived** and **acked** are different evidence. An ACK is proof of arrival,
+  but it comes from the sender's own file, whereas arrival needs the receiver's
+  — so a message sent while the peer was not recording counts as *unknown*, not
+  as lost. On 2026-08-22 that leaves arrival measurable only in the 120 m window
+  (28/34), while ACKs cover the whole sweep (245/252 = 97.2 %). The desk pair
+  from the same build, where both phones recorded 100 messages a trial, closes
+  the gap: **400/400 arrived and 400/400 acked, both directions.**

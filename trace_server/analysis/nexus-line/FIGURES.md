@@ -81,3 +81,41 @@ Two things about how the percentages are drawn:
   (28/34), while ACKs cover the whole sweep (245/252 = 97.2 %). The desk pair
   from the same build, where both phones recorded 100 messages a trial, closes
   the gap: **400/400 arrived and 400/400 acked, both directions.**
+
+## Does transmit power move the delivery numbers?
+
+**It is already at maximum, so there is nothing to turn up.** The Android
+advertiser is built with `ADVERTISE_TX_POWER_HIGH`
+(`GrassrootsBluetoothPlugin.kt`), and every trace record that reports a level
+— 1213 of them, across 6 devices, the whole history — reads level 3, HIGH.
+There is no variation anywhere in the data, so no natural experiment exists.
+
+Two things follow, and they are separate:
+
+* **That setting governs the beacon, not the data path.** `setTxPowerLevel`
+  applies to advertising PDUs. Messages travel over a GATT connection whose
+  transmit power the controller picks; Android exposes no API to set it. So
+  advertising power can move *discovery reach*, and cannot by itself move the
+  received or acknowledged counts on a link that already exists.
+* **Within this run, link budget does not predict failure either.** Transmit
+  power only shifts RSSI, so the question can be asked of the data directly.
+  `analyze.py` splits every send into RSSI tertiles and runs a Fisher exact
+  test — on 2026-08-22, the weakest third (−91..−81 dBm) returned ACKs on
+  80/84 = 95.2 % against 83/84 = 98.8 % for the strongest third (−76..−63 dBm),
+  **p = 0.37**. No detectable effect across 28 dB.
+
+The failures say the same thing. Six of the seven sit at 120 m against the
+restarted phone, whose per-trial resets ran on an unsynchronised schedule —
+dead air, not a weak link — and the seventh is at 20 m and −72 dBm, a
+strong-signal loss that no amount of transmit power addresses. Delivery here
+is limited by whether a link exists at that moment, not by how loud it is.
+
+The test re-runs automatically, so the loaded rerun (100 messages a trial, ~50×
+the failure sample) will either confirm this or find the effect this run had no
+power to see.
+
+**The experiment that would answer it directly** has to go *downward* —
+HIGH against MEDIUM/LOW at a fixed near-edge position, measuring establishment
+and delivery separately. It needs the level plumbed through the plugin
+(pigeon + Kotlin + Swift), a field-plan knob, and a rebuild, so it is not a
+change to make to phones already staged for a thesis run.

@@ -255,6 +255,24 @@ def main():
             return None, None, True
         return got, round(statistics.median(rate)) * len(rw), True
 
+    def fisher(a, b, c, d):
+        """Two-sided Fisher exact p for a 2x2 table. Exact rather than a
+        chi-square because the failure counts are single digits."""
+        from math import comb
+        n = a + b + c + d
+        if not n or not (a + c) or not (b + d):
+            return 1.0
+        obs = comb(a + b, a) * comb(c + d, c) / comb(n, a + c)
+        p = 0.0
+        for i in range(min(a + b, a + c) + 1):
+            k2, l = a + c - i, c + d - (a + c - i)
+            if k2 < 0 or l < 0 or a + b - i < 0:
+                continue
+            pr = comb(a + b, i) * comb(c + d, k2) / comb(n, a + c)
+            if pr <= obs + 1e-12:
+                p += pr
+        return min(1.0, p)
+
     def wilson(k, n, z=1.96):
         """95% CI for a binomial proportion — the right error bar for a
         yes/no outcome. A per-trial percentage box plot is not: at two
@@ -543,6 +561,34 @@ def main():
                       f"[{l:.1f}, {h:.1f}] 95% CI")
             else:
                 print(f"{name:28s} no cross-file evidence in this pair")
+
+    # Does link budget predict failure? Transmit power only shifts RSSI, so
+    # if the weakest third of sends is no worse than the strongest, there is
+    # no headroom for more power to buy — delivery is limited by whether the
+    # link exists, not by how loud it is.
+    for key, name in (("acked", "ACK returned"), ("arrived", "arrived")):
+        have = sorted([m for m in allm if m[key] is not None],
+                      key=lambda m: m["rssi"])
+        if len(have) < 3 * MIN_N:
+            continue
+        third = len(have) // 3
+        weak, strong = have[:third], have[-third:]
+        a1 = sum(1 for m in weak if m[key])
+        a2 = sum(1 for m in strong if m[key])
+        p = fisher(a1, len(weak) - a1, a2, len(strong) - a2)
+        print(f"\nlink budget vs {name}: weakest third "
+              f"{a1}/{len(weak)} = {100 * a1 / len(weak):.1f}% "
+              f"({weak[0]['rssi']}..{weak[-1]['rssi']} dBm)  vs  strongest third "
+              f"{a2}/{len(strong)} = {100 * a2 / len(strong):.1f}% "
+              f"({strong[0]['rssi']}..{strong[-1]['rssi']} dBm)")
+        print(f"  Fisher exact two-sided p = {p:.3f}"
+              + ("  — no detectable effect of signal strength"
+                 if p >= 0.05 else "  — signal strength DOES predict failure"))
+        bad = [m for m in have if not m[key]]
+        if bad:
+            print("  failures at: " + ", ".join(
+                f"d={m['d']}m {m['rssi']}dBm" for m in sorted(
+                    bad, key=lambda m: m["rssi"])[:10]))
 
     # summary
     A_, B_ = sides[0]["dev"][:8], sides[1]["dev"][:8]

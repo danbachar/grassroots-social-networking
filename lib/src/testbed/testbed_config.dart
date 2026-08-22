@@ -449,6 +449,13 @@ class FieldPlan {
   /// since the dark window has to open on every phone at once.
   final bool scriptedRadio;
 
+  /// The operator resets the whole OS Bluetooth stack at every position,
+  /// during the walk window — the thesis line design: each distance starts
+  /// from a stack that carries nothing over. The runner PROMPTS the toggle;
+  /// the radio observer's bt-off/bt-on markers are the record of whether it
+  /// actually happened, position by position.
+  final bool stackResetPerPosition;
+
   const FieldPlan({
     required this.expId,
     required this.steps,
@@ -465,6 +472,7 @@ class FieldPlan {
     this.placementSec = 300,
     this.alignSec = 600,
     this.scriptedRadio = false,
+    this.stackResetPerPosition = false,
   });
 
   /// Resolve a role-free diluting plan for THIS device: every step carrying
@@ -515,6 +523,7 @@ class FieldPlan {
       placementSec: placementSec,
       alignSec: alignSec,
       scriptedRadio: scriptedRadio,
+      stackResetPerPosition: stackResetPerPosition,
     );
   }
 
@@ -535,6 +544,7 @@ class FieldPlan {
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
         if (scriptedRadio) 'scriptedRadio': true,
+        if (stackResetPerPosition) 'stackResetPerPosition': true,
       };
 
   factory FieldPlan.fromJson(Map<String, dynamic> json) => FieldPlan(
@@ -559,6 +569,8 @@ class FieldPlan {
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
         scriptedRadio: json['scriptedRadio'] as bool? ?? false,
+        stackResetPerPosition:
+            json['stackResetPerPosition'] as bool? ?? false,
       );
 
   @override
@@ -578,7 +590,8 @@ class FieldPlan {
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
-      other.scriptedRadio == scriptedRadio;
+      other.scriptedRadio == scriptedRadio &&
+      other.stackResetPerPosition == stackResetPerPosition;
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,

@@ -239,6 +239,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white38, fontSize: 14)),
         const SizedBox(height: 18),
+        if (runner.wantsStackReset) _stackResetPrompt(runner),
         Text(_mmss(runner.remainingSec),
             textAlign: TextAlign.center,
             style: const TextStyle(
@@ -296,6 +297,43 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         : ((windowAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
     return _radioPrompt('on', remaining < 0 ? 0 : remaining,
         order: runner.joinOrder);
+  }
+
+  /// The stack-reset instruction, paired with live radio state.
+  ///
+  /// The plan cannot perform the reset itself (modern Android forbids it),
+  /// so the operator does — and the screen must say so while the walk
+  /// window is open, with feedback that the toggle registered. The radio
+  /// observer's bt-off/bt-on markers are the trace-side record.
+  Widget _stackResetPrompt(FieldRunner runner) {
+    final up = runner.radioUp;
+    return Container(
+      margin: const EdgeInsets.only(top: 14),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+      decoration: BoxDecoration(
+        color: up ? Colors.orange.shade900 : Colors.blueGrey.shade800,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(children: [
+        Text(
+          up
+              ? 'RESET BLUETOOTH NOW — toggle OFF, then ON'
+              : 'BLUETOOTH IS OFF — toggle it back ON',
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          up
+              ? 'radio is up — the reset for this position has not happened '
+                  'until it goes down and comes back'
+              : 'good — now bring it back up before the countdown ends',
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: Colors.white70, fontSize: 14),
+        ),
+      ]),
+    );
   }
 
   /// The dwell, named: the phones are measuring and must not move.
@@ -380,6 +418,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         Text('at ${_hhmmss(move.atMs)}',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        if (runner.wantsStackReset) _stackResetPrompt(runner),
         const SizedBox(height: 18),
         Text(
             runner.planEndMs == null

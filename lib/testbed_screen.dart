@@ -258,6 +258,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
     _markerController.dispose();
     _planController.dispose();
     _sweepStepController.dispose();
+    _sweepReceiverController.dispose();
     super.dispose();
   }
 
@@ -805,6 +806,18 @@ class _TestbedScreenState extends State<TestbedScreen> {
             ),
           ),
         ]),
+        const SizedBox(height: 8),
+        TextField(
+          controller: _sweepReceiverController,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            isDense: true,
+            labelText: 'One-way receiver pubkey prefix (blank = both send)',
+            helperText: 'July design: paste the STATIC phone\'s pubkey '
+                'prefix; every other phone sends 100/trial toward it',
+          ),
+          onChanged: (_) => _applySweep(),
+        ),
         const SizedBox(height: 6),
         Text(
           '$_sweepPositions positions '
@@ -854,11 +867,15 @@ class _TestbedScreenState extends State<TestbedScreen> {
   int _sweepTrials = 3;
   String? _selectedPreset;
 
+  late final TextEditingController _sweepReceiverController =
+      TextEditingController();
+
   FieldPlan get _sweepPlan => FieldPlanPresets.lineSweepUpTo(
         startDistance: _sweepStartDistance,
         maxDistance: _sweepMaxDistance,
         stepMetres: _sweepStepMetres,
         trials: _sweepTrials,
+        receiverPrefix: _sweepReceiverController.text,
       );
 
   void _applySweep() => _setPlan(_sweepPlan);

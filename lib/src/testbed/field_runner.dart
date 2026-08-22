@@ -365,6 +365,14 @@ class FieldRunner extends ChangeNotifier {
     return starts.last + (plan.steps.last.dwellSec + plan.settleSec) * 1000;
   }
 
+  /// Whether the plan asks the operator to cycle the whole Bluetooth stack
+  /// at every position, and whether the radio currently reads up — the
+  /// screens pair the instruction with live feedback so a toggle that did
+  /// not register is visible before the window closes. The bt-off/bt-on
+  /// markers the radio observer stamps are the per-position record of
+  /// whether the reset actually happened.
+  bool get wantsStackReset => _plan?.stackResetPerPosition ?? false;
+
   /// When the operator has to be standing somewhere new, and where.
   ///
   /// A step the plan does not auto-advance is one it considers a new

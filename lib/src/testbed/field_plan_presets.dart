@@ -960,17 +960,46 @@ class FieldPlanPresets {
     int maxDistance = 120,
     int stepMetres = 10,
     int trials = 3,
+    String? receiverPrefix,
   }) {
     final step = stepMetres < 1 ? 1 : stepMetres;
     final distances = <int>[
       for (var d = startDistance; d <= maxDistance; d += step) d,
     ];
-    return manualized(
-        lineSweep(
-          distances: distances.isEmpty ? [startDistance] : distances,
-          trials: trials,
-        ),
-        placementSec: 120);
+    // Thesis line design: 100 messages per trial (1000 a distance at x10,
+    // the July load), and the operator resets the whole Bluetooth stack at
+    // every position during the walk — each distance's trials run on a
+    // stack that carries nothing over from the previous one.
+    // One-way when a receiver prefix is given, exactly the July design: the
+    // phone whose pubkey matches receives, every other phone sends 100 a
+    // trial toward it, and the receiver itself matches no target and sends
+    // nothing. Blank keeps both phones sending.
+    final base = lineSweep(
+      distances: distances.isEmpty ? [startDistance] : distances,
+      trials: trials,
+      sendCount: 100,
+      sendTo: (receiverPrefix == null || receiverPrefix.trim().isEmpty)
+          ? 'all'
+          : receiverPrefix.trim().toLowerCase(),
+    );
+    return FieldPlan(
+      expId: base.expId,
+      steps: base.steps,
+      settleSec: base.settleSec,
+      roster: base.roster,
+      resetSessions: base.resetSessions,
+      resetLinks: base.resetLinks,
+      linkResetDarkSec: base.linkResetDarkSec,
+      resetDtnBuffer: base.resetDtnBuffer,
+      autoAdvanceGapSec: base.autoAdvanceGapSec,
+      resetBudgetSec: base.resetBudgetSec,
+      walkBudgetSec: base.walkBudgetSec,
+      manualJoin: true,
+      placementSec: 120,
+      alignSec: 120,
+      scriptedRadio: base.scriptedRadio,
+      stackResetPerPosition: true,
+    );
   }
 
   static FieldPlan lineSweep({
@@ -981,6 +1010,7 @@ class FieldPlanPresets {
     int trials = 10,
     int dwellSec = 30,
     int sendCount = 2,
+    String sendTo = 'all',
     int darkSec = 3,
     int resetBudgetSec = 5,
     int walkBudgetSec = 120,
@@ -1012,6 +1042,7 @@ class FieldPlanPresets {
               label: 'd=$d t$t',
               dwellSec: dwellSec,
               sendCount: sendCount,
+              sendTo: sendTo,
               // Only the first trial at a distance waits for the operator —
               // the repeats have nothing to walk to.
               autoAdvance: t > 1,
@@ -1049,6 +1080,7 @@ class FieldPlanPresets {
       walkBudgetSec: p.walkBudgetSec,
       manualJoin: true,
       scriptedRadio: p.scriptedRadio,
+      stackResetPerPosition: p.stackResetPerPosition,
       placementSec: placementSec,
       alignSec: alignSec,
     );

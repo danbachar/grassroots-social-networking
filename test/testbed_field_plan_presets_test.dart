@@ -1098,6 +1098,28 @@ void main() {
           greaterThan(mins(base)));
     });
 
+    test('the thesis line design: 100 one-way sends and a stack reset per '
+        'position', () {
+      final plan = FieldPlanPresets.lineSweepUpTo(
+          maxDistance: 20, trials: 2, receiverPrefix: '499F5C75');
+      expect(plan.stackResetPerPosition, isTrue,
+          reason: 'the operator cycles the whole stack at every position');
+      expect(plan.steps.first.sendCount, 100,
+          reason: '100 a trial — 1000 a distance at x10, the July load');
+      expect(plan.steps.first.sendTo, '499f5c75',
+          reason: 'one-way: only phones whose target matches the prefix '
+              'send; the receiver matches no target and sends nothing');
+
+      // The flag survives the JSON the phones actually launch from.
+      final back = FieldPlan.fromJson(plan.toJson());
+      expect(back.stackResetPerPosition, isTrue);
+      expect(back.steps.first.sendTo, '499f5c75');
+
+      // Blank prefix keeps both phones sending.
+      final both = FieldPlanPresets.lineSweepUpTo(maxDistance: 20, trials: 1);
+      expect(both.steps.first.sendTo, 'all');
+    });
+
     test('the dropdown entry carries the defaults', () {
       final preset =
           FieldPlanPresets.presets[FieldPlanPresets.lineSweepPresetName]!;

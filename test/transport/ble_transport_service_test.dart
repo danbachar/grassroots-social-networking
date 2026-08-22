@@ -122,6 +122,12 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   Future<void> dispose() async {
     calls.add('dispose');
   }
+
+  @override
+  Future<bool> restartAdapter() async {
+    calls.add('restartAdapter');
+    return true;
+  }
 }
 
 Future<GrassrootsIdentity> _makeIdentity(String nickname) async {

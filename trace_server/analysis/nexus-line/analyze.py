@@ -1,85 +1,85 @@
 """Control-plane line-sweep figures for the thesis.
 
-Fetches the two newest exp_line-* upload generations (one per device) from
-the trace server, joins the pair by message id, and writes the chapter's
-figures next to this script as PDF + PNG, plus summary.csv.
+Fetches line-sweep uploads from the trace server, joins the pair by message
+id, and writes the chapter's figures next to this script as PDF + PNG, plus
+summary.csv.
 
-    python3 analyze.py             # newest pair, figures + CSV
-    python3 analyze.py --list      # show candidate uploads and exit
-    python3 analyze.py --uploads 'exp_line-1.jsonl:123:0' 'exp_line-1.jsonl:456:0'
-    python3 analyze.py --until '2026-08-22 10:49:48'   # cut the window (UTC)
+    python3 analyze.py                       # newest pair on the server
+    python3 analyze.py --list                # candidate uploads, then exit
+    python3 analyze.py --uploads A B         # pin the two upload ids
+    python3 analyze.py --until '2026-08-22 10:49:48'    # cut the window (UTC)
 
 Figures:
-    fig_establishment  per-trial stack-cold establishment vs distance
-    fig_delivery       delivered fraction per direction vs distance
-    fig_stages         bt-on -> discovered/GATT/session/usable medians
-    fig_control_power  control-plane bytes a trial by class; power
-    fig_path_loss      conn-RSSI medians + log-distance fit (Pixel overlay)
+    fig_establishment   per-trial stack-cold establishment, per device
+    fig_delivery        delivered fraction per direction
+    fig_stages          bt-on -> discovered / GATT / session / usable
+    fig_control_bytes   control-plane bytes a trial by class, data overlaid
+    fig_power           discharge current during the dwell
+    fig_path_loss       conn-RSSI medians + log-distance fit, Pixel overlay
 
 Establishment is anchored at the bt-on marker; in this build links-reset and
-bt-on stamp in the same second, so the numbers compare directly with the
-July Pixel run's links-reset anchor. Delivery counts only traffic between
-the analyzed pair: sends to bystander phones (any other session peer in
-radio range) are excluded on the message record's peer field.
+bt-on stamp within the same second, so the numbers compare directly with the
+July Pixel run's links-reset anchor.
+
+Delivery is measured from whichever side recorded it. A sender's own file is
+authoritative (it holds sent and the end-to-end ackRx). Where a sender's file
+is missing — a phone that crashed mid-run loses everything since its last
+flush — the direction is reconstructed from the RECEIVER's receipts, with the
+denominator taken from the per-trial send rate observed on the recording side
+(the plan is symmetric). Those points are drawn hollow and named INFERRED in
+the legend and the CSV; they are a floor, since a message lost in flight is
+invisible to both files.
+
+Only traffic between the analyzed pair is counted: sends to bystander phones
+in radio range are excluded on the message record's peer field.
 """
-import argparse, collections, csv, html, json, math, os, re, statistics
-import subprocess, sys
+import argparse, collections, csv, json, math, os, re, statistics, subprocess, sys
 
 DB = "/mnt/HC_Volume_106351660/data/traces.db"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, ".cache")
 STEP = re.compile(r"^d=(\d+) t(\d+)$")
-PIXEL_FIT = (-36.6, -18.2)  # July Pixel comparator: A, slope (line-field/)
+PIXEL_FIT = (-36.6, -18.2)      # July Pixel comparator (line-field/README.md)
+CTRL_ORDER = ["announce", "handshake", "secure:sync", "secure:ack"]
+DATA_CLASS = "secure"
 
 
 def server(sql):
     out = subprocess.run(["ssh", "trace-server", f"sqlite3 -json {DB} \"{sql}\""],
-                         capture_output=True, text=True, timeout=1200)
+                         capture_output=True, text=True, timeout=1800)
     if out.returncode != 0:
         sys.exit(f"server query failed: {out.stderr.strip()}")
     return json.loads(out.stdout) if out.stdout.strip() else []
 
 
-def newest_pair():
-    rows = server(
+def candidates():
+    return server(
         "select upload_id, device_id, max(id) mx, count(*) n,"
         " datetime(min(t)/1000,'unixepoch') a, datetime(max(t)/1000,'unixepoch') b"
         " from records where upload_id like 'exp_line-%'"
-        " group by upload_id, device_id order by mx desc limit 12")
-    picked, seen = [], set()
-    for r in rows:
-        if r["device_id"] in seen:
-            continue
-        seen.add(r["device_id"])
-        picked.append(r)
-        if len(picked) == 2:
-            break
-    return picked, rows
+        " group by upload_id, device_id order by mx desc limit 14")
 
 
 def fetch(upload_id):
     os.makedirs(CACHE, exist_ok=True)
-    path = os.path.join(CACHE, upload_id.replace("/", "_").replace(":", "_") + ".json")
+    path = os.path.join(CACHE, re.sub(r"[/:]", "_", upload_id) + ".json")
     if os.path.exists(path):
         return json.load(open(path))
-    rows = server(
-        "select device_id, t, type, body from records"
-        f" where upload_id='{upload_id}'"
-        " and type in ('marker','message','rssi','wire','power','link')"
-        " order by t, id")
+    rows = server("select device_id, t, type, body from records"
+                  f" where upload_id='{upload_id}'"
+                  " and type in ('marker','message','rssi','wire','power','link')"
+                  " order by t, id")
     json.dump(rows, open(path, "w"))
     return rows
 
 
 def parse(rows, until_ms):
-    dev = rows[0]["device_id"] if rows else "?"
-    ev = []
+    dev, ev = (rows[0]["device_id"] if rows else "?"), []
     for r in rows:
         b = json.loads(r["body"]) if r["body"] else {}
         t = r["t"] if r["t"] is not None else b.get("t")
-        if t is None or t > until_ms:
-            continue
-        ev.append((t, r["type"], b))
+        if t is not None and t <= until_ms:
+            ev.append((t, r["type"], b))
     ev.sort(key=lambda x: x[0])
     return dev, ev
 
@@ -94,7 +94,6 @@ def trials_of(ev):
         m = STEP.match(lab)
         if not m:
             continue
-        d, tr = int(m.group(1)), int(m.group(2))
         sess = end = None
         for t2, l2 in marks[i + 1:]:
             if l2 == "session-up" and sess is None:
@@ -104,8 +103,8 @@ def trials_of(ev):
                 break
             elif STEP.match(l2):
                 break
-        out.append(dict(d=d, tr=tr, t0=t, bt=bt, sess=sess,
-                        end=end if end else t + 30000))
+        out.append(dict(d=int(m.group(1)), tr=int(m.group(2)), t0=t, bt=bt,
+                        sess=sess, end=end if end else t + 30000))
     return out
 
 
@@ -116,40 +115,49 @@ def main():
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
-    if args.list or not args.uploads:
-        picked, rows = newest_pair()
-        if args.list:
-            for r in rows:
-                print(f"{r['upload_id']:44s} {r['device_id'][:8]} "
-                      f"{r['n']:>7} records  {r['a']}..{r['b']}")
-            return
-    uploads = args.uploads or [r["upload_id"] for r in picked]
+    if args.list:
+        for r in candidates():
+            print(f"{r['upload_id']:44s} {r['device_id'][:8]} {r['n']:>7} rec  "
+                  f"{r['a']}..{r['b']}")
+        return
+    uploads = args.uploads
+    if not uploads:
+        picked, seen = [], set()
+        for r in candidates():
+            if r["device_id"] in seen:
+                continue
+            seen.add(r["device_id"])
+            picked.append(r["upload_id"])
+            if len(picked) == 2:
+                break
+        uploads = picked
     if len(uploads) < 2:
-        sys.exit("need two uploads (one per device); use --list / --uploads")
+        sys.exit("need one upload per device — see --list")
+
     until_ms = 4102444800000
     if args.until:
         import datetime as dt
-        until_ms = int(dt.datetime.fromisoformat(args.until + "+00:00").timestamp() * 1000)
+        until_ms = int(dt.datetime.fromisoformat(args.until + "+00:00")
+                       .timestamp() * 1000)
 
     sides = []
     for u in uploads:
         dev, ev = parse(fetch(u), until_ms)
         sides.append(dict(u=u, dev=dev, ev=ev, tw=trials_of(ev)))
         print(f"{u}  device {dev[:8]}  {len(ev)} records  {len(sides[-1]['tw'])} trials")
-    pair = {s["dev"] for s in sides}
-    if len(pair) != 2:
-        sys.exit("the two uploads are the same device — pick one per phone")
+    if len({s["dev"] for s in sides}) != 2:
+        sys.exit("both uploads are the same device — pick one per phone")
+    sides.sort(key=lambda s: -len(s["tw"]))     # the fuller recording first
 
-    # message ledger per side, pair traffic only
     for s in sides:
-        other = next(d for d in pair if d != s["dev"])
+        other = next(x["dev"] for x in sides if x["dev"] != s["dev"])
         sent, ack, recv = {}, {}, []
         for t, ty, b in s["ev"]:
             if ty != "message":
                 continue
-            if b.get("peer") not in (other, None) and b.get("dir") in ("sent", "ackRx"):
-                continue
             d = b.get("dir")
+            if d in ("sent", "ackRx") and b.get("peer") not in (other, None):
+                continue          # traffic with a bystander phone in range
             if d == "sent":
                 sent[b["messageId"]] = t
             elif d == "ackRx":
@@ -159,12 +167,10 @@ def main():
         s.update(sent=sent, ack=ack, recv=recv)
         s["rssi"] = [(t, b["rssi"]) for t, ty, b in s["ev"]
                      if ty == "rssi" and b.get("src") == "conn" and b.get("peer") == other]
-        s["wire"] = [(t, b.get("txBytes", {})) for t, ty, b in s["ev"] if ty == "wire"]
+        s["wire"] = [(t, b.get("txBytes") or {}) for t, ty, b in s["ev"] if ty == "wire"]
         s["power"] = [(t, b) for t, ty, b in s["ev"] if ty == "power"]
         s["link"] = [(t, b) for t, ty, b in s["ev"] if ty == "link"]
 
-    # per-trial attribution
-    for s in sides:
         for w in s["tw"]:
             a, e = w["t0"], w["end"]
             ids = [m for m, t in s["sent"].items() if a <= t < e]
@@ -181,27 +187,42 @@ def main():
             cur = [-b["currentNowUa"] / 1000 for t, b in s["power"]
                    if a <= t < e and not b.get("charging") and b.get("currentNowUa", 0) < 0]
             w["mA"] = statistics.median(cur) if cur else None
-            stages = {}
+            st = {}
             for t, b in s["link"]:
-                evn = b.get("event")
-                if evn in ("discovered", "gattConnected", "session", "usable") \
-                        and w["bt"] and w["bt"] <= t < e and evn not in stages:
-                    stages[evn] = (t - w["bt"]) / 1000
-            w["stages"] = stages
+                n = b.get("event")
+                if n not in ("discovered", "gattConnected", "session", "usable"):
+                    continue
+                # Peer-scope everything that names a peer. gattConnected does
+                # not: a GATT link exists before identity does, so a leg the
+                # PEER dialled lands before its advertisement is ever seen.
+                if b.get("peer") and b["peer"] != other:
+                    continue
+                if w["bt"] and w["bt"] <= t < e and n not in st:
+                    st[n] = (t - w["bt"]) / 1000
+            w["stages"] = st
 
     ds = sorted({w["d"] for s in sides for w in s["tw"]})
 
-    def agg(dist):
-        ws = [w for s in sides for w in s["tw"] if w["d"] == dist]
-        est = [w["estab"] for w in ws if w["estab"] is not None]
-        rssi = [v for w in ws for v in w["rssi"]]
-        return ws, est, rssi
+    def at(s, dist):
+        return [w for w in s["tw"] if w["d"] == dist]
+
+    def direction(sender, receiver, dist):
+        """(delivered, offered, inferred) for sender -> receiver at dist."""
+        sw = at(sender, dist)
+        if sw and sum(w["sent"] for w in sw):
+            return sum(w["acked"] for w in sw), sum(w["sent"] for w in sw), False
+        rw = at(receiver, dist)
+        got = sum(w["recv"] for w in rw)
+        rate = [w["sent"] for w in rw if w["sent"]]
+        if not rw or not rate:
+            return None, None, True
+        return got, round(statistics.median(rate)) * len(rw), True
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams.update({"font.size": 11, "figure.dpi": 110})
-    C_A, C_B = "#2b6cb0", "#dd6b20"
+    COL = ["#2b6cb0", "#dd6b20"]
 
     def save(fig, name):
         fig.tight_layout()
@@ -210,123 +231,159 @@ def main():
         plt.close(fig)
         print(f"wrote {name}.pdf/.png")
 
-    # 1 — establishment
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    for dist in ds:
-        ws, est, _ = agg(dist)
-        ax.scatter([dist] * len(est), est, s=14, alpha=0.5, color=C_A, zorder=3)
-        if est:
-            ax.scatter([dist], [statistics.median(est)], marker="_", s=110,
-                       color="#c53030", linewidths=2.4, zorder=4)
-        ax.annotate(f"{len(est)}/{len(ws)}", (dist, 0.3), ha="center",
-                    fontsize=8, color="#4a5568")
+    # 1 — establishment, per device
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
+    span = max(ds) - min(ds) if len(ds) > 1 else 10
+    jit = span / len(ds) / 6
+    for s, col, off in zip(sides, COL, (-jit, jit)):
+        xs = [w["d"] + off for w in s["tw"] if w["estab"] is not None]
+        ys = [w["estab"] for w in s["tw"] if w["estab"] is not None]
+        ax.scatter(xs, ys, s=15, alpha=0.55, color=col, zorder=3,
+                   label=f"{s['dev'][:8]} ({len(ys)}/{len(s['tw'])} sessions)")
+        mx = [(d, statistics.median([w["estab"] for w in at(s, d)
+                                     if w["estab"] is not None]))
+              for d in ds if any(w["estab"] is not None for w in at(s, d))]
+        ax.plot([d + off for d, _ in mx], [m for _, m in mx], color=col, lw=1.1,
+                alpha=0.85)
     ax.set_xlabel("distance (m)")
     ax.set_ylabel("stack-cold establishment (s)")
-    ax.set_title("Session establishment per trial (bt-on anchored)")
+    ax.set_title("Session establishment per trial (anchored at bt-on)")
     ax.set_xticks(ds)
     ax.grid(alpha=0.25)
     ax.set_ylim(bottom=0)
+    ax.legend(fontsize=9, title="lines are per-distance medians", title_fontsize=8)
     save(fig, "fig_establishment")
 
     # 2 — delivery per direction
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    for s, col, off in zip(sides, (C_A, C_B), (-0.8, 0.8)):
-        xs, ys = [], []
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
+    for (a, b), col in zip(((0, 1), (1, 0)), COL):
+        solid_x, solid_y, inf_x, inf_y = [], [], [], []
         for dist in ds:
-            ws = [w for w in s["tw"] if w["d"] == dist]
-            snt = sum(w["sent"] for w in ws)
-            if snt:
-                xs.append(dist)
-                ys.append(100 * sum(w["acked"] for w in ws) / snt)
-        ax.plot([x + off for x in xs], ys, "o-", color=col, ms=5,
-                label=f"{s['dev'][:8]} → peer (acked/sent)")
+            got, off_, inferred = direction(sides[a], sides[b], dist)
+            if got is None or not off_:
+                continue
+            (inf_x if inferred else solid_x).append(dist)
+            (inf_y if inferred else solid_y).append(100 * got / off_)
+        lbl = f"{sides[a]['dev'][:8]} → {sides[b]['dev'][:8]}"
+        if solid_x:
+            ax.plot(solid_x, solid_y, "o-", color=col, ms=5, label=lbl)
+        if inf_x:
+            ax.plot(inf_x, inf_y, "o--", color=col, ms=6, mfc="white", mew=1.4,
+                    label=f"{lbl} — INFERRED from receipts")
     ax.set_xlabel("distance (m)")
     ax.set_ylabel("delivered (%)")
     ax.set_title("End-to-end delivery per direction")
     ax.set_xticks(ds)
     ax.set_ylim(0, 104)
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=9, loc="lower left")
     save(fig, "fig_delivery")
 
-    # 3 — establishment stages
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    for stage, col in (("discovered", "#718096"), ("gattConnected", "#2b6cb0"),
-                       ("session", "#c53030"), ("usable", "#2f855a")):
+    # 3 — stages
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
+    for stage, col, name in (
+            ("discovered", "#718096", "peer advertisement seen"),
+            ("gattConnected", "#2b6cb0", "GATT link up (either leg, pre-identity)"),
+            ("session", "#c53030", "Noise session"),
+            ("usable", "#2f855a", "pair usable (first message out)")):
         xs, ys = [], []
         for dist in ds:
-            vals = [w["stages"][stage] for s in sides for w in s["tw"]
-                    if w["d"] == dist and stage in w["stages"]]
-            if vals:
+            v = [w["stages"][stage] for s in sides for w in at(s, dist)
+                 if stage in w["stages"]]
+            if v:
                 xs.append(dist)
-                ys.append(statistics.median(vals))
-        ax.plot(xs, ys, "o-", ms=4, color=col, label=stage)
+                ys.append(statistics.median(v))
+        if xs:
+            ax.plot(xs, ys, "o-", ms=4, color=col, label=name)
     ax.set_xlabel("distance (m)")
     ax.set_ylabel("median seconds after bt-on")
     ax.set_title("Control-plane stages to a usable pair")
+    ax.text(0.01, -0.235, "GATT can precede discovery: the leg the peer dials "
+            "lands before its advertisement is seen.", transform=ax.transAxes,
+            fontsize=8, color="#4a5568")
     ax.set_xticks(ds)
     ax.grid(alpha=0.25)
     ax.legend(fontsize=9)
     save(fig, "fig_stages")
 
-    # 4 — control-plane bytes a trial + power
-    classes = sorted({k for s in sides for w in s["tw"] for k in w["wire"]})
-    ctrl = [c for c in classes if c != "secure"]
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    # 4 — control bytes by class, with the data plane overlaid
+    present = [c for c in CTRL_ORDER
+               if any(w["wire"].get(c) for s in sides for w in s["tw"])]
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
     bottom = {d: 0.0 for d in ds}
-    palette = ["#2b6cb0", "#dd6b20", "#2f855a", "#718096", "#b83280", "#975a16"]
-    for c, col in zip(ctrl, palette):
+    palette = ["#2b6cb0", "#dd6b20", "#718096", "#2f855a", "#b83280"]
+    width = (span / len(ds)) * 0.62 if len(ds) > 1 else 6
+    for c, col in zip(present, palette):
         ys = []
         for dist in ds:
-            vals = [w["wire"].get(c, 0) for s in sides for w in s["tw"] if w["d"] == dist]
-            ys.append(statistics.median(vals) / 1000 if vals else 0)
-        ax1.bar(ds, ys, 6.5, bottom=[bottom[d] for d in ds], label=c, color=col)
+            v = [w["wire"].get(c, 0) for s in sides for w in at(s, dist)]
+            ys.append(statistics.median(v) / 1000 if v else 0)
+        ax.bar(ds, ys, width, bottom=[bottom[d] for d in ds], label=c, color=col)
         for d, y in zip(ds, ys):
             bottom[d] += y
-    ax1.set_xlabel("distance (m)")
-    ax1.set_ylabel("kB per trial (median, tx)")
-    ax1.set_title("Control plane on the wire")
-    ax1.set_xticks(ds)
-    ax1.legend(fontsize=8)
-    ax1.grid(alpha=0.25, axis="y")
-    xs, ys = [], []
+    dat = []
     for dist in ds:
-        vals = [w["mA"] for s in sides for w in s["tw"] if w["d"] == dist and w["mA"]]
-        if vals:
-            xs.append(dist)
-            ys.append(statistics.median(vals))
-    ax2.plot(xs, ys, "o-", color=C_A, ms=5)
-    ax2.set_xlabel("distance (m)")
-    ax2.set_ylabel("median discharge (mA)")
-    ax2.set_title("Power during the dwell")
-    ax2.set_xticks(ds)
-    ax2.set_ylim(bottom=0)
-    ax2.grid(alpha=0.25)
-    save(fig, "fig_control_power")
+        v = [w["wire"].get(DATA_CLASS, 0) for s in sides for w in at(s, dist)]
+        dat.append(statistics.median(v) / 1000 if v else 0)
+    ax.plot(ds, dat, "k^--", ms=5, lw=1.2, label=f"{DATA_CLASS} (data plane)")
+    ax.set_xlabel("distance (m)")
+    ax.set_ylabel("kB transmitted per trial (median)")
+    ax.set_title("Control plane on the wire, by packet class")
+    ax.set_xticks(ds)
+    ax.grid(alpha=0.25, axis="y")
+    ax.set_ylim(0, max(bottom.values()) * 1.34)
+    ax.legend(fontsize=9, ncol=3, loc="upper center", framealpha=0.95)
+    ctrl_tot = statistics.median(list(bottom.values()))
+    dat_tot = statistics.median(dat)
+    if dat_tot:
+        ax.set_xlabel(f"distance (m)          control : data = "
+                      f"{ctrl_tot / dat_tot:.1f} : 1 at this load")
+    save(fig, "fig_control_bytes")
 
-    # 5 — path loss
+    # 5 — power
+    fig, ax = plt.subplots(figsize=(7.6, 4.0))
+    for s, col in zip(sides, COL):
+        xs, ys = [], []
+        for dist in ds:
+            v = [w["mA"] for w in at(s, dist) if w["mA"]]
+            if v:
+                xs.append(dist)
+                ys.append(statistics.median(v))
+        if xs:
+            ax.plot(xs, ys, "o-", color=col, ms=5, label=s["dev"][:8])
+    ax.set_xlabel("distance (m)")
+    ax.set_ylabel("median discharge during dwell (mA)")
+    ax.set_title("Power")
+    ax.set_xticks(ds)
+    ax.set_ylim(bottom=0)
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=9)
+    save(fig, "fig_power")
+
+    # 6 — path loss
     med = {}
     for dist in ds:
-        _, _, rssi = agg(dist)
-        if rssi:
-            med[dist] = statistics.median(rssi)
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+        v = [x for s in sides for w in at(s, dist) for x in w["rssi"]]
+        if v:
+            med[dist] = statistics.median(v)
+    fig, ax = plt.subplots(figsize=(7.6, 4.3))
     n = A = sigma = None
     if len(med) >= 3:
         xs = [math.log10(d) for d in med]
         ys = list(med.values())
         mx, my = statistics.mean(xs), statistics.mean(ys)
-        sl = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
-        A = my - sl * mx
-        n = -sl / 10
+        sl = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / \
+            sum((x - mx) ** 2 for x in xs)
+        A, n = my - sl * mx, -sl / 10
         res = [y - (A + sl * x) for x, y in zip(xs, ys)]
         sigma = (sum(r * r for r in res) / max(1, len(res) - 2)) ** 0.5
-        dd = [min(med) * 10 ** (i / 40) for i in range(0, 45)]
-        ax.plot(dd, [A + sl * math.log10(x) for x in dd], color=C_A, lw=1.2,
-                label=f"fit: {A:.1f} − {-sl:.1f}·log₁₀d  (n={n:.2f}, σ={sigma:.1f} dB)")
+        dd = [min(med) * 10 ** (i / 40) for i in range(46)]
+        ax.plot(dd, [A + sl * math.log10(x) for x in dd], color=COL[0], lw=1.3,
+                label=f"fit: {A:.1f} − {-sl:.1f}·log₁₀d   n={n:.2f}, σ={sigma:.1f} dB")
         ax.plot(dd, [PIXEL_FIT[0] + PIXEL_FIT[1] * math.log10(x) for x in dd],
-                ls="--", color="#c53030", lw=1.2, label="Pixel 10 Pro, July (n=1.82)")
-    ax.scatter(list(med), list(med.values()), color=C_A, zorder=3, label="median conn-RSSI")
+                "--", color="#c53030", lw=1.2, label="Pixel 10 Pro, July (n=1.82)")
+    ax.scatter(list(med), list(med.values()), color=COL[0], zorder=3,
+               label="median conn-RSSI")
     ax.set_xscale("log")
     ax.set_xticks(ds)
     ax.set_xticklabels(ds)
@@ -337,40 +394,50 @@ def main():
     ax.legend(fontsize=9)
     save(fig, "fig_path_loss")
 
-    # summary CSV + stdout table
+    # summary
+    A_, B_ = sides[0]["dev"][:8], sides[1]["dev"][:8]
     with open(os.path.join(HERE, "summary.csv"), "w", newline="") as f:
-        wcsv = csv.writer(f)
-        wcsv.writerow(["distance_m", "trials", "sessions", "estab_median_s",
-                       "estab_max_s", "sent_AtoB", "acked_AtoB", "sent_BtoA",
-                       "acked_BtoA", "rssi_median_dBm", "ctrl_kB_trial", "mA_median"])
-        print(f"\n{'d':>4} {'sess':>7} {'estab':>7} {'A→B':>9} {'B→A':>9} {'rssi':>6}")
+        wr = csv.writer(f)
+        wr.writerow(["distance_m", "trials", "sessions", "estab_median_s",
+                     "estab_max_s", f"{A_}_to_{B_}_delivered", f"{A_}_to_{B_}_offered",
+                     f"{B_}_to_{A_}_delivered", f"{B_}_to_{A_}_offered",
+                     "reverse_inferred", "rssi_median_dBm",
+                     "ctrl_kB_per_trial", "data_kB_per_trial", "mA_median"])
+        print(f"\n{'d':>5} {'sessions':>9} {'estab':>7} {'A→B':>10} {'B→A':>12} "
+              f"{'rssi':>6} {'ctrl kB':>8}")
+        tot = collections.Counter()
         for dist in ds:
-            ws, est, rssi = agg(dist)
-            per_side = []
-            for s in sides:
-                sws = [w for w in s["tw"] if w["d"] == dist]
-                per_side.append((sum(w["sent"] for w in sws),
-                                 sum(w["acked"] for w in sws)))
-            ctrl_kb = statistics.median(
-                [sum(v for k, v in w["wire"].items() if k != "secure") / 1000
-                 for w in ws]) if ws else 0
+            ws = [w for s in sides for w in at(s, dist)]
+            est = [w["estab"] for w in ws if w["estab"] is not None]
+            rssi = [x for w in ws for x in w["rssi"]]
+            fwd = direction(sides[0], sides[1], dist)
+            rev = direction(sides[1], sides[0], dist)
+            ctrl = statistics.median([sum(v for k, v in w["wire"].items()
+                                          if k != DATA_CLASS) / 1000 for w in ws]) if ws else 0
+            data = statistics.median([w["wire"].get(DATA_CLASS, 0) / 1000
+                                      for w in ws]) if ws else 0
             mas = [w["mA"] for w in ws if w["mA"]]
-            wcsv.writerow([dist, len(ws), len(est),
-                           round(statistics.median(est), 2) if est else "",
-                           round(max(est), 2) if est else "",
-                           per_side[0][0], per_side[0][1],
-                           per_side[1][0], per_side[1][1],
-                           statistics.median(rssi) if rssi else "",
-                           round(ctrl_kb, 2),
-                           round(statistics.median(mas)) if mas else ""])
-            print(f"{dist:>4} {len(est):>3}/{len(ws):<3} "
-                  f"{statistics.median(est):>7.2f} " if est else f"{dist:>4} {0:>3}/{len(ws):<3} {'-':>7} ",
-                  end="")
-            print(f"{per_side[0][1]:>4}/{per_side[0][0]:<4} "
-                  f"{per_side[1][1]:>4}/{per_side[1][0]:<4} "
-                  f"{statistics.median(rssi) if rssi else float('nan'):>6.1f}")
+            wr.writerow([dist, len(ws), len(est),
+                         round(statistics.median(est), 2) if est else "",
+                         round(max(est), 2) if est else "",
+                         fwd[0] if fwd[0] is not None else "", fwd[1] or "",
+                         rev[0] if rev[0] is not None else "", rev[1] or "",
+                         "yes" if rev[2] else "no",
+                         statistics.median(rssi) if rssi else "",
+                         round(ctrl, 2), round(data, 2),
+                         round(statistics.median(mas)) if mas else ""])
+            tot["fwd_g"] += fwd[0] or 0; tot["fwd_o"] += fwd[1] or 0
+            tot["rev_g"] += rev[0] or 0; tot["rev_o"] += rev[1] or 0
+            e_txt = f"{statistics.median(est):7.2f}" if est else f"{'-':>7}"
+            r_txt = f"{rev[0]}/{rev[1]}{'*' if rev[2] else ''}" if rev[0] is not None else "-"
+            print(f"{dist:>5} {len(est):>4}/{len(ws):<4} {e_txt} "
+                  f"{str(fwd[0]) + '/' + str(fwd[1]):>10} {r_txt:>12} "
+                  f"{statistics.median(rssi) if rssi else float('nan'):>6.1f} "
+                  f"{ctrl:>8.2f}")
+    print(f"\ntotals   {A_}→{B_} {tot['fwd_g']}/{tot['fwd_o']}"
+          f"   {B_}→{A_} {tot['rev_g']}/{tot['rev_o']}   (* = inferred from receipts)")
     if n is not None:
-        print(f"\npath loss: n={n:.2f}, A={A:.1f} dBm, σ={sigma:.1f} dB")
+        print(f"path loss: n={n:.2f}  A={A:.1f} dBm  σ={sigma:.1f} dB")
     print("wrote summary.csv")
 
 

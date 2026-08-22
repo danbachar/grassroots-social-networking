@@ -201,6 +201,97 @@ void main() {
     });
   });
 
+  group('operator stack-reset verification', () {
+    FieldPlan resetPlan() => FieldPlan(
+          expId: 'reset-ui-1',
+          settleSec: 0,
+          manualJoin: true,
+          placementSec: 60,
+          alignSec: 60,
+          resetBudgetSec: 5,
+          walkBudgetSec: 120,
+          stackResetPerPosition: true,
+          steps: const [
+            FieldStep(label: 'd=10 t1', dwellSec: 30),
+            FieldStep(label: 'd=20 t1', dwellSec: 30),
+          ],
+        );
+
+    test('a full off-then-on cycle flips the prompt to done', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final radio = StreamController<bool>.broadcast(sync: true);
+        final runner = FieldRunner(
+          recorder: recorder,
+          bleUsable: () => true,
+          bleUsableChanges: radio.stream,
+          myNickname: '1',
+        );
+        runner.start(resetPlan());
+        async.flushMicrotasks();
+
+        expect(runner.phase, FieldPhase.placement);
+        expect(runner.stackResetDone, isFalse,
+            reason: 'the radio has only been seen up; nothing was reset');
+
+        radio.add(true);
+        async.flushMicrotasks();
+        expect(runner.stackResetDone, isFalse,
+            reason: 'up without a preceding down is not a reset');
+
+        radio.add(false);
+        async.flushMicrotasks();
+        expect(runner.stackResetDone, isFalse,
+            reason: 'half a cycle: the radio is still down');
+
+        radio.add(true);
+        async.flushMicrotasks();
+        expect(runner.stackResetDone, isTrue);
+
+        runner.dispose();
+        radio.close();
+      });
+    });
+
+    test('each walk window owes its own reset', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final radio = StreamController<bool>.broadcast(sync: true);
+        final runner = FieldRunner(
+          recorder: recorder,
+          bleUsable: () => true,
+          bleUsableChanges: radio.stream,
+          myNickname: '1',
+        );
+        runner.start(resetPlan());
+        async.flushMicrotasks();
+
+        radio.add(false);
+        radio.add(true);
+        async.flushMicrotasks();
+        expect(runner.stackResetDone, isTrue,
+            reason: 'reset during placement, verified');
+
+        // Through placement and the d=10 dwell, into the walk to d=20.
+        while (runner.phase != FieldPhase.positioning) {
+          async.elapse(const Duration(seconds: 5));
+          async.flushMicrotasks();
+          if (!runner.isRunning) fail('run ended before the walk window');
+        }
+        expect(runner.stackResetDone, isFalse,
+            reason: 'the new position has not been reset yet');
+
+        radio.add(false);
+        radio.add(true);
+        async.flushMicrotasks();
+        expect(runner.stackResetDone, isTrue);
+
+        runner.dispose();
+        radio.close();
+      });
+    });
+  });
+
   test('nextMove is null once there is nothing left to walk to', () {
     fakeAsync((async) {
       final recorder = _FakeRecorder();

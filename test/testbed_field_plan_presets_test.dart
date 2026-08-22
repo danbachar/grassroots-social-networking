@@ -1123,9 +1123,24 @@ void main() {
     test('the dropdown entry carries the defaults', () {
       final preset =
           FieldPlanPresets.presets[FieldPlanPresets.lineSweepPresetName]!;
-      expect(preset.steps.last.label, 'd=120 t3');
+      expect(preset.steps.last.label, 'd=120 t10');
       expect(preset.manualJoin, isTrue,
           reason: 'the sweep runs on the clock, with no taps');
+    });
+
+    test('the untouched pickers ARE the thesis run', () {
+      // Selecting the preset and launching, with no field edited, must
+      // produce the full thesis slate: the run that shipped with repeats
+      // defaulting to 3 measured a third of the design without any screen
+      // saying so.
+      final plan = FieldPlanPresets.lineSweepUpTo();
+      expect(plan.steps, hasLength(120), reason: '12 distances x 10 trials');
+      expect(plan.steps.every((s) => s.sendCount == 100), isTrue,
+          reason: '100 a trial, 1000 a distance, in each direction');
+      expect(plan.steps.every((s) => s.sendTo == 'all'), isTrue,
+          reason: 'both phones send unless a receiver prefix narrows it');
+      expect(plan.stackResetPerPosition, isTrue);
+      expect(plan.steps.last.label, 'd=120 t10');
     });
   });
 }

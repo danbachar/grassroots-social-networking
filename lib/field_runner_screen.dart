@@ -220,7 +220,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('PLACE THE PHONES',
+        const Text('PLACEMENT TIME — PLACE THE PHONES',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white54, fontSize: 24)),
         const SizedBox(height: 10),
@@ -307,28 +307,40 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   /// observer's bt-off/bt-on markers are the trace-side record.
   Widget _stackResetPrompt(FieldRunner runner) {
     final up = runner.radioUp;
+    final done = runner.stackResetDone;
+    final color = done
+        ? Colors.green.shade800
+        : up
+            ? Colors.orange.shade900
+            : Colors.blueGrey.shade800;
+    final title = done
+        ? 'RESET DONE — leave Bluetooth ON'
+        : up
+            ? 'BT RESET TIME — toggle Bluetooth OFF, then ON'
+            : 'BLUETOOTH IS OFF — toggle it back ON';
+    final detail = done
+        ? 'the off-and-back-on cycle registered; nothing more to do here'
+        : up
+            ? 'radio is up — the reset for this position has not happened '
+                'until it goes down and comes back'
+            : 'good — now bring it back up before the countdown ends';
     return Container(
       margin: const EdgeInsets.only(top: 14),
       padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
       decoration: BoxDecoration(
-        color: up ? Colors.orange.shade900 : Colors.blueGrey.shade800,
+        color: color,
         borderRadius: BorderRadius.circular(10),
       ),
       child: Column(children: [
         Text(
-          up
-              ? 'RESET BLUETOOTH NOW — toggle OFF, then ON'
-              : 'BLUETOOTH IS OFF — toggle it back ON',
+          title,
           textAlign: TextAlign.center,
           style: const TextStyle(
               color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800),
         ),
         const SizedBox(height: 4),
         Text(
-          up
-              ? 'radio is up — the reset for this position has not happened '
-                  'until it goes down and comes back'
-              : 'good — now bring it back up before the countdown ends',
+          detail,
           textAlign: TextAlign.center,
           style: const TextStyle(color: Colors.white70, fontSize: 14),
         ),
@@ -367,6 +379,11 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         Text('${_mmss(runner.remainingSec)} left in this trial',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        Text(
+            'measurement time — do not touch Bluetooth'
+            ' · step ${runner.stepIndex + 1}/${widget.plan.steps.length}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white38, fontSize: 16)),
         if (move != null) ...[
           const SizedBox(height: 18),
           Text('then walk to ${move.label} — be there ${_hhmmss(move.atMs)}',
@@ -399,6 +416,17 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         Icon(late ? Icons.directions_run : Icons.directions_walk,
             color: late ? Colors.redAccent : Colors.orangeAccent, size: 64),
         const SizedBox(height: 14),
+        Text(
+            runner.wantsStackReset
+                ? 'WALK WINDOW — BT RESET HAPPENS NOW'
+                : 'WALK WINDOW',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        const SizedBox(height: 6),
         FittedBox(
           child: Text(late ? 'BE AT ${move.label} NOW' : 'MOVE TO ${move.label} IN',
               style: TextStyle(

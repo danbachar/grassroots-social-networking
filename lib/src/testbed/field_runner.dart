@@ -304,6 +304,11 @@ class FieldRunner extends ChangeNotifier {
   StreamSubscription<bool>? _btSub;
   bool _btOnSeen = false;
   bool _radioUp = false;
+  // Operator stack-reset verification for the open placement/walk window:
+  // down then up observed while the window is open. The runner's own
+  // scripted resets are excluded via [_resetting].
+  bool _resetDownSeen = false;
+  bool _resetCycleDone = false;
 
   /// ACKed sends in the current saturating step (throughput numerator).
   int get ackedCount => _ackedCount;
@@ -372,6 +377,12 @@ class FieldRunner extends ChangeNotifier {
   /// markers the radio observer stamps are the per-position record of
   /// whether the reset actually happened.
   bool get wantsStackReset => _plan?.stackResetPerPosition ?? false;
+
+  /// Whether the operator's full off-then-on Bluetooth cycle has been
+  /// observed during the current placement/walk window. The screen flips
+  /// the reset prompt to DONE on this, so a completed reset cannot be
+  /// mistaken for one still owed.
+  bool get stackResetDone => _resetCycleDone;
 
   /// When the operator has to be standing somewhere new, and where.
   ///
@@ -513,6 +524,8 @@ class FieldRunner extends ChangeNotifier {
         if (myNickname != null && myNickname!.isNotEmpty) 'nick': myNickname,
       });
       _startRadioObserver();
+      _resetDownSeen = false;
+      _resetCycleDone = false;
       _phase = FieldPhase.placement;
       _countdownToMs(anchor - resetMs, () => inPosition());
       _notify();
@@ -548,6 +561,16 @@ class FieldRunner extends ChangeNotifier {
       if (up == _radioUp) return;
       _radioUp = up;
       if (up) _btOnSeen = true;
+      if (wantsStackReset &&
+          !_resetting &&
+          (_phase == FieldPhase.placement ||
+              _phase == FieldPhase.positioning)) {
+        if (!up) {
+          _resetDownSeen = true;
+        } else if (_resetDownSeen) {
+          _resetCycleDone = true;
+        }
+      }
       await recorder.logMarker(up ? 'bt-on' : 'bt-off', extra: {
         if (joinOrder != null) 'order': joinOrder,
       });
@@ -580,6 +603,8 @@ class FieldRunner extends ChangeNotifier {
   /// tap still skips the remaining gap. Otherwise the runner waits for the
   /// tap that marks "I reached the new position".
   void _enterPositioning() {
+    _resetDownSeen = false;
+    _resetCycleDone = false;
     _phase = FieldPhase.positioning;
     if (manualJoin && _stepStartMs != null) {
       // The gap counts down to the instant the next step's resets open, which
@@ -710,6 +735,9 @@ class FieldRunner extends ChangeNotifier {
         'popN': step.cliqueN,
       if (step.maxParallelDials != null) 'rep': _repOf(step.label),
     });
+    // Everything up to this step marker is on disk before the step runs: a
+    // dead process costs the current step, not the run.
+    unawaited(recorder.flush());
     if (step.bulk) onStartBulk?.call();
     _phase = FieldPhase.dwelling;
     // No dead-radio watchdog in manual mode: the radio being down is the

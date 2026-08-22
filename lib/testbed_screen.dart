@@ -864,7 +864,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
   int _sweepStartDistance = 10;
   int _sweepMaxDistance = 120;
   int _sweepStepMetres = 10;
-  int _sweepTrials = 3;
+  int _sweepTrials = 10;
   String? _selectedPreset;
 
   late final TextEditingController _sweepReceiverController =

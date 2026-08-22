@@ -91,6 +91,25 @@ void main() {
     });
   });
 
+  test('a run is on disk from its first record, so a crash cannot free its '
+      'id', () async {
+    await recorder.startExperiment('fall-1');
+    await recorder.logMarker('pre-fall position');
+    // No stop: the process dies here. The relaunch sees the file and steps
+    // the id on — reusing it would record the new run where the dead one's
+    // upload expects its own records.
+    final relaunched = ExperimentRecorder();
+    await relaunched.startExperiment('fall-1');
+    expect(relaunched.experimentId, 'fall-2');
+    await relaunched.stopExperiment();
+
+    final paths = await recorder.experimentFilePaths();
+    final first = readJsonl(
+        paths.singleWhere((p) => p.endsWith('/exp_fall-1.jsonl')));
+    expect(first.first['event'], 'expStart',
+        reason: 'the birth record is durable before anything else happens');
+  });
+
   test('records land in the experiment file while recording', () async {
     expect(recorder.active, isFalse);
     await recorder.startExperiment('cp-line-1');

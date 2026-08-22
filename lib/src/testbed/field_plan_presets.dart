@@ -959,7 +959,7 @@ class FieldPlanPresets {
     int startDistance = 10,
     int maxDistance = 120,
     int stepMetres = 10,
-    int trials = 3,
+    int trials = 10,
     String? receiverPrefix,
   }) {
     final step = stepMetres < 1 ? 1 : stepMetres;

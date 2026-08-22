@@ -244,6 +244,10 @@ class ExperimentRecorder {
     for (final r in linkSnapshot?.call() ?? const []) {
       await log(r);
     }
+    // The file exists on disk from the first record: [_freeExperimentId]
+    // reads a missing file as a free id, so a run that crashed before its
+    // first flush would otherwise hand its id to the next launch.
+    await _writeBufferToDisk();
     final probe = powerProbe;
     if (probe != null) {
       Future<void> sample() async {

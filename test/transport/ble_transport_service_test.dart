@@ -8,6 +8,7 @@ import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/store/app_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart'
     show
+        BleDeviceDiscoveredAction,
         BleDeviceRemovedAction,
         FriendEstablishedAction,
         PeerAnnounceReceivedAction;
@@ -21,6 +22,27 @@ import 'package:grassroots_networking/src/transport/transport_service.dart'
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
+import 'package:grassroots_networking/src/trace/experiment_recorder.dart';
+
+/// An active recorder that keeps every record in memory: the dial grid's
+/// whole measurement is what the `link` records carry, so the assertions are
+/// on the records themselves, not on a file.
+class _CapturingTrace extends ExperimentRecorder {
+  final List<Map<String, dynamic>> records = [];
+  bool _active = false;
+
+  @override
+  bool get active => _active;
+
+  @override
+  Future<void> startExperiment(String id) async => _active = true;
+
+  @override
+  Future<void> stopExperiment() async => _active = false;
+
+  @override
+  Future<void> log(Map<String, dynamic> record) async => records.add(record);
+}
 
 /// Records the sequence of host API calls so tests can assert them.
 class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
@@ -77,9 +99,17 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
     calls.add('disconnect:${request.pathId}');
   }
 
+  /// Path ids whose writes are refused, as the plugin refuses them: a throw
+  /// raised while validating the path or when the stack will not take the
+  /// buffer — always BEFORE any byte reaches the controller.
+  final Set<String> refuse = {};
+
   @override
   Future<void> send(BleSendRequest request) async {
     calls.add('send:${request.pathId}:${request.value.length}');
+    if (refuse.contains(request.pathId)) {
+      throw StateError('refused write on ${request.pathId}');
+    }
   }
 
   @override
@@ -91,6 +121,12 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   @override
   Future<void> dispose() async {
     calls.add('dispose');
+  }
+
+  @override
+  Future<bool> restartAdapter() async {
+    calls.add('restartAdapter');
+    return true;
   }
 }
 
@@ -358,8 +394,8 @@ void main() {
     });
 
     test(
-        'a fresh advertisement after a failed dial immediately triggers '
-        'another dial (no backoff)', () async {
+        'a fresh advertisement inside the cooldown after a failed dial does '
+        'not redial', () async {
       const remoteId = 'AABBCC';
       const pathId = 'central:$remoteId';
       const serviceUuid = '84c40316-0871-e5ad-2222-000000000000';
@@ -386,9 +422,10 @@ void main() {
       ));
       await Future<void>.delayed(Duration.zero);
 
-      // The next ad must re-fire the dial — there is no rate-limit window
-      // beyond the in-flight cap and the standard isConnecting / isConnected
-      // gates. The application layer owns retry pacing.
+      // The next ad inside the cooldown must NOT re-fire the dial: a failed
+      // connectGatt holds a native GATT slot for its full timeout, so
+      // redialing on every scan tick (the scanner runs allowDuplicates)
+      // exhausts the table. The address is retried once the cooldown elapses.
       callbacks.pushAdvertisement(BleAdvertisement(
         remoteId: remoteId,
         serviceUuids: [serviceUuid],
@@ -398,7 +435,162 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       expect(
-          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(2));
+          hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
+    test('a failed central dial keeps the address but cools down the redial',
+        () async {
+      const remoteId = 'DEADADDR';
+      const pathId = 'central:$remoteId';
+      const serviceUuid = '84c40316-0871-e5ad-8888-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true);
+      final dialsAfterFirst =
+          hostApi.calls.where((c) => c == 'connect:$remoteId').length;
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT_ERROR(133)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The failed address is EVICTED — the measured cause of a fast failure
+      // is an address nobody on the air owns any more, and a dead entry
+      // lingering in discovery would be dialed ahead of the peer's live one.
+      // The cooldown record survives the eviction; the rest of this test is
+      // the alive case.
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), false,
+          reason: 'A failed dial evicts the dead address.');
+
+      // An address that re-advertises after failing is ALIVE: it re-enters
+      // discovery, and the cooldown is what keeps it off the GATT slot table
+      // until it elapses.
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: remoteId,
+        serviceUuids: [serviceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'Re-advertising proves the address is alive; it re-enters.');
+      final dialsAfterCooldownAd =
+          hostApi.calls.where((c) => c == 'connect:$remoteId').length;
+      expect(dialsAfterCooldownAd, dialsAfterFirst,
+          reason: 'Within the cooldown, a re-advertisement of the same address '
+              'is not redialed.');
+    });
+
+    test('a dead address is evicted and the newest sighting dialed at once',
+        () async {
+      const uuid = '84c40316-0871-e5ad-1111-000000000000';
+
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'OLDRPA',
+        serviceUuids: [uuid],
+        rssi: -40,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:OLDRPA'), hasLength(1));
+
+      // The peer's fresh address arrives while the doomed dial is in flight.
+      // Strictly newer information than the sighting that produced the dial.
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'NEWRPA',
+        serviceUuids: [uuid],
+        rssi: -41,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      callbacks.pushPath(BlePath(
+        pathId: 'central:OLDRPA',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -40,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT status 133 (GATT_ERROR generic)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The dead address leaves; the chase dials the live one without
+      // waiting out any cooldown — the cooldown belongs to addresses that
+      // answer, and this one demonstrably does not.
+      expect(store.state.peers.discoveredBlePeers.containsKey('central:OLDRPA'),
+          isFalse,
+          reason: 'nobody on the air owns the failed address any more');
+      // Exactly one dial at the live address — the chase fired without any
+      // cooldown wait, and it never double-dials one already in flight.
+      expect(hostApi.calls.where((c) => c == 'connect:NEWRPA'), hasLength(1),
+          reason: 'the identity is still here, under its new address');
+    });
+
+    test('a failed dial with no newer sighting waits, as before', () async {
+      const uuid = '84c40316-0871-e5ad-3333-000000000000';
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'ONLYRPA',
+        serviceUuids: [uuid],
+        rssi: -50,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      final dials = hostApi.calls.where((c) => c.startsWith('connect:')).length;
+
+      callbacks.pushPath(BlePath(
+        pathId: 'central:ONLYRPA',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: -50,
+        mtu: 23,
+        canSend: false,
+        error: 'GATT status 133 (GATT_ERROR generic)',
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')).length, dials,
+          reason: 'nothing newer to chase; the next advertisement decides');
+    });
+
+    test('a failed peripheral path does NOT drop a discovered address',
+        () async {
+      // Planted under the peripheral pathId so the two keys coincide: the
+      // dial-failure cooldown is gated on the central role, so an inbound
+      // peripheral failure must not touch this address.
+      const pathId = 'peripheral:INBOUND';
+      store.dispatch(BleDeviceDiscoveredAction(
+        deviceId: pathId,
+        rssi: -55,
+        serviceUuid: '84c40316-0871-e5ad-9999-000000000000',
+      ));
+
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.peripheral,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+        error: 'Connection timed out.',
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(store.state.peers.discoveredBlePeers.containsKey(pathId), true,
+          reason: 'Only our own dial exhausts GATT slots. A failure on an '
+              'inbound leg says nothing about whether that address is dialable.');
     });
 
     test(
@@ -823,6 +1015,229 @@ void main() {
               'inbound link is live.');
     });
 
+    test(
+        'a reverse dial that starts and dies before ready retries ONCE at '
+        'the freshly advertised MAC', () async {
+      // The measured failure mode: the over-ACL dial to the peer's
+      // connection address connects and drops in milliseconds. Before this
+      // retry existed, nothing fired until the next advertisement election
+      // — which is where the pair's convergence time was going.
+      const advertisingMac = 'AA:BB:CC:DD:EE:11';
+      const connectionMac = '99:88:77:66:55:12';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // The sighting itself dials now (no leg-order election). Settle that
+      // dial as gone — a plain disconnect, not `failed`, so no cooldown is
+      // armed against the advertised address — before the scenario begins.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.disconnected,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
+          hasLength(1));
+
+      // The over-ACL dial dies before ready.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$connectionMac',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          hasLength(1),
+          reason: 'the death of the over-ACL dial must immediately retry at '
+              'the advertised MAC, not wait for the next election');
+
+      // And only once: a second death of the SAME pathId retries nothing.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$connectionMac',
+        role: BleRole.central,
+        state: BlePathState.failed,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:$advertisingMac'),
+          hasLength(1),
+          reason: 'one retry per registered reverse dial — the advertisement '
+              'election owns everything after');
+    });
+
+    test(
+        'a dial wedged in connecting is cancelled when the inbound leg wins, '
+        'and the reverse leg opens at once', () async {
+      // The measured wedge: our dial sits in `connecting` for its full 20 s
+      // timeout while the peer's dial has already landed. The inbound READY
+      // leg is proof the race is lost; waiting out the timeout kept
+      // dual-role convergence at ~21 s on a link whose session was up in
+      // under 3 s.
+      const advertisingMac = 'AA:BB:CC:DD:EE:21';
+      const connectionMac = '99:88:77:66:55:22';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // The sighting dialed; the plugin reports it stuck in `connecting`.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.connecting,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      // The peer's dial wins: our peripheral leg comes up and identifies.
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:central:')),
+          ['disconnect:central:$advertisingMac'],
+          reason: 'the wedged dial is torn down, not waited out');
+      expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
+          hasLength(1),
+          reason: 'the reverse leg opens over the winning ACL immediately — '
+              'the cancelled dial no longer counts as the pair\'s central');
+    });
+
+    test('a dial past connecting is left to finish, not cancelled', () async {
+      const advertisingMac = 'AA:BB:CC:DD:EE:31';
+      const connectionMac = '99:88:77:66:55:32';
+
+      final peerIdentity = await _makeIdentity('Remote');
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: advertisingMac,
+        serviceUuids: [peerIdentity.bleServiceUuid],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // The dial has already CONNECTED — 140 ms of GATT setup from ready.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:$advertisingMac',
+        role: BleRole.central,
+        state: BlePathState.connected,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:$connectionMac',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 517,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peerIdentity.publicKey,
+        nickname: 'Remote',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:$connectionMac',
+      ));
+      hostApi.calls.clear();
+      transport.onPeerIdentified(
+          'peripheral:$connectionMac', peerIdentity.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'a progressing dial is never sacrificed');
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'the pair still has its one central in flight');
+    });
+
+    test('the connect leash scales with the sighting RSSI', () {
+      // Anchors from the field path-loss fit (RSSI = -30 - 32.3 log d):
+      // touching distance gets ~2 s, the 45 m fringe keeps the full 20 s.
+      expect(BleTransportService.connectTimeoutForRssi(-30),
+          const Duration(seconds: 2));
+      expect(BleTransportService.connectTimeoutForRssi(-40),
+          const Duration(seconds: 2));
+      expect(BleTransportService.connectTimeoutForRssi(-85),
+          const Duration(seconds: 20));
+      expect(BleTransportService.connectTimeoutForRssi(-100),
+          const Duration(seconds: 20));
+      // Midpoint: linear in dB.
+      expect(
+          BleTransportService.connectTimeoutForRssi(-62).inMilliseconds, 10800);
+      // No reading — and every iOS dial — stays patient: CoreBluetooth can
+      // legitimately take 10-15 s.
+      expect(BleTransportService.connectTimeoutForRssi(null),
+          const Duration(seconds: 20));
+    });
+
+    test('two sides of one pair get different leashes from their own readings',
+        () {
+      // Directional asymmetry is measured at several dB on every pair; the
+      // deadlock's fix is exactly that the shorter leash frees its advertiser
+      // first, so equal leashes would be the failure mode.
+      final a = BleTransportService.connectTimeoutForRssi(-44);
+      final b = BleTransportService.connectTimeoutForRssi(-52);
+      expect(a, isNot(b));
+      expect(b - a, const Duration(milliseconds: 3200));
+    });
+
     test('dead-path payloads are dropped (no resurrected ANNOUNCE)', () async {
       const pathId = 'central:DEADBEEF';
 
@@ -964,6 +1379,83 @@ void main() {
       expect(hostApi.calls.where((c) => c == 'connect:$friendRemoteId'),
           hasLength(1));
     });
+
+    test('closed trust scans ONLY for its friends\' derived UUIDs', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      expect(hostApi.scanRequests, hasLength(1));
+      final request = hostApi.scanRequests.single;
+      // The prefix stays — it is what makes the filter a Grassroots filter —
+      // but the scan now carries the friend's candidate UUIDs, so a stranger's
+      // advertisement is dropped by the scanner and never reaches us.
+      expect(request.serviceUuidPrefix,
+          equals(GrassrootsIdentity.grassrootsUuidPrefix));
+      expect(
+        request.serviceUuids.map((u) => u!.toLowerCase()).toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
+
+    test('closed trust with no friends does not scan at all', () async {
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      hostApi.calls.clear();
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // An unfiltered prefix scan here would surface exactly the strangers
+      // closed trust exists to ignore, so we scan nothing.
+      expect(hostApi.scanRequests, isEmpty);
+      expect(hostApi.calls.where((c) => c.startsWith('startScan:')), isEmpty);
+      expect(hostApi.calls, contains('stopScan'));
+      // Advertising continues regardless: a friend added later must still be
+      // able to find US, and being findable is not the same as meeting.
+      expect(hostApi.calls.where((c) => c.startsWith('startAdvertising:')),
+          hasLength(1));
+    });
+
+    test('open trust never filters the scan to friends', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      hostApi.scanRequests.clear();
+
+      await transport.start();
+
+      // Filtering to friends is the behaviour open trust exists to refuse.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(hostApi.scanRequests.single.serviceUuids, isEmpty);
+    });
+
+    test('closing trust at runtime re-filters the live scan at once', () async {
+      final friend = await _makeIdentity('Friend');
+      store.dispatch(FriendEstablishedAction(publicKey: friend.publicKey));
+      await transport.start();
+      // Boot completes when the controller confirms the requested roles —
+      // `active` is the booted state, and the trust re-filter gates on it.
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.scanRequests.clear();
+
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+      await transport.applyTrustModeChange();
+
+      // Waiting for the scan watchdog would leave the node meeting strangers
+      // for up to a silence window after the user asked it to stop.
+      expect(hostApi.scanRequests, hasLength(1));
+      expect(
+        hostApi.scanRequests.single.serviceUuids
+            .map((u) => u!.toLowerCase())
+            .toSet(),
+        equals(GrassrootsIdentity.candidateServiceUuids(friend.publicKey)),
+      );
+    });
   });
 
   group('BleTransportService — symmetric connection invariants', () {
@@ -1000,13 +1492,12 @@ void main() {
     });
   });
 
-  group('BleTransportService — deterministic first-mover (collision avoidance)',
-      () {
-    // A peer UUID below the threshold → a high-sorting local identity is the
-    // non-initiator (waiter) against it.
+  group('BleTransportService — one deterministic initiator per pair', () {
+    // "Central" is not a role a peer can claim before a link exists — it is
+    // what one BECOMES by dialing. These identities sit at opposite ends of
+    // the UUID sort order, which is the rule both sides compute to reach
+    // opposite verdicts about who dials.
     const lowPeerUuid = '84c40316-0871-e5ad-0000-000000000001';
-    // A peer UUID above the threshold → a low-sorting local identity is the
-    // initiator against it.
     const highPeerUuid = '84c40316-0871-e5ad-ffff-fffffffffffe';
 
     Future<
@@ -1015,10 +1506,7 @@ void main() {
           FakeGrassrootsBluetoothCallbacks,
           Store<AppState>,
           BleTransportService,
-        )> build(
-      GrassrootsIdentity identity, {
-      Duration firstMoverFallback = const Duration(hours: 1),
-    }) async {
+        )> build(GrassrootsIdentity identity) async {
       final hostApi = _RecordingHostApi();
       final callbacks = FakeGrassrootsBluetoothCallbacks();
       final ble =
@@ -1028,7 +1516,6 @@ void main() {
       final transport = BleTransportService(
         identity: identity,
         store: store,
-        firstMoverFallback: firstMoverFallback,
         grassrootsBluetooth: ble,
       );
       await transport.initialize();
@@ -1036,70 +1523,64 @@ void main() {
       return (hostApi, callbacks, store, transport);
     }
 
-    test('the initiator (lower service UUID) dials on discovery', () async {
+    void sight(FakeGrassrootsBluetoothCallbacks callbacks, String uuid,
+        {int rssi = -55}) {
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'PEER',
+        serviceUuids: [uuid],
+        rssi: rssi,
+        connectable: true,
+      ));
+    }
+
+    test('the initiator — lower service UUID — dials on sight', () async {
       final (hostApi, callbacks, _, _) =
           await build(await _makeLowIdentity('Initiator'));
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [highPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
+      sight(callbacks, highPeerUuid);
       await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'The lower service UUID is the initiator and opens the first '
-              'leg immediately.');
+      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1));
     });
 
-    test(
-        'the non-initiator (higher service UUID) holds off the first-mover dial',
+    test('the higher peer holds its dial, so the pair is never both-dialing',
         () async {
-      final (hostApi, callbacks, store, _) =
+      // The property that matters: two in-flight connectGatts leave both
+      // stacks deaf, and a deadlock nothing can signal away costs a full
+      // connect timeout — measured at ~30% of windows at 20 s each.
+      final (hostApi, callbacks, _, _) =
           await build(await _makeHighIdentity('Waiter'));
-
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
+      sight(callbacks, lowPeerUuid);
       await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), isEmpty,
-          reason: 'The higher-keyed peer waits for the initiator to dial first '
-              'so the two legs form sequentially instead of colliding.');
-      expect(store.state.peers.discoveredBlePeers.containsKey('central:PEER'),
-          true,
-          reason: 'Discovery is still recorded while waiting, so the reverse '
-              'leg has a dial candidate later.');
-    });
-
-    test(
-        'the non-initiator opens its reverse leg once the inbound peripheral '
-        'leg is up', () async {
-      final peer = await _makeLowIdentity('Peer'); // lower → the initiator
-      final (hostApi, callbacks, store, transport) =
-          await build(await _makeHighIdentity('Waiter'));
-
-      const advertisingMac = 'AA:BB:CC:DD:EE:01';
-      const connectionMac = '99:88:77:66:55:02';
-
-      // Peer advertises; we (non-initiator) hold off.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: advertisingMac,
-        serviceUuids: [peer.bleServiceUuid],
-        rssi: -55,
-        connectable: true,
-      ));
+      sight(callbacks, lowPeerUuid, rssi: -54);
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
-          reason: 'Non-initiator must not first-mover-dial.');
+          reason: 'inside the grace the initiator dials uncontested');
+    });
 
-      // The initiator dials us → inbound peripheral leg, then ANNOUNCE
-      // identifies it. (The path event must deliver first — in production
-      // the ANNOUNCE payload is only forwarded once the path is ready.)
+    test('the higher peer dials once the grace passes — an initiator that '
+        'never comes must not strand the pair', () async {
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeHighIdentity('Waiter'));
+      sight(callbacks, lowPeerUuid);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty);
+
+      // 1.5 s of grace — a few connect-latencies, not the five seconds that
+      // made the ordering look like the culprit.
+      await Future<void>.delayed(const Duration(milliseconds: 1600));
+      sight(callbacks, lowPeerUuid, rssi: -54);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
+          reason: 'the fallback still exists; only its constant changed');
+    });
+
+    test('an inbound leg needs no grace: the reverse dial goes at once',
+        () async {
+      // Holding here would be waiting for a race already lost — the peer's
+      // link is up, and this dial attaches over its ACL rather than racing.
+      const connectionMac = '99:88:77:66:55:42';
+      final (hostApi, callbacks, store, transport) =
+          await build(await _makeHighIdentity('Waiter'));
+      final peer = await _makeIdentity('Remote');
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:$connectionMac',
         role: BleRole.peripheral,
@@ -1111,70 +1592,464 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       store.dispatch(PeerAnnounceReceivedAction(
         publicKey: peer.publicKey,
-        nickname: 'Peer',
+        nickname: 'Remote',
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:$connectionMac',
       ));
+      hostApi.calls.clear();
       transport.onPeerIdentified('peripheral:$connectionMac', peer.publicKey);
       await Future<void>.delayed(Duration.zero);
-
       expect(hostApi.calls.where((c) => c == 'connect:$connectionMac'),
-          hasLength(1),
-          reason: 'Once the inbound leg is up, the non-initiator opens its '
-              'reverse central leg over the existing ACL (the inbound '
-              'connection MAC), not via a second ACL to the advertised MAC.');
+          hasLength(1));
     });
+  });
 
-    test(
-        'the non-initiator falls back to dialing if the initiator never '
-        'connects', () async {
-      // Zero fallback: any re-sighting after the first is already "elapsed".
-      final (hostApi, callbacks, _, _) = await build(
-        await _makeHighIdentity('Waiter'),
-        firstMoverFallback: Duration.zero,
+
+
+  group('BleTransportService — testbed dial cap', () {
+    // Fixed peer UUIDs above the initiator threshold: the transport under
+    // test is built with a LOW identity, so it is always the election's
+    // initiator and every advertisement below auto-dials. That greedy dial
+    // is the mechanism the grid measures — the cap is a bound ON it, never
+    // a replacement for it.
+    String peerUuid(int i) =>
+        '84c40316-0871-e5ad-aaaa-00000000000${i.toRadixString(16)}';
+
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late _CapturingTrace trace;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble = GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      trace = _CapturingTrace();
+      await trace.startExperiment('dial-cap');
+      transport = BleTransportService(
+        identity: await _makeLowIdentity('Prober'),
+        store: store,
+        grassrootsBluetooth: ble,
+        trace: trace,
       );
-
-      // First sighting: just discovered, fallback not yet elapsed → hold off.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), isEmpty);
-
-      // Re-sighting: discoveredAt is now in the past → fallback elapsed → dial.
-      callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -54,
-        connectable: true,
-      ));
-      await Future<void>.delayed(Duration.zero);
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'If the initiator never dials, the non-initiator eventually '
-              'first-moves anyway so the handshake cannot deadlock.');
+      await transport.initialize();
     });
 
-    test(
-        'central-only mode dials even as the non-initiator (gate is auto-only)',
-        () async {
-      final (hostApi, callbacks, store, _) =
-          await build(await _makeHighIdentity('CentralOnly'));
-      store.dispatch(SetBleRoleModeAction(BleRoleMode.centralOnly));
+    tearDown(() async {
+      await transport.dispose();
+    });
 
+    Future<void> adv(int i, {int rssi = -55}) async {
       callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
-        serviceUuids: [lowPeerUuid],
-        rssi: -55,
+        remoteId: 'MAC$i',
+        serviceUuids: [peerUuid(i)],
+        rssi: rssi,
         connectable: true,
       ));
       await Future<void>.delayed(Duration.zero);
+    }
 
-      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
-          reason: 'A central-only device never advertises, so it can never be '
-              'dialed — it must always first-move regardless of the tie-break.');
+    /// What the plugin does after a `connect()` it accepted: the path shows
+    /// up as `connecting`. Only then does the dial occupy a slot, exactly as
+    /// on a device — the cap reads `_paths`, not the calls we made.
+    Future<void> pushState(int i, BlePathState state) async {
+      callbacks.pushPath(BlePath(
+        pathId: 'central:MAC$i',
+        role: BleRole.central,
+        state: state,
+        rssi: -55,
+        mtu: state == BlePathState.ready ? 247 : 23,
+        canSend: state == BlePathState.ready,
+      ));
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    int dials(int i) =>
+        hostApi.calls.where((c) => c == 'connect:MAC$i').length;
+
+    test('the cap defaults to the production value', () {
+      expect(transport.maxInFlightCentralDials,
+          BleTransportService.defaultMaxInFlightCentralDials);
+      expect(BleTransportService.defaultMaxInFlightCentralDials, 7);
+    });
+
+    test('setDialParallelism sets the cap and restores it on null', () {
+      transport.setDialParallelism(maxParallel: 2, popN: 5);
+      expect(transport.maxInFlightCentralDials, 2);
+      expect(transport.dialProbeMaxParallel, 2);
+      expect(transport.dialProbePopN, 5);
+
+      transport.setDialParallelism();
+      expect(transport.maxInFlightCentralDials, 7,
+          reason: 'A null M is how the runner puts production behaviour back '
+              'when a run ends; nothing else ever writes this field.');
+      expect(transport.dialProbeMaxParallel, isNull);
+      expect(transport.dialProbePopN, isNull);
+    });
+
+    test('with the cap at M, never more than M central dials are in flight',
+        () async {
+      transport.setDialParallelism(maxParallel: 2, popN: 5);
+      // Four peers appear. The transport wants to dial all four — that
+      // greedy behaviour is untouched — but only two may be underway.
+      for (var i = 1; i <= 4; i++) {
+        await adv(i);
+        if (dials(i) > 0) await pushState(i, BlePathState.connecting);
+        expect(store.state.peers.discoveredBlePeersList.length, i);
+      }
+
+      final inFlight = [for (var i = 1; i <= 4; i++) if (dials(i) > 0) i];
+      expect(inFlight, [1, 2],
+          reason: 'The third and fourth advertisements are refused at the '
+              'choke point while two dials occupy the cap.');
+      expect(dials(3), 0);
+      expect(dials(4), 0);
+    });
+
+    test('a freed slot lets a waiting peer dial — the cap tops up', () async {
+      transport.setDialParallelism(maxParallel: 1, popN: 3);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await adv(2);
+      expect(dials(2), 0, reason: 'One slot, and peer 1 is holding it.');
+
+      // Peer 1 lands. A `ready` path has finished dialing, so it no longer
+      // occupies an in-flight slot.
+      await pushState(1, BlePathState.ready);
+      // The scanner runs allowDuplicates: peer 2 re-advertises, and THAT is
+      // the top-up — the election refires on its own, nothing re-drives it.
+      await adv(2);
+      expect(dials(2), 1);
+      await pushState(2, BlePathState.connecting);
+
+      await adv(3);
+      expect(dials(3), 0,
+          reason: 'The freed slot was taken by peer 2; the cap still holds.');
+    });
+
+    test('the establishment is the LINK coming up, not `ready`', () async {
+      // Anchoring the count on `ready` conflated three outcomes: reaching
+      // `ready` also needs the peer's ANNOUNCE to identify the path, so a
+      // link that demonstrably established was reported as a failed dial
+      // whenever announces were not flowing (dial-3-cap-greedy-n6: 181 GATT
+      // links up, ~0 establishments recorded).
+      transport.setDialParallelism(maxParallel: 3, popN: 6);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await adv(2);
+      await pushState(2, BlePathState.connecting);
+      // Peer 1's link comes up while peer 2's dial is still underway.
+      await pushState(1, BlePathState.connected);
+
+      final rec = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'gattConnected');
+      expect(rec['role'], 'central');
+      expect(rec['establishment'], isTrue);
+      expect(rec['inFlight'], 2,
+          reason: 'Both dials hold a slot: this one is `connected` but not '
+              'yet `ready`, and the cap counts it too — so the field runs '
+              '1..M and equals M when saturated.');
+      expect(rec['maxParallel'], 3);
+      expect(rec['popN'], 6);
+      expect(rec['peripheralLinks'], 0);
+      expect(rec['totalLinks'], 1,
+          reason: 'A slot is held from GATT connect, not from `ready` — this '
+              'link is already consuming the controller budget.');
+
+      // Reaching `ready` later is its own stage and must NOT re-count.
+      await pushState(1, BlePathState.ready);
+      expect(transport.establishmentCount, 1);
+      final ready = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'connected');
+      expect(ready.containsKey('establishment'), isFalse);
+    });
+
+    test('an establishment counts the inbound legs sharing the link budget',
+        () async {
+      transport.setDialParallelism(maxParallel: 2, popN: 8);
+      // Two peers dialed US: inbound legs nothing caps, because only a
+      // central issues connectGatt and nothing limits accepting.
+      for (final mac in ['IN1', 'IN2']) {
+        callbacks.pushPath(BlePath(
+          pathId: 'peripheral:$mac',
+          role: BleRole.peripheral,
+          state: BlePathState.ready,
+          rssi: -55,
+          mtu: 247,
+          canSend: true,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.connected);
+
+      final rec = trace.records.lastWhere((r) =>
+          r['type'] == 'link' && r['event'] == 'gattConnected' &&
+          r['role'] == 'central');
+      expect(rec['peripheralLinks'], 2);
+      expect(rec['totalLinks'], 3,
+          reason: 'Both roles draw on ONE controller link budget, so a '
+              'failure at high N has to be separable from "out of slots".');
+      expect(rec['inFlight'], 1,
+          reason: 'this dial itself still holds a slot at `connected`');
+    });
+
+    test('an inbound peripheral leg carries no dial context', () async {
+      transport.setDialParallelism(maxParallel: 3, popN: 6);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:INBOUND',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      final rec = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'connected');
+      expect(rec['role'], 'peripheral');
+      expect(rec.containsKey('establishment'), isFalse,
+          reason: 'The grid counts what this phone DIALED; a leg someone '
+              'else opened is not an establishment of ours.');
+      expect(rec.containsKey('inFlight'), isFalse,
+          reason: 'in-flight dials are a central-side fact');
+      // maxParallel/popN DO ride every stage record: they are the step's
+      // context, not a claim that this leg was an establishment. The analyzer
+      // needs them on each stage to join stages to their (N, M) cell.
+      expect(rec['maxParallel'], 3);
+      expect(rec['popN'], 6);
+    });
+
+    test('establishmentCount counts central legs and resets on demand',
+        () async {
+      transport.setDialParallelism(maxParallel: 2, popN: 4);
+      expect(transport.establishmentCount, 0);
+
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.connected);
+      expect(transport.establishmentCount, 1,
+          reason: 'counted when the link came up');
+      await pushState(1, BlePathState.ready);
+      expect(transport.establishmentCount, 1,
+          reason: '`ready` is a later stage, not a second establishment');
+
+      // An inbound leg is not ours to count.
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:INBOUND',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -55,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(transport.establishmentCount, 1);
+
+      transport.resetEstablishmentCount();
+      expect(transport.establishmentCount, 0);
+    });
+
+    test('a second leg to an already-linked peer in the same role is dropped',
+        () async {
+      // Android rotates its advertised address and the plugin surfaces no
+      // rotation event, so the same phone is rediscovered under a new address
+      // and dialed again — connectGatt opens a SECOND real connection to
+      // hardware we already hold a leg to. Measured on dial-5: 32 same-role
+      // duplicates across six phones, overlapping up to 69s, each consuming a
+      // controller slot the dial cap then denies to a genuinely new peer.
+      final peer = Uint8List.fromList(List.generate(32, (i) => i + 7));
+      for (final mac in ['AA:1', 'BB:2']) {
+        callbacks.pushPath(BlePath(
+          pathId: 'central:$mac',
+          role: BleRole.central,
+          state: BlePathState.ready,
+          rssi: -50,
+          mtu: 247,
+          canSend: true,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+
+      // First identification: nothing to compare against, so it stands.
+      transport.onPeerIdentified('central:AA:1', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+
+      // The rotated address resolves to the SAME peer in the SAME role.
+      transport.onPeerIdentified('central:BB:2', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls, contains('disconnect:central:BB:2'),
+          reason: 'the new duplicate goes, not the proven leg');
+      expect(hostApi.calls, isNot(contains('disconnect:central:AA:1')));
+    });
+
+    test('the opposite role is NOT a duplicate — that is the dual-leg pair',
+        () async {
+      // Every pair is REQUIRED to converge to two legs, one per role. A
+      // check that keyed on peer alone would tear the pair down.
+      final peer = Uint8List.fromList(List.generate(32, (i) => i + 11));
+      callbacks.pushPath(BlePath(
+        pathId: 'central:CC:3',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50, mtu: 247, canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:CC:3',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: -50, mtu: 247, canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      transport.onPeerIdentified('central:CC:3', peer);
+      transport.onPeerIdentified('peripheral:CC:3', peer);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'one leg per role is the design, not a duplicate');
+    });
+
+    test('an address that never reaches ready is pruned; a ready one is not',
+        () async {
+      // Nothing else removes it: _paths.remove runs only from a plugin-reported
+      // failed/disconnected/stale, so a peer that vanishes without the OS
+      // saying so is counted forever — against the dial cap and against the
+      // controller slot count. dial-6-n8: 300 of 1419 paths that came up (21%)
+      // never reached ready and never dropped.
+      await adv(1);
+      await pushState(1, BlePathState.connecting);
+      await pushState(1, BlePathState.connected);
+      await adv(2);
+      await pushState(2, BlePathState.connecting);
+      await pushState(2, BlePathState.connected);
+      await pushState(2, BlePathState.ready);
+
+      // Not yet old enough — neither goes.
+      transport.pruneNeverReadyPathsNow();
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+
+      // Age BOTH past the timeout. Only the one still short of `ready` dies:
+      // a live link must never be reaped for being long-lived.
+      transport.ageNotReadyForTest('central:MAC1', const Duration(seconds: 121));
+      transport.ageNotReadyForTest('central:MAC2', const Duration(seconds: 121));
+      transport.pruneNeverReadyPathsNow();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls, contains('disconnect:central:MAC1'),
+          reason: 'stuck at `connected` for a full dwell — it is not coming');
+      expect(hostApi.calls, isNot(contains('disconnect:central:MAC2')),
+          reason: 'reached ready, so age is irrelevant');
+      final rec = trace.records.singleWhere((r) => r['event'] == 'pruned');
+      expect(rec['path'], 'central:MAC1');
+      expect(rec['reason'], 'neverReady');
+      expect(rec['stuckState'], 'connected',
+          reason: 'the link came up and the peer never identified itself — '
+              'distinct from a dial that never landed');
+    });
+
+    test('the failed-dial cooldown still refuses a redial', () async {
+      transport.setDialParallelism(maxParallel: 4, popN: 5);
+      await adv(2);
+      final afterDial = dials(2);
+      await pushState(2, BlePathState.failed);
+
+      expect(await transport.connectToDevice('central:MAC2'), isFalse,
+          reason: 'The cooldown is production behaviour and the grid leaves '
+              'it exactly as it is — only the cap is the variable.');
+      expect(dials(2), afterDial);
+    });
+  });
+
+  group('BleTransportService — active means booted', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    Future<void> build(BleRoleMode mode) async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetBleRoleModeAction(mode));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Boot'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      await transport.start();
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    tearDown(() async => transport.dispose());
+
+    TransportState st() => store.state.transports.bleState;
+
+    test('the requests returning does not boot the service', () async {
+      await build(BleRoleMode.auto);
+      expect(st(), TransportState.ready,
+          reason: 'accepted requests are intent; active reports the fact');
+
+      callbacks.pushScanState(BleScanState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.ready,
+          reason: 'the mode asked for both roles; one confirmation is half '
+              'a boot');
+
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'every requested role confirmed on the air — booted');
+    });
+
+    test('central-only boots on the scanner alone', () async {
+      await build(BleRoleMode.centralOnly);
+      callbacks.pushScanState(BleScanState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'a mode that never advertises has nothing else to confirm');
+    });
+
+    test('a refused advertiser keeps the service un-booted', () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(
+          active: false,
+          failure: BleAdvertiseFailure.transient,
+          reason: 'slots taken'));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.ready,
+          reason: 'scanning alone is the half-booted phone nobody can find');
+
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'the retry landing completes the boot');
+    });
+
+    test('the watchdog restarting the scan does not un-boot the service',
+        () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active);
+
+      // A deliberate stop carries no reason — the watchdog's own restart, a
+      // mode change. Boot regressions carry the controller's refusal.
+      callbacks.pushScanState(BleScanState(active: false));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'a deliberate stop is not a boot regression, and a marker '
+              'flicker here would poison every establishment anchor');
     });
   });
 
@@ -1306,6 +2181,264 @@ void main() {
       expect(hostApi.scanRequests.last.serviceUuids, isEmpty,
           reason: 'With no stranded reverse leg the scan stays unfiltered so '
               'new peers keep being discovered.');
+    });
+  });
+
+  group('BleTransportService — retry on the pair\'s other leg', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Sender'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      addTearDown(transport.dispose);
+    });
+
+    /// A converged pair: both GATT legs ready and both attributed to one
+    /// identity, which is the only state in which a fallback is possible.
+    Future<GrassrootsIdentity> convergedPair({
+      String centralPathId = 'central:PAIR',
+      String peripheralPathId = 'peripheral:PAIR',
+      int centralMtu = 247,
+      int peripheralMtu = 247,
+    }) async {
+      final peer = await _makeIdentity('PairPeer');
+      callbacks.pushPath(BlePath(
+        pathId: centralPathId,
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: centralMtu,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: peripheralPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: peripheralMtu,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: centralPathId,
+        blePeripheralDeviceId: peripheralPathId,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      return peer;
+    }
+
+    test("a refused write falls back to the pair's OTHER leg", () async {
+      await convergedPair();
+      // The flood prefers our peripheral leg, and the peripheral leg is the
+      // one with no queue behind it — so it is the one that refuses first.
+      hostApi.refuse.add('peripheral:PAIR');
+
+      final aired = await transport.broadcast(Uint8List(40));
+
+      expect(aired, 1,
+          reason: 'The neighbour was reached — on the other leg, but reached.');
+      expect(hostApi.calls, [
+        'send:peripheral:PAIR:40',
+        'send:central:PAIR:40',
+      ], reason: 'Refused on the preferred leg, then written on the other. '
+          'The order matters: the fallback is a consequence of the failure, '
+          'never a second copy sent alongside the first.');
+    });
+
+
+
+    test('a write that succeeds never touches the second leg', () async {
+      await convergedPair();
+      final aired = await transport.broadcast(Uint8List(40));
+      expect(aired, 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:40'],
+          reason: 'One leg per peer per flood: the same bytes on both legs is '
+              'double airtime for a copy the packetId bloom drops.');
+    });
+
+    test('both legs refusing reports the neighbour as not reached', () async {
+      await convergedPair();
+      hostApi.refuse.addAll({'peripheral:PAIR', 'central:PAIR'});
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Each leg is tried exactly once — no retry loop.');
+    });
+
+    test('sendToPeer falls back too (sync conveyance, directed sends)',
+        () async {
+      await convergedPair();
+      hostApi.refuse.add('central:PAIR');
+      expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
+      expect(hostApi.calls.last, 'send:peripheral:PAIR:40');
+    });
+
+    test('no fallback onto a leg that would truncate the packet', () async {
+      // The legs negotiate their MTUs separately, and on iOS the notify limit
+      // is a per-central property. A 200-byte packet fits the peripheral leg
+      // and not the central one; retrying there would put an unparseable
+      // write on the air and count it as a success.
+      await convergedPair(centralMtu: 23, peripheralMtu: 247);
+      hostApi.refuse.add('peripheral:PAIR');
+      expect(await transport.broadcast(Uint8List(200)), 0);
+      expect(hostApi.calls, ['send:peripheral:PAIR:200'],
+          reason: 'The undersized leg is not attempted at all.');
+    });
+
+    test('an unidentified path gets no fallback', () async {
+      // Two ready legs, no ANNOUNCE on either: they cannot be shown to belong
+      // to the same peer, and a "fallback" onto a stranger's leg would send
+      // this packet to someone the flood did not choose.
+      callbacks.pushPath(BlePath(
+        pathId: 'central:UNKNOWN-A',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: 247,
+        canSend: true,
+      ));
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:UNKNOWN-B',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+      hostApi.refuse.addAll({'central:UNKNOWN-A', 'peripheral:UNKNOWN-B'});
+
+      expect(await transport.broadcast(Uint8List(40)), 0);
+      expect(hostApi.calls, hasLength(2),
+          reason: 'Both unidentified legs are flood targets in their own '
+              'right, but neither is the other one\'s fallback.');
+    });
+
+  });
+
+  group('BleTransportService — a write outruns its leg\'s MTU', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late BleTransportService transport;
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      transport = BleTransportService(
+        identity: await _makeIdentity('Sender'),
+        store: store,
+        grassrootsBluetooth: ble,
+      );
+      await transport.initialize();
+      addTearDown(transport.dispose);
+    });
+
+    /// The measured field state this group pins: the peer has dialed us, so
+    /// the pair holds ONE leg — our peripheral — still at the 23-byte ATT
+    /// default, with the MTU request racing the first writes.
+    Future<void> singleLegAtDefault() async {
+      final peer = await _makeIdentity('PairPeer');
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:PAIR',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 23,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:PAIR',
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+    }
+
+    test('the caller is answered at once; the write goes out on the MTU',
+        () async {
+      await singleLegAtDefault();
+
+      // 113 bytes is the first Noise handshake message that was refused four
+      // times per reconnection in the field: too big for 20 usable bytes,
+      // nowhere else to go. The caller must NOT be held while the leg
+      // negotiates — the announce loop and the flood iterate peers serially,
+      // and one cold leg awaiting its MTU would stall every peer behind it.
+      final aired = await transport.broadcast(Uint8List(113))
+          .timeout(const Duration(milliseconds: 500));
+      expect(aired, 0, reason: 'same immediate answer a refusal always gave');
+      expect(hostApi.calls, isEmpty);
+
+      // The MTU arrives ~95 ms later on hardware; deliver it now.
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:PAIR',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 185,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(hostApi.calls, ['send:peripheral:PAIR:113'],
+          reason: 'the held write goes out the moment the leg can carry it');
+    });
+
+    test('a leg that never negotiates gets the write anyway, once', () async {
+      await singleLegAtDefault();
+
+      expect(await transport.broadcast(Uint8List(113)), 0);
+
+      // No MTU ever arrives. The deadline sends rather than holding forever;
+      // at 20 usable bytes the attempt is refused, which is the pre-deferral
+      // outcome — deferral may only ever turn a certain loss into a chance.
+      await Future<void>.delayed(const Duration(milliseconds: 3400));
+      expect(hostApi.calls, isEmpty,
+          reason: 'refused by the size check before reaching the stack');
+    });
+
+    test('disposal cancels a held write instead of leaking its timer',
+        () async {
+      await singleLegAtDefault();
+
+      expect(await transport.broadcast(Uint8List(113)), 0);
+      await transport.dispose();
+      // The deadline would fire at 3 s; nothing may reach the stack after
+      // dispose, and no timer may be left running.
+      await Future<void>.delayed(const Duration(milliseconds: 3400));
+      expect(hostApi.calls.where((c) => c.startsWith('send:')), isEmpty,
+          reason: 'teardown calls are dispose\'s own; a send would mean the '
+              'deadline timer outlived the transport');
+    });
+
+    test('a small write is unaffected by the default MTU', () async {
+      await singleLegAtDefault();
+      expect(await transport.broadcast(Uint8List(16)), 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:16']);
     });
   });
 }

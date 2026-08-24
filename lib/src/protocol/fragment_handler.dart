@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import '../models/packet.dart';
 import '../models/secure_frame.dart';
 
 /// Splits large payloads into [SecureFrame]s and reassembles them.
@@ -14,16 +15,30 @@ class FragmentHandler {
   ///
   /// Each fragment is sent as ONE BLE GATT write — the plugin does not
   /// split/reassemble, so a sealed packet larger than `ATT_MTU - 3` is
-  /// silently truncated on the wire and the receiver can't parse it. A flooded
-  /// packet reaches peers with different MTUs, so we size for the floor MTU we
-  /// request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead per packet:
-  ///   58 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
-  ///   = 104 bytes.
-  /// So chunk ≤ 244 − 104 = 140; we use 132 for margin (236-byte packet).
+  /// silently truncated on the wire and the receiver can't parse it. A packet
+  /// conveyed onward reaches peers with different MTUs, so we size for the
+  /// floor MTU we request ([_bleFloorMtu] = 247 → 244 usable). Fixed overhead
+  /// per packet:
+  ///   60 (packet header) + 25 (Noise version+nonce+tag) + 21 (frame header)
+  ///   = 106 bytes.
+  /// So the chunk is the whole remainder, 244 − 106 = 138. The overhead is
+  /// DERIVED from [GrassrootsPacket.headerSize], so a header change moves the
+  /// budget with it rather than silently overrunning the ceiling.
+  ///
+  /// This spends the ATT ceiling exactly, which is the same thing the sync
+  /// filter does (`sync_codec.dart`), and it rests on 247 being the MTU a pair
+  /// actually negotiates rather than merely the one requested. Against a peer
+  /// that settles lower, a full-width fragment truncates. Nothing in the
+  /// traces reports a negotiated value — MTU is recorded only alongside a
+  /// drop — so the way to hold this number honest is the ATT-ceiling probe
+  /// (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]), which
+  /// walks the write size across the boundary and finds where the peer stops
+  /// parsing.
   static const int _bleFloorMtu = 247;
-  static const int _packetFixedOverhead = 58 + 25 + 21; // = 104
+  static const int _packetFixedOverhead =
+      GrassrootsPacket.headerSize + 25 + 21; // = 106
   static const int maxFragmentPayload =
-      _bleFloorMtu - 3 - _packetFixedOverhead - 8; // = 132
+      _bleFloorMtu - 3 - _packetFixedOverhead; // = 138
 
   /// Payloads larger than this are fragmented; at or below fit one sealed
   /// packet within the BLE floor MTU. Same budget as [maxFragmentPayload] (a
@@ -34,7 +49,7 @@ class FragmentHandler {
   static const Duration fragmentDelay = Duration(milliseconds: 20);
 
   /// Timeout for an incomplete reassembly. Must outlast the slowest transfer
-  /// we allow: a capped file at ~132 B/fragment × 20 ms/fragment. Sized for
+  /// we allow: a capped file at ~138 B/fragment × 20 ms/fragment. Sized for
   /// the ~1 MB attachment cap (~8k fragments ≈ 160 s) plus slack.
   static const Duration reassemblyTimeout = Duration(minutes: 4);
 
@@ -44,7 +59,7 @@ class FragmentHandler {
   /// Fired when a partial reassembly is abandoned: the 4-minute timeout swept
   /// it ('timeout') or reassembly failed despite a complete count — an
   /// out-of-range fragIndex was counted ('broken'). Both are whole-message
-  /// losses that were previously invisible; the coordinator wires this to a
+  /// losses that are otherwise invisible; the coordinator wires this to a
   /// `drop` trace record.
   void Function(String reason, String messageId, int have, int total)?
       onAbandon;
@@ -66,16 +81,29 @@ class FragmentHandler {
 
   /// Build the [SecureFrame]s carrying [payload] under [messageId].
   ///
-  /// A payload at or below [fragmentThreshold] yields a single frame
-  /// (`fragCount == 1`); larger payloads are chunked at [maxFragmentPayload].
-  /// The caller seals each frame into its own [PacketType.secure] packet and
-  /// floods them [fragmentDelay] apart.
+  /// A payload at or below the chunk budget yields a single frame
+  /// (`fragCount == 1`); larger payloads are chunked at the budget. The caller
+  /// seals each frame into its own [PacketType.secure] packet and floods them
+  /// [fragmentDelay] apart.
+  ///
+  /// [chunkBudget] overrides the chunk size AND the single-vs-multi threshold.
+  /// Null (the default) is the sealed end-to-end path, sized to the floor MTU
+  /// ([maxFragmentPayload]). A caller passes an explicit budget to size
+  /// fragments to a specific target's DISCOVERED per-leg MTU — the cleartext,
+  /// neighbour-local path (ANNOUNCE / Noise handshake), where the frame is
+  /// written as `frame.encode()` in the packet payload instead of being sealed.
+  /// Reassembly is identical either way: [accept] keys on the 16-byte
+  /// [SecureFrame.messageId], which is globally unique, so no per-peer keying
+  /// is needed.
   List<SecureFrame> framesFor({
     required Uint8List payload,
     required String messageId,
     ContentType contentType = ContentType.message,
+    int? chunkBudget,
   }) {
-    if (!needsFragmentation(payload)) {
+    final budget = chunkBudget ?? maxFragmentPayload;
+
+    if (payload.length <= budget) {
       return [
         SecureFrame(
           contentType: contentType,
@@ -85,11 +113,11 @@ class FragmentHandler {
       ];
     }
 
-    final total = (payload.length / maxFragmentPayload).ceil();
+    final total = (payload.length / budget).ceil();
     final frames = <SecureFrame>[];
     for (var i = 0; i < total; i++) {
-      final start = i * maxFragmentPayload;
-      final end = (start + maxFragmentPayload).clamp(0, payload.length);
+      final start = i * budget;
+      final end = (start + budget).clamp(0, payload.length);
       frames.add(SecureFrame(
         contentType: contentType,
         messageId: messageId,

@@ -63,11 +63,11 @@ class GrassrootsIdentity {
 
   /// Generate a fresh Ed25519 identity.
   ///
-  /// Spec `putIdentity()` (`docs/GLP_Networking_API/sections/api.tex` §Identity)
-  /// generates *and* persists; here generation lives on the model and
-  /// persistence on `IdentityStore.putIdentity`. The app calls this once on
-  /// first launch and persists the result. When [nickname] is omitted a
-  /// placeholder is derived from the public key.
+  /// Generation half of spec `putIdentity()`
+  /// (`docs/GLP_Networking_API/sections/api.tex` §Identity), which generates
+  /// *and* persists: `GrassrootsNetwork.putIdentity` calls this and then
+  /// persists the result. When [nickname] is omitted a placeholder is derived
+  /// from the public key.
   static Future<GrassrootsIdentity> generate({String? nickname}) async {
     final keyPair = await Ed25519().newKeyPair();
     final pk = await keyPair.extractPublicKey();

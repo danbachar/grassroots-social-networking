@@ -306,7 +306,7 @@ class NoiseSessionManager {
   }
 
   /// A handshake or session died without producing anything — a
-  /// security-relevant or availability-relevant event that was previously
+  /// security-relevant or availability-relevant event that would otherwise be
   /// silent. `why`: 'verifyFailed' (delivered static key does not match the
   /// claimed identity — tampering or impersonation), 'timeout' (peer never
   /// answered within [handshakeTimeout]), 'reaped' (stalled handshake swept).
@@ -978,7 +978,7 @@ int _nonceFromBytes(Uint8List nonceBytes) {
 }
 
 /// Application AEAD AAD: binds the ciphertext to its type, sender, recipient
-/// and packet id — but NOT to ttl/timestamp. TTL is mutated by every relay, so
+/// and packet id — but NOT to ttl. TTL is mutated by every relay, so
 /// it cannot be authenticated end-to-end. [senderPubkey] is the originator: the
 /// local identity on encrypt, the session peer on (trial-)decrypt.
 Uint8List _applicationAad(

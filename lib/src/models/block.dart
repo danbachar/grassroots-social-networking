@@ -74,8 +74,11 @@ abstract class Block {
     }
   }
 
-  /// Try to deserialize, returns null if data is not a valid block
-  /// (e.g., legacy plain text message)
+  /// Decode, or null when the bytes are not a block at all.
+  ///
+  /// Null means MALFORMED, not "some older format": there is no plain-text
+  /// message shape and never was one in the wild. The caller drops the
+  /// payload.
   static Block? tryDeserialize(Uint8List data) {
     try {
       // Check if first byte is a valid block type
@@ -85,7 +88,6 @@ abstract class Block {
       }
       final typeValue = data[0];
       if (!BlockType.isValidType(typeValue)) {
-        // Not a block - treat as legacy plain text
         debugPrint('Data is not a valid block type: $typeValue');
         return null;
       }

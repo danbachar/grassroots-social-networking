@@ -68,7 +68,7 @@ class UdpTransportService extends TransportService {
   final ProtocolHandler protocolHandler;
 
   /// Optional trace logger (null in tests / when recording is off). The UDP
-  /// transport previously emitted NO trace records at all — every failure
+  /// transport needs the same trace coverage as BLE, or every failure
   /// mode was a debugPrint — while the BLE side had full coverage.
   final ExperimentRecorder? trace;
 
@@ -518,7 +518,7 @@ class UdpTransportService extends TransportService {
       _lastConnectFailureKind = _classifyConnectFailure(lastSocketError ?? e);
       debugPrint('Failed to connect to peer $pubkeyHex: $e');
       // Includes the 10s UDX handshake timeout — a connect that dies here
-      // was previously classified in memory and never reached the trace.
+      // is classified here rather than only in memory.
       _traceDrop('udpConnect', _lastConnectFailureKind?.name ?? 'unknown',
           {'peer': pubkeyHex});
 
@@ -595,7 +595,7 @@ class UdpTransportService extends TransportService {
   Future<int> broadcast(Uint8List data, {Set<String>? excludePeerIds}) async {
     var sent = 0;
     // Send via UDX connections. Count SUCCESSES: the returned neighbour
-    // count feeds delivery accounting, and the old unconditional sent++
+    // count feeds delivery accounting, and an unconditional sent++
     // overstated reach whenever a stream was dead.
     for (final entry in _peerConnections.entries.toList()) {
       if (excludePeerIds != null && excludePeerIds.contains(entry.key)) {

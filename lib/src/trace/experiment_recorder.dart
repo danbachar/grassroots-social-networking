@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:device_info_plus/device_info_plus.dart';
+
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -170,6 +172,36 @@ class ExperimentRecorder {
     return cleaned.isEmpty ? 'exp' : cleaned;
   }
 
+  /// The id one step on from [id]: a trailing `-<n>` counts up, and an id
+  /// without one gains `-2`. `line-1` -> `line-2`, `dial-8-n11` -> the
+  /// digits there belong to the node count, not to a run counter, so it
+  /// becomes `dial-8-n11-2` rather than silently claiming to be twelve nodes.
+  static String nextExperimentId(String id) {
+    final m = RegExp(r'^(.*)-(\d+)$').firstMatch(id);
+    if (m == null) return '$id-2';
+    return '${m.group(1)}-${int.parse(m.group(2)!) + 1}';
+  }
+
+  /// [id], or the first id after it whose file does not exist yet.
+  ///
+  /// A run must never write into a file another run already filled. The
+  /// upload sends the whole file, so an id reused across runs re-sends every
+  /// earlier run inside it, and the server ingests those records a second
+  /// time under a new upload — silently doubling every count that is not
+  /// keyed on something unique.
+  Future<String> _freeExperimentId(String id) async {
+    var candidate = id;
+    // The fleet is eleven phones and a field day is tens of runs; the bound
+    // is only here so a directory that cannot be written to ends the loop.
+    for (var i = 0; i < 1000; i++) {
+      if (!await (await _file(_expFileName(candidate))).exists()) {
+        return candidate;
+      }
+      candidate = nextExperimentId(candidate);
+    }
+    return candidate;
+  }
+
   /// Append one record to the active experiment's in-memory buffer. No-op
   /// when inactive; never throws. Purely synchronous — ordered, no I/O, no
   /// possibility of a dropped record.
@@ -184,8 +216,9 @@ class ExperimentRecorder {
     }
   }
 
-  /// Begin (or resume — the eventual write appends to an existing file of
-  /// the same id) an experiment recording. Marks the boundary with an
+  /// Begin an experiment recording under [id], or under the first id after it
+  /// that has no file yet — a run never writes into another run's file.
+  /// Marks the boundary with an
   /// `expStart` marker.
   Future<void> startExperiment(String id) async {
     if (_experimentId != null) await _writeBufferToDisk();
@@ -197,7 +230,10 @@ class ExperimentRecorder {
     _bufTimer = null;
     _lastFlushLevel = null;
     _floorReported = false;
-    final clean = sanitizeExperimentId(id);
+    final clean = await _freeExperimentId(sanitizeExperimentId(id));
+    if (clean != sanitizeExperimentId(id)) {
+      debugPrint('[exp] $id already has a file; recording as $clean');
+    }
     _experimentId = clean;
     await log({
       'type': 'marker',
@@ -208,6 +244,10 @@ class ExperimentRecorder {
     for (final r in linkSnapshot?.call() ?? const []) {
       await log(r);
     }
+    // The file exists on disk from the first record: [_freeExperimentId]
+    // reads a missing file as a free id, so a run that crashed before its
+    // first flush would otherwise hand its id to the next launch.
+    await _writeBufferToDisk();
     final probe = powerProbe;
     if (probe != null) {
       Future<void> sample() async {
@@ -543,6 +583,25 @@ class ExperimentRecorder {
   }
 
   /// POST one batch. Returns whether the server accepted (or already had) it.
+  /// The handset model (`Build.MODEL` / the iOS machine name), or null where
+  /// the platform channel is unavailable. An upload is never worth failing
+  /// over a label, so every error here is swallowed.
+  static Future<String?> _deviceModel() async {
+    try {
+      final info = DeviceInfoPlugin();
+      if (Platform.isAndroid) {
+        final a = await info.androidInfo;
+        return '${a.manufacturer} ${a.model}'.trim();
+      }
+      if (Platform.isIOS) {
+        return (await info.iosInfo).utsname.machine;
+      }
+    } catch (_) {
+      // No channel (unit tests, desktop) — the field is simply absent.
+    }
+    return null;
+  }
+
   Future<bool> _postChunk({
     required String url,
     required String token,
@@ -558,6 +617,13 @@ class ExperimentRecorder {
         'schemaVersion': 1,
         'generatedAt': DateTime.now().toUtc().toIso8601String(),
         'platform': Platform.isIOS ? 'ios' : 'android',
+        // The hardware behind the pubkey. A trace identifies a device by its
+        // key, which is stable but says nothing about which handset it is,
+        // and a run's nicknames are renumbered between campaigns so they do
+        // not carry that across runs either. Naming the model here is what
+        // lets a per-device result — a radio that never negotiates an MTU, a
+        // leg that never reaches a session — be attributed to real hardware.
+        if (await _deviceModel() case final String model) 'model': model,
         'experiment': name,
         'consent': true,
         'records': records,
@@ -590,6 +656,35 @@ class ExperimentRecorder {
       u = u.substring(0, u.length - 1);
     }
     return u;
+  }
+
+  /// Move an abandoned recording aside, so the next arm under the same id
+  /// starts a clean file.
+  ///
+  /// Delete the recording of a run that aborted.
+  ///
+  /// [startExperiment] APPENDS to an existing file of the same id, so the dead
+  /// run cannot simply be left in place: its step labels and re-minted message
+  /// ids would interleave with the next arm's records in one upload, and every
+  /// reader downstream would have to know to cut them out.
+  ///
+  /// A failed run is deleted rather than kept under a separate id: the file
+  /// would upload alongside real runs, carry the same experiment id prefix,
+  /// and every analysis would have to filter it out. This is the one place to
+  /// change if an aborted recording ever needs keeping.
+  ///
+  /// Returns the path it deleted, or null if there was nothing to delete.
+  Future<String?> discardAbortedExperiment(String id) async {
+    final src = await _file(_expFileName(sanitizeExperimentId(id)));
+    if (!await src.exists()) return null;
+    final path = src.path;
+    try {
+      await src.delete();
+      return path;
+    } catch (e) {
+      debugPrint('[exp] could not delete aborted $id: $e');
+      return null;
+    }
   }
 
   /// Delete all experiment files (after a successful share/upload).

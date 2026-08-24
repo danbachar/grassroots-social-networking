@@ -47,7 +47,7 @@ class WireLedger {
   int get totalBytes => _totalBytes;
 
   /// Resolves the inner content type of one of OUR sealed packets by its
-  /// packetId (bytes 38..54 of the envelope). Only the sender knows this —
+  /// packetId, read straight off the envelope. Only the sender knows this —
   /// the ledger sits below decryption — so tx `secure` bytes are split
   /// exactly (`secure:data`, `secure:ack`, `secure:sync`, …) while rx
   /// `secure` stays aggregate, which is precisely what a peer on the air
@@ -58,10 +58,18 @@ class WireLedger {
 
   void onRx(Uint8List data) => _count(_rxBytes, _rxPackets, data);
 
+  /// Read off the header layout, never hardcoded: this slice silently
+  /// followed the 58-byte header for one commit after the header lost its
+  /// timestamp, and since [GrassrootsPacket.bytesToUuid] happily formats any
+  /// 16 bytes as a UUID, it did not throw — it just returned an id that
+  /// matched nothing, and the whole tx `secure:*` split disappeared without a
+  /// single failure anywhere.
   static String? _packetIdOf(Uint8List data) {
-    if (data.length < 54) return null;
+    if (data.length < GrassrootsPacket.headerSize) return null;
     try {
-      return GrassrootsPacket.bytesToUuid(data.sublist(38, 54));
+      return GrassrootsPacket.bytesToUuid(data.sublist(
+          GrassrootsPacket.packetIdOffset,
+          GrassrootsPacket.packetIdOffset + 16));
     } catch (_) {
       return null;
     }

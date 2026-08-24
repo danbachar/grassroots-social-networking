@@ -14,42 +14,10 @@ class FieldRunnerScreen extends StatefulWidget {
   final FieldRunner runner;
   final FieldPlan plan;
 
-  /// DEBUG/TESTBED. Signals every peer to start; returns how many were
-  /// reached. Present only when the runner was armed for a remote start.
-  final Future<int> Function(String expId)? onBroadcastStart;
-
-  /// Peers this phone holds a Noise SESSION with — one hop, not the mesh.
-  ///
-  /// Sessions, not live links: the start signal travels on sessions, and a
-  /// session is keyed by peer identity so it survives the link churn a
-  /// joining phone causes. Counting live links instead made this collapse to
-  /// 1-2 mid-join while the flood was entirely healthy.
-  ///
-  /// It does not have to reach the roster size before pressing — phones
-  /// further out are reached by relay. It has to be non-zero and settled.
-  final int Function()? neighbourCount;
-
-  /// Phones in the connected component containing this one, learned from the
-  /// armed-time neighbour gossip. This is the number that answers "will the
-  /// start signal reach everyone", which a one-hop count cannot.
-  final int Function()? meshComponentSize;
-
-  /// Gossip this phone's neighbours to its peers. Driven on a timer while
-  /// armed, and never while a run is under way.
-  final Future<int> Function()? onGossipNeighbours;
-
-  /// Drop the gossiped view when the run begins.
-  final VoidCallback? onClearMeshView;
-
   const FieldRunnerScreen({
     super.key,
     required this.runner,
     required this.plan,
-    this.onBroadcastStart,
-    this.neighbourCount,
-    this.meshComponentSize,
-    this.onGossipNeighbours,
-    this.onClearMeshView,
   });
 
   @override
@@ -57,33 +25,17 @@ class FieldRunnerScreen extends StatefulWidget {
 }
 
 class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
-  Timer? _armedTick;
-  int _tickCount = 0;
-
   @override
   void initState() {
     super.initState();
     widget.runner.addListener(_onRunner);
-    // Nothing notifies while merely armed, but the peer count is changing as
-    // the mesh converges — and that is exactly what you are waiting on.
-    _armedTick = Timer.periodic(const Duration(seconds: 2), (_) {
-      if (!mounted || widget.runner.armedPlan == null) return;
-      // Gossip every other tick: often enough that the count settles while
-      // you walk back from placing the last phone, rare enough to be
-      // invisible next to ANNOUNCE traffic.
-      if ((_tickCount++).isEven) unawaited(widget.onGossipNeighbours?.call());
-      setState(() {});
-    });
-    // An ARMED runner is deliberately not started: it is waiting for a
-    // peer's signal (or for this phone to be the one that sends it).
-    if (!widget.runner.isRunning && widget.runner.armedPlan == null) {
+    if (!widget.runner.isRunning) {
       widget.runner.start(widget.plan);
     }
   }
 
   @override
   void dispose() {
-    _armedTick?.cancel();
     widget.runner.removeListener(_onRunner);
     super.dispose();
   }
@@ -95,6 +47,16 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   String _mmss(int sec) =>
       '${(sec ~/ 60).toString().padLeft(2, '0')}:'
       '${(sec % 60).toString().padLeft(2, '0')}';
+
+  /// Hours only once there are hours: a whole run is four digits of minutes
+  /// in mm:ss, which is read as a clock time and misread as minutes.
+  String _span(int sec) {
+    if (sec < 0) sec = 0;
+    if (sec < 3600) return _mmss(sec);
+    return '${sec ~/ 3600}:'
+        '${((sec % 3600) ~/ 60).toString().padLeft(2, '0')}:'
+        '${(sec % 60).toString().padLeft(2, '0')}';
+  }
 
   Future<void> _confirmAbort() async {
     final confirmed = await showDialog<bool>(
@@ -132,7 +94,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
           foregroundColor: Colors.white,
           title: Text('${plan.expId} — step '
               '${(runner.stepIndex + 1).clamp(1, total)}/$total'
-              '${plan.deviceOrder == null ? '' : ' · #${plan.deviceOrder}'}'),
+              '${runner.joinOrder == null ? '' : ' · #${runner.joinOrder}'}'),
           actions: [
             if (runner.isRunning)
               IconButton(
@@ -147,13 +109,38 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         // than the viewport, centre it when it is not, so nothing is ever
         // unreachable and the common case still looks deliberate.
         body: SafeArea(
-          child: LayoutBuilder(
+          child: Column(children: [
+            // A phone nobody can find still scans, still dials, still counts
+            // down — nothing in the normal display contradicts it. This is the
+            // only thing between that and an hour of empty trace, so it sits
+            // above every phase rather than inside one.
+            if (widget.runner.bleUndiscoverable?.call() ?? false)
+              Container(
+                width: double.infinity,
+                color: Colors.red.shade900,
+                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                child: const Row(children: [
+                  Icon(Icons.wifi_tethering_off, color: Colors.white, size: 30),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'NOT ADVERTISING — no peer can find this phone.\n'
+                      'Check aeroplane mode and Bluetooth.',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ]),
+              ),
+            Expanded(
+              child: LayoutBuilder(
             builder: (context, constraints) => SingleChildScrollView(
               padding: const EdgeInsets.all(24),
               child: ConstrainedBox(
                 constraints: BoxConstraints(minHeight: constraints.maxHeight - 48),
                 child: switch (runner.phase) {
-                  _ when runner.armedPlan != null => _armed(runner),
                   _ when runner.finishing => _finishing(runner),
                   _ when runner.resetting => _resetting(step),
                   FieldPhase.placement => _placement(runner),
@@ -161,19 +148,15 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   FieldPhase.positioning => runner.manualJoin
                       ? _manualGap(step!, runner)
                       : _positioning(step!, runner),
-                  FieldPhase.dwelling => _countdown(
-                      'HOLD — ${step!.label}',
-                      runner.remainingSec,
-                      [
-                        step.bulk ? 'bulk flows running' : 'recording',
-                        if (runner.radioAction != null)
-                          'TURN BLUETOOTH '
-                              '${runner.radioAction == 'on' ? 'ON' : 'OFF'} — '
-                              'the window has already started',
-                        if (runner.locationStatus.isNotEmpty)
-                          runner.locationStatus,
-                      ].join('\n'),
-                      Colors.orangeAccent),
+                  // A dwell the operator has to act in is an instruction;
+                  // one they do not is just time left on the run.
+                  // Measuring and walking are different instructions — one
+                  // means stand still, the other means go — so they cannot
+                  // share a headline. The dwell names itself; the walk window
+                  // (positioning) carries the big MOVE countdown.
+                  FieldPhase.dwelling => runner.radioAction != null
+                      ? _radioPrompt(runner.radioAction!, runner.remainingSec)
+                      : _measuring(step!, runner),
                   FieldPhase.settling => _countdown(
                       'SETTLING',
                       runner.remainingSec,
@@ -189,123 +172,28 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               ),
             ),
           ),
+            ),
+          ]),
         ),
       ),
     );
   }
 
-  /// Waiting for a peer's start signal. Every phone sits here; ONE is
-  /// tapped and signals the rest, so devices spread over hundreds of metres
-  /// begin together instead of however far apart their taps landed.
-  Widget _armed(FieldRunner runner) {
-    final broadcast = widget.onBroadcastStart;
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        const Icon(Icons.podcasts_rounded, color: Colors.tealAccent, size: 88),
-        const SizedBox(height: 20),
-        const Text('ARMED',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-                color: Colors.tealAccent,
-                fontSize: 44,
-                fontWeight: FontWeight.w800)),
-        // The join order decides when this phone enters the mesh, and a phone
-        // handed to the wrong spot silently costs a whole mesh size: the
-        // 7-device smoke run's n=3 steps had two devices because one slot was
-        // never filled. This is the screen you are looking at while placing
-        // the phones, so the order is stated here, big, not left to the
-        // preset name in a list somewhere behind you.
-        if (runner.armedPlan!.deviceOrder != null) ...[
-          const SizedBox(height: 16),
-          _orderBadge(runner.armedPlan!.deviceOrder!),
-        ],
-        const SizedBox(height: 12),
-        Text('waiting for the start signal\n"${runner.armedPlan!.expId}"',
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white70, fontSize: 19),
-            ),
-        const SizedBox(height: 10),
-        const Text(
-            'Place every phone first, then press START ALL on exactly one.',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white38, fontSize: 15)),
-        if (widget.neighbourCount != null) ...[
-          const SizedBox(height: 14),
-          Builder(builder: (_) {
-            final n = widget.neighbourCount!();
-            // One hop. Phones further out are reached by relay, so this does
-            // not need to equal the roster — it needs to be non-zero and to
-            // have stopped climbing.
-            // The mesh figure is the one that answers "will the signal
-            // reach everyone" — the neighbour count is only this phone's
-            // one-hop view and is shown as supporting detail.
-            final mesh = widget.meshComponentSize?.call();
-            return Column(children: [
-              if (mesh != null)
-                Text('$mesh phone(s) in the mesh',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                        color: mesh <= 1
-                            ? Colors.orangeAccent
-                            : Colors.tealAccent,
-                        fontSize: 30,
-                        fontWeight: FontWeight.w800)),
-              const SizedBox(height: 4),
-              Text(
-                  n == 0
-                      ? 'no sessions yet — wait for the mesh to form'
-                      : '$n session peer(s) of this phone',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: n == 0 ? Colors.orangeAccent : Colors.white54,
-                      fontSize: 15)),
-              const SizedBox(height: 4),
-              const Text('press START ALL once this stops climbing',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white30, fontSize: 13)),
-            ]);
-          }),
-        ],
-        const SizedBox(height: 34),
-        if (broadcast != null)
-          SizedBox(
-            height: 88,
-            child: FilledButton(
-              onPressed: () async {
-                final expId = runner.armedPlan!.expId;
-                final n = await broadcast(expId);
-                if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text(n == 0
-                        ? 'No peer reached — is anyone else armed and in range?'
-                        : 'Signalled $n peer(s)')));
-                // This phone starts too: it is part of the mesh, not a
-                // remote control.
-                widget.onClearMeshView?.call();
-                await runner.remoteStart(expId);
-              },
-              child: const Text('START ALL',
-                  style: TextStyle(
-                      fontSize: 30, fontWeight: FontWeight.w800)),
-            ),
-          ),
-        const SizedBox(height: 14),
-        SizedBox(
-          height: 60,
-          child: OutlinedButton(
-            onPressed: () {
-              runner.disarm();
-              Navigator.of(context).pop();
-            },
-            child: const Text('Cancel', style: TextStyle(fontSize: 20)),
-          ),
-        ),
-      ],
-    );
-  }
-
+  /// The shared anchor, rendered in UTC.
+  ///
+  /// This string is the fleet's alignment CHECK — every phone must show the
+  /// same one — and the anchor itself is an epoch instant, identical on every
+  /// phone regardless of timezone. Rendering it in LOCAL time made the check
+  /// test the timezone instead: a phone whose zone is two hours out would
+  /// display a start time two hours off while computing exactly the same
+  /// anchor, which reads as a broken clock. In
+  /// UTC, phones that agree show identical text and phones that disagree
+  /// really do disagree.
+  /// A wall-clock time for the operator, in the phone's own timezone.
+  ///
+  /// The schedule is computed in UTC so every phone lands on one instant, but
+  /// nobody standing at the bench is holding a UTC clock — the time shown here
+  /// is the one they can compare against a watch.
   static String _hhmmss(int epochMs) {
     final d = DateTime.fromMillisecondsSinceEpoch(epochMs);
     String two(int v) => v.toString().padLeft(2, '0');
@@ -332,7 +220,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('PLACE THE PHONES',
+        const Text('PLACEMENT TIME',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white54, fontSize: 24)),
         const SizedBox(height: 10),
@@ -345,21 +233,29 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                     fontWeight: FontWeight.w800)),
           ),
         const SizedBox(height: 6),
-        const Text(
-            'every phone must show this exact time — one that differs has a '
-            'wrong clock',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white38, fontSize: 14)),
+        // const Text(
+        //     'every phone must show this exact time — one that differs has a '
+        //     'wrong clock',
+        //     textAlign: TextAlign.center,
+        //     style: TextStyle(color: Colors.white38, fontSize: 14)),
+        // const SizedBox(height: 6),
+        // const Text('it starts itself — there is nothing to press',
+        //     textAlign: TextAlign.center,
+        //     style: TextStyle(
+        //         color: Colors.white54,
+        //         fontSize: 16,
+        //         fontWeight: FontWeight.w600)),
         const SizedBox(height: 18),
+        if (runner.wantsStackReset) _stackResetPrompt(runner),
         Text(_mmss(runner.remainingSec),
             textAlign: TextAlign.center,
             style: const TextStyle(
                 color: Colors.white,
                 fontSize: 88,
                 fontWeight: FontWeight.w800)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 14),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 14),
         if (runner.radioAction != null)
@@ -387,80 +283,304 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     );
   }
 
-  /// A phone that has not joined the mesh yet: the run's step progression is
-  /// irrelevant to its operator — the one thing that matters is when to turn
-  /// Bluetooth on, so that is the whole screen.
+  /// A phone that has not joined the mesh yet. On a scripted-radio plan the
+  /// runner works the transport itself, so there is nothing to ask for and
+  /// the screen counts down to the end of the run like any other idle phone.
+  /// Where the operator owns the radio, their join IS an instruction, so it
+  /// wears the same ENABLE BT face as every other radio window.
   Widget _waitingToJoin(FieldRunner runner) {
     final joinAt = runner.myJoinAtMs;
     final windowAt = joinAt == null
         ? null
         : joinAt - widget.plan.autoAdvanceGapSec * 1000;
+    if (widget.plan.scriptedRadio) {
+      return _untilEnd(runner,
+          note: windowAt == null
+              ? null
+              : 'joins itself at ${_hhmmss(windowAt)}');
+    }
     final remaining = windowAt == null
         ? 0
         : ((windowAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
+    return _radioPrompt('on', remaining < 0 ? 0 : remaining,
+        order: runner.joinOrder);
+  }
+
+  /// The stack-reset instruction, paired with live radio state.
+  ///
+  /// The plan cannot perform the reset itself (modern Android forbids it),
+  /// so the operator does — and the screen must say so while the walk
+  /// window is open, with feedback that the toggle registered. The radio
+  /// observer's bt-off/bt-on markers are the trace-side record.
+  Widget _stackResetPrompt(FieldRunner runner) {
+    final up = runner.radioUp;
+    final done = runner.stackResetDone;
+    final color = done
+        ? Colors.green.shade800
+        : up
+            ? Colors.orange.shade900
+            : Colors.blueGrey.shade800;
+    final title = done
+        ? 'RESET DONE'
+        : up
+            ? 'BT RESET TIME'
+            : 'toggle BT ON';
+    final detail = done
+        ? ''
+        : up
+            ? 'radio is up'
+            : 'radio is down';
+    return Container(
+      margin: const EdgeInsets.only(top: 14),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(children: [
+        Text(
+          title,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+              color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 4),
+        if (detail.isNotEmpty)
+          Text(
+            detail,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 14),
+          ),
+      ]),
+    );
+  }
+
+  /// The dwell, named: the phones are measuring and must not move.
+  ///
+  /// The next position rides along as a footnote so the operator knows where
+  /// they are headed, but the instruction to GO is the walk window's alone —
+  /// a headline that says MOVE while the trial is still running reads as an
+  /// instruction to move.
+  Widget _measuring(FieldStep step, FieldRunner runner) {
+    final move = runner.nextMove;
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Icon(Icons.bluetooth_disabled,
-            color: Colors.white54, size: 72),
+        const Icon(Icons.wifi_tethering, color: Colors.tealAccent, size: 64),
         const SizedBox(height: 14),
-        const Text('KEEP BLUETOOTH OFF',
+        const Text('MEASURING',
             textAlign: TextAlign.center,
             style: TextStyle(
-                color: Colors.white70,
-                fontSize: 30,
-                fontWeight: FontWeight.w800)),
-        const SizedBox(height: 22),
-        const Text('you turn it ON in',
+                color: Colors.white54,
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        FittedBox(
+          child: Text(step.label,
+              style: const TextStyle(
+                  color: Colors.tealAccent,
+                  fontSize: 96,
+                  fontWeight: FontWeight.w800)),
+        ),
+        Text('${_mmss(runner.remainingSec)} left in this trial',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54, fontSize: 20)),
-        Text(_mmss(remaining < 0 ? 0 : remaining),
+            style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        Text(
+            // 'measurement time — do not touch Bluetooth'
+            ' · step ${runner.stepIndex + 1}/${widget.plan.steps.length}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white38, fontSize: 16)),
+        if (move != null) ...[
+          const SizedBox(height: 18),
+          Text('then walk to ${move.label} — starts ${_hhmmss(move.startsAtMs)}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.orangeAccent, fontSize: 20)),
+        ],
+      ],
+    );
+  }
+
+  /// The operator's next walk, counted down.
+  ///
+  /// On a plan that asks nobody to move, time-to-end is the only number worth
+  /// this size. On a sweep it is the wrong one: the run ends in an hour and
+  /// the next position is due in two minutes, and missing that instant
+  /// measures a distance the trace will still label as the one intended.
+  Widget _untilMove(
+      FieldRunner runner, ({int atMs, int startsAtMs, String label}) move) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // Counted to the run's own start. Nothing waits for a tap, so this is
+    // simply when the next measurement happens — and the operator's job is
+    // to be standing at the mark before it does.
+    final remaining = ((move.startsAtMs - now) / 1000).ceil();
+    final beThere = ((move.atMs - now) / 1000).ceil();
+    final late = remaining <= 0;
+    final urgent = beThere <= 0;
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Icon(late ? Icons.directions_run : Icons.directions_walk,
+            color: late ? Colors.redAccent : Colors.orangeAccent, size: 64),
+        const SizedBox(height: 14),
+        Text(
+          'WALK WINDOW',
             textAlign: TextAlign.center,
             style: const TextStyle(
-                color: Colors.tealAccent,
-                fontSize: 96,
-                fontWeight: FontWeight.w800)),
-        if (windowAt != null)
-          Text('at ${_hhmmss(windowAt)}',
+                color: Colors.white54,
+                fontSize: 18,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        const SizedBox(height: 6),
+        FittedBox(
+          child: Text(
+              late ? '${move.label} IS STARTING' : '${move.label} STARTS IN',
+              style: TextStyle(
+                  color: late ? Colors.redAccent : Colors.orangeAccent,
+                  fontSize: 34,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1.1)),
+        ),
+        if (!late)
+          FittedBox(
+            child: Text(_span(remaining),
+                style: TextStyle(
+                    color: urgent ? Colors.redAccent : Colors.tealAccent,
+                    fontSize: 96,
+                    fontWeight: FontWeight.w800)),
+          ),
+        Text('at ${_hhmmss(move.startsAtMs)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white54, fontSize: 20)),
+        Text(
+            urgent
+                ? 'STAND AT ${move.label} NOW'
+                : '',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: urgent ? Colors.redAccent : Colors.white38,
+                fontSize: 17,
+                fontWeight: urgent ? FontWeight.w800 : FontWeight.w600)),
+        if (runner.wantsStackReset) _stackResetPrompt(runner),
+        const SizedBox(height: 18),
+        Text(
+            runner.planEndMs == null
+                ? ''
+                : 'run ends ${_hhmmss(runner.planEndMs!)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white38, fontSize: 18)),
+        if (runner.joinOrder != null) ...[
+          const SizedBox(height: 14),
+          _orderBadge(runner.joinOrder!),
+        ],
+      ],
+    );
+  }
+
+  /// The one screen for a phone with nothing to do: how long until the whole
+  /// run is over. A step boundary nobody has to act on is not worth a number
+  /// this size, and an unattended run is read from across a room.
+  Widget _untilEnd(FieldRunner runner, {String? note}) {
+    final endAt = runner.planEndMs;
+    final remaining = endAt == null
+        ? runner.remainingSec
+        : ((endAt - DateTime.now().millisecondsSinceEpoch) / 1000).ceil();
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Icon(Icons.hourglass_bottom, color: Colors.white24, size: 64),
+        const SizedBox(height: 14),
+        const Text('EXPERIMENT ENDS IN',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Colors.white54,
+                fontSize: 24,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2)),
+        FittedBox(
+          child: Text(_span(remaining),
+              style: const TextStyle(
+                  color: Colors.tealAccent,
+                  fontSize: 96,
+                  fontWeight: FontWeight.w800)),
+        ),
+        if (endAt != null)
+          Text('at ${_hhmmss(endAt)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white54, fontSize: 22)),
-        if (widget.plan.deviceOrder != null) ...[
+        if (runner.joinOrder != null) ...[
           const SizedBox(height: 18),
-          _orderBadge(widget.plan.deviceOrder!),
+          _orderBadge(runner.joinOrder!),
         ],
         const SizedBox(height: 16),
         Text(
-            'run in progress — '
-            '${runner.currentStep?.label ?? ''} '
-            '(step ${runner.stepIndex + 1}/${widget.plan.steps.length})',
+            [
+              if (note != null) note,
+              '${runner.currentStep?.label ?? ''} '
+                  '(step ${runner.stepIndex + 1}/${widget.plan.steps.length})',
+            ].join('\n'),
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white30, fontSize: 14)),
       ],
     );
   }
 
-  /// The between-step gap in manual mode — no taps exist. When the NEXT step
-  /// is this phone's first joined one, this gap IS the operator's window to
-  /// turn Bluetooth on, and the screen is nothing but that instruction.
+  /// The between-step gap in manual mode — no taps exist. Where the operator
+  /// owns the radio and the NEXT step is this phone's first joined one, this
+  /// gap IS their window to turn Bluetooth on, and the screen is nothing but
+  /// that instruction; `radioAction` is what decides that, and it stays null
+  /// on a scripted-radio plan.
   Widget _manualGap(FieldStep step, FieldRunner runner) {
     final action = runner.radioAction;
     if (action != null) return _radioPrompt(action, runner.remainingSec);
-    return _countdown(
-      'NEXT — ${step.label}',
-      runner.remainingSec,
-      [
-        'between steps',
-        if (!runner.radioSeenUp && runner.joinsLater) _joinEta(runner),
-      ].join('\n'),
-      Colors.blueGrey,
-    );
+    if (!runner.radioSeenUp && runner.joinsLater) {
+      return _untilEnd(runner, note: _joinEta(runner));
+    }
+    final move = runner.nextMove;
+    if (move != null) return _untilMove(runner, move);
+    // No walk pending: this gap sits between repeats at one position, and
+    // the only instruction is to keep standing still.
+    return _betweenTrials(step, runner);
   }
 
+  /// The gap between two trials at the SAME position. It wears the dwell's
+  /// instruction, not the walk's: nothing about moving, and no reset card —
+  /// the position was reset before its first trial and must not be touched
+  /// again until it is done.
+  Widget _betweenTrials(FieldStep step, FieldRunner runner) => Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Icon(Icons.pause_circle_outline,
+              color: Colors.tealAccent, size: 56),
+          const SizedBox(height: 14),
+          const Text('HOLD POSITION — SAME PLACE',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.2)),
+          const SizedBox(height: 8),
+          FittedBox(
+            child: Text('next: ${step.label}',
+                style: const TextStyle(
+                    color: Colors.tealAccent,
+                    fontSize: 64,
+                    fontWeight: FontWeight.w800)),
+          ),
+          Text('${runner.remainingSec}s — do not move, do not touch Bluetooth',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 17)),
+        ],
+      );
+
   /// Full-screen radio instruction: the operator's window to toggle system
-  /// Bluetooth, counted down. One widget for both directions so an off-step
-  /// and a join-step can never phrase the ask differently.
-  Widget _radioPrompt(String action, int remainingSec) {
+  /// Bluetooth, counted down. One widget for both directions and for both a
+  /// mid-run window and a join, so the ask is phrased the same everywhere.
+  Widget _radioPrompt(String action, int remainingSec, {int? order}) {
     final on = action == 'on';
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -470,23 +590,28 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
             color: Colors.orangeAccent, size: 88),
         const SizedBox(height: 16),
         FittedBox(
-          child: Text(on ? 'TURN ON BLUETOOTH NOW' : 'TURN OFF BLUETOOTH NOW',
+          child: Text(on ? 'ENABLE BT IN' : 'DISABLE BT IN',
               style: const TextStyle(
                   color: Colors.orangeAccent,
                   fontSize: 44,
                   fontWeight: FontWeight.w800)),
         ),
         const SizedBox(height: 10),
-        Text(_mmss(remainingSec),
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                color: Colors.white,
-                fontSize: 88,
-                fontWeight: FontWeight.w800)),
+        FittedBox(
+          child: Text(_span(remainingSec),
+              style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 88,
+                  fontWeight: FontWeight.w800)),
+        ),
         const SizedBox(height: 10),
         const Text('in the phone\'s Settings — the step starts either way',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white54, fontSize: 16)),
+        if (order != null) ...[
+          const SizedBox(height: 18),
+          _orderBadge(order),
+        ],
       ],
     );
   }
@@ -649,20 +774,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white70, fontSize: 22)),
         ],
-        // Say what the tap will do about position, because the answer differs
-        // by step and is otherwise only discoverable from the data afterwards.
-        if (runner.hasLocation) ...[
-          const SizedBox(height: 10),
-          Text(
-              step.label == 'distribute'
-                  ? 'no GPS fix yet — this tap starts the walk-out.\n'
-                      'The fix is taken where you put the phone down.'
-                  : runner.locationFixes == 0
-                      ? 'a GPS fix is taken when this step begins'
-                      : 'tapping re-fixes this phone\'s position',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white38, fontSize: 15)),
-        ],
         const SizedBox(height: 48),
         SizedBox(
           height: 140,
@@ -681,7 +792,6 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         ),
         const SizedBox(height: 16),
         Text('dwell ${_mmss(step.dwellSec)}'
-            '${step.bulk ? ' + bulk flows' : ''}'
             '${step.sendCount > 0 ? ' + ${step.sendCount} sends' : ''}'
             '${runner.sentCount > 0 ? ' — ${runner.sentCount} sent' : ''}',
             textAlign: TextAlign.center,

@@ -1,0 +1,49 @@
+records: 28210   span: 3347s
+
+receiver1 (18130c0f):
+  records by type: {'rssi': 6265, 'link': 314, 'buf': 258, 'power': 258, 'session': 140, 'marker': 50, 'wire': 29, 'dialcell': 15}
+  link stages: {'discovered': 257, 'connected': 20, 'gattConnected': 20, 'drop': 13, 'scanRestart': 4}
+  wire bytes: {'rx:announce': 45136, 'rx:secure': 28756, 'tx:announce': 49504, 'tx:secure:sync': 28243}
+
+receiver2 (44a266c4):
+  records by type: {'rssi': 5072, 'buf': 258, 'power': 258, 'link': 236, 'session': 115, 'marker': 50, 'wire': 29, 'dialcell': 15}
+  link stages: {'discovered': 199, 'gattConnected': 14, 'connected': 12, 'drop': 8, 'scanRestart': 3}
+  wire bytes: {'rx:announce': 36218, 'rx:secure': 19801, 'tx:announce': 40768, 'tx:secure:sync': 22181}
+
+receiver3 (929a022c):
+  records by type: {'rssi': 4678, 'link': 388, 'buf': 258, 'power': 258, 'session': 99, 'drop': 58, 'marker': 48, 'wire': 31, 'dialcell': 15}
+  link stages: {'discovered': 230, 'gattConnected': 114, 'connected': 24, 'drop': 14, 'scanRestart': 6}
+  wire bytes: {'rx:announce': 46592, 'rx:secure': 24714, 'tx:announce': 40222, 'tx:secure:sync': 24025}
+
+receiver4 (b7d04acb):
+  records by type: {'rssi': 7178, 'buf': 258, 'power': 258, 'link': 252, 'session': 99, 'marker': 50, 'wire': 29, 'dialcell': 15, 'drop': 1}
+  link stages: {'discovered': 195, 'gattConnected': 25, 'connected': 17, 'drop': 14, 'scanRestart': 1}
+  wire bytes: {'rx:announce': 35126, 'rx:secure': 18328, 'tx:announce': 34944, 'tx:secure:sync': 19706}
+
+receiver5 (d5aedd63):
+  records by type: {'buf': 258, 'power': 258, 'link': 154, 'rssi': 56, 'session': 56, 'marker': 50, 'wire': 28, 'dialcell': 15}
+  link stages: {'discovered': 114, 'scanRestart': 27, 'connected': 6, 'gattConnected': 4, 'drop': 3}
+  wire bytes: {'rx:announce': 20384, 'rx:secure': 12036, 'tx:announce': 19656, 'tx:secure:sync': 10587}
+battery receiver1 (18130c0f): 100% -> 100% [WARNING: 258/258 samples while charging — excluded from draw]
+battery receiver2 (44a266c4): 100% -> 100% [WARNING: 258/258 samples while charging — excluded from draw]
+battery receiver3 (929a022c): 100% -> 100% [WARNING: 258/258 samples while charging — excluded from draw]
+battery receiver4 (b7d04acb): 100% -> 100% [WARNING: 258/258 samples while charging — excluded from draw]
+battery receiver5 (d5aedd63): 100% -> 100% [WARNING: 258/258 samples while charging — excluded from draw]
+
+Packet loss by site (drop records)
+------------------------------------------------------------
+ _device    where   reason  count
+929a022c    bleRx notReady     57
+929a022c bleStale    sweep      1
+b7d04acb bleStale    sweep      1
+
+Session cap (LRU) sizing
+------------------------------------------------------------
+  inbound sealed packets that opened nothing: 0 (0.0/s)
+  inbound sealed packets that opened: 507
+  18130c0f: 5 pairings with 5 distinct peers -> cheapest cap 8 (hit 0.00, 0.042% of one core)
+  44a266c4: 4 pairings with 4 distinct peers -> cheapest cap 8 (hit 0.00, 0.034% of one core)
+  929a022c: 7 pairings with 5 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  b7d04acb: 6 pairings with 4 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  d5aedd63: 2 pairings with 2 distinct peers -> cheapest cap 8 (hit 0.00, 0.017% of one core)
+  NOTE: no failed trial-decrypts in this trace, so the table-walk term is zero and the cheapest cap is simply the largest. That is the correct answer WHILE the envelope still carries a recipient; re-run against a recipient-less arm to get the trade-off.

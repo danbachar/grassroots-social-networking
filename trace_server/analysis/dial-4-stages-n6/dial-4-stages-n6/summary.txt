@@ -1,0 +1,62 @@
+records: 31004   span: 2455s
+
+receiver1 (18130c0f):
+  records by type: {'rssi': 5676, 'link': 322, 'buf': 247, 'power': 247, 'session': 68, 'marker': 50, 'wire': 17, 'dialcell': 15, 'drop': 1}
+  link stages: {'identified': 134, 'discovered': 134, 'connected': 20, 'gattConnected': 17, 'drop': 12, 'scanRestart': 4, 'bounce': 1}
+  wire bytes: {'rx:announce': 23296, 'rx:secure': 9100, 'tx:announce': 29302, 'tx:secure:sync': 16265}
+
+receiver2 (44a266c4):
+  records by type: {'rssi': 3943, 'buf': 247, 'power': 247, 'link': 219, 'session': 51, 'marker': 50, 'wire': 17, 'dialcell': 15, 'drop': 1}
+  link stages: {'identified': 85, 'discovered': 85, 'gattConnected': 23, 'connected': 11, 'scanRestart': 7, 'drop': 7, 'bounce': 1}
+  wire bytes: {'rx:announce': 14560, 'rx:secure': 10791, 'tx:announce': 17654, 'tx:secure:sync': 9003}
+
+receiver3 (929a022c):
+  records by type: {'rssi': 4163, 'link': 416, 'buf': 247, 'power': 247, 'session': 69, 'marker': 48, 'wire': 19, 'dialcell': 15, 'drop': 2}
+  link stages: {'discovered': 138, 'identified': 137, 'gattConnected': 104, 'connected': 19, 'drop': 10, 'scanRestart': 7, 'bounce': 1}
+  wire bytes: {'rx:announce': 24388, 'rx:secure': 13958, 'tx:announce': 23660, 'tx:secure:sync': 13474}
+
+receiver4 (b7d04acb):
+  records by type: {'rssi': 6606, 'link': 248, 'buf': 247, 'power': 247, 'session': 51, 'marker': 50, 'wire': 20, 'dialcell': 15, 'drop': 2}
+  link stages: {'discovered': 104, 'identified': 102, 'gattConnected': 16, 'connected': 15, 'drop': 7, 'scanRestart': 3, 'bounce': 1}
+  wire bytes: {'rx:announce': 18928, 'rx:secure': 10747, 'tx:announce': 17654, 'tx:secure:sync': 9557}
+
+receiver5 (be3a5ef5):
+  records by type: {'rssi': 4965, 'link': 406, 'buf': 247, 'power': 247, 'session': 86, 'marker': 48, 'wire': 19, 'dialcell': 15, 'drop': 3}
+  link stages: {'discovered': 173, 'identified': 172, 'connected': 18, 'gattConnected': 17, 'scanRestart': 16, 'drop': 9, 'bounce': 1}
+  wire bytes: {'rx:announce': 30758, 'rx:secure': 16049, 'tx:announce': 29302, 'tx:secure:sync': 17847}
+
+receiver6 (d5aedd63):
+  records by type: {'buf': 247, 'power': 247, 'link': 178, 'marker': 50, 'rssi': 34, 'session': 34, 'wire': 17, 'dialcell': 15, 'drop': 1}
+  link stages: {'identified': 68, 'discovered': 68, 'scanRestart': 25, 'connected': 7, 'gattConnected': 5, 'drop': 4, 'bounce': 1}
+  wire bytes: {'rx:announce': 12376, 'rx:secure': 6272, 'tx:announce': 11648, 'tx:secure:sync': 6282}
+battery receiver1 (18130c0f): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+battery receiver2 (44a266c4): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+battery receiver3 (929a022c): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+battery receiver4 (b7d04acb): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+battery receiver5 (be3a5ef5): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+battery receiver6 (d5aedd63): 100% -> 100% [WARNING: 247/247 samples while charging — excluded from draw]
+
+Packet loss by site (drop records)
+------------------------------------------------------------
+ _device    where          reason  count
+be3a5ef5 bleStale           sweep      2
+18130c0f  testbed bounceNotActive      1
+44a266c4  testbed bounceNotActive      1
+929a022c bleStale           sweep      1
+929a022c  testbed bounceNotActive      1
+b7d04acb bleStale           sweep      1
+b7d04acb  testbed bounceNotActive      1
+be3a5ef5  testbed bounceNotActive      1
+d5aedd63  testbed bounceNotActive      1
+
+Session cap (LRU) sizing
+------------------------------------------------------------
+  inbound sealed packets that opened nothing: 0 (0.0/s)
+  inbound sealed packets that opened: 359
+  18130c0f: 5 pairings with 5 distinct peers -> cheapest cap 8 (hit 0.00, 0.058% of one core)
+  44a266c4: 3 pairings with 3 distinct peers -> cheapest cap 8 (hit 0.00, 0.035% of one core)
+  929a022c: 5 pairings with 4 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  b7d04acb: 5 pairings with 4 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  be3a5ef5: 6 pairings with 5 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  d5aedd63: 2 pairings with 2 distinct peers -> cheapest cap 8 (hit 0.00, 0.023% of one core)
+  NOTE: no failed trial-decrypts in this trace, so the table-walk term is zero and the cheapest cap is simply the largest. That is the correct answer WHILE the envelope still carries a recipient; re-run against a recipient-less arm to get the trade-off.

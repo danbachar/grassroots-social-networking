@@ -1,0 +1,6 @@
+stage,trials,reached,reach_rate,median_s,p90_s,max_s
+discovered,20,20,1.0,3.28,8.02,9.83
+gattConnected,20,20,1.0,1.48,3.0,3.67
+identified,20,20,1.0,3.28,8.02,9.83
+connected,20,20,1.0,3.22,7.97,9.81
+session,20,3,0.15,9.8,20.55,23.24

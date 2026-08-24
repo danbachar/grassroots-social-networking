@@ -17,7 +17,20 @@ enum ContentType {
   readReceipt(0x03),
 
   /// Hole-punch / address signaling. Chunk is a `SignalingCodec` payload.
-  signaling(0x04);
+  signaling(0x04),
+
+  /// Buffer reconciliation: a GCS filter of the packetIds this node holds,
+  /// over a creation-time window. Neighbor-local (TTL 1, never relayed) and
+  /// sealed like every other content — the Noise session exists before any
+  /// sync runs, so the filter never travels in the clear. The peer answers by
+  /// conveying the packets in the window its filter proves the sender lacks;
+  /// there is no separate request frame, so 0x06 is retired.
+  ///
+  /// 0x07 and 0x08 are retired too: they carried the testbed's remote
+  /// run-start signal and its armed-time neighbour gossip, deleted when
+  /// field runs moved to the wall-clock-anchored manual launch. Never reuse
+  /// the values.
+  syncFilter(0x05);
 
   final int value;
   const ContentType(this.value);

@@ -116,6 +116,11 @@ class PeerState {
   final PeerConnectionState connectionState;
   final PeerTransport transport;
 
+  /// Whether the peer advertises willingness to introduce strangers redeeming
+  /// a friend's invite (from its signed ANNOUNCE). Used to pick eligible
+  /// introducers when creating an invite.
+  final bool willingToFacilitate;
+
   /// Latest BLE signal strength in dBm.
   ///
   /// Null when the peer has no live BLE link or when the BLE stack cannot
@@ -124,7 +129,6 @@ class PeerState {
   /// BLE path drops.
   final int? rssi;
 
-  final int protocolVersion;
   final DateTime? lastSeen;
 
   /// PathId of our central → their peripheral path, when one is currently
@@ -180,13 +184,23 @@ class PeerState {
   /// handshake itself): a peer is only [isReachable] once authenticated.
   final bool bleAuthenticated;
 
+  /// Whether we hold an end-to-end Noise session with this peer.
+  ///
+  /// Transport-independent, and NOT the same as [isReachable]: a session is
+  /// keyed by identity and survives the link that formed it, so this stays
+  /// true after the peer walks out of range. That is the point — sealing needs
+  /// a session, not a live path, and a message to an absent peer is exactly
+  /// what the DTN buffer carries. Sending is gated on this, never on
+  /// reachability.
+  final bool hasNoiseSession;
+
   const PeerState({
     required this.publicKey,
     required this.nickname,
     this.connectionState = PeerConnectionState.discovered,
     this.transport = PeerTransport.bleDirect,
+    this.willingToFacilitate = false,
     this.rssi,
-    this.protocolVersion = 1,
     this.lastSeen,
     this.bleCentralDeviceId,
     this.blePeripheralDeviceId,
@@ -199,6 +213,7 @@ class PeerState {
     this.lastDirectReachAt,
     this.hasLiveUdpConnection = false,
     this.bleAuthenticated = false,
+    this.hasNoiseSession = false,
   });
 
   /// Hex representation of public key (for map keys)
@@ -235,7 +250,10 @@ class PeerState {
   bool get hasKnownAddress =>
       hasBleConnection || allUdpAddressCandidates.isNotEmpty;
 
-  /// UDP candidates in first-seen order, including legacy fields.
+  /// UDP candidates in first-seen order. The single-valued
+  /// [linkLocalAddress] and [udpAddress] are current fields, not remnants:
+  /// one peer advertises several candidates and each pair picks the one that
+  /// works between them.
   Set<String> get allUdpAddressCandidates => normalizeAddressStrings([
         linkLocalAddress,
         udpAddress,
@@ -285,8 +303,8 @@ class PeerState {
     String? nickname,
     PeerConnectionState? connectionState,
     PeerTransport? transport,
+    bool? willingToFacilitate,
     int? rssi,
-    int? protocolVersion,
     DateTime? lastSeen,
     String? bleCentralDeviceId,
     String? blePeripheralDeviceId,
@@ -300,14 +318,15 @@ class PeerState {
     bool clearLastDirectReachAt = false,
     bool? hasLiveUdpConnection,
     bool? bleAuthenticated,
+    bool? hasNoiseSession,
   }) {
     return PeerState(
       publicKey: publicKey ?? this.publicKey,
       nickname: nickname ?? this.nickname,
       connectionState: connectionState ?? this.connectionState,
       transport: transport ?? this.transport,
+      willingToFacilitate: willingToFacilitate ?? this.willingToFacilitate,
       rssi: rssi ?? this.rssi,
-      protocolVersion: protocolVersion ?? this.protocolVersion,
       lastSeen: lastSeen ?? this.lastSeen,
       bleCentralDeviceId: bleCentralDeviceId ?? this.bleCentralDeviceId,
       blePeripheralDeviceId:
@@ -323,6 +342,7 @@ class PeerState {
           : lastDirectReachAt ?? this.lastDirectReachAt,
       hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
       bleAuthenticated: bleAuthenticated ?? this.bleAuthenticated,
+      hasNoiseSession: hasNoiseSession ?? this.hasNoiseSession,
     );
   }
 
@@ -335,6 +355,7 @@ class PeerState {
           nickname == other.nickname &&
           connectionState == other.connectionState &&
           transport == other.transport &&
+          willingToFacilitate == other.willingToFacilitate &&
           rssi == other.rssi &&
           bleCentralDeviceId == other.bleCentralDeviceId &&
           blePeripheralDeviceId == other.blePeripheralDeviceId &&
@@ -351,6 +372,7 @@ class PeerState {
         nickname,
         connectionState,
         transport,
+        willingToFacilitate,
         rssi,
         bleCentralDeviceId,
         blePeripheralDeviceId,
@@ -395,6 +417,18 @@ class PeersState {
   /// All identified peers as list
   List<PeerState> get peersList => peers.values.toList();
 
+  /// Peers a message can actually be addressed to: those with a live Noise
+  /// session.
+  ///
+  /// Being known and being reachable are different facts and arrive at
+  /// different times — a verified ANNOUNCE puts a peer in [peersList] while
+  /// the handshake with it is still ahead, so there is a real window where
+  /// its identity is established and nothing can be sent to it. A session is
+  /// keyed by identity rather than by any link, so this survives a transport
+  /// dropping underneath it.
+  List<PeerState> get sessionPeers =>
+      peers.values.where((p) => p.hasNoiseSession).toList();
+
   /// Connected peers only
   List<PeerState> get connectedPeers =>
       peers.values.where((p) => p.isConnected).toList();
@@ -415,7 +449,7 @@ class PeersState {
   /// transition. The BLE device-id fields are the ground truth of whether
   /// we still hold a path. The `_removeStalePeers` sweep in
   /// `GrassrootsNetwork` clears those ids on `lastBleSeen` staleness so a
-  /// peer that's gone silent for two announce cycles falls off this list.
+  /// peer that's gone silent for ten announce cycles falls off this list.
   List<PeerState> get nearbyBlePeers =>
       peers.values.where((p) => p.hasBleConnection).toList();
 
@@ -446,14 +480,6 @@ class PeersState {
   /// Direct accepted friend public keys.
   Set<String> get friendPubkeyHexes =>
       friends.map((friend) => friend.pubkeyHex).toSet();
-
-  /// Common friends between us and [friendPubkeyHex], based on the last
-  /// FRIEND_LIST received from that direct friend.
-  Set<String> commonFriendHexesWith(String friendPubkeyHex) {
-    final advertised = friendsOfFriends[friendPubkeyHex.toLowerCase()];
-    if (advertised == null || advertised.isEmpty) return const {};
-    return advertised.intersection(friendPubkeyHexes);
-  }
 
   /// Connected direct friends that can mediate to [targetPubkeyHex] because
   /// their advertised friend list contains the target.

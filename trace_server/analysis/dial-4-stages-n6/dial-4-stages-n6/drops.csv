@@ -1,0 +1,10 @@
+_device,where,reason,count
+be3a5ef5,bleStale,sweep,2
+18130c0f,testbed,bounceNotActive,1
+44a266c4,testbed,bounceNotActive,1
+929a022c,bleStale,sweep,1
+929a022c,testbed,bounceNotActive,1
+b7d04acb,bleStale,sweep,1
+b7d04acb,testbed,bounceNotActive,1
+be3a5ef5,testbed,bounceNotActive,1
+d5aedd63,testbed,bounceNotActive,1

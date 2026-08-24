@@ -13,7 +13,9 @@ enum PacketType {
   /// Session-sealed envelope. Everything that is not an ANNOUNCE or a handshake
   /// is one opaque `secure` packet: the content type and any fragmentation live
   /// INSIDE the encrypted payload (see [SecureFrame]), so a relay only ever sees
-  /// an opaque, recipient-addressed blob — never the message class.
+  /// an opaque, recipient-addressed blob — never the message class. Sync-on-
+  /// connect control frames ride inside it too, so buffer contents are
+  /// never on the air in the clear.
   secure(0x03);
 
   final int value;
@@ -27,39 +29,55 @@ enum PacketType {
   }
 }
 
-/// A Grassroots packet ready for mesh transmission.
-///
-/// **Sender-anonymous envelope.** The outer header carries only the *recipient*
-/// ID — never the sender — so a relay can route by recipient without learning
-/// who originated the packet, and there is no whole-packet Ed25519 signature on
-/// the wire (relays cannot authenticate an anonymous sender; authentication is
-/// end-to-end inside the Noise session). See CLAUDE.md → Mesh Envelope & Trust.
-///
-/// Binary format:
-/// ```
-/// [0]      : Packet type (1 byte)
-/// [1]      : TTL (1 byte, decremented at each relay hop, dropped at 0)
-/// [2-5]    : Timestamp (4 bytes, seconds since epoch, big-endian)
-/// [6-37]   : Recipient public key (32 bytes, zeros for broadcast)
-/// [38-53]  : Packet ID (16 bytes, UUID — dedup / loop prevention)
-/// [54-57]  : Payload length (4 bytes, big-endian)
-/// [58-N]   : Payload (variable length; Noise-sealed for session types)
-/// ```
-///
-/// Total header size: 58 bytes. The 4-byte payload length is the on-wire
-/// framer: stream transports (UDP/UDX) accumulate bytes until
-/// `headerSize + payloadLength` are available before treating a buffer as
-/// one packet.
-class GrassrootsPacket {
-  static const int headerSize = 58;
-  static const int payloadLengthOffset = 54; // byte index of length field
 
-  /// Soft target for fragmented payloads — chosen to keep a single
-  /// encrypted packet under ~500 byte MTU on BLE.
-  static const int maxPayloadSize = 442; // 500 - 58
+class GrassrootsPacket {
+  static const int headerSize = 60;
+  static const int packetIdOffset = 34; // byte index of the 16-byte packet id
+  static const int payloadLengthOffset = 50; // byte index of length field
+
+  /// Byte index of the 6-byte creation time. APPENDED after the length field
+  /// rather than inserted, so every offset above keeps its value — the wire
+  /// ledger reads the packetId at 34 and the UDP framer reads the length at
+  /// 50 to know where a packet ends, and moving either would have broken
+  /// framing for a field neither of them needs.
+  static const int createdAtOffset = 54;
+
   static const int defaultTtl = 7;
 
   static const _uuid = Uuid();
+
+  /// When the ORIGINATOR created this packet, in Unix MILLISECONDS.
+  ///
+  /// Carried on the wire because it is the only age every node can agree on.
+  /// Each node's own `storedAt` is its receipt time, so a packet that keeps
+  /// hopping restarts its clock at every hop and can outlive the buffer's age
+  /// cap many times over; and a sync window scoped by receipt time means two
+  /// nodes comparing "the same" window are comparing different numbers. This
+  /// field fixes both — expiry becomes absolute, and a filter can name the
+  /// window it covers.
+  ///
+  /// Milliseconds, in 6 bytes rather than 4-byte seconds. The sync
+  /// sweep bounds a window by `[from, to]` where `to` is the creation stamp of
+  /// the last packet that fit the filter, and the responder answers from that
+  /// window — so every packet sharing the boundary stamp must either be inside
+  /// the filter or outside the window. At second resolution and a saturating
+  /// send rate against a 106-element filter, a single second
+  /// routinely holds more packets than the filter can carry: the boundary
+  /// would cut mid-second, the responder would re-send what it could not know
+  /// was advertised, and the cursor could never advance past that second at
+  /// all. Milliseconds make ties rare and the boundary well defined. 4 bytes
+  /// of ms only spans 49 days, hence 6.
+  ///
+  /// It was in the header until 9bff06d, which removed it as part of a
+  /// slimming without giving a reason. Costs 6 bytes, taking the single-packet
+  /// payload budget from 136 to 130.
+  ///
+  /// Privacy: this tells any relay the AGE of traffic it carries. The
+  /// envelope is otherwise sender-anonymous, so it is a weak correlation aid
+  /// — packets minted together look alike. Accepted deliberately: the sync
+  /// window needs a shared, originator-stamped clock, and no coarser
+  /// resolution gives one (see the tie/boundary reasoning above).
+  final int createdAtMs;
 
   /// Unique packet identifier for deduplication
   final String packetId;
@@ -69,9 +87,6 @@ class GrassrootsPacket {
 
   /// Time-to-live: decremented at each hop, dropped when 0
   int ttl;
-
-  /// Creation timestamp (Unix seconds)
-  final int timestamp;
 
   /// Recipient's public key (null/zeros for broadcast)
   final Uint8List? recipientPubkey;
@@ -84,11 +99,12 @@ class GrassrootsPacket {
     String? packetId,
     required this.type,
     this.ttl = defaultTtl,
-    int? timestamp,
     this.recipientPubkey,
     required this.payload,
+    int? createdAtMs,
   })  : packetId = packetId ?? _uuid.v4(),
-        timestamp = timestamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000 {
+        createdAtMs =
+            createdAtMs ?? DateTime.now().millisecondsSinceEpoch {
     if (recipientPubkey != null && recipientPubkey!.length != 32) {
       throw ArgumentError('Recipient public key must be 32 bytes');
     }
@@ -107,9 +123,12 @@ class GrassrootsPacket {
       packetId: packetId,
       type: type,
       ttl: ttl - 1,
-      timestamp: timestamp,
       recipientPubkey: recipientPubkey,
       payload: payload,
+      // The creation time is the ORIGINATOR's and never re-stamped: a hop is
+      // not a new packet, and re-stamping would reset the age every relay —
+      // exactly the bug this field exists to remove.
+      createdAtMs: createdAtMs,
     );
   }
 
@@ -117,17 +136,17 @@ class GrassrootsPacket {
     String? packetId,
     PacketType? type,
     int? ttl,
-    int? timestamp,
     Uint8List? recipientPubkey,
     Uint8List? payload,
+    int? createdAtMs,
   }) {
     return GrassrootsPacket(
       packetId: packetId ?? this.packetId,
       type: type ?? this.type,
       ttl: ttl ?? this.ttl,
-      timestamp: timestamp ?? this.timestamp,
       recipientPubkey: recipientPubkey ?? this.recipientPubkey,
       payload: payload ?? this.payload,
+      createdAtMs: createdAtMs ?? this.createdAtMs,
     );
   }
 
@@ -142,10 +161,6 @@ class GrassrootsPacket {
     // TTL (1 byte)
     buffer.setUint8(offset++, ttl);
 
-    // Timestamp (4 bytes, big-endian)
-    buffer.setUint32(offset, timestamp, Endian.big);
-    offset += 4;
-
     final bytes = buffer.buffer.asUint8List();
 
     // Recipient pubkey (32 bytes, zeros if broadcast)
@@ -157,13 +172,19 @@ class GrassrootsPacket {
     offset += 32;
 
     // Packet ID (16 bytes - UUID as bytes)
-    final idBytes = _uuidToBytes(packetId);
+    final idBytes = uuidToBytes(packetId);
     bytes.setRange(offset, offset + 16, idBytes);
     offset += 16;
 
     // Payload length (4 bytes, big-endian)
     buffer.setUint32(offset, payload.length, Endian.big);
     offset += 4;
+
+    // Creation time (6 bytes, Unix milliseconds, big-endian). 48 bits spans
+    // ~8900 years; 32 would span 49 days.
+    buffer.setUint16(offset, (createdAtMs >> 32) & 0xFFFF, Endian.big);
+    buffer.setUint32(offset + 2, createdAtMs & 0xFFFFFFFF, Endian.big);
+    offset += 6;
 
     // Payload
     bytes.setRange(offset, offset + payload.length, payload);
@@ -186,10 +207,6 @@ class GrassrootsPacket {
     // TTL
     final ttl = buffer.getUint8(offset++);
 
-    // Timestamp
-    final timestamp = buffer.getUint32(offset, Endian.big);
-    offset += 4;
-
     // Recipient pubkey
     final recipientBytes = data.sublist(offset, offset + 32);
     final recipientPubkey = recipientBytes.every((b) => b == 0)
@@ -199,12 +216,16 @@ class GrassrootsPacket {
 
     // Packet ID
     final idBytes = data.sublist(offset, offset + 16);
-    final packetId = _bytesToUuid(idBytes);
+    final packetId = bytesToUuid(idBytes);
     offset += 16;
 
     // Payload length
     final payloadLength = buffer.getUint32(offset, Endian.big);
     offset += 4;
+
+    final createdAtMs = (buffer.getUint16(offset, Endian.big) << 32) |
+        buffer.getUint32(offset + 2, Endian.big);
+    offset += 6;
 
     // Payload
     if (data.length < offset + payloadLength) {
@@ -218,9 +239,9 @@ class GrassrootsPacket {
       packetId: packetId,
       type: type,
       ttl: ttl,
-      timestamp: timestamp,
       recipientPubkey: recipientPubkey,
       payload: payload,
+      createdAtMs: createdAtMs,
     );
   }
 
@@ -236,7 +257,7 @@ class GrassrootsPacket {
   }
 
   /// Convert UUID string to 16 bytes
-  static Uint8List _uuidToBytes(String uuid) {
+  static Uint8List uuidToBytes(String uuid) {
     final hex = uuid.replaceAll('-', '');
     final bytes = Uint8List(16);
     for (var i = 0; i < 16; i++) {
@@ -246,7 +267,7 @@ class GrassrootsPacket {
   }
 
   /// Convert 16 bytes to UUID string
-  static String _bytesToUuid(Uint8List bytes) {
+  static String bytesToUuid(Uint8List bytes) {
     if (bytes.length != 16) throw ArgumentError('UUID must be 16 bytes');
     final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     return '${hex.substring(0, 8)}-'

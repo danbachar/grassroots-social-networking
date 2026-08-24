@@ -1,0 +1,8 @@
+d,direction,trials,discovered_rate,connected_rate,session_rate,usable_rate,drop_rate,advCoverage_mean,rssi_adv_mean,msg_sent,recv_rate,delivery_rate,rtt_median_ms
+1.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.567,-44.0,1000,1.0,1.0,120
+2.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.558,-53.4,1000,1.0,1.0,144
+3.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.496,-57.2,1000,1.0,1.0,146
+4.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.554,-67.3,1000,0.99,0.99,206
+5.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.458,-58.9,1000,1.0,1.0,167
+6.0,approach,10,1.0,1.0,1.0,1.0,1.0,0.466,-58.2,1000,1.0,1.0,168
+7.0,approach,10,1.0,1.0,1.0,0.9,1.0,0.44,-63.2,1000,0.929,0.9,174

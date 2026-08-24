@@ -1,0 +1,128 @@
+records: 417097   span: 14694s
+
+receiver1 (18130c0f):
+  records by type: {'rssi': 42036, 'link': 11879, 'session': 2294, 'buf': 1471, 'power': 1471, 'wire': 1326, 'marker': 491, 'drop': 176, 'dialcell': 110, 'app': 6}
+  link stages: {'identified': 4730, 'discovered': 4730, 'gattConnected': 1087, 'connected': 603, 'drop': 594, 'bounce': 120, 'duplicateLeg': 5, 'session': 3, 'advertiseFailed': 3, 'pruned': 2, 'scanRestart': 2}
+  wire bytes: {'rx:announce': 853376, 'rx:handshake': 770, 'rx:secure': 484161, 'tx:announce': 908429, 'tx:handshake': 572, 'tx:secure:sync': 494899}
+
+receiver2 (44a266c4):
+  records by type: {'rssi': 33667, 'link': 3802, 'buf': 1471, 'power': 1471, 'session': 691, 'wire': 672, 'marker': 481, 'dialcell': 110, 'drop': 13}
+  link stages: {'identified': 1473, 'discovered': 1473, 'gattConnected': 262, 'connected': 192, 'drop': 187, 'bounce': 117, 'scanRestart': 90, 'session': 7, 'pruned': 1}
+  wire bytes: {'rx:announce': 264637, 'rx:handshake': 1882, 'rx:secure': 146139, 'tx:announce': 273182, 'tx:handshake': 1671, 'tx:secure:sync': 98985}
+
+receiver3 (4fecd00f):
+  records by type: {'rssi': 9650, 'link': 5134, 'buf': 1471, 'power': 1471, 'drop': 980, 'session': 936, 'wire': 465, 'marker': 327, 'dialcell': 110}
+  link stages: {'identified': 1997, 'discovered': 1997, 'gattConnected': 582, 'connected': 225, 'drop': 223, 'pruned': 67, 'bounce': 40, 'session': 3}
+  wire bytes: {'rx:announce': 359464, 'rx:handshake': 604, 'rx:secure': 204346, 'tx:announce': 435906, 'tx:handshake': 738, 'tx:secure:sync': 209573}
+
+receiver4 (6b819f64):
+  records by type: {'rssi': 12915, 'link': 4254, 'buf': 1471, 'power': 1471, 'session': 995, 'drop': 328, 'marker': 289, 'wire': 273, 'dialcell': 110}
+  link stages: {'identified': 1685, 'discovered': 1685, 'gattConnected': 449, 'connected': 206, 'drop': 198, 'bounce': 21, 'scanRestart': 5, 'session': 5}
+  wire bytes: {'rx:announce': 423437, 'rx:handshake': 981, 'rx:secure': 203839, 'tx:announce': 376422, 'tx:handshake': 1524, 'tx:secure:sync': 215436}
+
+receiver5 (929a022c):
+  records by type: {'link': 459, 'rssi': 227, 'buf': 118, 'power': 118, 'session': 100, 'drop': 87, 'marker': 22, 'wire': 20, 'dialcell': 6}
+  link stages: {'identified': 211, 'discovered': 211, 'connected': 16, 'drop': 16, 'gattConnected': 4, 'session': 1}
+  wire bytes: {'rx:announce': 37724, 'rx:handshake': 246, 'rx:secure': 18602, 'tx:announce': 55456, 'tx:handshake': 278, 'tx:secure:sync': 28063}
+
+receiver6 (b7d04acb):
+  records by type: {'rssi': 40433, 'link': 13586, 'session': 2765, 'buf': 1471, 'power': 1471, 'wire': 1290, 'drop': 993, 'marker': 505, 'dialcell': 110, 'app': 13, 'retry': 3}
+  link stages: {'identified': 5295, 'discovered': 5295, 'gattConnected': 1398, 'connected': 735, 'drop': 717, 'bounce': 120, 'advertiseFailed': 12, 'scanRestart': 5, 'duplicateLeg': 4, 'session': 3, 'pruned': 2}
+  wire bytes: {'rx:announce': 949663, 'rx:handshake': 492, 'rx:secure': 574971, 'tx:announce': 1152798, 'tx:handshake': 441, 'tx:secure:sync': 605289}
+
+receiver7 (be3a5ef5):
+  records by type: {'rssi': 31008, 'link': 13673, 'session': 2734, 'buf': 1471, 'power': 1471, 'wire': 1105, 'marker': 445, 'drop': 323, 'dialcell': 110, 'retry': 1}
+  link stages: {'identified': 5532, 'discovered': 5532, 'gattConnected': 1117, 'connected': 640, 'drop': 639, 'pruned': 107, 'bounce': 96, 'session': 4, 'duplicateLeg': 3, 'advertiseFailed': 2, 'scanRestart': 1}
+  wire bytes: {'rx:announce': 998462, 'rx:handshake': 738, 'rx:secure': 598567, 'tx:announce': 1102335, 'tx:handshake': 604, 'tx:secure:sync': 630486}
+
+receiver8 (c3cba742):
+  records by type: {'rssi': 47410, 'link': 4938, 'buf': 1471, 'power': 1471, 'session': 1105, 'drop': 680, 'wire': 527, 'marker': 417, 'dialcell': 110}
+  link stages: {'identified': 1907, 'discovered': 1907, 'gattConnected': 454, 'connected': 290, 'drop': 289, 'bounce': 85, 'session': 3, 'scanRestart': 3}
+  wire bytes: {'rx:announce': 343858, 'rx:handshake': 572, 'rx:secure': 243487, 'tx:announce': 467431, 'tx:handshake': 770, 'tx:secure:sync': 247844}
+
+receiver9 (d5aedd63):
+  records by type: {'buf': 1471, 'power': 1471, 'link': 497, 'marker': 252, 'dialcell': 110, 'wire': 24, 'session': 13, 'drop': 1}
+  link stages: {'scanRestart': 373, 'identified': 54, 'discovered': 54, 'connected': 6, 'drop': 5, 'bounce': 2, 'gattConnected': 2, 'advertiseFailed': 1}
+  wire bytes: {'rx:announce': 9282, 'rx:secure': 2799, 'tx:announce': 15470, 'tx:secure:sync': 4426}
+
+receiver10 (dbac04ef):
+  records by type: {'rssi': 26522, 'link': 10959, 'drop': 3137, 'session': 2082, 'buf': 1471, 'power': 1471, 'wire': 675, 'marker': 361, 'dialcell': 110}
+  link stages: {'identified': 4346, 'discovered': 4346, 'gattConnected': 1181, 'connected': 446, 'drop': 440, 'pruned': 140, 'bounce': 57, 'scanRestart': 2, 'session': 1}
+  wire bytes: {'rx:announce': 806273, 'rx:handshake': 163, 'rx:secure': 451170, 'tx:announce': 999501, 'tx:handshake': 246, 'tx:secure:sync': 488955}
+
+receiver11 (f5aee069):
+  records by type: {'rssi': 23159, 'link': 14697, 'session': 2944, 'buf': 1471, 'power': 1471, 'wire': 854, 'drop': 817, 'marker': 391, 'dialcell': 110, 'retry': 1}
+  link stages: {'identified': 6026, 'discovered': 6026, 'gattConnected': 1236, 'connected': 673, 'drop': 661, 'bounce': 72, 'session': 2, 'duplicateLeg': 1}
+  wire bytes: {'rx:announce': 1310047, 'rx:handshake': 492, 'rx:secure': 634736, 'tx:announce': 1187009, 'tx:handshake': 441, 'tx:secure:sync': 698632}
+battery receiver1 (18130c0f): 81% -> 85% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver2 (44a266c4): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver3 (4fecd00f): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver4 (6b819f64): 17% -> 33%, median draw 134 mA (141 samples) [WARNING: 1330/1471 samples while charging — excluded from draw]
+battery receiver5 (929a022c): 100% -> 100% [WARNING: 118/118 samples while charging — excluded from draw]
+battery receiver6 (b7d04acb): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver7 (be3a5ef5): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver8 (c3cba742): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver9 (d5aedd63): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver10 (dbac04ef): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+battery receiver11 (f5aee069): 100% -> 100% [WARNING: 1471/1471 samples while charging — excluded from draw]
+
+Packet loss by site (drop records)
+------------------------------------------------------------
+ _device            where          reason  count
+dbac04ef          bleSend       oversized   3132
+4fecd00f          bleSend       oversized    976
+b7d04acb          bleSend       oversized    893
+f5aee069          bleSend       oversized    788
+c3cba742          bleSend       oversized    669
+6b819f64          bleSend       oversized    310
+be3a5ef5          bleSend       oversized    267
+18130c0f            bleRx        notReady     94
+929a022c          bleSend       oversized     84
+18130c0f          bleSend       oversized     80
+b7d04acb            bleRx        notReady     75
+be3a5ef5            bleRx        notReady     48
+f5aee069            bleRx        notReady     26
+b7d04acb          bleSend          noPath     16
+44a266c4            bleRx        notReady     13
+c3cba742          bleSend          noPath      8
+b7d04acb          bleSend     writeFailed      8
+6b819f64       reassembly         timeout      6
+6b819f64            bleRx        notReady      5
+6b819f64          decrypt       noSession      4
+be3a5ef5          bleSend          noPath      4
+6b819f64        handshake         timeout      3
+4fecd00f          decrypt       noSession      2
+929a022c          bleSend     writeFailed      2
+dbac04ef       reassembly         timeout      2
+dbac04ef            bleRx        notReady      2
+c3cba742          decrypt       noSession      2
+f5aee069       reassembly         timeout      2
+be3a5ef5          bleSend     writeFailed      2
+c3cba742            bleRx        notReady      1
+be3a5ef5         bleStale           sweep      1
+4fecd00f          bleSend     writeFailed      1
+be3a5ef5 bleSend:otherLeg     writeFailed      1
+d5aedd63          testbed bounceNotActive      1
+4fecd00f            bleRx        notReady      1
+dbac04ef          decrypt       noSession      1
+b7d04acb bleSend:otherLeg     writeFailed      1
+18130c0f        handshake         timeout      1
+18130c0f          bleSend     writeFailed      1
+f5aee069          bleSend     writeFailed      1
+929a022c         bleStale           sweep      1
+
+Session cap (LRU) sizing
+------------------------------------------------------------
+  inbound sealed packets that opened nothing: 9 (0.001/s)
+  inbound sealed packets that opened: 16618
+  18130c0f: 88 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  44a266c4: 79 pairings with 8 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  4fecd00f: 57 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  6b819f64: 36 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  929a022c: 7 pairings with 7 distinct peers -> cheapest cap 8 (hit 0.00, 0.014% of one core)
+  b7d04acb: 104 pairings with 10 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  be3a5ef5: 83 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  c3cba742: 42 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  d5aedd63: 3 pairings with 3 distinct peers -> cheapest cap 8 (hit 0.00, 0.006% of one core)
+  dbac04ef: 64 pairings with 9 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)
+  f5aee069: 103 pairings with 10 distinct peers -> cheapest cap 8 (hit 1.00, 0.000% of one core)

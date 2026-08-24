@@ -21,6 +21,15 @@ class UdpTransportStateChangedAction extends TransportAction {
 }
 
 /// BLE scanning state changed
+/// The controller's answer about whether we are broadcasting. Dispatched from
+/// the plugin's advertising-state event, never from the start request — the
+/// request being accepted says nothing about the radio.
+class BleAdvertisingChangedAction extends TransportAction {
+  final bool advertising;
+
+  BleAdvertisingChangedAction(this.advertising);
+}
+
 class BleScanningChangedAction extends TransportAction {
   final bool scanning;
 
@@ -71,4 +80,11 @@ class UnsolicitedInboundObservedAction extends TransportAction {
 
   UnsolicitedInboundObservedAction({DateTime? observedAt})
     : observedAt = observedAt ?? DateTime.now();
+}
+
+/// Fresh OS-level BLE link snapshot from the plugin (debug diagnostics poll).
+class BleLinkSnapshotAction extends TransportAction {
+  final List<BleLinkDiagnostic> links;
+
+  BleLinkSnapshotAction(this.links);
 }

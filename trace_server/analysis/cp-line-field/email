@@ -1,0 +1,47 @@
+
+Hi David,
+
+Quick update on the evaluation for the thesis. Over the past week I completed the two-device laboratory characterization of the BLE transport, and today ran the first field experiment (control-plane line test).
+
+The experiment setup: two Android phones in an open field, 10-100 m in 10 m steps, 10 runs for testing control-plane establishment per distance (between runs the Bluetooth stack was restarted, secure noise sessions dropped, and message stores emptied before every trial), 100 lightweight messages per trial. One phone remains static, one phone dynamic (just like the GR paper). The moving peer sends messages to the static peer.
+
+Five figures are attached, in the order they are referenced below: fieldday_lineexp, fieldday_establish_time, fieldday_establish_bytes, fieldday_power, throughput_story.
+
+Terminology used in the figures:
+- "discovered" = the peer's BLE advertisement was seen, "session" = the Noise handshake was completed, "usable" = the first end-to-end acknowledgment returned, i.e. the time it takes for the ACK sent by the static peer for the first message, to arrive back at the dynamic peer: it is the end-to-end latency.
+- "received/sent" = fraction of transmitted messages that arrived at the receiver (forward path only); "ACK-confirmed/sent" = fraction whose acknowledgment also made it back to the sender (forward AND reverse path). The gap between the two curves is pure reverse-path loss.
+- In the path-loss graph, each point is the mean advertisement RSSI at that distance with its standard deviation across trials
+
+FIELD RESULTS
+
+[FIGURE 1 - fieldday_lineexp.png - place here]
+The line experiment itself: establishment probability per stage, forward vs round-trip delivery, and the path-loss fit (n = 3.23, residual 2.8 dB). Reliable hop ~50 m, best-effort to ~70 m, dead at 80 m and beyond.
+
+[FIGURE 2 - fieldday_establish_time.png - place here]
+How long a cold link takes to form. Inside 50 m: usable in 5.2 s median (7.8 s mean, 15.7 s p90). At 60-70 m: ~20 s median. Almost all of the increase is discovery - the handshake tail stays 1.5-3 s at every distance.
+
+[FIGURE 3 - fieldday_establish_bytes.png - place here]
+What forming it costs on the air, control plane only (sealed messages, acknowledgments and the custody sync exchange are excluded), charged over the 30 s dwell of each trial. Our control plane is 2.7 KB at close range falling to nothing at the edge; simply being discoverable is a flat 51 KB per 30 s whatever happens - 19x our control plane at 10 m, 95x at 90 m, and at 100 m we spend nothing while the radio still spends 51 KB.
+
+POWER
+[FIGURE 4 - fieldday_power.png - place here]
+Both phones ran unplugged with the battery level sampled every 10 seconds. Two things are worth reporting and one is not yet measurable. Sending and receiving cost the same to within noise - the moving sender averaged 348 mA and the static receiver 380 mA, i.e. the receiver was marginally the more expensive of the two.
+In absolute terms the run drew 733 mAh (mover) / 833 mAh (static) in 2.1 h from ~2700 mAh batteries, which amounts to roughly 7-8 h of continuous operation from a full charge under field-day conditions - screen on max brightness throughout, which dominates the figure (should be repeated with minimum brightness). BLE-off intervals were statistically indistinguishable from BLE-active ones under screen load (median deltas 4-12 mA against a standard error of ~5 mA), so all I can bound is activity-dependent BLE draw at <= ~15 mA. Isolating the constant radio cost needs a screen-constant desk baseline (BLE off vs connected-idle vs loaded), which I plan to run next.
+
+LABORATORY CHARACTERIZATION - same pair, 1 m
+[FIGURE 5 - throughput_story.png - place here]
+Four panels: the capacity ceiling, the bufferbloat it produces, the raw GATT pipe per leg, and per-message wire cost against payload size.
+
+Terminology:
+- "offered" load = messages/s the sender pushed at the link; "carried" = messages/s whose end-to-end acknowledgment returned. A healthy link carries all it is offered; the capacity ceiling is where carried stops following offered.
+- "concurrent senders" = independent send loops, each with exactly one message in flight (they are not queues - queueing happens below, in the OS Bluetooth stack).
+- The "unsaturated RTT" reference (0.11 s) is the send-to-acknowledgment round trip at light load (9000 messages, overnight), i.e. the latency floor with no queueing.
+- In the raw-pipe panel, "notify" and "write" are the two GATT mechanisms available on a converged pair (each device is central on one link and peripheral on the other; a peripheral pushes notifications, a central writes to the peer's characteristic). "Stripe" alternates consecutive packets across both. Result: stripe matches the  best single leg rather than their sum - the two legs share one radio, so the second leg buys redundancy, not bandwidth.
+
+
+Next: the three-phone multi-hop and store-carry-forward experiments (the 50 m hop result suggests ~40 m relay spacing), the screen-constant power baseline above, and optionally a warm-link variant of the line test to measure formation-vs-survival hysteresis.
+
+Happy to walk through the data - everything is scripted and reproducible from the raw traces.
+
+Best,
+Dan

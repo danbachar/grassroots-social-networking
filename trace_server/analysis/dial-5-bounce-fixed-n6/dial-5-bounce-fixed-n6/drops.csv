@@ -1,0 +1,11 @@
+_device,where,reason,count
+929a022c,bleRx,notReady,71
+b7d04acb,bleRx,notReady,15
+44a266c4,bleSend,noPath,4
+18130c0f,bleRx,notReady,3
+b7d04acb,bleSend,writeFailed,3
+be3a5ef5,bleRx,notReady,2
+d5aedd63,bleRx,notReady,2
+44a266c4,bleRx,notReady,1
+44a266c4,bleSend,writeFailed,1
+929a022c,decrypt,noSession,1

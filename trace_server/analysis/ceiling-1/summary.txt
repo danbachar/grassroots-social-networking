@@ -1,0 +1,30 @@
+records: 97768   span: 875s
+
+receiver (adbed3e0):
+  records by type: {'custody': 16709, 'message': 16694, 'rssi': 493, 'link': 172, 'wire': 73, 'packetDup': 24, 'marker': 2}
+  link stages: {'discovered': 132, 'drop': 16, 'connected': 16, 'session': 8}
+  wire bytes: {'rx:announce': 22572, 'rx:handshake': 1784, 'rx:secure': 3940250, 'tx:announce': 22230, 'tx:handshake': 1120, 'tx:secure:ack': 2095660, 'tx:secure:sync': 1235237}
+
+sender (ba2af95f):
+  records by type: {'custody': 31362, 'message': 31362, 'rssi': 582, 'link': 152, 'wire': 57, 'marker': 51, 'packetDup': 27, 'flow': 8}
+  link stages: {'discovered': 111, 'connected': 16, 'drop': 9, 'session': 8, 'usable': 8}
+  messages sent: 16694, delivered: 14668 (88%)
+  wire RTT ms (send->ACK): median 7766, p90 20172, max 44432
+  app latency ms (create->ACK): median 7425, p90 16113 — the extra over wire RTT is enqueue + seal + waiting for a settled link
+  flow saturate: sent 2811.0, acked 2806.0 (370392.0 B), goodput n/a
+  flow saturate: sent 2620.0, acked 2286.0 (301752.0 B), goodput n/a
+  flow saturate: sent 1906.0, acked 1888.0 (249216.0 B), goodput n/a
+  flow saturate: sent 1442.0, acked 1327.0 (175164.0 B), goodput n/a
+  flow saturate: sent 3046.0, acked 1163.0 (153516.0 B), goodput n/a
+  flow saturate: sent 1238.0, acked 926.0 (122232.0 B), goodput n/a
+  flow saturate: sent 2016.0, acked 1427.0 (188364.0 B), goodput n/a
+  flow saturate: sent 1615.0, acked 1075.0 (141900.0 B), goodput n/a
+  wire bytes: {'rx:announce': 17613, 'rx:handshake': 1120, 'rx:secure': 2603047, 'tx:announce': 20862, 'tx:handshake': 1784, 'tx:secure': 3909812, 'tx:secure:sync': 466}
+
+=== mesh ===
+messages sent: 16694, delivered: 16693 (100%)
+delivered by relay hops (receiver TTL view): {0: 16693}
+  MULTI-HOP deliveries: 0/16693
+custody events: {'store': 33387, 'end': 14668, 'convey': 16}
+packet redundancy: 51 redundant packet arrival(s) for 16693 delivered message(s) = 1.00 copies on the air per message (1.00 = every packet arrived exactly once)
+message re-delivery: 1 (must be 0 — a duplicate of an already-delivered message triggers nothing)

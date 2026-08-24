@@ -1,0 +1,1923 @@
+<title>Mesh Topology Viewer</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --page:       #f0efec;
+    --surface-1:  #fcfcfb;
+    --surface-2:  #eceae5;
+    --line:       #dbd8d1;
+    --line-soft:  #e8e5df;
+    --ink-1:      #14140f;
+    --ink-2:      #55534a;
+    --ink-3:      #838075;
+    --accent:     #2a78d6;
+    --accent-dim: #86b6ef;
+    --good:       #0ca30c;
+    --critical:   #d03b3b;
+    --warning:    #fab219;
+    --seq-100: #cde2fb; --seq-200: #9ec5f4; --seq-300: #6da7ec;
+    --seq-400: #3987e5; --seq-500: #256abf; --seq-600: #184f95; --seq-700: #0d366b;
+    --node-off:   #cbc7bf;
+    --shadow:     0 1px 2px rgba(20,20,15,.06), 0 4px 16px rgba(20,20,15,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:       #111110;
+      --surface-1:  #1a1a19;
+      --surface-2:  #232322;
+      --line:       #33332f;
+      --line-soft:  #2a2a27;
+      --ink-1:      #f4f3ef;
+      --ink-2:      #adaa9e;
+      --ink-3:      #7d7a70;
+      --accent:     #3987e5;
+      --accent-dim: #1c5cab;
+      --seq-100: #0d366b; --seq-200: #184f95; --seq-300: #256abf;
+      --seq-400: #3987e5; --seq-500: #6da7ec; --seq-600: #9ec5f4; --seq-700: #cde2fb;
+      --node-off:   #3d3d39;
+      --shadow:     0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:       #111110;
+    --surface-1:  #1a1a19;
+    --surface-2:  #232322;
+    --line:       #33332f;
+    --line-soft:  #2a2a27;
+    --ink-1:      #f4f3ef;
+    --ink-2:      #adaa9e;
+    --ink-3:      #7d7a70;
+    --accent:     #3987e5;
+    --accent-dim: #1c5cab;
+    --seq-100: #0d366b; --seq-200: #184f95; --seq-300: #256abf;
+    --seq-400: #3987e5; --seq-500: #6da7ec; --seq-600: #9ec5f4; --seq-700: #cde2fb;
+    --node-off:   #3d3d39;
+    --shadow:     0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink-1);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+
+  .mono, .num {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 28px 20px 72px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  header h1 {
+    margin: 0;
+    font-size: 26px;
+    font-weight: 620;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+  }
+  header p {
+    margin: 6px 0 0;
+    color: var(--ink-2);
+    max-width: 64ch;
+  }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px;
+    box-shadow: var(--shadow);
+  }
+
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+    color: var(--ink-3);
+    margin: 0 0 12px;
+  }
+
+  /* ---- file loading ---- */
+  #drop {
+    border: 1.5px dashed var(--line);
+    border-radius: 10px;
+    padding: 26px 18px;
+    text-align: center;
+    background: var(--surface-1);
+    transition: border-color .15s, background .15s;
+  }
+  #drop.hot { border-color: var(--accent); background: var(--surface-2); }
+  #drop p { margin: 0 0 4px; }
+  #drop .hint { color: var(--ink-2); font-size: 13.5px; }
+
+  button, .btn {
+    font: inherit;
+    font-size: 14px;
+    padding: 7px 14px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+    color: var(--ink-1);
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--ink-3); }
+  button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button[disabled] { opacity: .45; cursor: not-allowed; }
+
+  select {
+    font: inherit; font-size: 14px; padding: 6px 10px;
+    border-radius: 7px; border: 1px solid var(--line);
+    background: var(--surface-2); color: var(--ink-1);
+    /* Run labels are long; without this the control is clipped by its row
+       on a phone instead of shrinking to fit. */
+    max-width: 100%; min-width: 0;
+  }
+  .row > label { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+
+  progress { width: 100%; height: 6px; }
+
+  /* ---- summary strip ---- */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 1px;
+    background: var(--line-soft);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .stat { background: var(--surface-1); padding: 12px 14px; }
+  .stat .k {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--ink-3);
+  }
+  .stat .v {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 21px; font-weight: 600; margin-top: 2px;
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12.5px; font-weight: 600;
+    padding: 3px 9px; border-radius: 999px;
+    border: 1px solid currentColor;
+  }
+  .pill.ok   { color: var(--good); }
+  .pill.bad  { color: var(--critical); }
+  .pill.warn { color: var(--warning); }
+  :root[data-theme="light"] .pill.warn,
+  :root:where(:not([data-theme="dark"])) .pill.warn { color: #8a5c00; }
+
+  /* ---- charts ---- */
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .grid-line { stroke: var(--line-soft); stroke-width: 1; }
+  .axis-text {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10.5px; fill: var(--ink-3);
+  }
+  .scrub-line { stroke: var(--ink-1); stroke-width: 1.5; }
+  #timelineWrap { cursor: crosshair; position: relative; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 13px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; background: var(--accent); }
+  .swatch.dash { background: repeating-linear-gradient(90deg, var(--ink-3) 0 4px, transparent 4px 7px); }
+
+  /* ---- phone chips ---- */
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--line); border-radius: 7px;
+    padding: 5px 9px; background: var(--surface-2);
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--node-off); flex: none; }
+  .chip.up .dot { background: var(--accent); }
+  .chip.dead { opacity: .5; text-decoration: line-through; }
+
+  /* ---- matrix ---- */
+  table { border-collapse: collapse; font-size: 13px; }
+  .matrix td, .matrix th {
+    width: 40px; height: 30px; text-align: center;
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    border: 2px solid var(--surface-1);
+  }
+  .matrix th { color: var(--ink-3); font-weight: 600; border: none; }
+  .matrix td.self { background: var(--surface-2); color: var(--ink-3); }
+  .scroll-x { overflow-x: auto; }
+
+  .datatable { width: 100%; }
+  .datatable th, .datatable td {
+    text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--line-soft);
+    font-size: 13px;
+  }
+  .datatable th { color: var(--ink-3); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; }
+  .datatable td.n { text-align: right; font-family: ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
+
+  details { border-top: 1px solid var(--line-soft); padding-top: 10px; margin-top: 14px; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 13.5px; }
+
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+  .grow { flex: 1 1 auto; }
+  .hidden { display: none !important; }
+  .note { color: var(--ink-2); font-size: 13.5px; margin: 10px 0 0; }
+  .err { color: var(--critical); }
+
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <h1>Mesh Topology Viewer</h1>
+    <p>Load the <code class="mono">exp_*.jsonl</code> recording from each phone. The viewer
+       reconstructs who was linked to whom at every moment of the run, and checks the mesh
+       size that was actually up against the size each step claimed.</p>
+  </header>
+
+  <div id="drop">
+    <p class="eyebrow" style="margin-bottom:10px">Experiments on this server</p>
+    <div class="row" style="justify-content:center">
+      <select id="expSelect" style="min-width:min(420px,80vw)"><option>Loading&hellip;</option></select>
+      <button id="openBtn" class="primary" disabled>Open</button>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+    <p class="hint" id="serverNote" style="margin-top:12px"></p>
+
+    <details style="margin-top:16px;text-align:left;max-width:560px;margin-inline:auto">
+      <summary>Load recordings from disk instead</summary>
+      <p class="hint" style="margin-top:8px">For a run that has not been uploaded yet. One file per
+         phone &mdash; select them all together so links can be matched between devices.
+         <label class="btn" style="display:inline-block;margin-top:8px">
+         <input type="file" id="fileInput" multiple accept=".jsonl,.json,.txt" hidden>Choose files</label></p>
+    </details>
+
+    <div id="parseStatus" class="hidden" style="margin-top:14px">
+      <progress id="parseBar" max="100" value="0"></progress>
+      <p class="hint mono" id="parseText" style="margin-top:6px"></p>
+    </div>
+    <p class="note err hidden" id="loadErr"></p>
+  </div>
+
+  <section class="panel" id="geoEntry">
+    <p class="eyebrow">Measured distances &mdash; enter for any experiment id, before or after the run</p>
+    <p class="note" style="margin-top:0">Type the id the phones will use (the wizard's
+       experiment id), pick how many phones, and fill one number per pair, in metres.
+       Phones are numbered by join order. Saved on the server, so entering them from a
+       phone at the field is enough. <strong>This beats GPS</strong>: at 30 m spacing a
+       phone fix carries &plusmn;6&ndash;29 m of error &mdash; the size of the thing
+       being measured.</p>
+    <div class="row" style="margin:10px 0">
+      <label class="mono" style="font-size:12px;color:var(--ink-3)">EXPERIMENT
+        <input id="distExp" type="text" placeholder="mesh-30m-2" spellcheck="false"
+          style="font:inherit;font-size:14px;padding:6px 10px;border-radius:7px;
+                 border:1px solid var(--line);background:var(--surface-2);
+                 color:var(--ink-1);min-width:150px">
+      </label>
+      <label class="mono" style="font-size:12px;color:var(--ink-3)">PHONES
+        <select id="distCount"></select>
+      </label>
+      <button id="distLoad">Load</button>
+      <button id="distSave" class="primary">Save distances</button>
+      <span class="mono" id="distStatus" style="font-size:12.5px;color:var(--ink-2)"></span>
+    </div>
+    <div class="scroll-x"><table class="matrix" id="distGrid"></table></div>
+  </section>
+
+  <div id="app" class="hidden" style="display:flex;flex-direction:column;gap:20px">
+
+    <div class="row">
+      <label class="mono" style="font-size:12px;color:var(--ink-3)">RUN
+        <select id="runSelect"></select>
+      </label>
+      <label class="mono" style="font-size:12px;color:var(--ink-3)">LAYOUT
+        <select id="layoutSelect">
+          <option value="ring">Ring</option>
+          <option value="triangle">Triangle + centre</option>
+          <option value="geo" id="geoOpt" disabled>Measured positions</option>
+        </select>
+      </label>
+      <span class="grow"></span>
+      <button id="resetBtn">Pick another experiment</button>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <section class="panel">
+      <p class="eyebrow">Mesh size over the run &mdash; claimed by the step vs actually up</p>
+      <div id="timelineWrap"><svg id="timeline" viewBox="0 0 1000 240" role="img"
+        aria-label="Step chart of realised mesh size against the size each step claimed"></svg></div>
+      <input type="range" id="scrub" min="0" max="1000" value="0" aria-label="Scrub through the run">
+      <div class="row" style="margin-top:8px">
+        <button id="playBtn" class="primary">Play</button>
+        <span class="mono num" id="clock" style="color:var(--ink-2);font-size:13px"></span>
+        <span class="grow"></span>
+        <span id="matchPill"></span>
+      </div>
+      <div class="legend">
+        <span><i class="swatch"></i>radios actually up</span>
+        <span><i class="swatch dash"></i>size the step claims</span>
+        <span>shaded bands mark each mesh-size block</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <p class="eyebrow">Topology at the scrubbed moment</p>
+      <div class="row" style="align-items:flex-start;gap:24px">
+        <svg id="graph" viewBox="0 0 460 400" style="flex:1 1 340px;max-width:520px" role="img"
+             aria-label="Node-link diagram of the mesh at the selected moment"></svg>
+        <div style="flex:1 1 260px;min-width:240px">
+          <p class="eyebrow" style="margin-bottom:8px">Each phone&rsquo;s own step right now</p>
+          <div class="chips" id="chips"></div>
+          <p class="note" id="skewNote"></p>
+        </div>
+      </div>
+      <details id="posPanel">
+        <summary>Or set positions directly (coordinates)</summary>
+        <p class="note">One line per phone: <code class="mono">order, x, y</code>.
+           Saved in this browser per experiment, so you enter them once. With positions
+           set, the graph is drawn to scale and pair distances appear in the uptime table
+           &mdash; which is what lets link uptime be read against real range.</p>
+        <label class="note" style="display:flex;gap:8px;align-items:center;margin:8px 0">
+          <input type="checkbox" id="posMetres">
+          <span>Local grid in <strong>metres</strong> (not latitude/longitude).
+            Use this for a layout you set out deliberately: the design is exact, and a
+            GPS fix can only add error to a number you already know.</span>
+        </label>
+        <textarea id="posInput" rows="5" spellcheck="false"
+          style="width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;
+                 padding:8px;border-radius:7px;border:1px solid var(--line);
+                 background:var(--surface-2);color:var(--ink-1)"
+          placeholder="1, 0, 17.32&#10;2, -15, -8.66&#10;3, 15, -8.66"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="posSave" class="primary">Save positions</button>
+          <button id="posClear">Clear</button>
+          <span class="mono" id="posStatus" style="font-size:12.5px;color:var(--ink-2)"></span>
+        </div>
+      </details>
+      <div class="legend">
+        <span><i class="swatch" style="height:4px"></i>two legs (dual-role pair)</span>
+        <span><i class="swatch" style="height:2px"></i>one leg only</span>
+        <span><i class="swatch dash"></i>one side sees it, the other does not</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <p class="eyebrow">Pair uptime within a block &mdash; share of the block each pair held a link</p>
+      <div class="row" style="margin-bottom:12px">
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">BLOCK
+          <select id="blockSelect"></select>
+        </label>
+      </div>
+      <div class="scroll-x"><table class="matrix" id="matrix"></table></div>
+      <details>
+        <summary>Same numbers as a table</summary>
+        <div class="scroll-x"><table class="datatable" id="matrixTable"></table></div>
+      </details>
+    </section>
+
+    <section class="panel" id="routePanel">
+      <p class="eyebrow">The route one packet took</p>
+      <p class="note" id="routeIntro">A packet&rsquo;s id survives relaying &mdash; it <em>is</em> the dedup
+         key &mdash; so every node that saw the same packet recorded the same id, and a relay
+         record names the neighbour it came from. That makes a real path, not a guess from timing.</p>
+      <div class="row" style="margin:12px 0">
+        <button id="pktBuild">Build the route index</button>
+        <span class="mono" id="pktIndexState" style="font-size:12.5px;color:var(--ink-2)"></span>
+      </div>
+      <div class="row" id="pktFilters" style="margin-bottom:12px">
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">KIND
+          <select id="pktKind">
+            <option value="">any</option>
+            <option value="data">message</option>
+            <option value="ack">ack</option>
+          </select>
+        </label>
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">OUTCOME
+          <select id="pktOutcome">
+            <option value="">any</option>
+            <option value="multihop">relayed at least once</option>
+            <option value="delivered">reached the recipient</option>
+            <option value="undelivered">never arrived</option>
+          </select>
+        </label>
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">SEEN&nbsp;BY&nbsp;&ge;
+          <select id="pktMinHops">
+            <option value="0">1 node</option>
+            <option value="1">2 nodes</option>
+            <option value="2">3 nodes</option>
+            <option value="3">4 nodes</option>
+          </select>
+        </label>
+        <input id="pktQuery" type="text" placeholder="packet or message id"
+               spellcheck="false" style="flex:1 1 180px;min-width:140px;padding:7px 9px;
+               border-radius:7px;border:1px solid var(--line);background:var(--surface-2);
+               color:var(--ink-1);font-family:ui-monospace,Menlo,monospace;font-size:12.5px">
+        <button id="pktSearch" class="primary">Find packets</button>
+      </div>
+      <!-- Capped and scrolled: 300 matches is a 13,000px panel otherwise, and
+           the route drawing below it becomes unreachable. -->
+      <div class="scroll-x" style="max-height:360px;overflow-y:auto">
+        <table class="datatable" id="pktTable"></table>
+      </div>
+
+      <div id="routeView" class="hidden" style="margin-top:20px;border-top:1px solid var(--line);padding-top:16px">
+        <div class="row" style="align-items:flex-start;gap:24px">
+          <svg id="routeSvg" viewBox="0 0 460 400" style="flex:1 1 340px;max-width:520px"
+               role="img" aria-label="The path this packet took through the mesh"></svg>
+          <div style="flex:1 1 300px;min-width:260px">
+            <p class="eyebrow" style="margin-bottom:8px">Every sighting, in order</p>
+            <div class="scroll-x" style="max-height:340px;overflow-y:auto">
+              <table class="datatable" id="routeHops"></table>
+            </div>
+            <p class="note" id="routeNote"></p>
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="swatch"></i>a hop, from the neighbour that handed it over</span>
+          <span><i class="swatch dash"></i>carried, then conveyed on a later meeting</span>
+          <span>ring = minted here &middot; double ring = delivered here</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <p class="eyebrow">Every step in this run</p>
+      <div class="scroll-x"><table class="datatable" id="stepsTable"></table></div>
+    </section>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------- parsing
+  // Recordings run to hundreds of MB, of which link/marker records are a tiny
+  // slice. Scan the file in slices and reject lines by substring before paying
+  // for JSON.parse -- that is the difference between seconds and minutes.
+  const WANT = ['"type":"link"', '"type":"marker"', '"type":"location"'];
+  const CHUNK = 8 << 20;
+
+  async function parseFile(file, onProgress) {
+    const dec = new TextDecoder("utf-8");
+    const markers = [], links = [], locations = [];
+    let rest = "", read = 0;
+
+    for (let off = 0; off < file.size; off += CHUNK) {
+      const buf = await file.slice(off, Math.min(off + CHUNK, file.size)).arrayBuffer();
+      read += buf.byteLength;
+      const text = rest + dec.decode(buf, { stream: true });
+      const lines = text.split("\n");
+      rest = lines.pop();
+      for (const line of lines) takeLine(line, markers, links, locations);
+      onProgress(read / file.size);
+      await new Promise(r => setTimeout(r, 0));  // keep the page responsive
+    }
+    takeLine(rest, markers, links, locations);
+    return { name: file.name, markers, links, locations };
+  }
+
+  function takeLine(line, markers, links, locations) {
+    if (line.length < 12) return;
+    let want = false;
+    for (const w of WANT) if (line.indexOf(w) !== -1) { want = true; break; }
+    if (!want) return;
+    let r;
+    try { r = JSON.parse(line); } catch { return; }   // a torn line is not fatal
+    if (r.type === "marker") markers.push(r);
+    else if (r.type === "location") locations.push(r);
+    else if (r.type === "link" && (r.event === "connected" || r.event === "drop")) links.push(r);
+  }
+
+  // ------------------------------------------------------------- structuring
+  // A step label declares ONE variable: `<key>=<value>`, with an optional
+  // trial suffix. `n=6 t2` is a population step, `d=40 t7` a distance step,
+  // and a shape nobody has run yet reads the same way. The KEY decides what
+  // the value means, so only `n=` is comparable with the radios actually up
+  // -- every other key is a quantity this dashboard cannot verify, and it
+  // labels and blocks by it without claiming to check it.
+  // The value may carry a unit (`p=264B`); a purely categorical value
+  // (`leg=notify`) is not a magnitude and deliberately does not match.
+  const STEP_RE =
+    /^([A-Za-z][A-Za-z0-9_]*)\s*=\s*(\d+(?:\.\d+)?)([A-Za-z]*)(?:\s*t(\d+))?$/;
+  const POPULATION_KEY = "n";
+
+  /// Reject a position claiming worse accuracy than this. 30 m is the scale
+  /// of the deployments being drawn, so a fix vaguer than that carries no
+  /// information about the layout.
+  const MAX_FIX_ACCURACY_M = 30;
+
+  function buildPhones(files) {
+    const phones = files.map((f, i) => {
+      const mac2peer = new Map();
+      for (const l of f.links) {
+        if (l.path && l.peer) mac2peer.set(l.path.split(":").slice(1).join(":"), l.peer);
+      }
+      const events = f.links.filter(l => l.path).map(l => {
+        const mac = l.path.split(":").slice(1).join(":");
+        return { t: l.t, ev: l.event, peer: mac2peer.get(mac) || ("mac:" + mac), path: l.path };
+      }).sort((a, b) => a.t - b.t);
+
+      const steps = [];
+      let order = null, batteryFloor = null;
+      for (const m of f.markers) {
+        if (typeof m.order === "number") order = m.order;
+        const lab = m.label;
+        if (typeof lab !== "string") continue;
+        // The recorder stamps this the moment a run stops itself on the
+        // battery floor. Reading it beats inferring a dropout from a tail
+        // that simply stops.
+        if (lab === "battery-floor" && batteryFloor == null) batteryFloor = m.t;
+        const mm = STEP_RE.exec(lab);
+        if (mm) {
+          const key = mm[1], value = +mm[2], unit = mm[3] || "";
+          steps.push({ t: m.t, label: lab, key, V: value, unit,
+                       // Only a population step claims a mesh size; a
+                       // distance step claims nothing this can check.
+                       N: key === POPULATION_KEY && !unit ? value : null,
+                       rep: mm[4] ? +mm[4] : 1,
+                       joined: m.joined, order: m.order });
+        } else if (typeof m.joined === "boolean") {
+          // A scheduled window that is not a measured step -- the walk-out
+          // `distribute` step is one, and phones 1-3 are already up for it.
+          // Both stay null so it never contributes a step or a claim.
+          steps.push({ t: m.t, label: lab, key: null, V: null, unit: "",
+                       N: null, rep: 1,
+                       joined: m.joined, order: m.order });
+        }
+      }
+      steps.sort((a, b) => a.t - b.t);
+      const bounds = f.markers.filter(m => m.event === "expStart" || m.event === "expStop");
+      const exp = (f.markers.find(m => m.exp) || {}).exp || "(unnamed)";
+      // A phone whose GPS has not locked returns a CELL-TOWER fix: same
+      // shape, accM in the kilometres, and a position up to 1.2 km away. Two
+      // of eight in the 30 m field run were like that, and plotting them put
+      // 2.1 km pair distances in a graph whose real spread was 30 m. Anything
+      // coarser than the geometry being measured is worse than no fix.
+      const fixes = (f.locations || []).filter(
+          l => typeof l.lat === "number" && (l.accM ?? 1e9) <= MAX_FIX_ACCURACY_M);
+      const fix = fixes.length
+        ? fixes.reduce((a, b) => ((b.accM ?? 1e9) < (a.accM ?? 1e9) ? b : a))
+        : null;
+      return { idx: i, file: f.name, order, exp, steps, events, bounds,
+               batteryFloor, fix, rawFixes: (f.locations || []).length,
+               // The upload envelope's deviceId IS the node's public key, so
+               // when the recording came from the server this is known rather
+               // than deduced. Files dropped from disk carry no envelope.
+               self: f.deviceId || null,
+               peers: new Set(events.map(e => e.peer)) };
+    });
+
+    // A recording never names the device that wrote it. But every phone lists
+    // the OTHER phones as link peers -- so the one pubkey missing from a
+    // phone's own peer set, yet present in someone else's, is its own.
+    const all = new Set();
+    for (const p of phones) for (const k of p.peers) if (!k.startsWith("mac:")) all.add(k);
+    for (const p of phones) {
+      if (p.self) continue;                       // already known, exactly
+      const missing = [...all].filter(k => !p.peers.has(k));
+      p.self = missing.length === 1 ? missing[0] : null;
+    }
+    const keyToOrder = new Map();
+    for (const p of phones) if (p.self && p.order != null) keyToOrder.set(p.self, p.order);
+    for (const p of phones) p.label = p.order != null ? "#" + p.order
+                                    : p.self ? p.self.slice(0, 8) : p.file.slice(0, 12);
+    // Every phone's view of every link, merged: a custody `convey` names the
+    // BLE device it was sent on, not a pubkey, so a route cannot say WHO was
+    // handed the packet without this. One phone alone is not enough — the
+    // mapping it needs may only appear in another phone's links.
+    const deviceToPeer = new Map();
+    for (const f of files) for (const l of f.links) {
+      if (l.path && l.peer) deviceToPeer.set(l.path.split(":").slice(1).join(":"), l.peer);
+    }
+    return { phones, keyToOrder, deviceToPeer };
+  }
+
+  // A run is one recording session. Files accumulate across sessions under the
+  // same experiment id, so split on a long silence rather than on the id alone.
+  function buildRuns(phones) {
+    const stamps = [];
+    for (const p of phones) for (const s of p.steps) stamps.push(s.t);
+    for (const p of phones) for (const b of p.bounds) stamps.push(b.t);
+    stamps.sort((a, b) => a - b);
+    if (!stamps.length) return [];
+    const GAP = 30 * 60 * 1000;
+    const runs = [];
+    let start = stamps[0], prev = stamps[0];
+    for (const t of stamps) {
+      if (t - prev > GAP) { runs.push({ t0: start, t1: prev }); start = t; }
+      prev = t;
+    }
+    runs.push({ t0: start, t1: prev });
+    return runs.map((r, i) => {
+      const inRun = p => p.steps.some(s => s.t >= r.t0 && s.t <= r.t1);
+      const involved = phones.filter(inRun);
+      const exp = (involved[0] || {}).exp || "run";
+      // The variable this run steps, taken from the steps themselves. Null
+      // when a run has no `<key>=<value>` labels at all.
+      const keys = new Set();
+      for (const p of involved)
+        for (const st of p.steps)
+          if (st.key && st.t >= r.t0 && st.t <= r.t1) keys.add(st.key);
+      const stepKey = keys.size === 1 ? [...keys][0] : (keys.size ? "mixed" : null);
+      return { ...r, i, exp, phones: involved, stepKey,
+               label: `${exp} · ${new Date(r.t0).toLocaleString()} · ` +
+                      `${involved.length} phone(s) · ${fmtDur(r.t1 - r.t0)}` };
+    });
+  }
+
+  const fmtDur = ms => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h ? `${h}h${String(m).padStart(2, "0")}m` : `${m}m${String(s % 60).padStart(2, "0")}s`;
+  };
+
+  // A phone's step windows run from one marker to the next; `joined` says
+  // whether it meant to have its radio up for that window.
+  function windowsFor(phone, run) {
+    const st = phone.steps.filter(s => s.t >= run.t0 && s.t <= run.t1);
+    return st.map((s, i) => ({
+      ...s, t1: i + 1 < st.length ? st[i + 1].t : Math.min(run.t1, s.t + 150000)
+    }));
+  }
+
+  function realisedSeries(run) {
+    const deltas = [];
+    for (const p of run.phones) {
+      let up = false;
+      for (const w of windowsFor(p, run)) {
+        const j = w.joined !== false;                      // absent flag => assume up
+        if (j !== up) { deltas.push([w.t, j ? 1 : -1]); up = j; }
+      }
+      if (up) {
+        const ws = windowsFor(p, run);
+        deltas.push([ws.length ? ws[ws.length - 1].t1 : run.t1, -1]);
+      }
+    }
+    deltas.sort((a, b) => a[0] - b[0]);
+    const out = []; let n = 0;
+    for (const [t, d] of deltas) { n += d; out.push([t, n]); }
+    return out;
+  }
+
+  const valueAt = (series, t) => {
+    let v = 0;
+    for (const [ts, n] of series) { if (ts > t) break; v = n; }
+    return v;
+  };
+
+  function claimedAt(run, t) {
+    const votes = [];
+    for (const p of run.phones) {
+      for (const w of windowsFor(p, run)) {
+        if (t >= w.t && t < w.t1) { if (w.N != null) votes.push(w.N); break; }
+      }
+    }
+    if (!votes.length) return null;
+    const c = new Map();
+    for (const v of votes) c.set(v, (c.get(v) || 0) + 1);
+    return [...c.entries()].sort((a, b) => b[1] - a[1] || b[0] - a[0])[0][0];
+  }
+
+  function liveEdges(run, t) {
+    const seen = new Map();       // "a|b" -> {a,b,legsA,legsB}
+    for (const p of run.phones) {
+      const live = new Map();     // peer -> Set(path)
+      for (const e of p.events) {
+        if (e.t > t) break;
+        if (!live.has(e.peer)) live.set(e.peer, new Set());
+        if (e.ev === "connected") live.get(e.peer).add(e.path);
+        else live.get(e.peer).delete(e.path);
+      }
+      for (const [peer, paths] of live) {
+        if (!paths.size) continue;
+        const other = ST.keyToOrder.get(peer);
+        if (other == null || p.order == null) continue;
+        const [a, b] = p.order < other ? [p.order, other] : [other, p.order];
+        const k = a + "|" + b;
+        if (!seen.has(k)) seen.set(k, { a, b, legsA: 0, legsB: 0 });
+        const rec = seen.get(k);
+        if (p.order === a) rec.legsA = paths.size; else rec.legsB = paths.size;
+      }
+    }
+    return [...seen.values()];
+  }
+
+  function phoneStateAt(run, t) {
+    return run.phones.map(p => {
+      const ws = windowsFor(p, run);
+      const w = ws.find(x => t >= x.t && t < x.t1);
+      const last = ws.length ? ws[ws.length - 1].t1 : run.t0;
+      const floored = p.batteryFloor != null && t >= p.batteryFloor;
+      return { phone: p, step: w || null, up: w ? w.joined !== false : false,
+               dead: t > last || floored, floored, order: p.order };
+    }).sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
+  }
+
+  // ------------------------------------------------------------------ render
+  const ST = { phones: [], keyToOrder: new Map(), deviceToPeer: new Map(),
+               runs: [], run: null, t: 0,
+               series: [], playing: false, timer: null, pos: {}, posMetres: false,
+               dist: {}, serverExp: null, pkts: [], route: null };
+
+  const $ = id => document.getElementById(id);
+  const SVGNS = "http://www.w3.org/2000/svg";
+  const el = (n, attrs = {}, text) => {
+    const e = document.createElementNS(SVGNS, n);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  };
+
+  function renderAll() {
+    renderStats();
+    renderTimeline();
+    renderGraph();
+    renderChips();
+    renderMatrix();
+    renderSteps();
+  }
+
+  function renderStats() {
+    const run = ST.run, t = ST.t;
+    const realised = valueAt(ST.series, t), claimed = claimedAt(run, t);
+    const peak = ST.series.reduce((m, [, n]) => Math.max(m, n), 0);
+    const mism = countMismatch(run);
+    $("stats").innerHTML = "";
+    const add = (k, v) => {
+      const d = document.createElement("div");
+      d.className = "stat";
+      d.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+      $("stats").appendChild(d);
+    };
+    add("Phones loaded", run.phones.length);
+    add("Run length", fmtDur(run.t1 - run.t0));
+    add("Steps", run.phones.reduce(
+      (m, p) => Math.max(m, windowsFor(p, run).filter(w => w.V != null).length), 0));
+    add("Peak size up", peak);
+    add("Radios up now", realised);
+    add("Step claims", claimed ?? "—");
+    add("Steps off-claim", `${mism.bad}/${mism.total}`);
+
+    const ok = claimed != null && realised === claimed;
+    $("matchPill").innerHTML = claimed == null ? "" :
+      `<span class="pill ${ok ? "ok" : "bad"}">${ok ? "✓" : "⚠"} ` +
+      `${ok ? "matches the claim" : `claims ${claimed}, ${realised} up`}</span>`;
+  }
+
+  // Only a population run makes a claim this can check: `n=6` says six radios
+  // should be up, and the measured series says how many were. `d=40` says
+  // nothing about radios, so there is nothing to be off by.
+  function countMismatch(run) {
+    if (run.stepKey !== POPULATION_KEY) return { bad: 0, total: 0 };
+    const ref = run.phones.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99))[0];
+    const ws = windowsFor(ref, run).filter(w => w.N != null);
+    let bad = 0;
+    for (const w of ws) {
+      const mid = w.t + (w.t1 - w.t) / 2;
+      if (valueAt(ST.series, mid) !== w.N) bad++;
+    }
+    return { bad, total: ws.length };
+  }
+
+  const narrow = () => window.innerWidth < 720;
+
+  function renderTimeline() {
+    const svg = $("timeline"); svg.innerHTML = "";
+    // On a phone the box is shorter and proportionally taller, so in-SVG text
+    // lands near its nominal size instead of being scaled into illegibility.
+    const N = narrow();
+    const W = N ? 420 : 1000, H = N ? 220 : 240;
+    const L = N ? 26 : 38, R = N ? 8 : 12, T = 14, B = 26;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    const run = ST.run;
+    // Population only: the axis counts radios, so a `d=120` step would
+    // stretch it to 120 and flatten the series it exists to show.
+    const maxN = Math.max(3, ST.series.reduce((m, [, n]) => Math.max(m, n), 0),
+                          ...run.phones.flatMap(
+                              p => windowsFor(p, run).map(w => w.N).filter(v => v != null)));
+    const x = t => L + (t - run.t0) / Math.max(1, run.t1 - run.t0) * (W - L - R);
+    const y = n => H - B - (n / maxN) * (H - T - B);
+
+    // shaded band per mesh-size block, from the lead phone's labels
+    const ref = run.phones.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99))[0];
+    const ws = windowsFor(ref, run).filter(w => w.V != null);
+    // Only a population run has a claim to draw against the measured series.
+    const claimWs = windowsFor(ref, run).filter(w => w.N != null);
+    const blocks = [];
+    for (const w of ws) {
+      const last = blocks[blocks.length - 1];
+      if (last && last.V === w.V) last.t1 = w.t1;
+      else blocks.push({ key: w.key, V: w.V, unit: w.unit, t0: w.t, t1: w.t1 });
+    }
+    blocks.forEach((b, i) => {
+      if (i % 2 === 0) return;
+      svg.appendChild(el("rect", { x: x(b.t0), y: T, width: Math.max(0, x(b.t1) - x(b.t0)),
+                                   height: H - T - B, fill: "var(--surface-2)" }));
+    });
+    blocks.forEach((b, i) => {
+      if (N && blocks.length > 6 && i % 2) return;   // avoid overlapping labels
+      svg.appendChild(el("text", {
+        x: (x(b.t0) + x(b.t1)) / 2, y: T + 11, "text-anchor": "middle", class: "axis-text"
+      }, `${b.key}=${b.V}${b.unit || ""}`));
+    });
+
+    for (let n = 0; n <= maxN; n++) {
+      svg.appendChild(el("line", { x1: L, x2: W - R, y1: y(n), y2: y(n), class: "grid-line" }));
+      svg.appendChild(el("text", { x: L - 8, y: y(n) + 3.5, "text-anchor": "end", class: "axis-text" }, n));
+    }
+
+    // claimed: a reference, so a neutral dashed step -- not a second series colour
+    let d = "";
+    for (const w of claimWs) d += `${d ? "L" : "M"}${x(w.t)},${y(w.N)}L${x(w.t1)},${y(w.N)}`;
+    if (d) svg.appendChild(el("path", { d, fill: "none", stroke: "var(--ink-3)",
+                                        "stroke-width": 1.5, "stroke-dasharray": "5 3" }));
+
+    // realised: the measured series
+    const pts = ST.series.filter(([t]) => t >= run.t0 && t <= run.t1);
+    if (pts.length) {
+      let a = `M${x(pts[0][0])},${y(0)}`;
+      let prevY = y(pts[0][1]);
+      a += `L${x(pts[0][0])},${prevY}`;
+      for (const [t, n] of pts.slice(1)) { a += `L${x(t)},${prevY}L${x(t)},${y(n)}`; prevY = y(n); }
+      a += `L${x(run.t1)},${prevY}`;
+      svg.appendChild(el("path", { d: a + `L${x(run.t1)},${y(0)}Z`, fill: "var(--accent)",
+                                   "fill-opacity": ".13", stroke: "none" }));
+      svg.appendChild(el("path", { d: a, fill: "none", stroke: "var(--accent)", "stroke-width": 2,
+                                   "stroke-linejoin": "round" }));
+    }
+
+    for (const p of run.phones) {
+      if (p.batteryFloor == null || p.batteryFloor < run.t0 || p.batteryFloor > run.t1) continue;
+      const bx = x(p.batteryFloor);
+      svg.appendChild(el("line", { x1: bx, x2: bx, y1: T, y2: H - B,
+        stroke: "var(--critical)", "stroke-width": 1.5, "stroke-dasharray": "3 3" }));
+      const near = bx > W * .6;
+      svg.appendChild(el("text", {
+        x: bx + (near ? -4 : 4), y: H - B - 5, class: "axis-text",
+        "text-anchor": near ? "end" : "start", fill: "var(--critical)"
+      }, N ? `${p.label} battery floor` : `${p.label} hit the battery floor`));
+    }
+    svg.appendChild(el("line", { x1: x(ST.t), x2: x(ST.t), y1: T, y2: H - B, class: "scrub-line" }));
+    svg.appendChild(el("circle", { cx: x(ST.t), cy: T, r: 3.5, fill: "var(--ink-1)" }));
+
+    const ticks = N ? 2 : 4;
+    for (let i = 0; i <= ticks; i++) {
+      const t = run.t0 + (run.t1 - run.t0) * i / ticks;
+      svg.appendChild(el("text", {
+        x: x(t), y: H - 8,
+        "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle",
+        class: "axis-text"
+      }, fmtDur(t - run.t0)));
+    }
+  }
+
+  // Positions are entered once per experiment and kept in this browser.
+  const posKey = () => "meshPos:" + (ST.run ? ST.run.exp : "?");
+  const posModeKey = () => posKey() + ":mode";
+  function loadPositions() {
+    try { ST.pos = JSON.parse(localStorage.getItem(posKey()) || "{}"); }
+    catch { ST.pos = {}; }
+    ST.posMetres = localStorage.getItem(posModeKey()) === "1";
+    $("posMetres").checked = ST.posMetres;
+    // A recorded fix beats a typed lat/lon, but never overrides a metric grid:
+    // that grid is a layout that was set out on purpose, and a GPS fix with
+    // metres of error cannot improve on a number that is exact by construction.
+    let recorded = 0;
+    if (!ST.posMetres) {
+      for (const p of (ST.run ? ST.run.phones : [])) {
+        if (p.fix && p.order != null) {
+          ST.pos[p.order] = { lat: p.fix.lat, lon: p.fix.lon, accM: p.fix.accM };
+          recorded++;
+        }
+      }
+    }
+    ST.recordedFixes = recorded;
+    maybeAutoGeo();
+    ST.rejectedFixes = (ST.run ? ST.run.phones : [])
+        .filter(p => !p.fix && (p.rawFixes || 0) > 0).length;
+    const n = Object.keys(ST.pos).length;
+    $("geoOpt").disabled = n < 2;
+    const rej = ST.rejectedFixes
+      ? ` · ${ST.rejectedFixes} rejected as too vague (>${MAX_FIX_ACCURACY_M} m)`
+      : "";
+    $("posStatus").textContent = (ST.recordedFixes
+      ? `${ST.recordedFixes} of ${n} recorded by the phones at placement`
+      : n ? `${n} position(s) entered` : "none set") + rej;
+    $("posInput").value = Object.entries(ST.pos).sort((a, b) => a[0] - b[0])
+      .map(([o, p]) => ST.posMetres ? `${o}, ${p.x}, ${p.y}` : `${o}, ${p.lat}, ${p.lon}`)
+      .join("\n");
+  }
+  function savePositions() {
+    const metric = $("posMetres").checked;
+    const out = {};
+    for (const line of $("posInput").value.split("\n")) {
+      const m = /^\s*(\d+)\s*[, \t]+(-?\d+(?:\.\d+)?)\s*[, \t]+(-?\d+(?:\.\d+)?)\s*$/.exec(line);
+      if (m) out[+m[1]] = metric ? { x: +m[2], y: +m[3] } : { lat: +m[2], lon: +m[3] };
+    }
+    localStorage.setItem(posModeKey(), metric ? "1" : "0");
+    localStorage.setItem(posKey(), JSON.stringify(out));
+    loadPositions();
+    if (!distExpId() || ST.lastRunExp === distExpId()) {
+      $("distExp").value = ST.run.exp;
+    }
+    ST.lastRunExp = ST.run.exp;
+    unawaited_loadDistances();
+    if (Object.keys(out).length >= 2) $("layoutSelect").value = "geo";
+    renderGraph(); renderMatrix();
+  }
+
+  // Equirectangular around the run's own centroid: over a field this is well
+  // under a centimetre of error and keeps metres linear in both axes.
+  const R_EARTH = 6371000;
+  // Measured distances -> 2D coordinates by classical MDS: double-centre the
+  // squared-distance matrix and take its top two eigenvectors. For a
+  // consistent set of Euclidean distances this reproduces the layout exactly
+  // (up to rotation and reflection, which do not matter for reading a graph),
+  // and for a slightly inconsistent one — hand measurement — it gives the
+  // best-fitting arrangement rather than refusing to draw.
+  function metresFromDistances() {
+    const d = ST.dist || {};
+    const ids = [...new Set(Object.keys(d).flatMap(k => k.split("-").map(Number)))]
+      .sort((a, b) => a - b);
+    const n = ids.length;
+    if (n < 3) return null;
+    // Every pair must be known: one missing edge and the arrangement is not
+    // determined, so fall back rather than invent a position.
+    const D = [];
+    for (let i = 0; i < n; i++) {
+      D.push([]);
+      for (let j = 0; j < n; j++) {
+        if (i === j) { D[i].push(0); continue; }
+        const v = d[pairKey(ids[i], ids[j])];
+        if (v == null) return null;
+        D[i].push(v);
+      }
+    }
+    // B = -1/2 J D^2 J
+    const sq = D.map(r => r.map(v => v * v));
+    const rowM = sq.map(r => r.reduce((a, b) => a + b, 0) / n);
+    const allM = rowM.reduce((a, b) => a + b, 0) / n;
+    const B = sq.map((r, i) => r.map((v, j) => -0.5 * (v - rowM[i] - rowM[j] + allM)));
+
+    // Top two eigenvectors by power iteration with deflation — n is 8.
+    const mul = (M, v) => M.map(r => r.reduce((a, x, k) => a + x * v[k], 0));
+    const norm = v => Math.hypot(...v);
+    function top(M) {
+      let v = Array.from({length: n}, (_, i) => Math.cos(i * 1.7) + 0.3);
+      let lam = 0;
+      for (let it = 0; it < 500; it++) {
+        const w = mul(M, v);
+        lam = norm(w);
+        if (lam < 1e-12) return {lam: 0, v};
+        v = w.map(x => x / lam);
+      }
+      return {lam, v};
+    }
+    const e1 = top(B);
+    const B2 = B.map((r, i) => r.map((x, j) => x - e1.lam * e1.v[i] * e1.v[j]));
+    const e2 = top(B2);
+    const out = {};
+    ids.forEach((id, i) => {
+      out[id] = {x: e1.v[i] * Math.sqrt(Math.max(e1.lam, 0)),
+                 y: e2.v[i] * Math.sqrt(Math.max(e2.lam, 0))};
+    });
+    return out;
+  }
+
+  function metres() {
+    // Hand-measured distances win over any coordinate source: they are the
+    // only input whose error is smaller than the geometry being drawn — but
+    // ONLY the open run's own distances. The entry panel can hold another
+    // experiment's grid (entering tomorrow's layout while viewing today's),
+    // and placing this run's nodes from that would draw a chimera: some
+    // phones to scale on the wrong geometry, the rest on the ring.
+    const fromD = (ST.run && distExpId() === ST.run.exp)
+        ? metresFromDistances()
+        : null;
+    if (fromD) return fromD;
+    const ps = Object.entries(ST.pos || {});
+    if (ps.length < 2) return null;
+    // Already metres: a deliberately set-out grid needs no projection, and
+    // y is kept as given (north-up) by negating for screen space at draw time.
+    if (ST.posMetres) {
+      const out = {};
+      for (const [o, p] of ps) out[o] = { x: p.x, y: -p.y };
+      return out;
+    }
+    const lat0 = ps.reduce((a, [, p]) => a + p.lat, 0) / ps.length;
+    const lon0 = ps.reduce((a, [, p]) => a + p.lon, 0) / ps.length;
+    const k = Math.PI / 180;
+    const out = {};
+    for (const [o, p] of ps) {
+      out[o] = { x: (p.lon - lon0) * k * R_EARTH * Math.cos(lat0 * k),
+                 y: -(p.lat - lat0) * k * R_EARTH };
+    }
+    return out;
+  }
+  const distM = (m, a, b) =>
+    (m && m[a] && m[b]) ? Math.hypot(m[a].x - m[b].x, m[a].y - m[b].y) : null;
+
+  function nodePos(order, count, layout) {
+    if (layout === "geo") {
+      const m = metres();
+      if (m && m[order]) {
+        const xs = Object.values(m).map(p => p.x), ys = Object.values(m).map(p => p.y);
+        const spanX = Math.max(...xs) - Math.min(...xs) || 1;
+        const spanY = Math.max(...ys) - Math.min(...ys) || 1;
+        const scale = Math.min(360 / spanX, 300 / spanY);
+        return [230 + (m[order].x - (Math.min(...xs) + spanX / 2)) * scale,
+                195 + (m[order].y - (Math.min(...ys) + spanY / 2)) * scale];
+      }
+    }
+    const cx = 230, cy = 195;
+    if (layout === "triangle") {
+      // The 8-phone field geometry: 1-3 at the vertices, 4 at the centre,
+      // 5-7 on the edge midpoints, 8 roaming near the middle.
+      const R = 145, verts = [0, 1, 2].map(i => {
+        const a = -Math.PI / 2 + i * 2 * Math.PI / 3;
+        return [cx + R * Math.cos(a), cy + R * Math.sin(a)];
+      });
+      if (order >= 1 && order <= 3) return verts[order - 1];
+      if (order === 4) return [cx, cy];
+      if (order >= 5 && order <= 7) {
+        const a = verts[(order - 5) % 3], b = verts[(order - 4) % 3];
+        return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      }
+      return [cx + 52, cy - 40];
+    }
+    const i = (order ?? 1) - 1, R = 150;
+    const a = -Math.PI / 2 + i * 2 * Math.PI / Math.max(count, 1);
+    return [cx + R * Math.cos(a), cy + R * Math.sin(a)];
+  }
+
+  function renderGraph() {
+    const svg = $("graph"); svg.innerHTML = "";
+    const run = ST.run, t = ST.t;
+    const layout = $("layoutSelect").value;
+    const states = phoneStateAt(run, t);
+    const pos = new Map();
+    states.forEach((s, i) => pos.set(s.order, nodePos(s.order ?? i + 1, states.length, layout)));
+
+    const edges = liveEdges(run, t);
+    for (const e of edges) {
+      const A = pos.get(e.a), B = pos.get(e.b);
+      if (!A || !B) continue;
+      const mutual = e.legsA > 0 && e.legsB > 0;
+      const legs = Math.max(e.legsA, e.legsB);
+      svg.appendChild(el("line", {
+        x1: A[0], y1: A[1], x2: B[0], y2: B[1],
+        stroke: "var(--accent)", "stroke-width": legs >= 2 ? 4 : 2,
+        "stroke-opacity": mutual ? .85 : .5,
+        "stroke-dasharray": mutual ? "none" : "6 4", "stroke-linecap": "round"
+      }));
+    }
+
+    for (const s of states) {
+      const P = pos.get(s.order); if (!P) continue;
+      const deg = edges.filter(e => e.a === s.order || e.b === s.order).length;
+      svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 21,
+        fill: s.up ? "var(--accent)" : "var(--node-off)",
+        "fill-opacity": s.dead ? .25 : s.up ? 1 : .55,
+        stroke: "var(--surface-1)", "stroke-width": 2
+      }));
+      svg.appendChild(el("text", {
+        x: P[0], y: P[1] + 5, "text-anchor": "middle",
+        fill: s.up && !s.dead ? "#fff" : "var(--ink-2)",
+        style: "font:600 15px ui-monospace,Menlo,monospace"
+      }, s.order ?? "?"));
+      svg.appendChild(el("text", {
+        x: P[0], y: P[1] + 36, "text-anchor": "middle", class: "axis-text"
+      }, s.floored ? "battery floor" : s.dead ? "stopped" : s.up ? `deg ${deg}` : "radio off"));
+    }
+
+    if (layout === "geo") {
+      const m = metres();
+      if (m) {
+        const xs = Object.values(m).map(p => p.x), ys = Object.values(m).map(p => p.y);
+        const spanX = Math.max(...xs) - Math.min(...xs) || 1;
+        const spanY = Math.max(...ys) - Math.min(...ys) || 1;
+        const scale = Math.min(360 / spanX, 300 / spanY);
+        // a round number of metres, drawn at the same scale as the nodes
+        const nice = [5, 10, 20, 25, 50, 100, 200].find(v => v * scale > 45) || 200;
+        const px = nice * scale;
+        svg.appendChild(el("line", { x1: 30, y1: 372, x2: 30 + px, y2: 372,
+          stroke: "var(--ink-3)", "stroke-width": 2 }));
+        for (const dx of [0, px]) svg.appendChild(el("line", {
+          x1: 30 + dx, y1: 368, x2: 30 + dx, y2: 376, stroke: "var(--ink-3)", "stroke-width": 2 }));
+        svg.appendChild(el("text", { x: 30 + px / 2, y: 388, "text-anchor": "middle",
+          class: "axis-text" }, nice + " m"));
+      }
+    }
+
+    if (!ST.keyToOrder.size) {
+      svg.appendChild(el("text", { x: 230, y: 380, "text-anchor": "middle", class: "axis-text" },
+        "Load every phone's file to resolve peers into numbers"));
+    }
+  }
+
+  function renderChips() {
+    const states = phoneStateAt(ST.run, ST.t);
+    $("chips").innerHTML = states.map(s =>
+      `<span class="chip ${s.up ? "up" : ""} ${s.dead ? "dead" : ""}">
+         <i class="dot"></i>${s.phone.label}
+         <span style="color:var(--ink-3)">${s.floored ? "battery floor" : s.dead ? "stopped" : s.step ? s.step.label : "—"}</span>
+       </span>`).join("");
+    const labels = new Set(states.filter(s => s.step && !s.dead).map(s => s.step.label));
+    $("skewNote").textContent = labels.size > 1
+      ? `${labels.size} different step labels are live at this instant — the phones ` +
+        `auto-advance on their own timers, so the labels drift apart by however far apart they started.`
+      : "";
+  }
+
+  function blocksOf(run) {
+    const ref = run.phones.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99))[0];
+    const out = [];
+    for (const w of windowsFor(ref, run).filter(w => w.V != null)) {
+      const last = out[out.length - 1];
+      if (last && last.V === w.V) last.t1 = w.t1;
+      else out.push({ key: w.key, V: w.V, unit: w.unit, t0: w.t, t1: w.t1 });
+    }
+    return out;
+  }
+
+  function pairUptime(run, b) {
+    const orders = run.phones.map(p => p.order).filter(o => o != null).sort((a, x) => a - x);
+    const share = new Map();
+    const SAMPLES = 90, dt = (b.t1 - b.t0) / SAMPLES;
+    for (let i = 0; i < SAMPLES; i++) {
+      for (const e of liveEdges(run, b.t0 + i * dt)) {
+        const k = e.a + "|" + e.b;
+        share.set(k, (share.get(k) || 0) + 1 / SAMPLES);
+      }
+    }
+    return { orders, share };
+  }
+
+  const seqStep = v =>
+    v <= 0 ? "var(--surface-1)" : v < .15 ? "var(--seq-100)" : v < .3 ? "var(--seq-200)" :
+    v < .5 ? "var(--seq-300)" : v < .7 ? "var(--seq-400)" : v < .85 ? "var(--seq-500)" :
+    v < .96 ? "var(--seq-600)" : "var(--seq-700)";
+
+  function renderMatrix() {
+    const run = ST.run, blocks = blocksOf(run);
+    const sel = $("blockSelect");
+    if (sel.dataset.run !== String(run.i)) {
+      sel.innerHTML = blocks.map((b, i) =>
+          `<option value="${i}">${b.key}=${b.V}${b.unit || ""} · ${fmtDur(b.t1 - b.t0)}</option>`).join("");
+      sel.dataset.run = String(run.i);
+    }
+    const b = blocks[Math.min(+sel.value || 0, blocks.length - 1)];
+    if (!b) { $("matrix").innerHTML = ""; return; }
+    const { orders, share } = pairUptime(run, b);
+
+    let html = "<tr><th></th>" + orders.map(o => `<th>${o}</th>`).join("") + "</tr>";
+    for (const r of orders) {
+      html += `<tr><th>${r}</th>`;
+      for (const c of orders) {
+        if (r === c) { html += `<td class="self">—</td>`; continue; }
+        const k = Math.min(r, c) + "|" + Math.max(r, c);
+        const v = share.get(k) || 0;
+        const light = v >= .5;
+        html += `<td style="background:${seqStep(v)};color:${light ? "#fff" : "var(--ink-2)"}"
+                     title="phones ${r} and ${c}: linked ${(v * 100).toFixed(0)}% of ${b.key}=${b.V}${b.unit || ""}">${
+                   v > 0 ? Math.round(v * 100) : ""}</td>`;
+      }
+      html += "</tr>";
+    }
+    $("matrix").innerHTML = html;
+
+    const m = metres();
+    let t2 = `<tr><th>Pair</th><th>Uptime</th>${m ? "<th>Distance</th>" : ""}</tr>`;
+    const rows = [];
+    for (let i = 0; i < orders.length; i++)
+      for (let j = i + 1; j < orders.length; j++) {
+        const k = orders[i] + "|" + orders[j];
+        // Show what was measured, not what was reconstructed from it.
+        const meas = (ST.dist || {})[pairKey(orders[i], orders[j])];
+        rows.push([`${orders[i]} ↔ ${orders[j]}`, share.get(k) || 0,
+                   meas ?? distM(m, orders[i], orders[j])]);
+      }
+    // sorted by distance when it is known: that ordering is the range curve
+    rows.sort((a, b2) => (m ? (a[2] ?? 1e9) - (b2[2] ?? 1e9) : b2[1] - a[1]));
+    for (const [k, v, d] of rows)
+      t2 += `<tr><td>${k}</td><td class="n">${(v * 100).toFixed(0)}%</td>` +
+            (m ? `<td class="n">${d == null ? "—" : d.toFixed(0) + " m"}</td>` : "") + "</tr>";
+    $("matrixTable").innerHTML = t2;
+  }
+
+  function renderSteps() {
+    const run = ST.run;
+    const ref = run.phones.slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99))[0];
+    // A population run can be judged against the radios that were up; any
+    // other variable cannot, so those columns are dropped rather than filled
+    // with a verdict on a comparison nobody made.
+    const claims = run.stepKey === POPULATION_KEY;
+    let html = claims
+      ? "<tr><th>Step</th><th>Claims</th><th>Actually up</th><th>Held for</th><th>Verdict</th></tr>"
+      : "<tr><th>Step</th><th>Radios up</th><th>Held for</th></tr>";
+    for (const w of windowsFor(ref, run).filter(w => w.V != null)) {
+      const mid = valueAt(ST.series, w.t + (w.t1 - w.t) / 2);
+      if (!claims) {
+        html += `<tr><td class="mono">${w.label}</td><td class="n">${mid}</td>` +
+                `<td class="n">${fmtDur(w.t1 - w.t)}</td></tr>`;
+        continue;
+      }
+      const SAMPLES = 30, dt = (w.t1 - w.t) / SAMPLES;
+      let hit = 0;
+      for (let i = 0; i < SAMPLES; i++) if (valueAt(ST.series, w.t + i * dt) === w.N) hit++;
+      const pct = hit / SAMPLES;
+      const ok = pct >= .9;
+      html += `<tr><td class="mono">${w.label}</td><td class="n">${w.N}</td>` +
+              `<td class="n">${mid}</td><td class="n">${Math.round(pct * 100)}%</td>` +
+              `<td><span class="pill ${ok ? "ok" : "bad"}">${ok ? "✓ clean" : "⚠ off-claim"}</span></td></tr>`;
+    }
+    $("stepsTable").innerHTML = html;
+  }
+
+  // -------------------------------------------------------------- interaction
+  function setT(t) {
+    ST.t = Math.max(ST.run.t0, Math.min(ST.run.t1, t));
+    $("scrub").value = Math.round((ST.t - ST.run.t0) / Math.max(1, ST.run.t1 - ST.run.t0) * 1000);
+    $("clock").textContent = `${fmtDur(ST.t - ST.run.t0)} into the run · ` +
+                             new Date(ST.t).toLocaleTimeString();
+    renderStats(); renderTimeline(); renderGraph(); renderChips();
+  }
+
+  const unawaited_loadDistances = () => { loadDistances(); };
+
+  function selectRun(i) {
+    ST.run = ST.runs[i];
+    ST.route = null;
+    $("routeView").classList.add("hidden");
+    ST.series = realisedSeries(ST.run);
+    loadPositions();
+    if (!distExpId() || ST.lastRunExp === distExpId()) {
+      $("distExp").value = ST.run.exp;
+    }
+    ST.lastRunExp = ST.run.exp;
+    unawaited_loadDistances();
+    $("blockSelect").dataset.run = "";
+    setT(ST.run.t0);
+    renderAll();
+  }
+
+  $("scrub").addEventListener("input", e => {
+    const run = ST.run;
+    setT(run.t0 + (+e.target.value / 1000) * (run.t1 - run.t0));
+  });
+
+  $("timelineWrap").addEventListener("click", e => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const W = narrow() ? 420 : 1000, L = narrow() ? 26 : 38, R = narrow() ? 8 : 12;
+    const frac = ((e.clientX - r.left) / r.width - L / W) / ((W - L - R) / W);
+    setT(ST.run.t0 + Math.max(0, Math.min(1, frac)) * (ST.run.t1 - ST.run.t0));
+  });
+
+  $("playBtn").addEventListener("click", () => {
+    ST.playing = !ST.playing;
+    $("playBtn").textContent = ST.playing ? "Pause" : "Play";
+    if (ST.timer) clearInterval(ST.timer);
+    if (ST.playing) {
+      ST.timer = setInterval(() => {
+        const span = ST.run.t1 - ST.run.t0;
+        let next = ST.t + span / 240;
+        if (next >= ST.run.t1) { next = ST.run.t0; }
+        setT(next);
+      }, 80);
+    }
+  });
+
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    if (!ST.run) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { renderTimeline(); renderGraph(); }, 150);
+  });
+
+  // ---- measured pairwise distances -------------------------------------
+  // Typed by hand because it is more accurate than the sensor: a phone GPS
+  // fix carries metres of error against a layout whose whole spread is 30 m.
+  const pairKey = (a, b) => `${Math.min(a, b)}-${Math.max(a, b)}`;
+
+  function renderDistGrid() {
+    const n = +$("distCount").value || 0;
+    const g = ST.dist || {};
+    let html = "<tr><th></th>" +
+      Array.from({length: n}, (_, i) => `<th>${i + 1}</th>`).join("") + "</tr>";
+    for (let r = 1; r <= n; r++) {
+      html += `<tr><th>${r}</th>`;
+      for (let c = 1; c <= n; c++) {
+        if (c <= r) { html += `<td class="self"></td>`; continue; }
+        const v = g[pairKey(r, c)];
+        html += `<td style="padding:0"><input class="distIn" data-p="${pairKey(r, c)}"
+          type="text" inputmode="decimal"
+          value="${v ?? ""}" aria-label="metres between ${r} and ${c}"
+          style="width:52px;padding:5px 4px;text-align:center;border:1px solid var(--line);
+                 border-radius:5px;background:var(--surface-1);color:var(--ink-1);
+                 font:inherit;font-size:12.5px"></td>`;
+      }
+      html += "</tr>";
+    }
+    $("distGrid").innerHTML = html;
+    const total = n * (n - 1) / 2;
+    const done = Object.keys(g).length;
+    $("distStatus").textContent = !total ? ""
+        : done === total ? `${done}/${total} pairs — drawn to scale`
+        : done ? `${done}/${total} pairs — all needed for the to-scale layout`
+        : `0/${total} pairs entered`;
+    // Enter moves to the next box, so a sheet of numbers goes in without
+    // reaching for the mouse between every one.
+    const boxes = [...$("distGrid").querySelectorAll(".distIn")];
+    boxes.forEach((el, i) => {
+      el.addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); boxes[i + 1]?.focus(); }
+      });
+      el.addEventListener("input", () => {
+        // A German keyboard's decimal key types "," — a number input refuses
+        // it outright, so these are text inputs and the comma is normalised
+        // here. "8,66" and "8.66" are the same measurement.
+        const v = el.value.trim().replace(",", ".");
+        const num = v === "" ? NaN : Number(v);
+        if (v === "" || Number.isNaN(num) || num < 0) {
+          delete ST.dist[el.dataset.p];
+        } else {
+          ST.dist[el.dataset.p] = num;
+        }
+        const d = Object.keys(ST.dist).length;
+        $("distStatus").textContent = `${d}/${total} pairs entered (unsaved)`;
+      });
+    });
+  }
+
+  const distExpId = () => $("distExp").value.trim();
+
+  async function loadDistances() {
+    const exp = distExpId();
+    let n = 8;
+    if (!exp) { ST.dist = {}; }
+    else {
+      try {
+        const g = await api("/v1/geometry?exp=" + encodeURIComponent(exp));
+        ST.dist = g.pairs || {};
+        if (g.devices) n = g.devices;
+        else if (ST.run && ST.run.exp === exp) {
+          const orders = ST.run.phones.map(p => p.order).filter(o => o != null);
+          if (orders.length) n = Math.max(...orders);
+        }
+      } catch (e) {
+        ST.dist = {};
+        $("distStatus").textContent = "load failed: " + e.message;
+      }
+    }
+    $("distCount").innerHTML = Array.from({length: 15}, (_, i) => i + 2)
+      .map(v => `<option value="${v}"${v === n ? " selected" : ""}>${v}</option>`).join("");
+    renderDistGrid();
+    if (ST.run) {
+      maybeAutoGeo();
+      renderGraph();
+      renderMatrix();
+    }
+  }
+
+  async function saveDistances() {
+    try {
+      const exp = distExpId();
+      if (!exp) { $("distStatus").textContent = "type an experiment id first"; return; }
+      await api("/v1/geometry", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({exp, devices: +$("distCount").value,
+                              pairs: ST.dist}),
+      });
+      const total = (+$("distCount").value) * (+$("distCount").value - 1) / 2;
+      const done = Object.keys(ST.dist).length;
+      $("distStatus").textContent = `${done}/${total} pairs saved`;
+      // Standalone entry (no run open yet): the save is the whole job — the
+      // graph and matrix only exist once a run is loaded.
+      if (!ST.run) return;
+      // Complete set: place the nodes by what was measured. A partial set
+      // keeps the schematic — one missing edge leaves the arrangement
+      // undetermined, and a half-real drawing is worse than an honest ring.
+      maybeAutoGeo();
+      renderGraph(); renderMatrix();
+    } catch (e) {
+      $("distStatus").textContent = "save failed: " + e.message;
+    }
+  }
+
+  $("distCount").addEventListener("change", renderDistGrid);
+  $("distSave").addEventListener("click", saveDistances);
+  $("distLoad").addEventListener("click", loadDistances);
+  $("distExp").addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); loadDistances(); }
+  });
+  loadDistances();
+
+  $("posSave").addEventListener("click", savePositions);
+  $("posMetres").addEventListener("change", () => { loadPositions(); });
+  $("posClear").addEventListener("click", () => {
+    localStorage.removeItem(posKey());
+    if ($("layoutSelect").value === "geo") $("layoutSelect").value = "ring";
+    loadPositions();
+    if (!distExpId() || ST.lastRunExp === distExpId()) {
+      $("distExp").value = ST.run.exp;
+    }
+    ST.lastRunExp = ST.run.exp;
+    unawaited_loadDistances(); renderGraph(); renderMatrix();
+  });
+
+  $("runSelect").addEventListener("change", e => selectRun(+e.target.value));
+  let layoutUserSet = false;
+  $("layoutSelect").addEventListener("change", () => {
+    layoutUserSet = true;
+    renderGraph();
+  });
+
+  // The graph draws to scale the moment measured geometry EXISTS — entered
+  // distances (MDS) or recorded/typed positions — without the operator
+  // knowing there is a dropdown. An explicit layout choice is never
+  // overridden.
+  function maybeAutoGeo() {
+    const ownDist = ST.run && distExpId() === ST.run.exp &&
+        metresFromDistances() != null;
+    const have = ownDist || Object.keys(ST.pos || {}).length >= 2;
+    if (!have) return;
+    $("geoOpt").disabled = false;
+    if (!layoutUserSet && $("layoutSelect").value === "ring") {
+      $("layoutSelect").value = "geo";
+    }
+  }
+  $("blockSelect").addEventListener("change", renderMatrix);
+  $("resetBtn").addEventListener("click", () => {
+    if (ST.timer) clearInterval(ST.timer);
+    ST.playing = false; $("playBtn").textContent = "Play";
+    $("app").classList.add("hidden"); $("drop").classList.remove("hidden");
+    $("fileInput").value = "";
+    loadExperimentList();
+  });
+
+  // ------------------------------------------------------------------ loading
+  async function load(fileList) {
+    const files = [...fileList];
+    if (!files.length) return;
+    $("loadErr").classList.add("hidden");
+    $("parseStatus").classList.remove("hidden");
+    const parsed = [];
+    for (let i = 0; i < files.length; i++) {
+      $("parseText").textContent = `Reading ${files[i].name} (${i + 1}/${files.length})`;
+      parsed.push(await parseFile(files[i], f => {
+        $("parseBar").value = ((i + f) / files.length) * 100;
+      }));
+    }
+    $("parseStatus").classList.add("hidden");
+    // Files loaded from disk carry no server identity, so a route index cannot
+    // be asked for. Clearing this is what makes the route panel say so.
+    ST.serverExp = null;
+    ingest(parsed);
+    refreshPacketIndex();
+  }
+
+  // Both sources — parsed files and the server's topology endpoint — hand over
+  // the same {name, markers, links} shape, so everything downstream is shared.
+  function ingest(parsed) {
+    const built = buildPhones(parsed);
+    ST.phones = built.phones; ST.keyToOrder = built.keyToOrder;
+    ST.deviceToPeer = built.deviceToPeer;
+    ST.runs = buildRuns(ST.phones);
+    if (!ST.runs.length) {
+      $("loadErr").textContent =
+        "No step markers found — this recording has no `<key>=<value>` step labels " +
+        "(`n=6`, `d=40`, …), so there is no schedule to plot.";
+      $("loadErr").classList.remove("hidden");
+      return;
+    }
+    $("runSelect").innerHTML = ST.runs.map((r, i) => `<option value="${i}">${r.label}</option>`).join("");
+    const longest = ST.runs.reduce((a, b) => (b.t1 - b.t0 > a.t1 - a.t0 ? b : a));
+    $("runSelect").value = String(longest.i);
+    $("drop").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    selectRun(longest.i);
+  }
+
+  $("fileInput").addEventListener("change", e => load(e.target.files));
+  const drop = $("drop");
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("hot"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("hot"));
+  drop.addEventListener("drop", e => {
+    e.preventDefault(); drop.classList.remove("hot");
+    load(e.dataTransfer.files);
+  });
+
+  // ------------------------------------------------------------ packet routes
+  // What a route can and cannot show, stated once so the drawing never implies
+  // more than the trace holds:
+  //   * A hop with a `fromPeer` is a MEASURED edge — the receiving node named
+  //     the neighbour that handed the packet over.
+  //   * A hop whose `fromPeer` is null happened over a link that was not yet
+  //     authenticated. The sighting is real, the edge is unknown; it is drawn
+  //     as an unattached arrival, never guessed from who else held it.
+  //   * The sync exchange is invisible on the wire: a conveyance appears as
+  //     the holder's `convey` and the receiver's later sighting, with nothing
+  //     joining them. Those two are drawn as a carry, dashed.
+  const EV_LABEL = {
+    mint: "minted here", aired: "put on the air", relay: "relayed on",
+    dup: "arrived again (already relayed)", packetDup: "arrived again (dropped)",
+    store: "held for the recipient", convey: "handed over on a sync",
+    end: "left the buffer", deliver: "DELIVERED to the recipient",
+    ackRx: "ack came back", drop: "dropped",
+  };
+
+  const orderOfPeer = k => (k == null ? null : ST.keyToOrder.get(k) ?? null);
+  // The trace's device_id IS the node's public key, so it resolves the same way.
+  // A BLE device id is not: it is the link path, and the two forms in the trace
+  // differ by the leading role — a link record's `path` is what deviceToPeer is
+  // keyed by (role stripped), while a custody `convey` records the id whole.
+  // Matching only one form silently dropped every conveyance from the drawing.
+  const peerOfBle = (d) => {
+    if (d == null) return null;
+    return ST.deviceToPeer.get(d)
+        ?? ST.deviceToPeer.get(d.split(":").slice(1).join(":"))
+        ?? null;
+  };
+  const orderOfBle = d => orderOfPeer(peerOfBle(d));
+  const nodeName = (k) => {
+    const o = orderOfPeer(k);
+    return o != null ? "#" + o : k ? k.slice(0, 6) : "?";
+  };
+
+  function routeNodeCount() {
+    return Math.max(ST.run ? ST.run.phones.length : 0, 1);
+  }
+
+  async function refreshPacketIndex() {
+    if (!ST.serverExp) {
+      $("pktIndexState").textContent =
+        "Routes need the server's copy of the run — open an experiment instead of loading files.";
+      $("pktBuild").disabled = true;
+      $("pktFilters").classList.add("hidden");
+      return;
+    }
+    try {
+      const r = await api("/v1/packets?limit=1&exp=" + encodeURIComponent(ST.serverExp));
+      if (!r.index) {
+        $("pktIndexState").textContent = "Not indexed yet — one full pass over this run.";
+        $("pktFilters").classList.add("hidden");
+        $("pktTable").innerHTML = "";
+      } else {
+        $("pktIndexState").textContent =
+          `${fmtCount(r.index.packets)} packets, ${fmtCount(r.index.events)} sightings ` +
+          `(indexed ${new Date(r.index.builtAt).toLocaleString()})`;
+        $("pktFilters").classList.remove("hidden");
+        $("pktBuild").textContent = "Rebuild the route index";
+      }
+    } catch (err) {
+      $("pktIndexState").textContent = err.message;
+    }
+  }
+
+  async function buildPacketIndex() {
+    $("pktBuild").disabled = true;
+    $("pktIndexState").textContent = "Indexing — a full pass over the run, this takes a while…";
+    try {
+      const r = await api("/v1/packets/index?exp=" + encodeURIComponent(ST.serverExp),
+                          { method: "POST" });
+      $("pktIndexState").textContent =
+        `${fmtCount(r.packets)} packets, ${fmtCount(r.events)} sightings.`;
+      $("pktFilters").classList.remove("hidden");
+      $("pktBuild").textContent = "Rebuild the route index";
+      await loadPackets();
+    } catch (err) {
+      $("pktIndexState").textContent = err.message;
+    } finally {
+      $("pktBuild").disabled = false;
+    }
+  }
+
+  async function loadPackets() {
+    const qs = new URLSearchParams({ exp: ST.serverExp, limit: "300" });
+    for (const [k, id] of [["kind", "pktKind"], ["outcome", "pktOutcome"],
+                           ["minHops", "pktMinHops"], ["q", "pktQuery"]]) {
+      const v = $(id).value.trim();
+      if (v) qs.set(k, v);
+    }
+    $("pktTable").innerHTML = "<tr><td class='axis-text'>Searching…</td></tr>";
+    try {
+      const r = await api("/v1/packets?" + qs.toString());
+      ST.pkts = r.packets;
+      renderPacketTable();
+    } catch (err) {
+      $("pktTable").innerHTML = `<tr><td class="err">${err.message}</td></tr>`;
+    }
+  }
+
+  function renderPacketTable() {
+    const t = $("pktTable");
+    if (!ST.pkts.length) {
+      t.innerHTML = "<tr><td class='axis-text'>No packet matches those filters.</td></tr>";
+      return;
+    }
+    const head = ["packet", "kind", "from", "to", "seen by", "relays", "carried",
+                  "outcome", "when"];
+    const rows = ST.pkts.map(p => {
+      const rel = ST.run ? fmtDur(p.t0 - ST.run.t0) : "";
+      return `<tr data-pid="${p.packetId}" style="cursor:pointer">
+        <td class="mono">${p.packetId.slice(0, 8)}</td>
+        <td>${p.kind === "ack" ? "ack" : "message"}</td>
+        <td class="n">${nodeName(p.origin)}</td>
+        <td class="n">${nodeName(p.recipient)}</td>
+        <td class="n">${p.nodes}</td>
+        <td class="n">${p.relays}</td>
+        <td class="n">${p.conveys}</td>
+        <td>${p.delivered ? '<span class="pill ok">✓ arrived</span>'
+                          : '<span class="pill bad">never arrived</span>'}</td>
+        <td class="n">${rel}</td></tr>`;
+    });
+    t.innerHTML = `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead>` +
+                  `<tbody>${rows.join("")}</tbody>`;
+    for (const tr of t.querySelectorAll("tbody tr")) {
+      tr.addEventListener("click", () => openRoute(tr.dataset.pid));
+    }
+  }
+
+  async function openRoute(pid) {
+    try {
+      ST.route = await api(`/v1/route?exp=${encodeURIComponent(ST.serverExp)}&pid=${encodeURIComponent(pid)}`);
+      ST.route.summary = ST.pkts.find(p => p.packetId === pid) || null;
+      $("routeView").classList.remove("hidden");
+      renderRoute();
+      $("routeView").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (err) {
+      $("routeNote").textContent = err.message;
+    }
+  }
+
+  function renderRoute() {
+    const r = ST.route, svg = $("routeSvg");
+    svg.innerHTML = "";
+    const evs = r.events;
+    const layout = $("layoutSelect").value;
+    const count = routeNodeCount();
+    const orders = (ST.run ? ST.run.phones : []).map(p => p.order).filter(o => o != null)
+                   .sort((a, b) => a - b);
+    const pos = new Map();
+    for (const o of orders) pos.set(o, nodePos(o, count, layout));
+
+    const defs = el("defs");
+    for (const [id, colour] of [["rArrow", "var(--accent)"], ["rArrowDim", "var(--ink-3)"]]) {
+      const m = el("marker", { id, viewBox: "0 0 10 10", refX: "9", refY: "5",
+                               markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse" });
+      m.appendChild(el("path", { d: "M 0 0 L 10 5 L 0 10 z", fill: colour }));
+      defs.appendChild(m);
+    }
+    svg.appendChild(defs);
+
+    // Faint node ring first, so a node the packet never touched is still
+    // visible — "did not reach #5" is a result, and it needs #5 on the page.
+    for (const o of orders) {
+      const P = pos.get(o);
+      svg.appendChild(el("circle", { cx: P[0], cy: P[1], r: 21, fill: "var(--node-off)",
+                                     "fill-opacity": .35 }));
+    }
+
+    const t0 = evs.length ? evs[0].t : 0;
+    const seen = new Set();      // orders the packet actually reached
+    const pairSeq = new Map();   // parallel hops between the same pair fan out
+    let hopNo = 0;
+
+    for (const e of evs) {
+      const to = orderOfPeer(e.device);
+      if (to != null) seen.add(to);
+      let from = null, dashed = false;
+      if (e.event === "convey") {
+        // Drawn FROM the holder TO the peer it was handed to: the receiving
+        // node logs nothing that names this exchange, so this record is the
+        // only evidence the packet moved, and its direction is not in doubt.
+        from = to;
+        const dest = orderOfBle(e.toDevice);
+        if (dest == null) continue;
+        drawHop(from, dest, ++hopNo, true, e);
+        seen.add(dest);
+        continue;
+      }
+      from = orderOfPeer(e.fromPeer);
+      if (from == null || to == null) continue;
+      if (e.event === "relay" || e.event === "deliver" || e.event === "dup") {
+        drawHop(from, to, ++hopNo, dashed, e);
+      }
+    }
+
+    function drawHop(a, b, n, dashed, e) {
+      const A = pos.get(a), B = pos.get(b);
+      if (!A || !B) return;
+      const key = a < b ? `${a}-${b}` : `${b}-${a}`;
+      const i = (pairSeq.get(key) || 0); pairSeq.set(key, i + 1);
+      const dx = B[0] - A[0], dy = B[1] - A[1];
+      const len = Math.hypot(dx, dy) || 1;
+      // Shorten to the node edge so the head lands on the circle, not in it.
+      const ux = dx / len, uy = dy / len, R = 24;
+      // Bow parallel hops apart rather than stacking them into one line.
+      const bow = (i % 2 ? 1 : -1) * Math.ceil(i / 2) * 22;
+      const mx = (A[0] + B[0]) / 2 - uy * bow, my = (A[1] + B[1]) / 2 + ux * bow;
+      const path = `M ${A[0] + ux * R} ${A[1] + uy * R} Q ${mx} ${my} ${B[0] - ux * R} ${B[1] - uy * R}`;
+      svg.appendChild(el("path", {
+        d: path, fill: "none",
+        stroke: e.event === "dup" ? "var(--ink-3)" : "var(--accent)",
+        "stroke-width": e.event === "deliver" ? 3.5 : 2.2,
+        "stroke-opacity": e.event === "dup" ? .5 : .9,
+        "stroke-dasharray": dashed ? "7 5" : "none",
+        "marker-end": `url(#${e.event === "dup" ? "rArrowDim" : "rArrow"})`,
+      }));
+      svg.appendChild(el("text", {
+        x: mx, y: my - 4, "text-anchor": "middle", class: "axis-text",
+      }, String(n)));
+    }
+
+    // Endpoints on top of the arrows.
+    const mint = evs.find(e => e.event === "mint");
+    const delivered = evs.filter(e => e.event === "deliver").map(e => orderOfPeer(e.device));
+    for (const o of orders) {
+      const P = pos.get(o);
+      const touched = seen.has(o);
+      svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 21,
+        fill: touched ? "var(--accent)" : "var(--node-off)",
+        "fill-opacity": touched ? .95 : .35,
+        stroke: "var(--surface-1)", "stroke-width": 2,
+      }));
+      if (delivered.includes(o)) svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 26, fill: "none",
+        stroke: "var(--accent)", "stroke-width": 2,
+      }));
+      if (mint && orderOfPeer(mint.device) === o) svg.appendChild(el("circle", {
+        cx: P[0], cy: P[1], r: 26, fill: "none", stroke: "var(--ink-2)",
+        "stroke-width": 1.5, "stroke-dasharray": "3 3",
+      }));
+      svg.appendChild(el("text", {
+        x: P[0], y: P[1] + 5, "text-anchor": "middle",
+        fill: touched ? "#fff" : "var(--ink-2)",
+        style: "font:600 15px ui-monospace,Menlo,monospace",
+      }, String(o)));
+    }
+
+    // The sightings, in order — the table is the evidence; the drawing is a
+    // summary of it.
+    const head = ["+time", "node", "what", "from", "ttl", "note"];
+    const body = evs.map(e => {
+      const ttl = e.ttlIn != null ? `${e.ttlIn}→${e.ttlOut}` : "";
+      const note = [
+        e.carried ? "kept a copy" : "",
+        e.dwellMs != null ? `held ${e.dwellMs} ms` : "",
+        e.toDevice ? "to " + nodeName(peerOfBle(e.toDevice)) : "",
+        e.reason || "",
+      ].filter(Boolean).join(" · ");
+      return `<tr data-t="${e.t}" style="cursor:pointer">
+        <td class="n">${((e.t - t0) / 1000).toFixed(2)}s</td>
+        <td class="n">${nodeName(e.device)}</td>
+        <td>${EV_LABEL[e.event] || e.event}</td>
+        <td class="n">${e.fromPeer ? nodeName(e.fromPeer)
+                        : ["relay", "deliver", "dup"].includes(e.event) ? "unknown" : "—"}</td>
+        <td class="n">${ttl}</td>
+        <td class="axis-text">${note}</td></tr>`;
+    });
+    $("routeHops").innerHTML =
+      `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body.join("")}</tbody>`;
+    for (const tr of $("routeHops").querySelectorAll("tbody tr")) {
+      tr.addEventListener("click", () => setT(+tr.dataset.t));   // scrub there
+    }
+
+    const s = r.summary;
+    const unknown = evs.filter(e => !e.fromPeer && ["relay", "deliver", "dup"].includes(e.event)).length;
+    const blindConvey = evs.filter(e => e.event === "convey" && orderOfBle(e.toDevice) == null).length;
+    const span = evs.length ? (evs[evs.length - 1].t - t0) / 1000 : 0;
+    $("routeNote").innerHTML =
+      `<span class="mono">${r.packetId}</span><br>` +
+      (s ? `${s.kind === "ack" ? "An ack" : "A message"} from ${nodeName(s.origin)} ` +
+           `to ${nodeName(s.recipient)}. ` : "") +
+      `${evs.length} sighting(s) across ${new Set(evs.map(e => e.device)).size} node(s), ` +
+      `spanning ${span.toFixed(1)} s.` +
+      (unknown ? ` ${unknown} arrival(s) came over a link that was not yet authenticated, ` +
+                 `so the trace does not name who handed those over — they are listed but not drawn.`
+               : "") +
+      (blindConvey ? ` ${blindConvey} conveyance(s) went to a BLE link no phone ever named a ` +
+                     `peer for, so the destination is unknown — listed, not drawn.` : "") +
+      ` Click a row to scrub the topology view to that instant.`;
+  }
+
+  $("pktBuild").addEventListener("click", buildPacketIndex);
+  $("pktSearch").addEventListener("click", loadPackets);
+  $("pktQuery").addEventListener("keydown", e => { if (e.key === "Enter") loadPackets(); });
+  for (const id of ["pktKind", "pktOutcome", "pktMinHops"]) {
+    $(id).addEventListener("change", loadPackets);
+  }
+
+  // ------------------------------------------------------- server-side source
+  // The server already holds every upload, and link+marker records are a few
+  // thousand rows out of tens of millions — so it filters, and the browser
+  // never sees the bulk. A token is kept in sessionStorage rather than a URL.
+  const api = async (path, opts = {}) => {
+    const headers = {...(opts.headers || {})};
+    const tok = localStorage.getItem("traceToken");
+    if (tok) headers.Authorization = "Bearer " + tok;
+    let res = await fetch(path, {...opts, headers});
+    if (res.status === 401 || res.status === 403) {
+      const entered = prompt("This trace server requires its upload token:");
+      if (!entered) throw new Error("A token is needed to read experiments from the server.");
+      localStorage.setItem("traceToken", entered);
+      res = await fetch(path, {...opts,
+          headers: {...headers, Authorization: "Bearer " + entered}});
+    }
+    if (!res.ok) throw new Error(`Server said ${res.status} for ${path}`);
+    return res.json();
+  };
+
+  const fmtCount = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M"
+                     : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : String(n);
+
+  async function loadExperimentList() {
+    const sel = $("expSelect");
+    try {
+      const list = await api("/v1/experiments");
+      if (!list.length) {
+        sel.innerHTML = "<option>No uploads on this server yet</option>";
+        $("serverNote").textContent = "Upload a run from a phone, then press Refresh.";
+        $("openBtn").disabled = true;
+        return;
+      }
+      sel.innerHTML = list.map(e => {
+        const when = e.lastUpload ? new Date(e.lastUpload).toLocaleDateString() : "";
+        return `<option value="${e.id}">${e.name} — ${e.devices} device(s), ` +
+               `${fmtCount(e.records)} records${when ? ", " + when : ""}</option>`;
+      }).join("");
+      $("openBtn").disabled = false;
+      $("serverNote").textContent = `${list.length} experiment(s) indexed.`;
+    } catch (err) {
+      sel.innerHTML = "<option>Server unavailable</option>";
+      $("openBtn").disabled = true;
+      $("serverNote").innerHTML =
+        `<span class="err">${err.message}</span> &mdash; start it with ` +
+        `<code class="mono">python server.py</code>, or load files from disk below.`;
+    }
+  }
+
+  async function openExperiment(expId) {
+    $("loadErr").classList.add("hidden");
+    $("parseStatus").classList.remove("hidden");
+    $("parseBar").removeAttribute("value");           // indeterminate: server-side work
+    $("parseText").textContent = "Fetching topology for " + expId;
+    try {
+      const data = await api("/v1/topology?exp=" + encodeURIComponent(expId));
+      const files = data.devices.map(d => ({
+        name: d.deviceId.slice(0, 8), deviceId: d.deviceId,
+        markers: d.markers, links: d.links, locations: d.locations || []
+      }));
+      $("parseStatus").classList.add("hidden");
+      $("parseBar").value = 0;
+      if (!files.length) throw new Error("That experiment has no link or marker records.");
+      ST.serverExp = expId;
+      ingest(files);
+      refreshPacketIndex();
+    } catch (err) {
+      $("parseStatus").classList.add("hidden");
+      $("parseBar").value = 0;
+      $("loadErr").textContent = err.message;
+      $("loadErr").classList.remove("hidden");
+    }
+  }
+
+  $("openBtn").addEventListener("click", () => openExperiment($("expSelect").value));
+  $("refreshBtn").addEventListener("click", loadExperimentList);
+  loadExperimentList();
+})();
+</script>

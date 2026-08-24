@@ -1,0 +1,4 @@
+d,payloadB,lanes,leg,direction,label,t0,t1,rssi_n,advPerMin,advCoverage,power_mA_0e7dde40,energy_mAh_0e7dde40,power_mA_1ce83c92,energy_mAh_1ce83c92,msg_sent,msg_recv,recv_rate,msg_delivered,delivery_rate,rtt_median_ms,rtt_p90_ms,applat_median_ms,active_s,msg_per_s,goodput_Bps,airB_per_msg,air_overhead,rssi_adv_mean,rssi_adv_std,rssi_conn_mean,rssi_conn_std,t_discovered_s,t_connected_s,t_session_s,t_usable_s,discovered,connected,session,usable,drop
+,,,,,discharge heavy,1785921614499,1785937292543,0,0.0,0.0,428.5,1951.326,421.4,1910.003,0,0,,0,,,,,,,,,,,,,,,,,,0,0,0,0,0
+,,,,,battery-floor,1785937292543,1785940062305,0,0.0,0.0,413.5,,206.1,162.792,0,0,,0,,,,,,,,,,,,,,,,,,0,0,0,0,0
+,,,,,battery-floor,1785940062305,1785937292543,0,0.0,0.0,,,,,0,0,,0,,,,,,,,,,,,,,,,,,0,0,0,0,0

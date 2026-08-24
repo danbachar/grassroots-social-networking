@@ -22,6 +22,11 @@ enum ChatMessageType {
   /// "1-time view" picture if `viewOnce` is true; the recipient deletes
   /// the file after viewing, the sender deletes when delivery confirms.
   picture,
+
+  /// Arbitrary file attachment — the file lives on disk at `mediaPath`,
+  /// `mediaMime` holds its MIME type, and `content` holds the original file
+  /// name. Rendered as a tappable card that opens/shares the file.
+  file,
 }
 
 /// Record of an outgoing message with delivery status
@@ -167,6 +172,8 @@ class ChatMessageState {
 
   /// Whether this is a picture message.
   bool get isPicture => messageType == ChatMessageType.picture;
+
+  bool get isFile => messageType == ChatMessageType.file;
 
   /// The peer's pubkey hex (the other party in the conversation)
   String get peerHex => isOutgoing ? recipientPubkeyHex : senderPubkeyHex;

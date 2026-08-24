@@ -17,6 +17,10 @@ TransportsState transportsReducer(
     return state.copyWith(bleScanning: action.scanning);
   }
 
+  if (action is BleAdvertisingChangedAction) {
+    return state.copyWith(bleAdvertising: action.advertising);
+  }
+
   if (action is PublicAddressUpdatedAction) {
     if (action.publicAddress == null) {
       return state.clearPublicAddress();
@@ -55,6 +59,10 @@ TransportsState transportsReducer(
     // Only meaningful if we have a public address to bind the observation to.
     if (state.publicAddress == null) return state;
     return state.copyWith(lastUnsolicitedInboundAt: action.observedAt);
+  }
+
+  if (action is BleLinkSnapshotAction) {
+    return state.copyWith(bleLinks: action.links);
   }
 
   return state;

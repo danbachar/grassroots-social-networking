@@ -134,6 +134,37 @@ void main() {
       });
     });
 
+    group('framesFor with an explicit chunkBudget (neighbour-local path)', () {
+      test('a payload above the budget round-trips through accept', () {
+        // The cleartext ANNOUNCE/handshake path: fragments sized to a small
+        // per-leg budget, reassembled by the frame messageId.
+        final payload = Uint8List.fromList(
+            List<int>.generate(241, (i) => i & 0xFF));
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4(), chunkBudget: 100);
+        expect(frames.length, 3); // ceil(241 / 100)
+        expect(frames.every((f) => f.isFragmented), isTrue);
+        expect(frames.map((f) => f.chunk.length).reduce((a, b) => a + b), 241);
+
+        // Feed each frame back through accept; reassembles to identical bytes.
+        Uint8List? whole;
+        for (final f in frames) {
+          whole = handler.accept(f);
+        }
+        expect(whole, isNotNull);
+        expect(whole, equals(payload));
+      });
+
+      test('a payload at or below the budget yields one frame', () {
+        final payload = Uint8List.fromList(List<int>.filled(80, 7));
+        final frames =
+            handler.framesFor(payload: payload, messageId: uuid.v4(), chunkBudget: 100);
+        expect(frames.length, 1);
+        expect(frames.first.isFragmented, isFalse);
+        expect(handler.accept(frames.first), equals(payload));
+      });
+    });
+
     group('accept - reassembly', () {
       test('returns chunk immediately for a single-fragment frame', () {
         final payload = Uint8List(100);
@@ -372,6 +403,61 @@ void main() {
         h.dispose();
         expect(() => h.dispose(), returnsNormally);
       });
+    });
+  });
+
+  group('abandonment reporting', () {
+    test('a broken reassembly (mismatched fragCount counted) reports itself',
+        () {
+      final handler = FragmentHandler();
+      final abandoned = <(String, String)>[];
+      handler.onAbandon =
+          (reason, messageId, have, total) => abandoned.add((reason, messageId));
+
+      // totalFragments pins to the FIRST fragment's fragCount (2). A later
+      // fragment self-consistent under a DIFFERENT fragCount (index 4 of 5)
+      // still lands in the same messageId state: the chunk count then reads
+      // complete while index 1 is missing, and reassemble() fails. That is
+      // the message-killing edge this reporting exists for.
+      final f0 = SecureFrame(
+        contentType: ContentType.message,
+        messageId: 'm-broken',
+        fragIndex: 0,
+        fragCount: 2,
+        chunk: Uint8List.fromList([1]),
+      );
+      final f4of5 = SecureFrame(
+        contentType: ContentType.message,
+        messageId: 'm-broken',
+        fragIndex: 4,
+        fragCount: 5,
+        chunk: Uint8List.fromList([2]),
+      );
+      expect(handler.accept(f0), isNull);
+      expect(handler.accept(f4of5), isNull);
+
+      expect(abandoned, [('broken', 'm-broken')]);
+      expect(handler.reassemblyCount, 0,
+          reason: 'the broken state is removed, not retried');
+      handler.dispose();
+    });
+
+    test('occupancy getters track partial reassemblies', () {
+      final handler = FragmentHandler();
+      expect(handler.reassemblyCount, 0);
+      expect(handler.reassemblyBytes, 0);
+
+      handler.accept(SecureFrame(
+        contentType: ContentType.message,
+        messageId: 'm-partial',
+        fragIndex: 0,
+        fragCount: 3,
+        chunk: Uint8List.fromList(List.filled(64, 1)),
+      ));
+
+      expect(handler.reassemblyCount, 1);
+      expect(handler.reassemblyBytes, 64);
+      handler.dispose();
     });
   });
 }

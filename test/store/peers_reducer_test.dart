@@ -93,43 +93,35 @@ void main() {
   });
 
   // =========================================================================
-  // BleDeviceRssiUpdatedAction
+  // BleDeviceDiscoveredAction — re-advertisement merge
   // =========================================================================
 
-  group('BleDeviceRssiUpdatedAction', () {
-    test('updates RSSI of existing discovered peer', () {
-      final now = DateTime.now();
+  group('BleDeviceDiscoveredAction re-advertisement merge', () {
+    test('refreshes RSSI and preserves discoveredAt for existing entry', () {
+      final firstSeen = DateTime.now().subtract(const Duration(seconds: 30));
       final initial = PeersState(
         discoveredBlePeers: {
           'device-1': DiscoveredPeerState(
             transportId: 'device-1',
             rssi: -80,
-            discoveredAt: now,
-            lastSeen: now,
+            discoveredAt: firstSeen,
+            lastSeen: firstSeen,
           ),
         },
       );
-      final action = BleDeviceRssiUpdatedAction(
+      final action = BleDeviceDiscoveredAction(
         deviceId: 'device-1',
         rssi: -45,
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.discoveredBlePeers['device-1']!.rssi, -45);
+      final entry = result.discoveredBlePeers['device-1']!;
+      expect(entry.rssi, -45);
+      expect(entry.discoveredAt, firstSeen);
+      expect(entry.lastSeen.isAfter(firstSeen), isTrue);
     });
 
-    test('is a no-op for unknown device', () {
-      const state = PeersState.initial;
-      final action = BleDeviceRssiUpdatedAction(
-        deviceId: 'nonexistent',
-        rssi: -45,
-      );
-
-      final result = peersReducer(state, action);
-
-      expect(result, same(state));
-    });
   });
 
   // =========================================================================
@@ -362,7 +354,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 2,
         rssi: -55,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'ble-central-1',
@@ -375,7 +366,6 @@ void main() {
       final peer = result.peers[hex]!;
       expect(peer.publicKey, pubkey);
       expect(peer.nickname, 'Alice');
-      expect(peer.protocolVersion, 2);
       expect(peer.rssi, -55);
       expect(peer.transport, PeerTransport.bleDirect);
       expect(peer.bleCentralDeviceId, 'ble-central-1');
@@ -392,7 +382,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -60,
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'ble-peripheral-1',
@@ -419,7 +408,6 @@ void main() {
           PeerAnnounceReceivedAction(
             publicKey: pubkey,
             nickname: 'Alice',
-            protocolVersion: 1,
             rssi: -55,
             transport: PeerTransport.bleDirect,
             bleCentralDeviceId: 'central-id',
@@ -435,7 +423,6 @@ void main() {
           PeerAnnounceReceivedAction(
             publicKey: pubkey,
             nickname: 'Alice',
-            protocolVersion: 1,
             rssi: -50,
             transport: PeerTransport.bleDirect,
             blePeripheralDeviceId: 'peripheral-id',
@@ -462,14 +449,12 @@ void main() {
             nickname: 'OldNick',
             connectionState: PeerConnectionState.disconnected,
             rssi: -90,
-            protocolVersion: 1,
           ),
         },
       );
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'NewNick',
-        protocolVersion: 3,
         rssi: -40,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::1]:4001',
@@ -479,7 +464,6 @@ void main() {
 
       final peer = result.peers[hex]!;
       expect(peer.nickname, 'NewNick');
-      expect(peer.protocolVersion, 3);
       expect(peer.rssi, -40);
       expect(peer.transport, PeerTransport.udp);
       expect(peer.udpAddress, '[2001:db8::1]:4001');
@@ -499,7 +483,6 @@ void main() {
             connectionState: PeerConnectionState.disconnected,
             transport: PeerTransport.udp,
             rssi: -90,
-            protocolVersion: 1,
             udpAddress: udpAddress,
             udpAddressCandidates: const {udpAddress},
             isFriend: true,
@@ -514,7 +497,6 @@ void main() {
         PeerAnnounceReceivedAction(
           publicKey: pubkey,
           nickname: 'NewNick',
-          protocolVersion: 3,
           rssi: -40,
           transport: PeerTransport.udp,
           udpAddress: udpAddress,
@@ -523,7 +505,6 @@ void main() {
 
       final peer = result.peers[hex]!;
       expect(peer.nickname, 'NewNick');
-      expect(peer.protocolVersion, 3);
       expect(peer.rssi, -40);
       expect(peer.connectionState, PeerConnectionState.connected);
       expect(peer.isFriend, isTrue);
@@ -536,7 +517,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Bob',
-        protocolVersion: 1,
         rssi: -60,
       );
 
@@ -563,7 +543,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Alice',
-        protocolVersion: 1,
         rssi: -40,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::1]:4001',
@@ -583,7 +562,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Carol',
-        protocolVersion: 1,
         rssi: -42,
         transport: PeerTransport.udp,
         udpAddress: '[2001:db8::3]:4003',
@@ -614,7 +592,6 @@ void main() {
       final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
         nickname: 'Dana',
-        protocolVersion: 1,
         rssi: -55,
         transport: PeerTransport.bleDirect,
         bleCentralDeviceId: 'central-4',
@@ -626,7 +603,6 @@ void main() {
     });
 
     // The "preserve RV servers across ANNOUNCE updates" invariant moved with
-    // knownRvServers to the friendship record — see friendships_reducer_test.
   });
 
   // =========================================================================
@@ -947,20 +923,20 @@ void main() {
   });
 
   // =========================================================================
-  // AssociateBleDeviceAction — role-based
+  // PeerAnnounceReceivedAction — role attachment + platform
   // =========================================================================
 
-  group('AssociateBleDeviceAction', () {
-    test('sets bleCentralDeviceId when role=central', () {
+  group('PeerAnnounceReceivedAction role attachment', () {
+    test('central announce sets bleCentralDeviceId only', () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
         peers: {hex: PeerState(publicKey: pubkey, nickname: 'Alice')},
       );
-      final action = AssociateBleDeviceAction(
+      final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
-        deviceId: 'ble-central-99',
-        role: BleRole.central,
+        nickname: 'Alice',
+        bleCentralDeviceId: 'ble-central-99',
       );
 
       final result = peersReducer(initial, action);
@@ -969,36 +945,31 @@ void main() {
       expect(result.peers[hex]!.blePeripheralDeviceId, isNull);
     });
 
-    test('sets blePeripheralDeviceId when role=peripheral', () {
+    test('peripheral announce sets blePeripheralDeviceId and keeps central',
+        () {
       final pubkey = _testPubkey(1);
       final hex = _pubkeyHex(pubkey);
       final initial = PeersState(
-        peers: {hex: PeerState(publicKey: pubkey, nickname: 'Alice')},
+        peers: {
+          hex: PeerState(
+            publicKey: pubkey,
+            nickname: 'Alice',
+            bleCentralDeviceId: 'ble-central-99',
+          ),
+        },
       );
-      final action = AssociateBleDeviceAction(
+      final action = PeerAnnounceReceivedAction(
         publicKey: pubkey,
-        deviceId: 'ble-peripheral-99',
-        role: BleRole.peripheral,
+        nickname: 'Alice',
+        blePeripheralDeviceId: 'ble-peripheral-99',
       );
 
       final result = peersReducer(initial, action);
 
-      expect(result.peers[hex]!.bleCentralDeviceId, isNull);
+      expect(result.peers[hex]!.bleCentralDeviceId, 'ble-central-99');
       expect(result.peers[hex]!.blePeripheralDeviceId, 'ble-peripheral-99');
     });
 
-    test('is a no-op for unknown peer', () {
-      const state = PeersState.initial;
-      final action = AssociateBleDeviceAction(
-        publicKey: _testPubkey(99),
-        deviceId: 'ble-device-99',
-        role: BleRole.central,
-      );
-
-      final result = peersReducer(state, action);
-
-      expect(result, same(state));
-    });
   });
 
   // =========================================================================
@@ -1477,7 +1448,7 @@ void main() {
     });
   });
 
-  group('PeersState rendezvous server getters', () {
+  group('PeersState well-connected friend getters', () {
     test(
       'wellConnectedFriends accepts public-address friends without proof',
       () {
@@ -1506,9 +1477,6 @@ void main() {
         );
       },
     );
-
-    // friendRvServers aggregation moved to FriendshipsState (knownRvServers
-    // is now friendship-scoped). Covered by friendships_state_test.
 
     test('stores FRIEND_LIST updates from direct friends only', () {
       final friendPubkey = _testPubkey(20);
@@ -1551,42 +1519,6 @@ void main() {
 
       expect(fromFriend.friendsOfFriends[friendHex], equals({commonHex}));
     });
-
-    test(
-      'commonFriendHexesWith intersects direct friends with FoF entries',
-      () {
-        final friendPubkey = _testPubkey(23);
-        final commonPubkey = _testPubkey(24);
-        final remoteOnlyPubkey = _testPubkey(25);
-        final friendHex = _pubkeyHex(friendPubkey);
-        final commonHex = _pubkeyHex(commonPubkey);
-        final remoteOnlyHex = _pubkeyHex(remoteOnlyPubkey);
-        final state = PeersState(
-          peers: {
-            friendHex: PeerState(
-              publicKey: friendPubkey,
-              nickname: 'Friend',
-              isFriend: true,
-            ),
-            commonHex: PeerState(
-              publicKey: commonPubkey,
-              nickname: 'Common',
-              isFriend: true,
-            ),
-            remoteOnlyHex: PeerState(
-              publicKey: remoteOnlyPubkey,
-              nickname: 'RemoteOnly',
-              isFriend: false,
-            ),
-          },
-          friendsOfFriends: {
-            friendHex: {commonHex, remoteOnlyHex},
-          },
-        );
-
-        expect(state.commonFriendHexesWith(friendHex), equals({commonHex}));
-      },
-    );
 
     test(
       'mediatorsForFriend returns live direct friends that advertise target',

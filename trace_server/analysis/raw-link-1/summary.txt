@@ -1,0 +1,20 @@
+records: 576   span: 397s
+
+receiver1 (adbed3e0):
+  records by type: {'rssi': 255, 'link': 76, 'marker': 44, 'wire': 34, 'flow': 9}
+  link stages: {'discovered': 68, 'session': 8}
+  flow raw: sent 5585.0, acked nan (0 B), goodput n/a
+  flow raw: sent 7000.0, acked nan (0 B), goodput n/a
+  flow raw: sent 5590.0, acked nan (0 B), goodput n/a
+  flow raw: sent 11432.0, acked nan (0 B), goodput n/a
+  flow raw: sent 0.0, acked nan (0 B), goodput n/a
+  flow raw: sent 10362.0, acked nan (0 B), goodput n/a
+  flow raw: sent 0.0, acked nan (0 B), goodput n/a
+  flow raw: sent 7558.0, acked nan (0 B), goodput n/a
+  flow raw: sent 6095.0, acked nan (0 B), goodput n/a
+  wire bytes: {'rx:announce': 11628, 'rx:handshake': 1820, 'tx:announce': 11286, 'tx:handshake': 2060, 'tx:raw': 13084988}
+
+receiver2 (ba2af95f):
+  records by type: {'link': 80, 'rssi': 38, 'wire': 38, 'marker': 2}
+  link stages: {'discovered': 72, 'session': 8}
+  wire bytes: {'rx:announce': 11970, 'rx:handshake': 2060, 'rx:raw': 10359996, 'tx:announce': 12996, 'tx:handshake': 1820}

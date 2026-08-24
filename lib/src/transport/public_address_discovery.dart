@@ -9,7 +9,7 @@ import 'address_utils.dart';
 /// UDP port to form the address we advertise to friends.
 ///
 /// Discovers public IPv6 and IPv4 candidates. The discovered addresses are
-/// included in ANNOUNCE messages so peers and rendezvous servers know where
+/// included in ANNOUNCE messages so peers know where
 /// to reach us.
 class PublicAddressDiscovery {
   final Map<InternetAddressType, InternetAddress> _cachedPublicIps = {};

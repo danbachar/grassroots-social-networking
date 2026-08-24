@@ -1,0 +1,7 @@
+/* grasslink webfonts — loaded from Google Fonts.
+   NOTE: these are the chosen brand fonts (this system was authored from a brand
+   brief with no supplied font files). To self-host, drop the .woff2 files in
+   assets/fonts/ and replace these @imports with local @font-face rules. */
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Hanken+Grotesk:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');

@@ -73,16 +73,6 @@ void main() {
       'aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344';
   const peerB =
       'eeff00112233445566778899aabbccddeeff00112233445566778899aabbccdd';
-  const rendezvousA = RendezvousServerSettings(
-    address: '[2001:db8::10]:9516',
-    pubkeyHex:
-        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-  );
-  const rendezvousB = RendezvousServerSettings(
-    address: '198.51.100.20:9514',
-    pubkeyHex:
-        'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-  );
 
   late PersistenceService service;
 
@@ -251,29 +241,6 @@ void main() {
           ]));
     });
 
-    test('loads multiple rendezvous servers and merges legacy single server',
-        () async {
-      final settingsJson = {
-        'anchorAddress': rendezvousA.address,
-        'anchorPubkeyHex': rendezvousA.pubkeyHex,
-        'rendezvousServers': [
-          rendezvousA.toJson(),
-          rendezvousB.toJson(),
-        ],
-      };
-
-      SharedPreferences.setMockInitialValues({
-        'grassroots_settings_v2': jsonEncode(settingsJson),
-      });
-      service = PersistenceService();
-
-      final result = await service.loadSettings();
-
-      expect(
-        result.configuredRendezvousServers,
-        equals(const [rendezvousA, rendezvousB]),
-      );
-    });
   });
 
   // ===================================================================
@@ -552,27 +519,6 @@ void main() {
             TransportProtocol.udp,
             TransportProtocol.bluetooth,
           ]));
-    });
-
-    test('round-trip: flush then load returns same rendezvous servers',
-        () async {
-      final settings = SettingsState(
-        anchorAddress: rendezvousA.address,
-        anchorPubkeyHex: rendezvousA.pubkeyHex,
-        rendezvousServers: const [rendezvousA, rendezvousB],
-      );
-
-      final state = makeAppState(settings: settings);
-      await service.flush(state);
-
-      final loadService = PersistenceService();
-      final loaded = await loadService.loadSettings();
-      loadService.dispose();
-
-      expect(
-        loaded.configuredRendezvousServers,
-        equals(const [rendezvousA, rendezvousB]),
-      );
     });
 
     test('round-trip: flush then load returns same conversations', () async {

@@ -9,6 +9,7 @@ import 'package:redux/redux.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:uuid/uuid.dart';
 import 'ble/permission_handler.dart';
+import 'identity_store.dart';
 import 'platform/transport_foreground_service.dart';
 import 'signaling/invite.dart';
 import 'signaling/signaling_service.dart';
@@ -20,7 +21,6 @@ import 'transport/public_address_discovery.dart';
 import 'transport/udp_transport_service.dart';
 import 'models/block.dart';
 import 'models/identity.dart';
-import 'testbed/bulk_flow_driver.dart';
 import 'trace/experiment_recorder.dart';
 import 'models/peer.dart';
 import 'models/packet.dart';
@@ -83,16 +83,6 @@ class _BurnedNonce {
 /// A message created before any Noise session with its recipient exists —
 /// held as plaintext until the eager handshake on an accepted pairing makes
 /// it sealable and bufferable.
-class _PendingSealMessage {
-  final Uint8List recipientPubkey;
-  final Uint8List payload;
-
-  _PendingSealMessage({
-    required Uint8List recipientPubkey,
-    required Uint8List payload,
-  })  : recipientPubkey = Uint8List.fromList(recipientPubkey),
-        payload = Uint8List.fromList(payload);
-}
 
 /// Whether a settings change that just brought a transport up must complete a
 /// deferred [GrassrootsNetwork.start].
@@ -334,7 +324,10 @@ class GrassrootsNetwork {
   /// Protocol handler for encoding/decoding packets
   late final ProtocolHandler _protocolHandler;
 
-  /// Fragment handler for large BLE messages
+  /// Fragment handler for large BLE messages. Also fragments the two cleartext,
+  /// neighbour-local packet types (ANNOUNCE and Noise handshake) via
+  /// [FragmentHandler.framesFor] with an explicit per-leg chunk budget — the
+  /// frame is written as cleartext (`frame.encode()`) instead of sealed.
   late final FragmentHandler _fragmentHandler;
 
   /// Message router for incoming packet processing
@@ -419,35 +412,36 @@ class GrassrootsNetwork {
   /// These hold application payloads that could not be sent because no live
   /// BLE/UDP path was available. They drain when the peer announces or a UDP
   /// connection event reports the peer as connected.
-  /// Messages awaiting their first Noise session with the recipient — the
-  /// plaintext cannot be sealed and buffered until the eager handshake on an
-  /// accepted pairing completes. Keyed by messageId.
-  ///
-  /// BOUNDED: this holds full payloads, so a peer that never pairs would
-  /// otherwise let it grow without limit — the sealed DTN store is capped
-  /// (32 packets per recipient) and this pre-seal buffer must be too, or the
-  /// unsealed side becomes the leak the sealed side was designed to avoid.
-  /// Insertion-ordered, so eviction drops the oldest hold first.
-  final Map<String, _PendingSealMessage> _pendingSeal = {};
-  static const int _maxPendingSeal = 256;
-
   /// messageId → the buffered packetIds belonging to it (one for a
   /// single-packet message, N for fragments) so the ACK can drop them from
   /// the buffer.
   ///
-  /// BOUNDED: entries leave on the recipient's ACK, so anything never ACKed
-  /// would accumulate forever. Evicting the oldest only costs the ability to
-  /// drop it from the buffer early — the DTN store still ages it out.
+  /// BOUNDED BY THE BUFFER: an entry leaves when its packets leave, for ANY
+  /// reason — the recipient's ACK, age expiry, or an eviction. The store
+  /// reports the non-ACK exits through [MessageRouter.onBufferedPacketDropped]
+  /// and [_forgetBufferedPacket] applies them here, so the index holds exactly
+  /// the messages with packets still in the store.
   ///
-  /// Sized to the DTN store's own packet ceiling ([MessageRouter.dtnCapacity]),
-  /// because an entry stops being useful exactly when its last packet leaves
-  /// the buffer, and at most that many packets can be live at once. The old
-  /// bound of 1000 (borrowed from `MessagesState.maxMessages`, an unrelated
-  /// UI-history depth) was 8x under the buffer and filled in ~50 s at the
-  /// measured saturation rate: the 7-device smoke run evicted 178,138 entries,
-  /// which silently turned ACK-driven buffer release off and left packets to
-  /// age out instead.
+  /// Draining the index on ACK alone would not do: the buffer sheds packets
+  /// on ACK, expiry AND eviction, and every non-ACK exit would leave a dead
+  /// entry behind. Once the index fills with dead entries its FIFO throws out
+  /// LIVE ones, so a later ACK cannot release its packets and they linger to
+  /// age expiry,
+  /// which keeps the buffer full. That is the same failure an earlier bound of
+  /// 1000 caused (178,138 evictions on a 7-device run); raising the number
+  /// only made it slower to arrive, because the number was never the problem.
   final Map<String, List<String>> _dtnPacketIds = {};
+
+  /// packetId → the messageId that sealed it. The store reports exits by
+  /// packetId and the index is keyed by messageId, so without this the prune
+  /// would be a scan of every entry per dropped packet.
+  final Map<String, String> _dtnMessageOfPacket = {};
+
+  /// Backstop only — reaching it means [_forgetBufferedPacket] is not being
+  /// called, since the index cannot otherwise outgrow the buffer. It fires an
+  /// `ackIndex / evicted` drop record, which is the alarm for exactly that
+  /// regression; in a healthy run the count is zero.
+  static const int _maxAckIndexEntries = 200000;
 
 
   // ===== Public callbacks =====
@@ -527,7 +521,7 @@ class GrassrootsNetwork {
     );
     _fragmentHandler = FragmentHandler();
     // A partial reassembly abandoned (4-min timeout, or count-complete but
-    // unassemblable) is a whole-message loss — previously fully silent.
+    // unassemblable) is a whole-message loss, so it gets a drop record.
     _fragmentHandler.onAbandon = (reason, messageId, have, total) {
       _traceDrop('reassembly', reason, {
         'messageId': messageId,
@@ -584,6 +578,7 @@ class GrassrootsNetwork {
         store.dispatch(action);
       }
       _processReachabilityTransitions(state.peers);
+      _emitLinkSettledTransitions(state.peers);
     });
   }
 
@@ -685,6 +680,10 @@ class GrassrootsNetwork {
     try {
       // Initialize BLE if enabled
       if (_isBleEnabledInSettings) {
+        // First start: no service exists, so state must read uninitialized
+        // for BleTransportService.initialize() to proceed.
+        store.dispatch(
+            BleTransportStateChangedAction(TransportState.uninitialized));
         anyTransportInitialized =
             await _initializeBle() || anyTransportInitialized;
       }
@@ -717,20 +716,45 @@ class GrassrootsNetwork {
   }
 
   /// Initialize BLE transport
-  Future<bool> _initializeBle() async {
+  /// [promptForPermissions] false = verify the grants we already hold and
+  /// never issue a request.
+  ///
+  /// A transport RESTART is not a fresh app start. Issuing a request on every
+  /// restart risks a call that does not come back `granted`, and this method
+  /// then returns before it ever touches the BLE stack — leaving `_bleService`
+  /// null, so every later bounce returns at its first line and the radio never
+  /// comes back. A restart already holds the grants; it only has to check.
+  Future<bool> _initializeBle({bool promptForPermissions = true}) async {
+    if (_bleInitInFlight) {
+      debugPrint('BLE init already in flight — refusing to race it');
+      return false;
+    }
+    _bleInitInFlight = true;
     try {
       debugPrint('Initializing BLE transport');
 
-      // Reset Redux state so the service sees uninitialized
-      store.dispatch(
-        BleTransportStateChangedAction(TransportState.uninitialized),
-      );
-
-      // Request BLE permissions
-      final permResult = await _permissions.requestPermissions();
-      if (permResult != PermissionResult.granted) {
-        debugPrint('BLE permissions not granted: $permResult');
-        return false;
+      // Deliberately does NOT reset the transport state. Blanking it here
+      // would apply to every caller, including one that then fails or bails,
+      // and would wipe a transport that is working.
+      // `BleTransportService.initialize()` only proceeds from `uninitialized`,
+      // so a caller that is genuinely replacing a disposed service sets that
+      // state itself, next to the dispose that made it true.
+      if (promptForPermissions) {
+        final permResult = await _permissions.requestPermissions();
+        _lastPermissionOutcome = permResult.name;
+        debugPrint('[perm] requestPermissions -> $permResult');
+        if (permResult != PermissionResult.granted) {
+          debugPrint('BLE permissions not granted: $permResult');
+          return false;
+        }
+      } else {
+        final held = await _permissions.hasRequiredPermissions();
+        _lastPermissionOutcome = held ? 'held' : 'notHeld';
+        debugPrint('[perm] hasRequiredPermissions -> $held (no prompt)');
+        if (!held) {
+          debugPrint('BLE permissions not held on restart');
+          return false;
+        }
       }
 
       // Create BLE transport service (manages BLE manager + router)
@@ -743,6 +767,11 @@ class GrassrootsNetwork {
       // Wire-ledger content split: only we know what our sealed packets carry.
       _bleService!.secureContentResolver =
           (packetId) => _sealedContentById[packetId] ?? '';
+      // A dial-grid step bounces the transport, so the cap it set has to be
+      // re-applied to the replacement service or the step would silently run
+      // at the production cap.
+      _bleService!.setDialParallelism(
+          maxParallel: _dialProbeMaxParallel, popN: _dialProbePopN);
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
       // broadcast stream that drops events with no listener. BLE connections
@@ -765,8 +794,16 @@ class GrassrootsNetwork {
       debugPrint('Stack trace: $stack');
       _bleService = null;
       return false;
+    } finally {
+      _bleInitInFlight = false;
     }
   }
+
+  /// True while [_initializeBle] is running. Two initializations overlapping
+  /// is how the transport ended up neither old nor new: the scripted bring-up
+  /// and the bounce's delayed re-init both ran, and the loser left the state
+  /// pointing at a service the winner had replaced.
+  bool _bleInitInFlight = false;
 
   /// Initialize UDP transport
   Future<bool> _initializeUdp() async {
@@ -1208,6 +1245,11 @@ class GrassrootsNetwork {
         await _bleService!.dispose();
         _bleService = null;
       }
+      // The dispose above is what makes `uninitialized` true; say so here,
+      // next to it, rather than inside _initializeBle where it also applied
+      // to callers that were not replacing anything.
+      store.dispatch(
+          BleTransportStateChangedAction(TransportState.uninitialized));
       await _initializeBle();
       if (wasStarted && _bleAvailable) {
         await _bleService!.start();
@@ -1307,12 +1349,42 @@ class GrassrootsNetwork {
 
   // ===== Identity =====
 
-  /// Update the user's nickname and broadcast to all peers
+  /// Spec `putIdentity()` (`docs/GLP_Networking_API/sections/api.tex`
+  /// §Identity): generate an Ed25519 key pair and persist it, returning the
+  /// identity to construct the coordinator with.
+  ///
+  /// The app calls this when [getIdentity] comes back null on first launch,
+  /// and again to reset the device's identity. Persistence is the
+  /// coordinator's own business — the platform keystore is not part of the
+  /// app-facing surface.
+  static Future<GrassrootsIdentity> putIdentity({String? nickname}) async {
+    final identity = await GrassrootsIdentity.generate(nickname: nickname);
+    await IdentityStore.putIdentity(identity);
+    return identity;
+  }
+
+  /// Spec `getIdentity() -> PubKey`: the identity persisted by a previous
+  /// launch, or null if this device has never generated one.
+  ///
+  /// Returns the whole [GrassrootsIdentity] rather than the bare public key
+  /// the spec names, because the coordinator needs the private key to sign
+  /// packets and run the Noise handshake. The spec's `PubKey` is
+  /// [GrassrootsIdentity.publicKey].
+  static Future<GrassrootsIdentity?> getIdentity() =>
+      IdentityStore.getIdentity();
+
+  /// Update the user's nickname, persist it, and broadcast to all peers.
+  ///
+  /// The nickname is a field of the persisted identity, so the method that
+  /// mutates it is the one that writes it back — a caller that forgot the
+  /// follow-up would show the new nickname until the next launch and then
+  /// silently revert to the old one.
   Future<void> updateNickname(String newNickname) async {
     if (newNickname.isEmpty) return;
 
     debugPrint('Updating nickname to: $newNickname');
     identity.nickname = newNickname;
+    await IdentityStore.putIdentity(identity);
 
     // Broadcast ANNOUNCE with new nickname to all connected peers
     await _broadcastAnnounce();
@@ -1330,6 +1402,11 @@ class GrassrootsNetwork {
   Future<void> setColdCallTrustLevel(ColdCallTrustLevel level) async {
     if (store.state.settings.coldCallTrustLevel == level) return;
     store.dispatch(SetColdCallTrustLevelAction(level));
+    // Re-filter the scanner immediately. Closed trust scans for the friend
+    // set alone; open trust goes back to the prefix scan. Waiting for the
+    // scan watchdog would leave a closed node meeting strangers for up to a
+    // silence window after the user asked it to stop.
+    await _bleService?.applyTrustModeChange();
   }
 
   static const _uuid = Uuid();
@@ -1382,34 +1459,16 @@ class GrassrootsNetwork {
       return messageId;
     }
 
-    // No Noise session with the recipient yet, so the message cannot be
-    // sealed and buffered. Hold the plaintext until the eager handshake on
-    // the next accepted pairing establishes the session —
-    // [_onNoiseSessionEstablished] then seals, buffers them, and floods.
-    _pendingSeal[messageId] = _PendingSealMessage(
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-    );
-    // Entry into the pre-seal hold: the queued->sealed gap is the session
-    // wait, previously folded invisibly into appLatencyMs.
-    _traceMessage('queued', messageId, {
-      'peer': _pubkeyToHex(recipientPubkey),
-      'payloadSize': payload.length,
-      'held': _pendingSeal.length,
-    });
-    while (_pendingSeal.length > _maxPendingSeal) {
-      final oldest = _pendingSeal.keys.first;
-      _pendingSeal.remove(oldest);
-      // Surfaced as failed: the user retries, we never silently re-attempt.
-      store.dispatch(MessageFailedAction(messageId: oldest));
-      _traceMessage('failed', oldest, {'reason': 'preSealEvicted'});
-      debugPrint('[dtn] pre-seal buffer full ($_maxPendingSeal) — '
-          'dropped the oldest hold');
-    }
-    store.dispatch(MessageQueuedAction(messageId: messageId));
+    // No session with the recipient and none could be established, so no
+    // packet was ever created and there is nothing to hold. The message fails
+    // here and the user retries once the peer is actually reachable — a
+    // plaintext hold waiting for a first pairing is exactly the thing this
+    // design refuses to keep.
+    store.dispatch(MessageFailedAction(messageId: messageId));
     debugPrint(
-      '[dtn] No session for ${_pubkeyToHex(recipientPubkey).substring(0, 8)} '
-      'yet; holding ${_pendingSeal.length} message(s) until pairing',
+      '[send] No session with '
+      '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; nothing created, '
+      'message failed',
     );
     return messageId;
   }
@@ -1419,15 +1478,41 @@ class GrassrootsNetwork {
     required Uint8List payload,
     required String messageId,
   }) async {
-    final peer = _peersState.getPeerByPubkey(recipientPubkey);
-    if (peer == null) {
-      debugPrint('Cannot send now: peer not found; message will remain queued');
+    // A PACKET MAY NOT EXIST BEFORE A SESSION WITH ITS TARGET DOES. This is
+    // the invariant, and it is enforced by ordering: establish the session
+    // first, and return without ever calling `createMessagePacket` if none can
+    // be had. Nothing is held, nothing is queued, nothing half-formed survives
+    // this function — a send to a peer we have never handshaked with simply
+    // fails, and the user retries once the peer is actually there.
+    //
+    // A peer RECORD is not what sending needs — a session is. The stale sweep
+    // deletes a non-friend peer from `peersList` after ten announce cycles of
+    // silence while its Noise session survives untouched, so a recipient that
+    // has merely gone quiet has no record but is still perfectly sendable:
+    // `hasSession` short-circuits the establish below and the message seals,
+    // buffers and floods as normal. That is the store-carry-forward case, and
+    // it is why the gate is the SESSION and never the record.
+    // The send path does NOT establish sessions. Pairing is eager and lives
+    // where it belongs: every accepted ANNOUNCE drives a Noise handshake, any
+    // sessionless side initiates, and by the time a user can address a peer
+    // the session either exists or that peer is not someone we can talk to.
+    // Handshaking from inside send would put session setup on the message
+    // latency path and, worse, make "sending" the thing that decides who we
+    // have met.
+    if (!_noiseSessions.hasSession(recipientPubkey)) {
+      debugPrint('Cannot send: no session with '
+          '${_pubkeyToHex(recipientPubkey).substring(0, 8)}; no packet created');
+      _traceMessage('failed', messageId, {
+        'reason': 'noSession',
+        'peer': _pubkeyToHex(recipientPubkey),
+      });
       return false;
     }
 
-    // Create the message packet. Its payload is sealed to the recipient's Noise
-    // session before flooding; the sender-anonymous envelope carries no wire
-    // signature (authentication is end-to-end inside Noise).
+    // Only now, with a session in hand, may a packet exist. Its payload is
+    // sealed to the recipient's Noise session before flooding; the
+    // sender-anonymous envelope carries no wire signature (authentication is
+    // end-to-end inside Noise).
     // packetId == messageId so the recipient's ACK (which echoes the
     // packetId back) matches the entry we just stored under `messageId`
     // in `MessageSendingAction`. Otherwise `MessageDeliveredAction` would
@@ -1438,192 +1523,82 @@ class GrassrootsNetwork {
       messageId: messageId,
     );
 
-    // --- BLE mesh: seal to the recipient's session and flood ---
-    // Reaches the recipient whether they are a direct neighbor or several hops
-    // away, as long as we hold an end-to-end Noise session with them. The
-    // session is established neighbor-local (handshake with a direct neighbor)
-    // and then survives the peer drifting out of direct range — which is what
-    // lets us keep messaging them across the mesh.
-    if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
-      // null when the recipient is not a direct neighbor; the handshake inside
-      // _ensureNoiseSession only succeeds for a direct neighbor, but an existing
-      // session lets us flood to a non-adjacent recipient.
-      final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
-      final ready = await _ensureNoiseSession(
-        transport: PeerTransport.bleDirect,
-        recipientPubkey: recipientPubkey,
-        peerId: bleDeviceId,
-      );
-      if (ready) {
-        debugPrint('Flooding message into BLE mesh for ${peer.displayName}');
-        // Seal ONCE; the sealed packets are simultaneously the wire bytes and
-        // our own buffer entries — the sender holds its outgoing packets
-        // exactly as a relay would. Offered in sync-on-connect, kept until ACK.
-        final List<GrassrootsPacket> sealedPackets;
-        try {
-          sealedPackets = _fragmentHandler.needsFragmentation(payload)
-              ? await _sealFragments(
-                  payload: payload,
-                  recipientPubkey: recipientPubkey,
-                  messageId: messageId,
-                )
-              : [
-                  await _noiseSessions.encryptPacket(
-                    packet,
-                    remotePubkey: recipientPubkey,
-                  ),
-                ];
-        } on StateError {
-          // Check-then-encrypt race: the session vanished between
-          // _ensureNoiseSession and sealing (testbed reset, handshake-timeout
-          // reset, glare teardown). Previously an unhandled async error that
-          // left the message stuck in 'sending' with no evidence; now it is
-          // reported and the caller re-parks the plaintext.
-          _traceDrop('seal', 'sessionRace', {'messageId': messageId});
-          return false;
-        }
-        _dtnPacketIds[messageId] = [
-          for (final p in sealedPackets) p.packetId,
-        ];
-        // THE fragment join: relay/packetDup/custody/decrypt records carry
-        // only per-fragment packetIds, and for a fragmented message those are
-        // random — unjoinable to the messageId without this record.
-        _traceMessage('sealed', messageId, {
-          'peer': _pubkeyToHex(recipientPubkey),
-          'packetIds': [for (final p in sealedPackets) p.packetId],
-          'fragments': sealedPackets.length,
-        });
-        while (_dtnPacketIds.length > _messageRouter.dtnCapacity) {
-          final evicted = _dtnPacketIds.keys.first;
-          _dtnPacketIds.remove(evicted);
-          // A later ACK for this message can no longer release its packets
-          // early — they linger to age expiry. Silent before.
-          _traceDrop('ackIndex', 'evicted', {'messageId': evicted});
-        }
-        for (final p in sealedPackets) {
-          _messageRouter.storeInDtnBuffer(recipientPubkey, p);
-        }
-
-        final wireMs = DateTime.now().millisecondsSinceEpoch;
-        var reachedNeighbors = false;
-        for (final p in sealedPackets) {
-          reachedNeighbors |= await _floodViaBle(p.serialize()) > 0;
-          if (sealedPackets.length > 1) {
-            await Future.delayed(FragmentHandler.fragmentDelay);
-          }
-        }
-
-        // Buffered either way; on-air reach only affects status.
-        _markSent(
-          messageId: messageId,
-          recipientPubkey: recipientPubkey,
-          payload: payload,
-          transport: MessageTransport.ble,
-          aired: reachedNeighbors,
-          atMs: wireMs,
-        );
-        return true;
-      }
-      debugPrint('BLE mesh send unavailable, falling back to UDP...');
-    }
-
-    // --- Try UDP (direct connection or connect-on-demand) ---
-    if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
-      // Re-read peer — state may have changed during BLE attempt.
-      final resolvedPeer = _peersState.getPeerByPubkey(recipientPubkey) ?? peer;
-
-      // Try existing UDX connection first
-      if (_udpService!.getPeerIdForPubkey(recipientPubkey) != null) {
-        final bytes = await _sealedPacketBytesForTransport(
-          packet: packet,
-          transport: PeerTransport.udp,
-          recipientPubkey: recipientPubkey,
-          peerId: resolvedPeer.pubkeyHex,
-        );
-        final udpWireMs = DateTime.now().millisecondsSinceEpoch;
-        if (bytes != null &&
-            await _udpService!.sendToPeer(resolvedPeer.pubkeyHex, bytes)) {
-          // debugPrint(
-          //   'Sent via existing UDP connection to ${resolvedPeer.displayName}',
-          // );
-          _markSent(
-            messageId: messageId,
-            recipientPubkey: recipientPubkey,
-            payload: payload,
-            transport: MessageTransport.udp,
-            aired: true,
-            atMs: udpWireMs,
-          );
-          return true;
-        }
-      }
-
-      // No existing connection — try connect-on-demand if we have an address
-      final udpCandidates = _udpCandidatesForPeer(resolvedPeer);
-      if (udpCandidates.isNotEmpty) {
-        final udpAddr = resolvedPeer.udpAddress ?? udpCandidates.first;
-        debugPrint(
-          'Sending via UDP to ${resolvedPeer.displayName} at $udpCandidates',
-        );
-        final demandWireMs = DateTime.now().millisecondsSinceEpoch;
-        if (await _sendPacketViaUdp(
-          pubkeyHex: resolvedPeer.pubkeyHex,
-          udpAddress: udpAddr,
-          packet: packet,
-          recipientPubkey: recipientPubkey,
-        )) {
-          _markSent(
-            messageId: messageId,
-            recipientPubkey: recipientPubkey,
-            payload: payload,
-            transport: MessageTransport.udp,
-            aired: true,
-            atMs: demandWireMs,
-          );
-          return true;
-        }
-      }
-
-      // No address — try discovery via well-connected friends
-      if (resolvedPeer.isFriend) {
-        debugPrint(
-          '[send] No direct path to ${resolvedPeer.displayName}, '
-          'attempting discovery via well-connected friends...',
-        );
-        final discovered = await _discoverPeerViaFriends(resolvedPeer);
-        if (discovered) {
-          // Re-read peer — discovery updated the address
-          final freshPeer = _peersState.getPeerByPubkey(recipientPubkey);
-          final freshCandidates = _udpCandidatesForPeer(freshPeer);
-          if (freshPeer != null && freshCandidates.isNotEmpty) {
-            debugPrint('[send] Discovery succeeded, sending via UDP');
-            final discWireMs = DateTime.now().millisecondsSinceEpoch;
-            if (await _sendPacketViaUdp(
-              pubkeyHex: freshPeer.pubkeyHex,
-              udpAddress: freshPeer.udpAddress ?? freshCandidates.first,
-              packet: packet,
+    // Seal ONCE; the sealed packets are simultaneously the wire bytes and
+    // our own buffer entries — the sender holds its outgoing packets exactly
+    // as a relay would. Offered in every sync exchange, kept until ACK. A
+    // buffered packet must stay conveyable over the BLE mesh, so the single
+    // seal fragments to the BLE floor MTU regardless of which transport ends
+    // up carrying it: the bytes in the buffer and the bytes on the wire are
+    // the same bytes, one packetId per fragment.
+    final List<GrassrootsPacket> sealedPackets;
+    try {
+      sealedPackets = _fragmentHandler.needsFragmentation(payload)
+          ? await _sealFragments(
+              payload: payload,
               recipientPubkey: recipientPubkey,
-            )) {
-              _markSent(
-                messageId: messageId,
-                recipientPubkey: recipientPubkey,
-                payload: payload,
-                transport: MessageTransport.udp,
-                aired: true,
-                atMs: discWireMs,
-              );
-              return true;
-            }
-          }
-        }
-        debugPrint('[send] Discovery failed for ${resolvedPeer.displayName}');
-      }
+              messageId: messageId,
+            )
+          : [
+              await _noiseSessions.encryptPacket(
+                packet,
+                remotePubkey: recipientPubkey,
+              ),
+            ];
+    } on StateError {
+      // Check-then-encrypt race: the session vanished between the
+      // hasSession gate and sealing (testbed reset, handshake-timeout
+      // reset, glare teardown). Reported, and the caller FAILS the
+      // message — nothing is held in 'sending' without evidence.
+      _traceDrop('seal', 'sessionRace', {'messageId': messageId});
+      return false;
     }
-
-    debugPrint(
-      'No transport currently available for ${peer.displayName}; queuing message',
+    _dtnPacketIds[messageId] = [
+      for (final p in sealedPackets) p.packetId,
+    ];
+    for (final p in sealedPackets) {
+      _dtnMessageOfPacket[p.packetId] = messageId;
+    }
+    // THE fragment join: relay/packetDup/custody/decrypt records carry
+    // only per-fragment packetIds, and for a fragmented message those are
+    // random — unjoinable to the messageId without this record.
+    _traceMessage('sealed', messageId, {
+      'peer': _pubkeyToHex(recipientPubkey),
+      'packetIds': [for (final p in sealedPackets) p.packetId],
+      'fragments': sealedPackets.length,
+    });
+    while (_dtnPacketIds.length > _maxAckIndexEntries) {
+      final evicted = _dtnPacketIds.keys.first;
+      for (final id in _dtnPacketIds.remove(evicted) ?? const <String>[]) {
+        _dtnMessageOfPacket.remove(id);
+      }
+      // A later ACK for this message can no longer release its packets
+      // early — they linger to age expiry. Silent before.
+      _traceDrop('ackIndex', 'evicted', {'messageId': evicted});
+    }
+    // The router owns the outbound decision — a direct write when the
+    // recipient is on a live link (BLE leg preferred, else UDX), the DTN
+    // buffer when it is not — one path for every packet type, no per-type
+    // delivery logic here. A fragmented message can split across outcomes;
+    // [via] is the transport that carried the first written fragment.
+    PeerTransport? via;
+    for (final p in sealedPackets) {
+      via ??= await _messageRouter.dispatchOutbound(recipientPubkey, p);
+    }
+    final wireMs = DateTime.now().millisecondsSinceEpoch;
+    // aired: at least one packet is on the air now. Otherwise everything
+    // sits in the DTN buffer and leaves when a neighbour's sync filter
+    // shows it missing.
+    _markSent(
+      messageId: messageId,
+      recipientPubkey: recipientPubkey,
+      payload: payload,
+      transport: via == PeerTransport.udp
+          ? MessageTransport.udp
+          : MessageTransport.ble,
+      aired: via != null,
+      atMs: wireMs,
     );
-    return false;
+    return true;
   }
 
   // ===== Delivery status + DTN buffer lifecycle =====
@@ -1700,36 +1675,10 @@ class GrassrootsNetwork {
         'payloadSize': payload.length,
         'degreeAtEvent': _reachablePeerCount(),
         'sentAt': atMs,
-        // Whether the flood reached at least one neighbour. aired:false is a
+        // Whether the send reached at least one neighbour. aired:false is a
         // send that exists only in this node's DTN buffer until a sync
-        // exchange — the trace previously could not tell those apart.
+        // exchange, which the trace has to be able to tell apart.
         'aired': aired,
-      }));
-    }
-  }
-
-  /// Seal-and-dispatch every [_pendingSeal] message destined for [pubkey] —
-  /// their first Noise session just formed, so they can finally be buffered.
-  void _sealPendingFor(Uint8List pubkey) {
-    final hex = _pubkeyToHex(pubkey);
-    final ready = _pendingSeal.entries
-        .where((e) => _pubkeyToHex(e.value.recipientPubkey) == hex)
-        .toList(growable: false);
-    for (final entry in ready) {
-      _pendingSeal.remove(entry.key);
-      debugPrint('[dtn] Session up — sealing held message ${entry.key}');
-      unawaited(_trySendMessageNow(
-        recipientPubkey: entry.value.recipientPubkey,
-        payload: entry.value.payload,
-        messageId: entry.key,
-      ).then((sent) {
-        if (sent) return;
-        // The retry failed AFTER the hold was removed (transport lost in the
-        // race): unlike send(), nothing re-parks the plaintext here, so this
-        // is a permanent, previously-silent message loss. Record it and
-        // surface it — the trace-side hole was a 'queued' with no 'sealed'.
-        _traceMessage('failed', entry.key, {'reason': 'sealSendFailed'});
-        store.dispatch(MessageFailedAction(messageId: entry.key));
       }));
     }
   }
@@ -1738,51 +1687,35 @@ class GrassrootsNetwork {
   /// our buffer
   /// of every sealed packet belonging to [messageId].
   void _dropFromDtnBufferFor(String messageId) {
-    _pendingSeal.remove(messageId);
     final ids = _dtnPacketIds.remove(messageId);
+    for (final id in ids ?? const <String>[]) {
+      _dtnMessageOfPacket.remove(id);
+    }
     _messageRouter.dropFromDtnBuffer(ids ?? [messageId]);
   }
 
-  /// DEBUG/TESTBED ONLY. Notified on every end-to-end ACK so the field
-  /// runner's saturating mode can refill its send window.
-  void Function(String messageId)? onTestbedAck;
+  /// Withdraw an unconfirmed sent message from the buffer so it stops being
+  /// conveyed — used to cancel an outstanding friend request. Idempotent: a
+  /// message already ACKed, expired, or from a previous process (the buffer is
+  /// memory-only) simply is not there.
+  void cancelBufferedMessage(String messageId) =>
+      _dropFromDtnBufferFor(messageId);
 
-  BulkFlowDriver? _bulkFlowDriver;
-
-  /// DEBUG/TESTBED ONLY. The sustained-throughput driver (data-plane
-  /// evaluation), lazily bound to [send]. Inert until [startBulkFlows].
-  BulkFlowDriver get bulkFlowDriver => _bulkFlowDriver ??= BulkFlowDriver(
-        send: send,
-        log: (m) => debugPrint(m),
-        trace: trace,
-      );
-
-  /// DEBUG/TESTBED ONLY. Begin executing the bulk-flow config stored in
-  /// settings. No-op without a config or while already running.
-  void startBulkFlows() {
-    final config = store.state.settings.bulkFlowConfig;
-    if (config == null) {
-      debugPrint('[bulk] no bulk-flow config set');
-      return;
-    }
-    bulkFlowDriver.start(
-        config: config, myPubkeyHex: _pubkeyToHex(identity.publicKey));
+  /// A packet left the DTN buffer without an ACK. Forget it, and forget the
+  /// whole message once its LAST packet is gone — a fragmented message keeps
+  /// its entry while any fragment is still buffered, so an ACK can still
+  /// release the rest.
+  void _forgetBufferedPacket(String packetId) {
+    final messageId = _dtnMessageOfPacket.remove(packetId);
+    if (messageId == null) return;
+    final ids = _dtnPacketIds[messageId];
+    if (ids == null) return;
+    ids.remove(packetId);
+    if (ids.isEmpty) _dtnPacketIds.remove(messageId);
   }
 
-  /// DEBUG/TESTBED ONLY. Stop the bulk-flow driver.
-  void stopBulkFlows() => _bulkFlowDriver?.stop();
 
-  /// DEBUG/TESTBED ONLY. Drop every Noise session so the next contact runs
-  /// the full establishment ladder from a cold handshake (the field runner
-  /// invokes this at each experiment step). Messages sent while sessionless
-  /// wait in the pending-seal buffer and trigger the lazy handshake.
-  /// DEBUG/TESTBED ONLY. Send one raw-throughput blob (unsealed, un-ACKed,
-  /// dropped before the peer's parser) to [peer] over [leg]. Returns the blob
-  /// size or null when the leg is not available.
-  Future<int?> sendRawBlob(Uint8List peer,
-          {required String leg, required int seq}) async =>
-      _bleService?.sendRawBlob(
-          peerHex: _pubkeyToHex(peer), leg: leg, seq: seq);
+
 
   /// Bytes on the air over BLE since the transport last came up, tx and rx
   /// together. Counted at the GATT send/receive choke points, so this only
@@ -1803,8 +1736,10 @@ class GrassrootsNetwork {
     // BLUETOOTH to an operator whose Bluetooth was already off, and its
     // bt-on/bt-off markers — the anchors of every establishment
     // measurement — were fiction.
-    return _bleService != null &&
-        store.state.transports.bleState == TransportState.active;
+    return bleRadioUp(
+      hasService: _bleService != null,
+      bleState: store.state.transports.bleState,
+    );
   }
 
   /// [bleUsable] transitions, emitted at the store dispatch that changes the
@@ -1816,155 +1751,22 @@ class GrassrootsNetwork {
   Stream<bool> get bleUsableChanges =>
       store.onChange.map((_) => bleUsable).distinct();
 
-  /// Experiment ids whose start signal we have already passed on. Bounded;
-  /// this is what stops the hop-by-hop flood from circulating forever.
-  final Set<String> _seenTestbedStarts = <String>{};
-
-  /// DEBUG/TESTBED ONLY. Fired when an authenticated peer broadcasts a run
-  /// start. Null unless the field runner has armed itself, which is what
-  /// stops a stray signal from launching a run nobody asked for.
-  void Function(String expId)? onTestbedStartRequested;
-
-  /// DEBUG/TESTBED ONLY. Tell every peer we hold a session with to start
-  /// [expId]. Sealed per-peer and flooded, so it reaches peers that are not
-  /// direct neighbours. Returns how many peers were signalled.
-  ///
-  /// Exists because a field run puts phones hundreds of metres apart: tapping
-  /// each one is impractical, and tapping them in sequence skews their
-  /// timelines by the walk itself, smearing the mesh composition at every
-  /// step boundary.
-  Future<int> broadcastTestbedStart(String expId,
-      {Uint8List? exceptPeer}) async {
-    var signalled = 0;
-    final skip = exceptPeer == null ? null : _pubkeyToHex(exceptPeer);
-    for (final peer in _peersState.peersList) {
-      if (!_noiseSessions.hasSession(peer.publicKey)) continue;
-      // Never bounce it back to whoever told us — that is the first and
-      // cheapest loop to cut.
-      if (skip != null && peer.pubkeyHex == skip) continue;
-      try {
-        final sealed = await _noiseSessions.encryptPacket(
-          _protocolHandler.createTestbedStartPacket(
-            expId: expId,
-            recipientPubkey: peer.publicKey,
-          ),
-          remotePubkey: peer.publicKey,
-        );
-        _messageRouter.markSeen(sealed.packetId);
-        if (await _floodViaBle(sealed.serialize()) > 0) signalled++;
-      } catch (e) {
-        debugPrint('[testbed] start signal to ${peer.pubkeyHex}: $e');
-      }
-    }
-    if (trace?.active ?? false) {
-      unawaited(trace!.log({
-        'type': 'runner',
-        't': DateTime.now().millisecondsSinceEpoch,
-        'event': 'startTx',
-        'exp': expId,
-        'peers': signalled,
-      }));
-    }
-    debugPrint('[testbed] broadcast run start "$expId" to $signalled peer(s)');
-    return signalled;
-  }
-
-  // ===== DEBUG/TESTBED: armed-time mesh view =====
-  //
-  // A device knows only its own one-hop neighbours, which cannot answer the
-  // operator's actual question: with the phones already placed, is every one
-  // of them reachable, or is one stranded behind a gap? Each node gossips its
-  // adjacency; the connected component containing self is the answer, and it
-  // is what decides whether pressing START ALL will reach everyone.
-
-  /// senderHex -> the neighbours it reported.
-  final Map<String, Set<String>> _meshView = {};
-
-  /// senderHex -> highest sequence merged, so a re-flood already seen is
-  /// dropped. Without this the gossip cannot terminate: every hop re-seals to
-  /// its own peers, minting fresh packet ids the bloom filter never matches.
-  final Map<String, int> _meshSeq = {};
-  int _myMeshSeq = 0;
-
-  /// Peers this phone holds a Noise session with — the edges the start
-  /// signal can actually leave on.
+  /// Peers this phone holds a Noise session with — recorded in each field-run
+  /// step summary alongside [noiseSessionCount].
   int get sessionPeerCount => _peersState.peersList
       .where((p) =>
           p.publicKey.length == 32 && _noiseSessions.hasSession(p.publicKey))
       .length;
 
-  /// Number of phones in the connected component containing this one,
-  /// including itself. 1 means nothing has been heard from anyone.
-  int get meshComponentSize {
-    final me = _pubkeyToHex(identity.publicKey);
-    final seen = <String>{me};
-    final queue = <String>[me];
-    while (queue.isNotEmpty) {
-      for (final n in _meshView[queue.removeLast()] ?? const <String>{}) {
-        if (seen.add(n)) queue.add(n);
-      }
-    }
-    return seen.length;
-  }
-
-  /// Drop everything learned. Called when a run starts: the gossip is an
-  /// operator aid for the armed phase and must never share the air with a
-  /// measurement.
-  void clearMeshView() {
-    _meshView.clear();
-    _meshSeq.clear();
-    _myMeshSeq = 0;
-  }
-
-  /// DEBUG/TESTBED. Tell every session peer who this phone can see, and
-  /// relay what it has been told. Returns how many peers it went to.
-  Future<int> broadcastTestbedNeighbours({
-    Uint8List? exceptPeer,
-    int? seq,
-    Uint8List? origin,
-    List<Uint8List>? neighbours,
-  }) async {
-    // Peers we hold a SESSION with, not peers with a live link. That is the
-    // exact edge set broadcastTestbedStart can send on, and sessions are keyed
-    // by peer identity so they survive the link churn that a phone joining
-    // causes. Reporting live links instead made the count collapse to 1-2
-    // while every session — and so the actual flood — was still intact.
-    final mine = neighbours ??
-        [
-          for (final p in _peersState.peersList)
-            if (p.publicKey.length == 32 &&
-                _noiseSessions.hasSession(p.publicKey))
-              p.publicKey
-        ];
-    final originKey = origin ?? identity.publicKey;
-    final useSeq = seq ?? ++_myMeshSeq;
-    // Record our own view locally too, so a phone that hears nobody still
-    // reports its own neighbours rather than an empty mesh.
-    _meshView[_pubkeyToHex(originKey)] = {for (final n in mine) _pubkeyToHex(n)};
-
-    var sent = 0;
-    final skip = exceptPeer == null ? null : _pubkeyToHex(exceptPeer);
-    for (final peer in _peersState.peersList) {
-      if (!_noiseSessions.hasSession(peer.publicKey)) continue;
-      if (skip != null && peer.pubkeyHex == skip) continue;
-      if (peer.pubkeyHex == _pubkeyToHex(originKey)) continue;
-      try {
-        final sealed = await _noiseSessions.encryptPacket(
-          _protocolHandler.createTestbedNeighboursPacket(
-            seq: useSeq,
-            neighbours: mine,
-            recipientPubkey: peer.publicKey,
-          ),
-          remotePubkey: peer.publicKey,
-        );
-        _messageRouter.markSeen(sealed.packetId);
-        if (await _floodViaBle(sealed.serialize()) > 0) sent++;
-      } catch (e) {
-        debugPrint('[testbed] neighbour gossip to ${peer.pubkeyHex}: $e');
-      }
-    }
-    return sent;
-  }
+  /// Sessions actually held, straight from the session table.
+  ///
+  /// [sessionPeerCount] intersects the table with Redux `peersList`, and a
+  /// non-friend peer is pruned from that list after ten announce cycles of
+  /// silence while its Noise session survives untouched — so the two numbers
+  /// diverge exactly when a link goes quiet, which is the case field runs
+  /// care about. Recording both makes "the session is gone" distinguishable
+  /// from "the peer stopped being listed".
+  int get noiseSessionCount => _noiseSessions.sessionCount;
 
   /// DEBUG/TESTBED ONLY. The BLE legs that are live RIGHT NOW, for the
   /// experiment recorder's start-of-trace snapshot.
@@ -1984,6 +1786,7 @@ class GrassrootsNetwork {
     debugPrint('[testbed] Clearing DTN memory buffer');
     _messageRouter.clearDtnBuffer();
     _dtnPacketIds.clear();
+    _dtnMessageOfPacket.clear();
   }
 
   void resetAllSessions() {
@@ -1997,6 +1800,67 @@ class GrassrootsNetwork {
   /// this so messages only travel over a link that is really ready — the
   /// establishment ladder itself is measured by the link events, not by
   /// racing data into a half-formed pair.
+  /// Whether a Noise session with [pubkey] exists — the whole requirement for
+  /// addressing a peer, and what the testbed gates a send on.
+  bool hasNoiseSessionWith(Uint8List pubkey) =>
+      _noiseSessions.hasSession(pubkey);
+
+  /// Fires the instant a Noise session is established with any peer.
+  ///
+  /// Pairs with [hasNoiseSessionWith]: the predicate answers "now?", this
+  /// says "now". A waiter that only has the predicate has to poll, and its
+  /// stamps then carry the poll period rather than the establishment — which
+  /// is both a delay before it can act and a bias in anything it records.
+  Stream<Uint8List> get noiseSessionEstablished =>
+      _noiseSessionEstablished.stream;
+  final StreamController<Uint8List> _noiseSessionEstablished =
+      StreamController<Uint8List>.broadcast();
+
+  /// We are running but nobody can find us.
+  ///
+  /// True while the transport is up and the role mode asks us to advertise,
+  /// yet the controller says we are not on the air. In that state the phone
+  /// still scans and still dials outward, so nothing about its own view looks
+  /// wrong — but no peer can open a leg to it, and a run recorded from it
+  /// reads as a range limit rather than a radio that never started. It is
+  /// worth putting in front of the operator, which is the one thing knowing
+  /// it in the trace cannot do.
+  bool get bleUndiscoverable => bleUndiscoverableFrom(
+        hasService: _bleService != null,
+        roleMode: store.state.settings.bleRoleMode,
+        scanning: store.state.transports.bleScanning,
+        advertising: store.state.transports.bleAdvertising,
+      );
+
+  Stream<bool> get bleUndiscoverableChanges =>
+      store.onChange.map((_) => bleUndiscoverable).distinct();
+
+  /// Fires the instant a peer's pair becomes settled — session plus both GATT
+  /// legs — and again on each later false→true edge.
+  ///
+  /// Derived from [isPeerLinkSettled] itself rather than from the leg events
+  /// underneath it, so the event and the predicate cannot drift apart. Both
+  /// its inputs are store-visible, which is why the edge is detected where
+  /// every other projection is: on the store's own change notification.
+  Stream<Uint8List> get peerLinkSettled => _peerLinkSettled.stream;
+  final StreamController<Uint8List> _peerLinkSettled =
+      StreamController<Uint8List>.broadcast();
+
+  /// Peers currently settled, so the stream reports edges and not levels.
+  /// Bounded by the peers that are settled right now: an entry leaves the set
+  /// as soon as the pair stops being settled.
+  final Set<String> _settledPeers = {};
+
+  void _emitLinkSettledTransitions(PeersState peersState) {
+    if (_peerLinkSettled.isClosed) return;
+    processLinkSettledTransitions(
+      peersState: peersState,
+      isSettled: isPeerLinkSettled,
+      settled: _settledPeers,
+      onSettled: _peerLinkSettled.add,
+    );
+  }
+
   bool isPeerLinkSettled(Uint8List pubkey) {
     if (!_noiseSessions.hasSession(pubkey)) return false;
     final peer = _peersState.getPeerByPubkey(pubkey);
@@ -2013,7 +1877,16 @@ class GrassrootsNetwork {
   /// (no chaotic same-identity redial race). The field runner pairs this with
   /// [resetAllSessions] for a clean per-step establishment ladder. Awaited by
   /// the runner so the step's sends only begin once the transport is back.
-  Future<void> resetAllBleLinks() async {
+  ///
+  /// [darkSec] overrides the dark gap (see below). Supply it only when EVERY
+  /// device bounces at the same instant — then both sides dispose together,
+  /// no stale path can survive on either, and there is nothing to wait for.
+  /// Bounce the BLE transport: dispose it, stay dark for [darkSec], bring it
+  /// back. [whileDark] runs in the dark window, with the radio down and the
+  /// transport gone — the only moment at which state can be cleared with no
+  /// chance of a peer re-establishing it, since pairing is eager and a
+  /// handshake completes on its own as soon as the radio is back.
+  Future<void> resetAllBleLinks({int? darkSec, void Function()? whileDark}) async {
     if (_bleService == null) return;
     debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
     await _bleService!.dispose();
@@ -2026,17 +1899,88 @@ class GrassrootsNetwork {
         store.dispatch(PeerBleDisconnectedAction(peer.publicKey));
       }
     }
-    // Dark gap = 2 announce cycles + 10s. Long enough for the peer's own
-    // stale sweep (staleThreshold = announceInterval * 2) to fire and drop
-    // the connection before we reappear, so the pair re-establishes fully
-    // cold rather than over any half-stale state.
-    final darkGap = config.announceInterval * 2 + const Duration(seconds: 10);
+    // Dark gap = 2 announce cycles + 10s. Going dark disposes the transport,
+    // so the peer learns through real link-layer disconnect events, not the
+    // stale sweep — the sweep (now 10 announce cycles) is only the safety net
+    // for a disconnect the peer's plugin failed to surface, and this gap no
+    // longer outlives it. Accepted: a peer that missed the event still holds
+    // a stale path, and its own connect handler closes stale GATTs on our
+    // redial, so the pair re-establishes cold either way.
+    final darkGap = darkSec != null
+        ? Duration(seconds: darkSec)
+        : config.announceInterval * 2 + const Duration(seconds: 10);
     debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
     await Future<void>.delayed(darkGap);
+    whileDark?.call();
     if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
     debugPrint('[testbed] BLE bounce: re-initializing transport');
-    await _initializeBle();
-    if (_started && _bleAvailable) await _bleService!.start();
+
+    // The bounce is BUDGETED, never awaited to success. Steps are anchored to
+    // wall clock and every device must be in the same step at the same time,
+    // so retrying here until the radio came back would make this phone late
+    // and put it in a different step from the rest of the fleet — worse than
+    // the outage. We bring the transport up, check ONCE, record what actually
+    // happened, and return on time either way. A step that ran without a
+    // radio is then visible as such instead of reporting honest-looking zeros.
+    //
+    // The record matters because a transport that comes back as `ready` and
+    // never reaches `active` never runs `start()`, so no ANNOUNCE goes out and
+    // a silent step is indistinguishable from a step of failed dials.
+    //
+    // Something else may bring the transport up while we are dark — the step's
+    // scripted `bleOn: true` does exactly that, landing inside the dark gap
+    // and leaving the radio scanning and advertising. Re-initializing on top
+    // of that would tear down a working transport and leave the state
+    // `uninitialized`. If the radio is already up, the bounce has nothing
+    // left to do.
+    if (_bleService != null && bleUsable) {
+      debugPrint('[testbed] BLE bounce: transport already back up — '
+          'leaving it alone');
+      if (trace?.active ?? false) {
+        unawaited(trace!.log({
+          'type': 'link',
+          't': DateTime.now().millisecondsSinceEpoch,
+          'event': 'bounce',
+          'darkSec': darkGap.inSeconds,
+          'reinit': false,
+          'usable': true,
+          'bleState': store.state.transports.bleState.name,
+        }));
+      }
+      return;
+    }
+    // We are genuinely replacing the disposed service, so the state the
+    // service checks has to say so.
+    store.dispatch(
+        BleTransportStateChangedAction(TransportState.uninitialized));
+    final initOk = await _initializeBle(promptForPermissions: false);
+    var startCalled = false;
+    if (initOk && _bleService != null) {
+      startCalled = true;
+      await _bleService!.start();
+    }
+    if (trace?.active ?? false) {
+      unawaited(trace!.log({
+        'type': 'link',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'bounce',
+        'darkSec': darkGap.inSeconds,
+        'initOk': initOk,
+        'startCalled': startCalled,
+        'started': _started,
+        'bleState': store.state.transports.bleState.name,
+        'usable': bleUsable,
+        if (_lastPermissionOutcome != null) 'perm': _lastPermissionOutcome,
+      }));
+    }
+    if (!bleUsable) {
+      debugPrint('[testbed] BLE bounce: transport NOT active after '
+          '${darkGap.inSeconds}s (state ${store.state.transports.bleState.name})');
+      _traceDrop('testbed', 'bounceNotActive', {
+        'bleState': store.state.transports.bleState.name,
+        'initOk': initOk,
+      });
+    }
   }
 
   /// DEBUG/TESTBED ONLY. Hold the BLE transport down or bring it back up,
@@ -2064,9 +2008,44 @@ class GrassrootsNetwork {
     if (_bleService != null) return;
     if (!_isBleEnabledInSettings) return;
     debugPrint('[testbed] BLE up (scripted segment)');
-    await _initializeBle();
+    // Reached only with _bleService == null (checked above), i.e. after a
+    // dispose — so the state genuinely is uninitialized and must read that
+    // way for initialize() to run.
+    store.dispatch(
+        BleTransportStateChangedAction(TransportState.uninitialized));
+    // A restart, not a first start — same reason as the bounce.
+    await _initializeBle(promptForPermissions: false);
     if (_started && _bleAvailable) await _bleService!.start();
   }
+
+  /// DEBUG/TESTBED ONLY. The dial grid's step setting: cap the transport's
+  /// in-flight central dials at [maxParallel] (null = the production cap)
+  /// and stamp [popN] onto the establishments that follow.
+  ///
+  /// Held HERE, not only on the service, because a dial-grid step bounces
+  /// the BLE transport ([resetAllBleLinks]) and the bounce builds a fresh
+  /// [BleTransportService]. Re-applying it in [_initializeBle] is what makes
+  /// the setting survive that; a runner that set it on the live service
+  /// alone would have its cap thrown away by the next step's bounce.
+  void setDialParallelismForTestbed({int? maxParallel, int? popN}) {
+    _dialProbeMaxParallel = maxParallel;
+    _dialProbePopN = popN;
+    _bleService?.setDialParallelism(maxParallel: maxParallel, popN: popN);
+  }
+
+  /// What the last permission evaluation returned, stamped into the bounce
+  /// record so a failed restart names its own cause instead of needing a log.
+  String? _lastPermissionOutcome;
+
+  int? _dialProbeMaxParallel;
+  int? _dialProbePopN;
+
+  /// DEBUG/TESTBED ONLY. Central legs that reached GATT-usable since the last
+  /// [resetBleEstablishmentCount] — the per-step establishment count the dial
+  /// grid records.
+  int get bleEstablishmentCount => _bleService?.establishmentCount ?? 0;
+
+  void resetBleEstablishmentCount() => _bleService?.resetEstablishmentCount();
 
   /// The application block class carried by a `message` payload, from its
   /// first byte (`BlockType`). Testbed traffic uses a reserved byte so it
@@ -2101,10 +2080,7 @@ class GrassrootsNetwork {
       ContentType.ack => 'ack',
       ContentType.readReceipt => 'receipt',
       ContentType.signaling => 'signaling',
-      ContentType.syncOffer || ContentType.syncRequest => 'sync',
-      ContentType.testbedStart ||
-      ContentType.testbedNeighbours =>
-        'testbed',
+      ContentType.syncFilter => 'sync',
     };
   }
 
@@ -2116,16 +2092,10 @@ class GrassrootsNetwork {
   /// `buf` record. Synchronous in-memory reads only — this runs every 10s
   /// inside the measurement window and must not itself become a load.
   Map<String, dynamic> bufferSnapshot() {
-    var preSealBytes = 0;
-    for (final e in _pendingSeal.values) {
-      preSealBytes += e.payload.length;
-    }
     return {
       'dtnPackets': _messageRouter.dtnBufferedCount,
       'dtnRecipients': _messageRouter.dtnBufferedRecipients,
       'dtnBytes': _messageRouter.dtnBufferedBytes,
-      'preSeal': _pendingSeal.length,
-      'preSealBytes': preSealBytes,
       'ackIndex': _dtnPacketIds.length,
       'sessions': _noiseSessions.sessionCount,
       'reassembly': _fragmentHandler.reassemblyCount,
@@ -2140,9 +2110,6 @@ class GrassrootsNetwork {
   Future<void> flushTraceTails() async {
     _bleService?.drainWireLedgerNow();
   }
-
-  @visibleForTesting
-  int get pendingSealCount => _pendingSeal.length;
 
   /// Send a read receipt to the original sender of a message.
   /// Call this when the user has read/viewed a message.
@@ -2183,12 +2150,11 @@ class GrassrootsNetwork {
         'peer': _pubkeyToHex(senderPubkey),
         'transport': 'ble',
       });
-      // Originator buffers it, same as ACKs: the sealed receipt rides future
-      // sync exchanges even if this flood reaches nobody. Age-expiry only.
-      _messageRouter.storeInDtnBuffer(senderPubkey, sealed);
-      if (await _floodViaBle(sealed.serialize()) > 0) {
-        return true;
-      }
+      // Same as ACKs: the router writes the sealed receipt directly when the
+      // sender is a connected neighbour, and buffers it otherwise (age-expiry
+      // only — nothing ACKs a receipt).
+      await _messageRouter.dispatchOutbound(senderPubkey, sealed);
+      return true;
     }
 
     // Fall back to UDP (direct point-to-point) if we have an address.
@@ -2212,73 +2178,6 @@ class GrassrootsNetwork {
     return false;
   }
 
-  /// Broadcast a message to all peers on all enabled transports.
-  Future<void> broadcast(Uint8List payload) async {
-    // Broadcast as individually encrypted unicast packets, one Noise session
-    // per peer per transport medium.
-    if (_isBleEnabledInSettings && _bleAvailable && _bleService != null) {
-      try {
-        for (final peerId in _bleService!.connectedPeerIds) {
-          final pubkey = _bleService!.getPubkeyForPeerId(peerId);
-          if (pubkey == null) continue;
-          if (_fragmentHandler.needsFragmentation(payload)) {
-            if (!_noiseSessions.hasSession(pubkey)) continue;
-            for (final sealed in await _sealFragments(
-              payload: payload,
-              recipientPubkey: pubkey,
-              messageId: _uuid.v4(),
-            )) {
-              await _floodViaBle(sealed.serialize());
-              await Future.delayed(FragmentHandler.fragmentDelay);
-            }
-          } else {
-            final packet = _protocolHandler.createMessagePacket(
-              payload: payload,
-              recipientPubkey: pubkey,
-              messageId: _uuid.v4(),
-            );
-            final bytes = await _sealedPacketBytesForTransport(
-              packet: packet,
-              transport: PeerTransport.bleDirect,
-              recipientPubkey: pubkey,
-              peerId: peerId,
-            );
-            if (bytes != null) {
-              await _bleService!.sendToPeer(peerId, bytes);
-            }
-          }
-        }
-      } catch (e) {
-        debugPrint('BLE broadcast failed: $e');
-      }
-    }
-
-    if (_isUdpEnabledInSettings && _udpAvailable && _udpService != null) {
-      try {
-        for (final peer in _peersState.peersList) {
-          if (_udpService!.getPeerIdForPubkey(peer.publicKey) == null) {
-            continue;
-          }
-          final packet = _protocolHandler.createMessagePacket(
-            payload: payload,
-            recipientPubkey: peer.publicKey,
-            messageId: _uuid.v4(),
-          );
-          final bytes = await _sealedPacketBytesForTransport(
-            packet: packet,
-            transport: PeerTransport.udp,
-            recipientPubkey: peer.publicKey,
-            peerId: peer.pubkeyHex,
-          );
-          if (bytes != null) {
-            await _udpService!.sendToPeer(peer.pubkeyHex, bytes);
-          }
-        }
-      } catch (e) {
-        debugPrint('UDP broadcast failed: $e');
-      }
-    }
-  }
 
   // ===== Public Address Discovery =====
 
@@ -2508,14 +2407,33 @@ class GrassrootsNetwork {
     if (trace?.active ?? false) {
       final hex = _pubkeyToHex(pubkey);
       _awaitingFirstAck.add(hex);
+      // The BLE leg this peer is attached to at establishment time, central
+      // (the leg we dialed) preferred. The dial-probe analysis joins a
+      // burst's targets to their session stamps by (pathId, stage, t), and
+      // `peer` alone cannot carry that join when the same peer forms legs
+      // across reps — the pathId is the per-dial identity.
+      final peer = _peersState.getPeerByPubkey(pubkey);
+      final blePath = transport == PeerTransport.udp
+          ? null
+          : (peer?.bleCentralDeviceId ?? peer?.blePeripheralDeviceId);
       unawaited(trace!.log({
         'type': 'link',
         't': DateTime.now().millisecondsSinceEpoch,
         'event': 'session',
         'peer': hex,
+        if (blePath != null) 'path': blePath,
         'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
       }));
     }
+    // The transport-independent fact: we now hold a session with this peer and
+    // can seal to them. It outlives the link below and never goes false, which
+    // is what lets the UI enable composing for a peer that has since walked out
+    // of range — the store-carry-forward case.
+    store.dispatch(PeerNoiseSessionEstablishedAction(pubkey));
+    if (!_noiseSessionEstablished.isClosed) {
+      _noiseSessionEstablished.add(pubkey);
+    }
+
     switch (transport) {
       case PeerTransport.udp:
         store.dispatch(
@@ -2530,26 +2448,25 @@ class GrassrootsNetwork {
         break;
     }
 
-    // Messages created before this session existed can now be sealed into
-    // buffered and flooded.
-    _sealPendingFor(pubkey);
-
-    // Buffered packets move ONLY through the sync exchange: offer packetIds,
-    // let the
-    // peer request what its seen-set lacks, convey exactly that. Never a
-    // blind push of held packets — measured on soak-night-1, the old push
-    // re-sent ~32 already-delivered packets on every reconnection (31% of
-    // all ACK bytes on the air) because the receiver has no way to know
-    // what the peer already holds. The offer costs ids, not packets.
-    // BLE only: the buffer is a mesh mechanism and the Internet transport
-    // stays
-    // direct point-to-point (CLAUDE.md). A buffered message is
-    // therefore redelivered over BLE alone — see the docs' note on the
-    // UDP-only-friend gap this leaves.
-    if (transport == PeerTransport.bleDirect) {
-      final bleDeviceId =
-          _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
-      if (bleDeviceId != null) _sendSyncOffers(bleDeviceId);
+    // Buffered packets move ONLY through the sync exchange: advertise a
+    // compact filter of what we have SEEN and let the peer answer with what
+    // that filter lacks. Never a blind push of held packets: the sender has
+    // no way to know what the peer already holds, so pushing re-sends packets
+    // that were already delivered on every reconnection. The filter costs a
+    // few hundred bytes whatever the buffer size.
+    //
+    // Both transports ask; they differ in what they may be answered with. Over
+    // BLE the peer answers as a mesh relay, with anything it holds. Over UDX it
+    // answers only with packets addressed to us — enough to close the gap where
+    // a friend reachable solely over the Internet never received a buffered
+    // message, without turning a continuous link into a buffer firehose.
+    switch (transport) {
+      case PeerTransport.bleDirect:
+        final bleDeviceId =
+            _connectedBleDeviceIdForPeer(_peersState.getPeerByPubkey(pubkey));
+        if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+      case PeerTransport.udp:
+        _sendSyncFilterUdx(pubkey);
     }
 
     // Cold-bootstrap invitee: if this session is with an inviter whose invite
@@ -2617,26 +2534,47 @@ class GrassrootsNetwork {
     required Uint8List payload,
     String? peerId,
   }) async {
-    final packet = GrassrootsPacket(
-      type: PacketType.noiseHandshake,
-      ttl: 1, // neighbor-local: handshakes are not relayed through the mesh
-      recipientPubkey: recipientPubkey,
-      payload: payload,
-    );
-    final bytes = packet.serialize();
-
     if (transport == PeerTransport.bleDirect) {
       final id = peerId ?? _bleService?.getPeerIdForPubkey(recipientPubkey);
-      if (id == null) return false;
+      if (id == null) {
+        // Untraced until now, and it is the denominator: without it a run
+        // reports handshake TIMEOUTS without reporting how many handshakes
+        // were never even put on the air, so no failure rate can be formed.
+        _traceDrop('handshake', 'noPath',
+            {'peer': _pubkeyToHex(recipientPubkey)});
+        return false;
+      }
       final service = _bleService;
-      if (service == null) return false;
-      return service.sendToPeer(id, bytes);
+      if (service == null) {
+        _traceDrop('handshake', 'noTransport',
+            {'peer': _pubkeyToHex(recipientPubkey)});
+        return false;
+      }
+      // Fragment the handshake message to this leg's discovered MTU (each
+      // fragment its own neighbour-local packet with a distinct packetId).
+      final packets = _neighbourPacketBytes(
+        payload: payload,
+        type: PacketType.noiseHandshake,
+        budget: service.usableFragmentBudgetFor(id),
+        recipientPubkey: recipientPubkey,
+      );
+      var sent = true;
+      for (final bytes in packets) {
+        final ok = await service.sendToPeer(id, bytes);
+        sent = sent && ok;
+      }
+      return sent;
     }
 
     if (transport == PeerTransport.udp) {
       final id = peerId ?? _pubkeyToHex(recipientPubkey);
       final service = _udpService;
       if (service == null) return false;
+      final bytes = _wholeNeighbourPacket(
+        payload: payload,
+        type: PacketType.noiseHandshake,
+        recipientPubkey: recipientPubkey,
+      );
       return service.sendToPeer(id, bytes);
     }
 
@@ -2887,7 +2825,10 @@ class GrassrootsNetwork {
       _sustainHolePunchTraffic(peerHex, target, phase: 'initiator-connect'),
     );
 
-    final announce = await _createSignedAnnounce(address: udpAddress);
+    final announce = _wholeNeighbourPacket(
+      payload: await _createSignedAnnouncePayload(address: udpAddress),
+      type: PacketType.announce,
+    );
     final connected = await _sendViaUdp(
       peerHex,
       target.toAddressString(),
@@ -3130,7 +3071,11 @@ class GrassrootsNetwork {
     late final Future<void> task;
     task = () async {
       try {
-        final announce = await _createSignedAnnounce(address: this.udpAddress);
+        final announce = _wholeNeighbourPacket(
+          payload:
+              await _createSignedAnnouncePayload(address: this.udpAddress),
+          type: PacketType.announce,
+        );
 
         // Try link-local first when peer is BLE-nearby (same LAN).
         // Link-local avoids AP client isolation and NAT issues.
@@ -3635,6 +3580,10 @@ class GrassrootsNetwork {
     };
 
     // ACK received (UDP delivery confirmation)
+    // The store sheds packets without an ACK (expiry, eviction); the index
+    // has to hear about it or it fills with dead entries.
+    _messageRouter.onBufferedPacketDropped = _forgetBufferedPacket;
+
     _messageRouter.onAckReceived = (messageId) {
       debugPrint('ACK received for message $messageId');
       // Duplicate-ACK guard for the TRACE (the reducer already refuses the
@@ -3684,63 +3633,12 @@ class GrassrootsNetwork {
         }
       }
       store.dispatch(MessageDeliveredAction(messageId: messageId));
-      _bulkFlowDriver?.onAck(messageId);
-      onTestbedAck?.call(messageId);
       _dropFromDtnBufferFor(messageId);
-    };
-
-    // DEBUG/TESTBED. A peer asked us to start a run. The sender is already
-    // authenticated (the frame decrypted under their session); the runner
-    // decides whether to act, and ignores it unless armed for this exact
-    // experiment id.
-    _messageRouter.onTestbedStart = (expId, senderPubkey) {
-      // Propagate hop by hop. The signal is sealed per RECIPIENT, so a
-      // device can only read the copies addressed to it — packet-level
-      // relaying carries it across the mesh but cannot make a phone that
-      // holds no session with the originator act on it. In a chain the far
-      // end has no session with phone 1, so without this re-flood it would
-      // never hear the start at all.
-      //
-      // Once per experiment id, so the flood terminates: a device that has
-      // already passed it on ignores every later copy.
-      if (!_seenTestbedStarts.add(expId)) return;
-      while (_seenTestbedStarts.length > 32) {
-        _seenTestbedStarts.remove(_seenTestbedStarts.first);
-      }
-      debugPrint('[testbed] run-start signal for "$expId" from '
-          '${_pubkeyToHex(senderPubkey).substring(0, 8)}');
-      // Forward BEFORE acting on it. Starting the run may take this radio
-      // down as its very first action — a device that is not in the mesh at
-      // n=3 turns BLE off immediately — and a phone that went dark before
-      // passing the signal on would strand everyone further along the chain.
-      unawaited(broadcastTestbedStart(expId, exceptPeer: senderPubkey)
-          .then((n) => debugPrint('[testbed] relayed start to $n peer(s)')));
-      onTestbedStartRequested?.call(expId);
-    };
-
-    // DEBUG/TESTBED. A peer's neighbour list, gossiped while phones sit
-    // armed. Merge it, then relay onward so the far end of the line learns
-    // about this end.
-    _messageRouter.onTestbedNeighbours = (senderPubkey, seq, neighbours) {
-      final hex = _pubkeyToHex(senderPubkey);
-      // Stale or already-merged: drop without relaying, or the gossip loops
-      // forever — each hop re-seals under its own packet ids, so the bloom
-      // filter cannot stop it.
-      if ((_meshSeq[hex] ?? -1) >= seq) return;
-      _meshSeq[hex] = seq;
-      _meshView[hex] = {for (final n in neighbours) _pubkeyToHex(n)};
-      unawaited(broadcastTestbedNeighbours(
-        exceptPeer: senderPubkey,
-        seq: seq,
-        origin: senderPubkey,
-        neighbours: neighbours,
-      ));
     };
 
     // Read receipt received
     _messageRouter.onReadReceiptReceived = (messageId) {
       debugPrint('Read receipt received for message $messageId');
-      // Read latency previously lived only in the volatile Redux store.
       final sentAt =
           store.state.messages.outgoingMessages[messageId]?.sentAt;
       _traceMessage('read', messageId, {
@@ -3754,9 +3652,9 @@ class GrassrootsNetwork {
       _dropFromDtnBufferFor(messageId);
     };
 
-    // Map incoming UDP connections from any verified packet's senderPubkey.
-    // Previously required ANNOUNCE as the first message on a stream; now any
-    // verified packet identifies the sender via its header.
+    // Map incoming UDP connections from any verified packet's senderPubkey:
+    // any verified packet identifies the sender via its header, so a stream
+    // does not have to open with an ANNOUNCE.
     _messageRouter.onUdpPeerIdentified = (senderPubkey, udpPeerId) {
       final pubkeyHex =
           senderPubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
@@ -3803,55 +3701,59 @@ class GrassrootsNetwork {
     // Trial-decrypt a sealed, sender-anonymous packet against active sessions.
     _messageRouter.trialDecrypt = (packet) => _noiseSessions.trialDecrypt(packet);
 
-    // Relay (managed flooding) — rebroadcast a sealed packet to all BLE
-    // neighbors except the inbound path. The router only relays over the BLE
-    // mesh; UDP stays direct.
-    _messageRouter.onRelay = (packet, {String? excludeBlePeerId}) {
-      // The relay record documents the DECISION; whether the flood reached
-      // anyone is only known after the writes. Kept unawaited so the receive
-      // path is never backpressured by GATT writes — the outcome lands as a
-      // separate tiny record joined on packetId. aired:0 means the hop the
-      // relay record claims never actually made it to the air.
-      unawaited(_floodViaBle(
-        packet.serialize(),
-        excludeBlePeerId: excludeBlePeerId,
-      ).then((aired) {
-        if (!(trace?.active ?? false)) return;
-        unawaited(trace!.log({
-          'type': 'relay',
-          't': DateTime.now().millisecondsSinceEpoch,
-          'event': 'aired',
-          'packetId': packet.packetId,
-          'aired': aired,
-        }));
-      }));
+    // Direct-write capability for the router's outbound path
+    // ([MessageRouter.dispatchOutbound]): write the sealed packet on a live
+    // link to the recipient — the BLE leg preferred, else a live UDX
+    // connection — and report which transport carried it. Null when neither
+    // link exists or the write is refused: the buffered copy then travels by
+    // sync exchange alone. Neither arm dials.
+    _messageRouter.directSend = (recipientPubkey, sealed) async {
+      final ble = _bleService;
+      if (ble != null && _bleAvailable) {
+        final deviceId = _connectedBleDeviceIdForPeer(
+            _peersState.getPeerByPubkey(recipientPubkey));
+        if (deviceId != null) {
+          if (await ble.sendToPeer(deviceId, sealed.serialize())) {
+            return PeerTransport.bleDirect;
+          }
+          // A pair that never converged holds one leg the transport still
+          // calls connected, and a write that goes there and is refused looks
+          // the same from here as one that was never attempted.
+          debugPrint('direct send refused on $deviceId');
+        }
+      }
+      final udp = _udpService;
+      if (udp != null && _udpAvailable) {
+        final peerId = udp.getPeerIdForPubkey(recipientPubkey);
+        if (peerId != null && await udp.sendToPeer(peerId, sealed.serialize())) {
+          return PeerTransport.udp;
+        }
+      }
+      return null;
     };
 
     // Sync-on-connect: directed (never flooded) send of an offer/request/
     // conveyed buffered packet to one specific neighbor.
     _messageRouter.onSyncSend = (packet, link) {
-      final ble = _bleService;
-      if (ble == null) {
+      // The conveyance goes back over the link the filter arrived on. The
+      // router already decided WHAT may go (everything held over BLE, only
+      // the peer's own packets over UDX); this only picks the wire.
+      final send = link.isUdx
+          ? _udpService?.sendToPeer
+          : _bleService?.sendToPeer;
+      if (send == null) {
         // The router already logged custody 'convey' for this packet — say
         // the conveyance never reached a transport.
-        _traceDrop('sync', 'conveyNoTransport', {'packetId': packet.packetId});
+        _traceDrop('sync', 'conveyNoTransport',
+            {'packetId': packet.packetId, 'via': link.transport.name});
         return;
       }
-      unawaited(
-          ble.sendToPeer(link.bleDeviceId, packet.serialize()).then((ok) {
+      unawaited(send(link.handle, packet.serialize()).then((ok) {
         if (!ok) {
-          _traceDrop('sync', 'conveySendFailed', {'packetId': packet.packetId});
+          _traceDrop('sync', 'conveySendFailed',
+              {'packetId': packet.packetId, 'via': link.transport.name});
         }
       }));
-    };
-
-    // Sync control frames (offer/request) are sealed to the neighbor's Noise
-    // session before they hit the air — the session exists by the time sync
-    // runs, so the list of buffer contents is never transmitted in the clear.
-    _messageRouter.onSyncFrame = (type, payload, link) {
-      // The link's peer is authenticated (the inbound frame decrypted under
-      // that session), so no transport-level identity lookup is needed.
-      unawaited(_sealAndSendSyncFrame(type, payload, link));
     };
 
     // Peer ANNOUNCE processed
@@ -4023,6 +3925,33 @@ class GrassrootsNetwork {
               ? udpPeerId
               : _connectedBleDeviceIdForPeer(peer),
         ));
+      } else {
+        // A peer we ALREADY hold a session with has just announced — it went
+        // away and came back. Ask it what we are missing, so anything it holds
+        // for us comes back on this encounter.
+        //
+        // Hanging the sync off session establishment alone would miss this:
+        // sessions outlive the link that formed them, so a neighbour whose
+        // radio cycles returns with its session intact, no establishment
+        // fires, and the buffer it left behind is never offered. That is
+        // precisely the case store-carry-forward exists to serve.
+        //
+        // ANNOUNCE is the "recipient appears" signal. It repeats every ~10 s;
+        // the send carries its own per-(transport, peer) debounce, and one
+        // filter is a few hundred bytes whatever the buffer size, so the
+        // steady-state cost of re-advertising is bounded and small.
+        //
+        // UDX needs no new trigger of its own: ANNOUNCE already goes out over
+        // UDP on the same `_announceTimer`, so the Internet path re-asks on the
+        // same cycle the radio one does.
+        switch (transport) {
+          case PeerTransport.bleDirect:
+            final peer = _peersState.getPeerByPubkey(data.publicKey);
+            final bleDeviceId = _connectedBleDeviceIdForPeer(peer);
+            if (bleDeviceId != null) _sendSyncFilter(bleDeviceId);
+          case PeerTransport.udp:
+            _sendSyncFilterUdx(data.publicKey);
+        }
       }
     };
 
@@ -4035,7 +3964,8 @@ class GrassrootsNetwork {
       if (!_noiseSessions.hasSession(senderPubkey)) {
         // Race: session torn down between decrypt and ACK. The message was
         // delivered and traced 'recv', but no ACK ever goes out — the sender
-        // keeps the packets buffered. Previously invisible on this side.
+        // keeps the packets buffered, so this side has to say so.
+        debugPrint('ACK for $messageId NOT sent — no session with sender');
         _traceDrop('ackTx', 'noSession', {'messageId': messageId});
         return;
       }
@@ -4065,20 +3995,25 @@ class GrassrootsNetwork {
         if (!ok) {
           // A failed UDP ACK is NOT buffered (the DTN buffer is BLE-only):
           // it is simply gone, and the sender redelivers until a BLE
-          // encounter ACKs it. Previously the result was discarded.
+          // encounter ACKs it, so the failure is recorded here.
           _traceDrop('ackTx', 'udpSendFailed', {
             'messageId': messageId,
             'packetId': sealed.packetId,
           });
         }
       } else {
-        // The ACK is epidemic traffic like everything else, and we are its
-        // the originator buffers it too: if no neighbor hears this flood,
-        // the sealed ACK
-        // still rides every future sync exchange. Nothing ACKs an ACK, so
-        // the entry leaves the buffer only by age expiry.
-        _messageRouter.storeInDtnBuffer(senderPubkey, sealed);
-        await _floodViaBle(bytes);
+        // The ACK is recipient-addressed traffic like everything else — the
+        // router writes it directly when the original sender is a connected
+        // neighbour (a direct-delivered message is confirmed in milliseconds,
+        // not at the next sync round), and buffers it otherwise (nothing ACKs
+        // an ACK, so a buffered entry leaves only by age expiry).
+        final direct =
+            await _messageRouter.dispatchOutbound(senderPubkey, sealed);
+        // The receiving side says "ACK received"; without its counterpart a
+        // confirmation that never arrives cannot be told apart from one that
+        // was never sent, and only the trace knew the difference.
+        debugPrint('ACK sent for message $messageId '
+            '(${direct != null ? 'direct over ${direct.name}' : 'buffered — no live path'})');
       }
     };
 
@@ -4338,8 +4273,8 @@ class GrassrootsNetwork {
 
     // Listen to connection events — update Redux state and log
     _udpService!.connectionStream.listen((event) {
-      // The UDP transport previously emitted no trace records at all — BLE
-      // link stages had full coverage while an entire transport was dark.
+      // UDP connection events get the same trace coverage as BLE link
+      // stages, so no transport is dark to analysis.
       if (trace?.active ?? false) {
         unawaited(trace!.log({
           'type': 'link',
@@ -4700,7 +4635,10 @@ class GrassrootsNetwork {
     final introHex = _pubkeyToHex(introducerPubkey);
     // Announce first so the introducer learns our identity and can bind the
     // Noise handshake that carries the INTRODUCE.
-    final announce = await _createSignedAnnounce(address: udpAddress);
+    final announce = _wholeNeighbourPacket(
+      payload: await _createSignedAnnouncePayload(address: udpAddress),
+      type: PacketType.announce,
+    );
     final announced = await _sendViaUdp(introHex, address, announce);
     if (!announced) {
       debugPrint(
@@ -4863,13 +4801,14 @@ class GrassrootsNetwork {
 
   /// Clean up resources
   Future<void> dispose() async {
+    unawaited(_noiseSessionEstablished.close());
+    unawaited(_peerLinkSettled.close());
     _connectivitySubscription?.cancel();
     _connectivitySubscription = null;
     _storeSubscription?.cancel();
     _storeSubscription = null;
     _announceTimer?.cancel();
     _scanTimer?.cancel();
-    _bulkFlowDriver?.stop();
 
     // Wait for any in-flight transport update to finish before disposing
     if (_transportUpdateLock != null) {
@@ -4892,8 +4831,8 @@ class GrassrootsNetwork {
     _introducedNonceUses.clear();
     _issuedNonceUses.clear();
     _invitedContacts.clear();
-    _pendingSeal.clear();
     _dtnPacketIds.clear();
+    _dtnMessageOfPacket.clear();
 
     _messageRouter.dispose();
     _signalingService.dispose();
@@ -4959,7 +4898,7 @@ class GrassrootsNetwork {
   ///
   /// Each connected device is targeted individually so friend/non-friend
   /// address inclusion is decided using the current mapping for that exact BLE
-  /// device ID. This avoids the old exclude-list logic that broke when BLE IDs
+  /// device ID, rather than an exclude list keyed on BLE IDs that
   /// rotated or when a peer had separate central/peripheral connections.
   Future<void> _broadcastAnnounce() async {
     if (_bleService == null || !_bleAvailable) return;
@@ -4975,9 +4914,12 @@ class GrassrootsNetwork {
   Future<void> _broadcastAnnounceViaUdp() async {
     if (_udpService == null || !_udpAvailable) return;
 
-    final announce = await _createSignedAnnounce(
-      address: udpAddress,
-      addressCandidates: _candidateAddresses(),
+    final announce = _wholeNeighbourPacket(
+      payload: await _createSignedAnnouncePayload(
+        address: udpAddress,
+        addressCandidates: _candidateAddresses(),
+      ),
+      type: PacketType.announce,
     );
     await _udpService!.broadcast(announce);
   }
@@ -4994,45 +4936,75 @@ class GrassrootsNetwork {
   /// §BLE Discovery: ANNOUNCE is exchanged upon successful BLE connection).
   /// Receivers treat repeated ANNOUNCEs from the same pubkey as idempotent,
   /// so racing with the periodic broadcast is harmless.
-  /// Last time we sent sync offers to a given neighbor (keyed by the pathId's
-  /// address part so the pair's two legs — central: and peripheral: — share
-  /// one debounce). Entries are pruned by age; BLE address rotation naturally
-  /// retires old keys.
+  /// Last time we sent sync offers to a given neighbor, keyed by PEER
+  /// IDENTITY. Keying by the pathId's address made the pair's two legs share
+  /// one debounce only while both rode a single ACL; the 19% of field-day
+  /// pairs that held two separate ACLs have two addresses for one peer and
+  /// were offered the same buffer twice per round. An offer is a statement
+  /// about a peer, so identity is its natural key. Entries are pruned by age.
   final Map<String, DateTime> _lastSyncOfferAt = {};
-  static const Duration _syncOfferDebounce = Duration(seconds: 60);
+  /// Collapses the two connect events a dual-role pair fires (one per leg)
+  /// into a single offer round — they arrive milliseconds apart.
+  ///
+  /// Deliberately SHORTER than the 10 s announce interval, so a peer that has
+  /// reappeared gets an offer on every announce cycle rather than once a
+  /// minute. At 60 s a returning neighbour could sit for most of a minute
+  /// with the carrier holding packets for it and saying nothing.
+  static const Duration _syncOfferDebounce = Duration(seconds: 5);
 
-  /// Offer our DTN buffer summary to a newly-connected neighbor
-  /// (sync-on-connect). Dual-role pairs fire two connect events (one per
-  /// leg); the per-address debounce collapses them into one offer round.
-  void _sendSyncOffers(String deviceId) {
+  /// Advertise our DTN buffer to a neighbour as a GCS filter (sync-on-connect
+  /// and on every announce cycle). Dual-role pairs fire two connect events
+  /// (one per leg); the per-peer debounce collapses them into one send.
+  void _sendSyncFilter(String deviceId) {
     if (_bleService == null || !_bleAvailable) return;
-    final addr = deviceId.substring(deviceId.indexOf(':') + 1);
+    final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
+    if (pubkey == null) return; // path not yet identified; retry next connect
+    _sendSyncFilterOver(SyncLink.ble(pubkey, deviceId));
+  }
+
+  /// The UDX counterpart of [_sendSyncFilter]. The peer answers it with packets
+  /// addressed to US and nothing else, which is what closes the gap where a
+  /// friend reachable only over the Internet never received a buffered message
+  /// until a BLE encounter happened to occur.
+  ///
+  /// The peer id on a UDX connection IS the pubkey hex, so unlike the BLE side
+  /// there is no path-to-identity lookup that can come back null.
+  void _sendSyncFilterUdx(Uint8List pubkey) {
+    if (_udpService == null) return;
+    _sendSyncFilterOver(SyncLink.udx(pubkey, _pubkeyToHex(pubkey)));
+  }
+
+  /// Build and send one seen-filter over [link], debounced.
+  ///
+  /// The debounce key is (transport, peer), not peer: the two links ask
+  /// different question sets — BLE can be answered with anything we hold, UDX
+  /// only with our own packets — so a BLE round must not suppress the UDX one
+  /// or the Internet path would go silent whenever a peer was also in radio
+  /// range, which is exactly when both are worth asking.
+  void _sendSyncFilterOver(SyncLink link) {
+    final key = '${link.transport.name}:${_pubkeyToHex(link.peerPubkey)}';
     final now = DateTime.now();
     _lastSyncOfferAt.removeWhere(
         (_, at) => now.difference(at) > const Duration(minutes: 10));
-    final last = _lastSyncOfferAt[addr];
+    final last = _lastSyncOfferAt[key];
     if (last != null && now.difference(last) < _syncOfferDebounce) return;
 
-    final offers = _messageRouter.buildSyncOffers();
-    if (offers.isEmpty) return; // carrying nothing — offer nothing
-    final pubkey = _bleService!.getPubkeyForPeerId(deviceId);
-    if (pubkey == null) return; // path not yet identified; retry next connect
-    _lastSyncOfferAt[addr] = now;
-    debugPrint(
-        '[sync] Offering ${_messageRouter.dtnBufferedCount} carried '
-        'packet(s) to $deviceId in ${offers.length} sealed offer(s)');
-    final link = SyncLink(pubkey, deviceId);
-    for (final payload in offers) {
-      unawaited(_sealAndSendSyncFrame(ContentType.syncOffer, payload, link));
-    }
+    final payload = _messageRouter.buildSyncFilter(link.peerPubkey);
+    if (payload == null) return; // nothing to advertise this round
+    _lastSyncOfferAt[key] = now;
+    debugPrint('[sync] Advertising a ${payload.length}-byte seen-filter to '
+        '${link.handle} over ${link.transport.name} '
+        '(${_messageRouter.dtnBufferedCount} carried)');
+    unawaited(_sealAndSendSyncFrame(ContentType.syncFilter, payload, link));
   }
 
   /// Seal a sync control frame to the link's peer and send it back over the
   /// link. No session yet (a pairing still handshaking) simply skips the
-  /// exchange — sync-on-connect retries on the next pairing.
-  Future<void> _sealAndSendSyncFrame(
+  /// exchange — sync-on-connect retries on the next pairing. Returns whether
+  /// the frame reached the link; the offer round is built from that answer.
+  Future<bool> _sealAndSendSyncFrame(
       ContentType type, Uint8List payload, SyncLink link) async {
-    if (!_noiseSessions.hasSession(link.peerPubkey)) return;
+    if (!_noiseSessions.hasSession(link.peerPubkey)) return false;
     try {
       final packet = _protocolHandler.createSyncPacket(
         type: type,
@@ -5044,9 +5016,13 @@ class GrassrootsNetwork {
         remotePubkey: link.peerPubkey,
       );
       _noteSealedContent(sealed.packetId, type);
-      await _bleService?.sendToPeer(link.bleDeviceId, sealed.serialize());
+      final send =
+          link.isUdx ? _udpService?.sendToPeer : _bleService?.sendToPeer;
+      if (send == null) return false;
+      return await send(link.handle, sealed.serialize());
     } catch (e) {
       debugPrint('[sync] Failed to seal/send ${type.name}: $e');
+      return false;
     }
   }
 
@@ -5071,14 +5047,27 @@ class GrassrootsNetwork {
     // Authenticated friends get our address + link-local. Non-friends, and
     // derived-UUID friend hints that have not yet sent a signed ANNOUNCE, get
     // only identity. A spoofed derived UUID must not unlock friend metadata.
-    final announce = isFriend
-        ? await _createSignedAnnounce(
+    final announcePayload = isFriend
+        ? await _createSignedAnnouncePayload(
             address: udpAddress,
             linkLocalAddress: _linkLocalAddress,
           )
-        : await _createSignedAnnounce();
+        : await _createSignedAnnouncePayload();
 
-    final sent = await _bleService!.sendToPeer(deviceId, announce);
+    // Fragment to THIS leg's discovered MTU: a friend ANNOUNCE (~301 B with
+    // address candidates) overflows the common 247 MTU as a single write.
+    // "Sent" means every fragment was accepted — a partial send leaves the
+    // neighbour unable to reassemble.
+    final packets = _neighbourPacketBytes(
+      payload: announcePayload,
+      type: PacketType.announce,
+      budget: _bleService!.usableFragmentBudgetFor(deviceId),
+    );
+    var sent = true;
+    for (final bytes in packets) {
+      final ok = await _bleService!.sendToPeer(deviceId, bytes);
+      sent = sent && ok;
+    }
     if (sent) {
       if (isFriend) {
         _bleFriendAnnounceSent.add(deviceId);
@@ -5111,7 +5100,14 @@ class GrassrootsNetwork {
   }
 
   /// Create a signed ANNOUNCE packet, optionally with address.
-  Future<Uint8List> _createSignedAnnounce({
+  /// Build the self-signed ANNOUNCE PAYLOAD (not a serialized packet).
+  ///
+  /// Callers wrap it in one-or-more neighbour-local packets via the fragmenter:
+  /// [_neighbourPacketBytes] over BLE (sized to the leg's discovered MTU) or
+  /// [_wholeNeighbourPacket] over UDP (a stream, always one fragment). The
+  /// fragment header is what lets a friend ANNOUNCE — ~301 bytes with address
+  /// candidates — survive the common 247 ATT MTU instead of being truncated.
+  Future<Uint8List> _createSignedAnnouncePayload({
     String? address,
     String? linkLocalAddress,
     Iterable<String> addressCandidates = const [],
@@ -5134,18 +5130,61 @@ class GrassrootsNetwork {
       normalizedAddress,
       normalizedLinkLocal,
     ]);
-    final payload = _protocolHandler.createAnnouncePayload(
+    return _protocolHandler.createAnnouncePayload(
       address: normalizedAddress,
       linkLocalAddress: normalizedLinkLocal,
       addressCandidates: normalizedCandidates,
       willingToFacilitate: store.state.settings.willingToFacilitateInvites,
     );
-    final packet = GrassrootsPacket(
-      type: PacketType.announce,
-      ttl: 1, // ANNOUNCE is neighbor-local; its payload is self-signed
+  }
+
+  /// Serialize [payload] as one-or-more neighbour-local packets of [type]
+  /// (ttl 1), fragmented at [budget] so no single write overflows the leg's
+  /// MTU. Each fragment rides its own packet (distinct packetId) with a
+  /// cleartext [SecureFrame] as its payload; the neighbour reassembles by the
+  /// frame's globally-unique messageId. [contentType] stays at its default —
+  /// it is vestigial here, since the outer `packet.type` routes these and
+  /// reassembly ignores it.
+  List<Uint8List> _neighbourPacketBytes({
+    required Uint8List payload,
+    required PacketType type,
+    required int budget,
+    Uint8List? recipientPubkey,
+  }) {
+    final frames = _fragmentHandler.framesFor(
       payload: payload,
+      messageId: _uuid.v4(),
+      chunkBudget: budget,
     );
-    return packet.serialize();
+    return [
+      for (final frame in frames)
+        GrassrootsPacket(
+          type: type,
+          ttl: 1,
+          recipientPubkey: recipientPubkey,
+          payload: frame.encode(),
+        ).serialize(),
+    ];
+  }
+
+  /// A large budget that forces a single frame for stream transports (UDP),
+  /// well above any ANNOUNCE or handshake payload.
+  static const int _wholeFragmentBudget = 1 << 20;
+
+  /// One neighbour-local packet carrying [payload] whole. Used for stream
+  /// transports (UDP), which have no MTU; it still wraps the payload in a
+  /// (single-fragment) cleartext frame so the receive path is uniform.
+  Uint8List _wholeNeighbourPacket({
+    required Uint8List payload,
+    required PacketType type,
+    Uint8List? recipientPubkey,
+  }) {
+    return _neighbourPacketBytes(
+      payload: payload,
+      type: type,
+      budget: _wholeFragmentBudget,
+      recipientPubkey: recipientPubkey,
+    ).single;
   }
 
   /// Send ANNOUNCE with address to a specific friend.
@@ -5172,27 +5211,37 @@ class GrassrootsNetwork {
       addressCandidates: _candidateAddresses(),
       willingToFacilitate: store.state.settings.willingToFacilitateInvites,
     );
-    final packet = GrassrootsPacket(
-      type: PacketType.announce,
-      ttl: 1, // ANNOUNCE is neighbor-local; its payload is self-signed
-      recipientPubkey: friendPubkey,
-      payload: payload,
-    );
-    final bytes = packet.serialize();
 
-    // Try BLE first if available
+    // Try BLE first if available. Fragment to the leg's discovered MTU; "sent"
+    // means every fragment was accepted so the neighbour can reassemble.
     if (_bleService != null && _bleAvailable) {
       final peerId = _bleService!.getPeerIdForPubkey(friendPubkey);
       if (peerId != null) {
-        sent = await _bleService!.sendToPeer(peerId, bytes);
+        final packets = _neighbourPacketBytes(
+          payload: payload,
+          type: PacketType.announce,
+          budget: _bleService!.usableFragmentBudgetFor(peerId),
+          recipientPubkey: friendPubkey,
+        );
+        var bleSent = true;
+        for (final bytes in packets) {
+          final ok = await _bleService!.sendToPeer(peerId, bytes);
+          bleSent = bleSent && ok;
+        }
+        sent = bleSent;
       }
     }
 
-    // Also try UDP if available
+    // Also try UDP if available. A stream has no MTU: one whole fragment.
     if (_udpService != null && _udpAvailable) {
+      final udpBytes = _wholeNeighbourPacket(
+        payload: payload,
+        type: PacketType.announce,
+        recipientPubkey: friendPubkey,
+      );
       final peerId = _udpService!.getPeerIdForPubkey(friendPubkey);
       if (peerId != null) {
-        final udpSent = await _udpService!.sendToPeer(peerId, bytes);
+        final udpSent = await _udpService!.sendToPeer(peerId, udpBytes);
         sent = sent || udpSent;
       } else {
         final peer = _peersState.getPeerByPubkeyHex(friendPubkeyHex);
@@ -5203,7 +5252,7 @@ class GrassrootsNetwork {
           final udpSent = await _sendViaUdp(
             friendPubkeyHex,
             friendAddress,
-            bytes,
+            udpBytes,
           );
           sent = sent || udpSent;
         }
@@ -5219,9 +5268,15 @@ class GrassrootsNetwork {
   /// independently via [PeerState.lastUdpSeen] so a nearby BLE friend can age
   /// out of "Friends Online" without disappearing from "Nearby".
   void _removeStalePeers() {
-    final staleThreshold = config.announceInterval * 2; // Give 2x grace period
+    // TEN missed announces, not two. Two cycles meant one announce lost on a
+    // busy air — or delayed by screen-off scan batching — put a peer one tick
+    // from eviction, and the sweep then tore down state that was about to
+    // refresh. At 10 cycles (~100 s at the default interval) only a peer that
+    // is genuinely gone ages out; a friend's Noise session was never touched
+    // by this sweep either way.
+    final staleThreshold = config.announceInterval * 10;
 
-    // Tear down quiet UDP sessions that have missed 2 announce cycles.
+    // Tear down quiet UDP sessions that have missed 10 announce cycles.
     final connectedUdpPubkeys = <String>{};
     if (_udpService != null) {
       for (final peer in _peersState.peersList) {
@@ -5266,7 +5321,7 @@ class GrassrootsNetwork {
     // `bleCentralDeviceId` / `blePeripheralDeviceId` stay set indefinitely
     // and `nearbyBlePeers` keeps showing them. Friends and strangers are
     // treated identically — both should fall off "Connected Peers" once
-    // they've been silent over BLE for two announce cycles.
+    // they've been silent over BLE for ten announce cycles.
     final staleBlePeers = computeStaleBlePeerPubkeys(
       peers: _peersState.peersList,
       staleThreshold: staleThreshold,
@@ -5278,6 +5333,17 @@ class GrassrootsNetwork {
         '[ble-stale] No BLE traffic from ${peer.displayName} for '
         '${staleThreshold.inSeconds}s; synthesizing disconnect',
       );
+      // This is the ONLY code path that voluntarily disconnects a live link,
+      // and before a session exists ANNOUNCE is the only thing that refreshes
+      // the clock it watches — so a pairing can be torn down mid-handshake
+      // and the teardown was, until now, invisible outside debug output. It
+      // is a measurement: it separates "the pairing was never attempted"
+      // from "the attempt lost its 5s race".
+      _traceDrop('bleStale', 'sweep', {
+        'peer': pubkeyHex,
+        'silentSec': staleThreshold.inSeconds,
+        'hadSession': _noiseSessions.hasSession(peer.publicKey),
+      });
       // Redux is a strict projection of transport facts — so when we
       // synthesize a disconnect, make it a fact: physically tear down any
       // plugin paths still attached to this peer. An ANNOUNCE-quiet link is
@@ -5337,18 +5403,6 @@ class GrassrootsNetwork {
     }
     return sealed;
   }
-
-  /// Flood a serialized packet into the BLE mesh (managed flooding). Returns the
-  /// number of neighbors it was sent to. [excludeBlePeerId] skips the inbound
-  /// path when relaying.
-  Future<int> _floodViaBle(Uint8List bytes, {String? excludeBlePeerId}) async {
-    final service = _bleService;
-    if (service == null || !_bleAvailable) return 0;
-    return service.broadcast(
-      bytes,
-      excludePeerIds: excludeBlePeerId == null ? null : {excludeBlePeerId},
-    );
-  }
 }
 
 /// Diff each peer's `isReachable` against the previous tick and fire the
@@ -5369,6 +5423,66 @@ class GrassrootsNetwork {
 ///   - state unchanged or one-of-two transports flipping while the other
 ///     stays live: no fire.
 @visibleForTesting
+/// Report each peer whose pair has just become settled.
+///
+/// [settled] is the running set of peers settled as of the previous call and
+/// is updated in place; [onSettled] fires only on a false→true edge, so a
+/// store change that leaves settledness alone reports nothing. A peer that
+/// stops being settled leaves the set and can report again later, which is
+/// what a per-step reset needs — it is the same pair settling anew, not a
+/// duplicate of the first time.
+/// Whether the BLE radio is participating.
+///
+/// `active` now MEANS the service finished booting — every role the mode
+/// asked for confirmed on the air by the controller (advertising by the
+/// advertiser callback, scanning by the scan-state event) — so this is a
+/// plain state read. `ready` is where the transport parks when the adapter
+/// is off or a requested role has not confirmed yet.
+bool bleRadioUp({
+  required bool hasService,
+  required TransportState bleState,
+}) =>
+    hasService && bleState == TransportState.active;
+
+/// See [GrassrootsNetwork.bleUndiscoverable].
+///
+/// The half-booted phone: its scanner is confirmed running, its advertiser
+/// is not, and the mode wants both. It finds peers and dials outward while
+/// no peer can find it — and because `active` requires every requested role,
+/// it never reads radio-up. This names the state so the runner can put it in
+/// front of the operator while the run is still salvageable.
+bool bleUndiscoverableFrom({
+  required bool hasService,
+  required BleRoleMode roleMode,
+  required bool scanning,
+  required bool advertising,
+}) {
+  if (!hasService) return false;
+  if (roleMode == BleRoleMode.centralOnly) return false;
+  return scanning && !advertising;
+}
+
+void processLinkSettledTransitions({
+  required PeersState peersState,
+  required bool Function(Uint8List pubkey) isSettled,
+  required Set<String> settled,
+  required void Function(Uint8List pubkey) onSettled,
+}) {
+  final seen = <String>{};
+  for (final peer in peersState.peersList) {
+    final pk = peer.pubkeyHex;
+    seen.add(pk);
+    if (isSettled(peer.publicKey)) {
+      if (settled.add(pk)) onSettled(peer.publicKey);
+    } else {
+      settled.remove(pk);
+    }
+  }
+  // A peer dropped from the store is no longer settled; keeping it would
+  // suppress the edge when it comes back.
+  settled.removeWhere((pk) => !seen.contains(pk));
+}
+
 void processReachabilityTransitions({
   required PeersState peersState,
   required Map<String, bool> lastKnownReachability,

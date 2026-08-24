@@ -13,12 +13,9 @@
 /// ```dart
 /// import 'package:grassroots_networking/grassroots_networking.dart';
 /// 
-/// // Create identity (provided by GSG layer)
-/// final identity = GrassrootsIdentity(
-///   publicKey: myPubKey,
-///   privateKey: myPrivKey,
-///   nickname: 'Alice',
-/// );
+/// // Restore the persisted identity, or generate one on first launch
+/// final identity = await GrassrootsNetwork.getIdentity()
+///     ?? await GrassrootsNetwork.putIdentity();
 /// 
 /// // Create GrassrootsNetwork instance
 /// final grassroots = GrassrootsNetwork(identity: identity);
@@ -37,7 +34,6 @@
 /// 
 /// // Send messages
 /// await grassroots.send(recipientPubkey, gsgBlockData);
-/// await grassroots.broadcast(gsgBlockData);
 /// ```
 /// 
 /// ## Architecture
@@ -72,7 +68,6 @@ export 'src/transport/transport.dart';
 
 // Models
 export 'src/models/identity.dart';
-export 'src/identity_store.dart';
 export 'src/models/peer.dart';
 export 'src/models/packet.dart';
 export 'src/models/block.dart';

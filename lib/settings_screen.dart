@@ -24,6 +24,12 @@ class SettingsScreen extends StatefulWidget {
   /// Debug-only: switch which BLE roles the local device runs.
   final Future<void> Function(BleRoleMode mode)? onBleRoleModeChanged;
 
+  /// Apply an open ⇄ closed trust change. Routed through the network rather
+  /// than dispatched here, because closing has to re-filter the BLE scanner
+  /// at once — a store dispatch alone would leave the node meeting strangers
+  /// until the scan watchdog next fires.
+  final Future<void> Function(ColdCallTrustLevel level)? onColdCallTrustChanged;
+
   /// Re-run public-address (seeip) discovery, invoked by the "Retry" button
   /// shown when discovery has failed and no IP is known.
   final Future<void> Function()? onRetryPublicAddressDiscovery;
@@ -31,9 +37,11 @@ class SettingsScreen extends StatefulWidget {
   /// Debug/testbed hooks, forwarded to [TestbedScreen]. Null when the network
   /// is not up. [myPubkeyHex] is this device's hex identity.
   final String? myPubkeyHex;
+
+  /// This device's ANNOUNCE nickname, forwarded to the testbed so a field
+  /// run can derive its join order from it.
+  final String? myNickname;
   final ExperimentRecorder? experimentRecorder;
-  final VoidCallback? onStartBulk;
-  final VoidCallback? onStopBulk;
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
@@ -41,54 +49,57 @@ class SettingsScreen extends StatefulWidget {
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
   final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
+  final bool Function()? bleUndiscoverable;
   final Stream<bool>? bleUsableChanges;
-  final Future<int> Function(String expId)? onBroadcastStart;
-
-  /// DEBUG/TESTBED. Armed-time mesh gossip, and the view it builds.
-  final Future<int> Function()? onGossipNeighbours;
   final int Function()? sessionPeerCount;
-  final int Function()? meshComponentSize;
-  final VoidCallback? onClearMeshView;
-  final void Function(void Function(String expId)? listener)?
-      registerStartListener;
-  final Future<int?> Function(Uint8List peer,
-      {required String leg, required int seq})? sendRaw;
+
+  /// Sessions in the Noise table, forwarded to the testbed.
+  final int Function()? sessionTableCount;
   final Future<void> Function(bool on)? onSetBle;
-  final Future<void> Function()? onResetLinks;
+  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+      onResetLinks;
   final bool Function(Uint8List peer)? linkSettled;
 
-  /// Registers a listener for end-to-end ACKs (saturating throughput mode).
-  final void Function(void Function(String messageId)? listener)?
-      registerAckListener;
+  /// Whether a Noise session exists with this peer — what a send is gated on.
+  final bool Function(Uint8List peer)? sessionUp;
+  final Stream<Uint8List>? sessionEvents;
+  final Stream<Uint8List>? linkSettledEvents;
+
+  /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
+  final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
+  final int Function()? establishmentCount;
+  final VoidCallback? onResetEstablishmentCount;
+
 
   const SettingsScreen({
     super.key,
     required this.store,
     this.onSettingsChanged,
     this.onBleRoleModeChanged,
+    this.onColdCallTrustChanged,
     this.onRetryPublicAddressDiscovery,
     this.myPubkeyHex,
+    this.myNickname,
     this.experimentRecorder,
-    this.onStartBulk,
-    this.onStopBulk,
     this.sendMessage,
     this.onResetSessions,
     this.onResetDtnBuffer,
     this.onCryptoBench,
     this.bleWireBytes,
     this.bleUsable,
+    this.bleUndiscoverable,
     this.bleUsableChanges,
-    this.onBroadcastStart,
-    this.registerStartListener,
-    this.onGossipNeighbours,
     this.sessionPeerCount,
-    this.meshComponentSize,
-    this.onClearMeshView,
-    this.sendRaw,
+    this.sessionTableCount,
     this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
-    this.registerAckListener,
+    this.sessionUp,
+    this.sessionEvents,
+    this.linkSettledEvents,
+    this.onSetDialParallelism,
+    this.establishmentCount,
+    this.onResetEstablishmentCount,
   });
 
   @override
@@ -312,27 +323,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     builder: (context) => TestbedScreen(
                       store: widget.store,
                       myPubkeyHex: widget.myPubkeyHex,
+                      myNickname: widget.myNickname,
                       experimentRecorder: widget.experimentRecorder,
-                      onStartBulk: widget.onStartBulk,
-                      onStopBulk: widget.onStopBulk,
-                      sendMessage: widget.sendMessage,
+                                                      sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetDtnBuffer: widget.onResetDtnBuffer,
                       onCryptoBench: widget.onCryptoBench,
                       bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,
+      bleUndiscoverable: widget.bleUndiscoverable,
                       bleUsableChanges: widget.bleUsableChanges,
-                      onBroadcastStart: widget.onBroadcastStart,
-                      registerStartListener: widget.registerStartListener,
-                      onGossipNeighbours: widget.onGossipNeighbours,
                       sessionPeerCount: widget.sessionPeerCount,
-                      meshComponentSize: widget.meshComponentSize,
-                      onClearMeshView: widget.onClearMeshView,
-                      sendRaw: widget.sendRaw,
+                      sessionTableCount: widget.sessionTableCount,
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
-                      registerAckListener: widget.registerAckListener,
+                      sessionUp: widget.sessionUp,
+                      sessionEvents: widget.sessionEvents,
+                      linkSettledEvents: widget.linkSettledEvents,
+                      onSetDialParallelism: widget.onSetDialParallelism,
+                      establishmentCount: widget.establishmentCount,
+                      onResetEstablishmentCount:
+                          widget.onResetEstablishmentCount,
                     ),
                   ),
                 );
@@ -512,8 +524,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   fontSize: GlType.textSm, fontWeight: FontWeight.w600),
             ),
             subtitle: const Text(
-              'Show physical BLE link (ACL) counts: total in the chat '
-              'screen, per-peer on peer rows. Ground truth from the OS.',
+              'Show what each pair\'s connection is made of: legs on peer rows '
+              'and in chat, where 2 legs means the pair converged to dual-role, '
+              'and this device\'s ACL count beside the Nearby totals. Ground '
+              'truth from the OS.',
               style: TextStyle(
                   fontSize: GlType.textXs, color: GlColors.textMuted),
             ),
@@ -630,10 +644,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ],
             selected: {level},
-            onSelectionChanged: (selection) {
+            onSelectionChanged: (selection) async {
               if (selection.isEmpty) return;
-              widget.store
-                  .dispatch(SetColdCallTrustLevelAction(selection.first));
+              final next = selection.first;
+              if (widget.onColdCallTrustChanged != null) {
+                await widget.onColdCallTrustChanged!(next);
+              } else {
+                widget.store.dispatch(SetColdCallTrustLevelAction(next));
+              }
+              if (!mounted) return;
+              setState(() {});
               widget.onSettingsChanged?.call();
             },
           ),

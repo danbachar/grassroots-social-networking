@@ -1,6 +1,5 @@
 import 'package:flutter/foundation.dart';
 
-import '../testbed/testbed_config.dart';
 
 /// Available transport protocols
 enum TransportProtocol {
@@ -93,9 +92,6 @@ class SettingsState {
 
   // ===== Testbed harnesses (debug-only; null/off in production) =====
 
-  /// DEBUG-ONLY sustained-throughput flow config (data-plane evaluation).
-  /// Presence does NOT start the driver.
-  final BulkFlowConfig? bulkFlowConfig;
 
   const SettingsState({
     this.bluetoothEnabled = true,
@@ -108,7 +104,6 @@ class SettingsState {
     this.coldCallTrustLevel = ColdCallTrustLevel.open,
     this.facilitateInvites = false,
     this.showLinkDiagnostics = false,
-    this.bulkFlowConfig,
   });
 
   static const SettingsState initial = SettingsState();
@@ -145,7 +140,6 @@ class SettingsState {
     bool? facilitateInvites,
     bool? showLinkDiagnostics,
     // Use Object? + sentinel so callers can pass null to clear.
-    Object? bulkFlowConfig = _sentinel,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -155,9 +149,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       facilitateInvites: facilitateInvites ?? this.facilitateInvites,
       showLinkDiagnostics: showLinkDiagnostics ?? this.showLinkDiagnostics,
-      bulkFlowConfig: identical(bulkFlowConfig, _sentinel)
-          ? this.bulkFlowConfig
-          : bulkFlowConfig as BulkFlowConfig?,
     );
   }
 
@@ -169,7 +160,6 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
         'showLinkDiagnostics': showLinkDiagnostics,
-        'bulkFlowConfig': bulkFlowConfig?.toJson(),
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -198,10 +188,6 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
-      bulkFlowConfig: json['bulkFlowConfig'] == null
-          ? null
-          : BulkFlowConfig.fromJson(
-              json['bulkFlowConfig'] as Map<String, dynamic>),
     );
   }
 
@@ -216,8 +202,7 @@ class SettingsState {
           bleRoleMode == other.bleRoleMode &&
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
-          showLinkDiagnostics == other.showLinkDiagnostics &&
-                    bulkFlowConfig == other.bulkFlowConfig;
+          showLinkDiagnostics == other.showLinkDiagnostics;
 
   @override
   int get hashCode => Object.hash(
@@ -228,7 +213,6 @@ class SettingsState {
         coldCallTrustLevel,
         facilitateInvites,
         showLinkDiagnostics,
-        bulkFlowConfig,
       );
 
   @override
@@ -237,4 +221,3 @@ class SettingsState {
 }
 
 /// Sentinel for copyWith — distinguishes "not passed" from "passed null".
-const _sentinel = Object();

@@ -3,7 +3,7 @@ import 'package:grassroots_networking/grassroots_networking.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:logger/logger.dart' show Logger, Level;
+import 'package:logger/logger.dart' show Level;
 import 'src/debug/log_buffer.dart';
 import 'src/trace/experiment_recorder.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -24,8 +24,6 @@ final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
 
 // Global key for navigation from notification
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
-
-final Logger _log = Logger();
 
 // Pending chat to open from notification
 String? _pendingChatPeerHex;
@@ -57,7 +55,7 @@ Future<GrassrootsIdentity> _initIdentity() async {
   // Spec putIdentity/getIdentity (docs/GLP_Networking_API/sections/api.tex
   // §Identity): restore the persisted identity, or generate-and-persist one on
   // first launch so the same Ed25519 key pair is reused every session.
-  final existing = await IdentityStore.getIdentity();
+  final existing = await GrassrootsNetwork.getIdentity();
   if (existing != null) {
     debugPrint('Identity found in secure storage.');
     debugPrint('Private Key Bytes (Seed): ${existing.privateKey.length} bytes');
@@ -67,62 +65,13 @@ Future<GrassrootsIdentity> _initIdentity() async {
   }
 
   debugPrint('No identity found, generating new one.');
-  final identity = await GrassrootsIdentity.generate();
-  await IdentityStore.putIdentity(identity);
+  final identity = await GrassrootsNetwork.putIdentity();
   debugPrint('Private Key Bytes (Seed): ${identity.privateKey.length} bytes');
   debugPrint('Public Key Bytes: ${identity.publicKey.length} bytes');
   debugPrint('Nickname: ${identity.nickname}');
   return identity;
 }
 
-Map<String, dynamic> _serializeAppState(AppState state) {
-  return {
-    'bleTransportState': state.transports.bleState.name,
-    'udpTransportState': state.transports.udpState.name,
-    'peers': {
-      'discoveredBlePeers': {
-        for (final e in state.peers.discoveredBlePeers.entries)
-          e.key: {
-            'transportId': e.value.transportId,
-            'displayName': e.value.displayName,
-            'rssi': e.value.rssi,
-            'isConnecting': e.value.isConnecting,
-            'isConnected': e.value.isConnected,
-            'lastSeen': e.value.lastSeen.toIso8601String(),
-          },
-      },
-      'peers': {
-        for (final e in state.peers.peers.entries)
-          e.key: {
-            'nickname': e.value.nickname,
-            'connectionState': e.value.connectionState.name,
-            'transport': e.value.transport.name,
-            'activeTransport': e.value.activeTransport.name,
-            'rssi': e.value.rssi,
-            'bleDeviceId': e.value.bleDeviceId,
-            'udpAddress': e.value.udpAddress,
-            'isFriend': e.value.isFriend,
-            'lastSeen': e.value.lastSeen?.toIso8601String(),
-          },
-      },
-    },
-    'messages': {
-      'conversationCount': state.messages.conversations.length,
-      'unreadCounts': state.messages.unreadCounts,
-      'outgoingCount': state.messages.outgoingMessages.length,
-      'incomingCount': state.messages.incomingMessages.length,
-    },
-    'friendships': {
-      for (final e in state.friendships.friendships.entries)
-        e.key: {
-          'nickname': e.value.nickname,
-          'status': e.value.status.name,
-          'udpAddress': e.value.udpAddress,
-        },
-    },
-    'settings': state.settings.toJson(),
-  };
-}
 
 /// Set up debug log capture by intercepting debugPrint.
 ///
@@ -387,6 +336,26 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   // Track nickname changes for animation
   final Map<String, _NicknameChange> _nicknameChanges = {};
 
+  // messageId of the last friend request we SENT per peer (hex), so a cancel
+  // can withdraw the still-buffered request. Session-only: the DTN buffer is
+  // memory-only, so a request from a previous process has nothing to withdraw.
+  final Map<String, String> _sentFriendRequestMsgIds = {};
+
+  // Nearby-list hysteresis. RSSI wobbles every reading and `lastSeen` advances
+  // every second, so rendering live state made the "In range" list churn
+  // continuously: rows resorted, dBm numbers flickered, and "Heard Ns ago"
+  // counted up in place. Both the ORDER and the VALUES are now recomputed at
+  // most once per announce cycle — the cycle is what actually refreshes the
+  // underlying facts, so showing them faster only shows noise.
+  //
+  // Newcomers are exempt: a peer that has just appeared is rendered
+  // immediately rather than waiting up to a cycle to become visible, since
+  // presence is the one thing the panel exists to report promptly. It folds
+  // into the snapshot at the next recompute.
+  List<String> _nearbySortOrder = [];
+  Map<String, PeerState> _nearbySnapshot = {};
+  DateTime? _nearbySortAt;
+
   // Transport availability derived from Redux store
   bool get _bleAvailable => appStore.state.transports.bleState.isUsable;
   bool get _udpAvailable => appStore.state.transports.udpState.isUsable;
@@ -472,7 +441,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     debugPrint('[lifecycle] App state -> $state');
     // Lifecycle into the trace: absolute draw is screen-dominated and
     // Android changes BLE scan behaviour in background — a run where the
-    // app backgrounded mid-step was previously indistinguishable from a
+    // app backgrounded mid-step must not be indistinguishable from a
     // clean one.
     if (experimentRecorder.active) {
       unawaited(experimentRecorder.log({
@@ -886,11 +855,44 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           store: appStore,
           onSendFriendRequest: () => _sendFriendRequest(peer),
           onAcceptFriendRequest: () => _acceptFriendRequest(peer),
+          onCancelFriendRequest: () => _cancelFriendRequest(peer),
           onUnfriend: () => _unfriend(peerHex),
           myUdpAddress: _myUdpAddress,
         ),
       ),
     );
+  }
+
+  /// Withdraw a pending OUTGOING friend request: stop conveying the buffered
+  /// request, tell the peer to drop it if it reached them, and clear our local
+  /// pending state.
+  Future<void> _cancelFriendRequest(PeerState peer) async {
+    if (_grassroots == null) return;
+    final peerHex = peer.pubkeyHex;
+
+    // Withdraw the still-buffered request so it stops being conveyed onward.
+    // This is a LOCAL cancel only — deliberately NOT a FriendshipRevokeBlock:
+    // a revoke removes the friendship and peer record on the other side, which
+    // in closed mode severs the link and can strand the Noise session (the
+    // handshake does not reliably re-establish). A pending request has no
+    // established friendship to revoke, so we just stop conveying it and clear
+    // our own pending; if the peer already received it they can decline it.
+    final messageId = _sentFriendRequestMsgIds.remove(peerHex);
+    if (messageId != null) {
+      _grassroots!.cancelBufferedMessage(messageId);
+    }
+
+    // Clear our pending outgoing locally.
+    appStore.dispatch(RemoveFriendshipAction(peerHex));
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Friend request to ${peer.displayName} canceled'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   Future<void> _sendFriendRequest(PeerState peer) async {
@@ -935,6 +937,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
       peerPubkeyHex: peerHex,
       nickname: peer.displayName,
     ));
+    // Remember the message so a cancel can withdraw it from the buffer.
+    _sentFriendRequestMsgIds[peerHex] = messageId;
 
     // Save as a chat message in Redux
     appStore.dispatch(SaveChatMessageAction(
@@ -1565,11 +1569,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                     ),
                   ),
                   const Spacer(),
-                  Text(
-                    '${_peers.length} nearby · ${onlineFriends.length} friends',
-                    style: const TextStyle(
-                        fontSize: GlType.textXs, color: GlColors.textMuted),
-                  ),
+                  Builder(builder: (context) {
+                    final counts =
+                        '${_peers.length} nearby · ${onlineFriends.length} friends';
+                    // What the radio is actually holding, beside what the app
+                    // can see: peers and friends are app-level facts, while
+                    // ACLs are the controller's own budget, and the gap
+                    // between them is the thing worth noticing.
+                    final acls = state.transports.bleLinks.length;
+                    return Text(
+                      state.settings.showLinkDiagnostics
+                          ? '$counts · $acls ACL${acls == 1 ? '' : 's'}'
+                          : counts,
+                      style: const TextStyle(
+                          fontSize: GlType.textXs, color: GlColors.textMuted),
+                    );
+                  }),
                 ],
               ),
             );
@@ -1636,9 +1651,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
                             horizontal: GlSpace.s4, vertical: GlSpace.s2),
                         child: EyebrowLabel('In range'),
                       ),
-                      ...(_peers.values.toList()
-                            ..sort((a, b) =>
-                                (b.rssi ?? -100).compareTo(a.rssi ?? -100)))
+                      ..._nearbyPeersSorted()
                           .map((peer) => _buildPeerListItem(peer)),
                     ],
                   ],
@@ -1646,6 +1659,48 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
         ),
       ],
     );
+  }
+
+  /// Peers for the "In range" list, RSSI-sorted but with HYSTERESIS: the order
+  /// is recomputed at most once per announce cycle, so a settled list stops
+  /// reshuffling on every 1s refresh as RSSI wobbles. Between recomputes the
+  /// cached order is kept for peers still present, the gone drop out, and
+  /// newcomers are appended (RSSI-sorted among themselves) so a fresh arrival
+  /// shows without disturbing the settled order.
+  List<PeerState> _nearbyPeersSorted() {
+    final byHex = {for (final p in _peers.values) p.pubkeyHex: p};
+    final now = DateTime.now();
+    final interval =
+        _grassroots?.config.announceInterval ?? const Duration(seconds: 10);
+    final recompute =
+        _nearbySortAt == null || now.difference(_nearbySortAt!) >= interval;
+    if (recompute) {
+      final sorted = byHex.values.toList()
+        ..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+      _nearbySortOrder = [for (final p in sorted) p.pubkeyHex];
+      _nearbySnapshot = {for (final p in sorted) p.pubkeyHex: p};
+      _nearbySortAt = now;
+      return sorted;
+    }
+    final result = <PeerState>[];
+    final placed = <String>{};
+    for (final hex in _nearbySortOrder) {
+      // Still present? Then render the value frozen at the last recompute, not
+      // the live one — that is what stops the row from twitching between
+      // cycles. A peer that has gone is simply absent.
+      if (!byHex.containsKey(hex)) continue;
+      final p = _nearbySnapshot[hex] ?? byHex[hex];
+      if (p != null) {
+        result.add(p);
+        placed.add(hex);
+      }
+    }
+    final newcomers = [
+      for (final entry in byHex.entries)
+        if (!placed.contains(entry.key)) entry.value
+    ]..sort((a, b) => (b.rssi ?? -100).compareTo(a.rssi ?? -100));
+    result.addAll(newcomers);
+    return result;
   }
 
   Widget _buildOnlineFriendChip(PeerState friend) {
@@ -1790,17 +1845,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             final heard = peer.lastBleSeen != null
                 ? 'Heard ${_formatSecondsAgo(peer.lastBleSeen!)}'
                 : 'Reaching out…';
-            // Debug link-diagnostics: physical link (ACL) count to this peer
-            // from the plugin's OS-level snapshot.
+            // Debug link-diagnostics: what this pair's connection is made
+            // of, from the plugin's OS-level snapshot. Legs, not ACLs: both
+            // GATT directions normally ride one ACL, so an ACL count reads 1
+            // for a converged pair and for a half-open one alike.
             if (!appStore.state.settings.showLinkDiagnostics) {
               return Text(heard);
             }
-            final linkCount = bleLinkCountForPathIds(
+            final tally = bleLinkTallyForPathIds(
               appStore.state.transports.bleLinks,
               [peer.bleCentralDeviceId, peer.blePeripheralDeviceId],
             );
-            return Text(
-                '$heard · $linkCount link${linkCount == 1 ? '' : 's'}');
+            final legs = '${tally.legs} leg${tally.legs == 1 ? '' : 's'}';
+            // Two ACLs is the unusual shape and worth surfacing; one is the
+            // norm and would just be noise on every row.
+            final acls = tally.acls > 1 ? ' over ${tally.acls} ACLs' : '';
+            return Text('$heard · $legs$acls');
           }),
           trailing: Row(
             mainAxisSize: MainAxisSize.min,
@@ -2443,22 +2503,24 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           onBleRoleModeChanged: _grassroots == null
               ? null
               : (mode) => _grassroots!.setBleRoleMode(mode),
+          onColdCallTrustChanged: _grassroots == null
+              ? null
+              : (level) => _grassroots!.setColdCallTrustLevel(level),
           onRetryPublicAddressDiscovery: _grassroots == null
               ? null
               : () => _grassroots!.retryPublicAddressDiscovery(),
           myPubkeyHex: _grassroots?.identity.publicKey
               .map((b) => b.toRadixString(16).padLeft(2, '0'))
               .join(),
+          myNickname: _grassroots?.identity.nickname,
           experimentRecorder: experimentRecorder,
-          onStartBulk:
-              _grassroots == null ? null : () => _grassroots!.startBulkFlows(),
-          onStopBulk:
-              _grassroots == null ? null : () => _grassroots!.stopBulkFlows(),
           sendMessage: _grassroots?.send,
           onResetSessions:
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
-          onResetLinks:
-              _grassroots == null ? null : () => _grassroots!.resetAllBleLinks(),
+          onResetLinks: _grassroots == null
+              ? null
+              : (darkSec, {whileDark}) => _grassroots!
+                  .resetAllBleLinks(darkSec: darkSec, whileDark: whileDark),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
           onCryptoBench:
@@ -2467,41 +2529,36 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               _grassroots == null ? null : () => _grassroots!.bleWireBytes,
           bleUsable:
               _grassroots == null ? null : () => _grassroots!.bleUsable,
-          bleUsableChanges: _grassroots?.bleUsableChanges,
-          sendRaw: _grassroots == null
+          bleUndiscoverable: _grassroots == null
               ? null
-              : (peer, {required leg, required seq}) =>
-                  _grassroots!.sendRawBlob(peer, leg: leg, seq: seq),
+              : () => _grassroots!.bleUndiscoverable,
+          bleUsableChanges: _grassroots?.bleUsableChanges,
           onSetBle: _grassroots == null
               ? null
               : (on) => _grassroots!.setBleActiveForTestbed(on),
           linkSettled: _grassroots == null
               ? null
               : (peer) => _grassroots!.isPeerLinkSettled(peer),
-          registerAckListener: _grassroots == null
+          sessionUp: _grassroots == null
               ? null
-              : (listener) => _grassroots!.onTestbedAck = listener,
-          // Multi-device runs: every phone arms and one signals the rest, so
-          // devices spread over hundreds of metres begin within the flood's
-          // latency of each other rather than however long the walk takes.
-          onBroadcastStart: _grassroots == null
+              : (peer) => _grassroots!.hasNoiseSessionWith(peer),
+          sessionEvents: _grassroots?.noiseSessionEstablished,
+          linkSettledEvents: _grassroots?.peerLinkSettled,
+          onSetDialParallelism: _grassroots == null
               ? null
-              : (expId) => _grassroots!.broadcastTestbedStart(expId),
-          // Armed-time only: each phone gossips who it can see, so every
-          // phone can show how many are actually in the mesh before the
-          // start signal is asked to cross it.
+              : ({int? maxParallel, int? popN}) =>
+                  _grassroots!.setDialParallelismForTestbed(
+                      maxParallel: maxParallel, popN: popN),
+          establishmentCount: _grassroots == null
+              ? null
+              : () => _grassroots!.bleEstablishmentCount,
+          onResetEstablishmentCount: _grassroots == null
+              ? null
+              : () => _grassroots!.resetBleEstablishmentCount(),
           sessionPeerCount:
               _grassroots == null ? null : () => _grassroots!.sessionPeerCount,
-          onGossipNeighbours: _grassroots == null
-              ? null
-              : () => _grassroots!.broadcastTestbedNeighbours(),
-          meshComponentSize:
-              _grassroots == null ? null : () => _grassroots!.meshComponentSize,
-          onClearMeshView:
-              _grassroots == null ? null : () => _grassroots!.clearMeshView(),
-          registerStartListener: _grassroots == null
-              ? null
-              : (listener) => _grassroots!.onTestbedStartRequested = listener,
+          sessionTableCount:
+              _grassroots == null ? null : () => _grassroots!.noiseSessionCount,
         ),
       ),
     );
@@ -2597,11 +2654,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
   Future<void> _updateNickname(String newNickname) async {
     if (_grassroots == null || _identity == null) return;
 
-    // Update nickname via Grassroots (broadcasts ANNOUNCE)
+    // Update nickname via Grassroots (persists it and broadcasts ANNOUNCE)
     await _grassroots!.updateNickname(newNickname);
 
-    // Persist to secure storage
-    await IdentityStore.putIdentity(_identity!);
+    // The announce loop above awaits one write per connected BLE peer, so the
+    // widget can be gone by the time it returns.
+    if (!mounted) return;
 
     setState(() {});
 
@@ -2656,12 +2714,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     });
     await oldGrassroots?.dispose();
 
-    // Fresh keypair (same shape as _initIdentity for a clean install).
-    final newIdentity = await GrassrootsIdentity.generate();
-
-    // Persist immediately so a crash mid-restart doesn't leave us with a
-    // stored identity that doesn't match anything in memory.
-    await IdentityStore.putIdentity(newIdentity);
+    // Fresh keypair, persisted before anything is built with it, so a crash
+    // mid-restart cannot leave a stored identity that matches nothing in
+    // memory (same shape as _initIdentity for a clean install).
+    final newIdentity = await GrassrootsNetwork.putIdentity();
 
     // Rebuild the transport with the new identity (mirrors _initialize).
     final newGrassroots = GrassrootsNetwork(
@@ -2704,60 +2760,6 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
     );
   }
 
-  void _showNicknameChangeAnimation(
-      String oldName, String newName, String peerId) {
-    // Store the nickname change for UI animation
-    _nicknameChanges[peerId] = _NicknameChange(
-      oldName: oldName,
-      newName: newName,
-      timestamp: DateTime.now(),
-    );
-
-    // Show a snackbar notification
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.person_rounded, color: GlColors.textInverse),
-            const SizedBox(width: GlSpace.s3),
-            Expanded(
-              child: RichText(
-                text: TextSpan(
-                  style: const TextStyle(
-                      fontFamily: GlType.sans, color: GlColors.textInverse),
-                  children: [
-                    TextSpan(
-                      text: oldName.isEmpty ? 'Unknown' : oldName,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        decoration: TextDecoration.lineThrough,
-                        color: GlColors.textInverse.withValues(alpha: 0.7),
-                      ),
-                    ),
-                    const TextSpan(text: ' → '),
-                    TextSpan(
-                      text: newName,
-                      style: const TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-        duration: const Duration(seconds: 3),
-      ),
-    );
-
-    // Clear the animation after a delay
-    Future.delayed(const Duration(seconds: 3), () {
-      if (mounted) {
-        setState(() {
-          _nicknameChanges.remove(peerId);
-        });
-      }
-    });
-  }
 }
 
 /// Helper class for tracking nickname changes

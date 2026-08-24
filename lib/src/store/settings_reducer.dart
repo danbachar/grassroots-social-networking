@@ -49,9 +49,6 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     return state.copyWith(showLinkDiagnostics: action.enabled);
   }
 
-  if (action is SetBulkFlowConfigAction) {
-    return state.copyWith(bulkFlowConfig: action.config);
-  }
 
   return state;
 }

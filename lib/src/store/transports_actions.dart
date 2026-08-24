@@ -21,6 +21,15 @@ class UdpTransportStateChangedAction extends TransportAction {
 }
 
 /// BLE scanning state changed
+/// The controller's answer about whether we are broadcasting. Dispatched from
+/// the plugin's advertising-state event, never from the start request — the
+/// request being accepted says nothing about the radio.
+class BleAdvertisingChangedAction extends TransportAction {
+  final bool advertising;
+
+  BleAdvertisingChangedAction(this.advertising);
+}
+
 class BleScanningChangedAction extends TransportAction {
   final bool scanning;
 

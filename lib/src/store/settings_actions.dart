@@ -1,4 +1,3 @@
-import '../testbed/testbed_config.dart';
 import 'settings_state.dart';
 
 /// Base class for settings-related actions
@@ -66,12 +65,3 @@ class SetShowLinkDiagnosticsAction extends SettingsAction {
 
   SetShowLinkDiagnosticsAction(this.enabled);
 }
-
-/// DEBUG/TESTBED ONLY. Install (or clear, with null) the sustained-throughput
-/// bulk-flow config. Does NOT start the driver.
-class SetBulkFlowConfigAction extends SettingsAction {
-  final BulkFlowConfig? config;
-
-  SetBulkFlowConfigAction(this.config);
-}
-

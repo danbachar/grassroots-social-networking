@@ -19,9 +19,18 @@ class DtnStore {
   /// Max distinct recipients held at once.
   final int maxRecipients;
 
-  /// Max cached packets across ALL recipients (globally-oldest evicted
-  /// first). 8192 packets ≈ 2 MB at typical sealed sizes.
-  final int maxTotal;
+  /// Max cached BYTES across ALL recipients (globally-oldest evicted first).
+  ///
+  /// The size bound is bytes, not a packet count. A count says nothing about
+  /// memory unless every packet is the same size, and they are not: a
+  /// fragmented message is several packets of whatever the MTU left over.
+  /// Bytes are the thing actually being bounded, so bytes are what the bound
+  /// is written in.
+  ///
+  /// This counts sealed PAYLOAD bytes, which is what [totalBytes] reports and
+  /// what the `buf` trace record carries — not the Dart object overhead
+  /// around each entry, so real process memory sits above this figure.
+  final int maxBytes;
 
   /// Packets older than this are dropped.
   final Duration maxAge;
@@ -38,7 +47,7 @@ class DtnStore {
 
   DtnStore({
     this.maxRecipients = 256,
-    this.maxTotal = 8192,
+    this.maxBytes = 512 * 1024 * 1024, // 512 MiB
     this.maxAge = const Duration(hours: 6),
   });
 
@@ -71,10 +80,10 @@ class DtnStore {
     list.add(_Entry(packet, at));
     _totalBytes += packet.payload.length;
 
-    // Bound the store as a whole: evict the globally-oldest packet. Each
-    // per-recipient list is append-ordered, so the oldest entry overall is
-    // the oldest list head.
-    while (totalCount > maxTotal) {
+    // Bound the store as a whole: evict the globally-oldest packet until the
+    // buffer is inside its byte ceiling. Each per-recipient list is
+    // append-ordered, so the oldest entry overall is the oldest list head.
+    while (_totalBytes > maxBytes) {
       String? evictKey;
       DateTime? oldestHead;
       for (final entry in _byRecipient.entries) {
@@ -125,6 +134,57 @@ class DtnStore {
     return [
       for (final list in _byRecipient.values)
         for (final e in list) e.packet.packetId,
+    ];
+  }
+
+  /// The packets this node holds whose ORIGINATOR-stamped creation time is at
+  /// or after [fromMs], oldest first, capped at [limit].
+  ///
+  /// Sorted by the packet's own `createdAtMs`, never by our `storedAt`: two
+  /// nodes reconciling a window have to agree on which packets are in it, and
+  /// receipt time is local to each of them. Oldest first because the sync
+  /// sweep advances a cursor through the buffer, and the packets below the
+  /// cursor are the ones that have been waiting longest.
+  List<GrassrootsPacket> windowFrom(int fromMs,
+      {required int limit, DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    final all = <GrassrootsPacket>[
+      for (final list in _byRecipient.values)
+        for (final e in list)
+          if (e.packet.createdAtMs >= fromMs) e.packet,
+    ]..sort((a, b) => a.createdAtMs.compareTo(b.createdAtMs));
+    if (all.length <= limit) return all;
+
+    // Cut on a whole-millisecond boundary. The window's upper bound is the
+    // creation stamp of the last packet that fits, and the responder answers
+    // with anything in `[from, to]` the filter does not cover — so a boundary
+    // that falls INSIDE a group sharing one stamp makes the packets we had to
+    // leave out look missing, and they come straight back at us. Dropping the
+    // partial trailing millisecond costs a few slots and removes that.
+    var end = limit;
+    final boundary = all[limit - 1].createdAtMs;
+    while (end > 0 && all[end - 1].createdAtMs == boundary) {
+      end--;
+    }
+    // Unless the whole window is one millisecond: then there is nothing to cut
+    // back to and refusing to advance would stall the sweep forever. Advertise
+    // what fits and accept that this one stamp may be re-sent — bounded, and
+    // far cheaper than a cursor that never moves.
+    return all.sublist(0, end == 0 ? limit : end);
+  }
+
+  /// Packets held whose creation time falls inside `[fromMs, toMs]` — what
+  /// a responder considers when answering a filter. Bounded by the window, so
+  /// a packet outside it is never sent in reply to that filter.
+  List<GrassrootsPacket> windowBetween(int fromMs, int toMs,
+      {DateTime? now}) {
+    _prune(now ?? DateTime.now());
+    return [
+      for (final list in _byRecipient.values)
+        for (final e in list)
+          if (e.packet.createdAtMs >= fromMs &&
+              e.packet.createdAtMs <= toMs)
+            e.packet,
     ];
   }
 

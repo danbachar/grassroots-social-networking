@@ -18,11 +18,11 @@ import 'package:grassroots_networking/src/store/store.dart';
 
 import '../helpers/sodium_test_bootstrap.dart';
 
-/// Sync-on-connect (DTN anti-entropy): offer carried packetIds on connect,
-/// request the unseen subset, convey the stored sealed packets. The buffer is
-/// replicated, never transferred. The offer/request frames are SEALED to the
-/// neighbour's Noise session (ContentType.syncOffer/syncRequest) — packetIds
-/// never travel in the clear.
+/// Sync-on-connect (DTN anti-entropy): a node advertises what it holds as a
+/// GCS compact filter over a time window (ContentType.syncFilter, SEALED to
+/// the neighbour's Noise session), and the neighbour conveys back every stored
+/// sealed packet the filter proves it lacks. The buffer is replicated, never
+/// transferred. PacketIds never travel in the clear.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -64,10 +64,33 @@ void main() {
       final payloads = buildSyncPayloads(ids);
       expect(payloads, hasLength(3));
       for (final payload in payloads) {
-        // header + sealed frame overhead must still fit a 244-byte write.
-        expect(payload.length, lessThanOrEqualTo(180));
+        // The bound that matters is the SEALED PACKET on the wire, not the
+        // payload: the old assertion checked the payload against 180 and so
+        // passed while every full chunk went out 37 bytes over the MTU and
+        // was truncated. Budget the three layers the packet actually carries.
+        expect(payload.length + syncPacketOverhead,
+            lessThanOrEqualTo(syncUsableWrite),
+            reason: 'a sealed sync chunk must fit one GATT write');
       }
       expect(payloads.expand(decodeSyncIds), ids);
+    });
+
+    test('sync filter window round-trips real epoch-ms (no uint32 overflow)',
+        () {
+      // The window bounds are the SAME clock as a packet's createdAtMs — real
+      // epoch-ms (~1.7e12), which overflow a uint32 (~4.29e9). A 4-byte field
+      // truncated every bound to its low 32 bits, so the responder's full-ms
+      // windowBetween matched nothing and delivered nothing. The bounds are
+      // 8-byte; assert a real timestamp survives the round-trip.
+      const from = 1731000000000; // > 2^32
+      const to = 1731000005000;
+      final enc = encodeSyncFilter(
+          n: 3, fromMs: from, toMs: to, filter: Uint8List.fromList([1, 2, 3]));
+      final d = decodeSyncFilter(enc);
+      expect(d.fromMs, from);
+      expect(d.toMs, to);
+      expect(d.n, 3);
+      expect(d.filter, Uint8List.fromList([1, 2, 3]));
     });
   });
 
@@ -100,8 +123,9 @@ void main() {
       expect(store.packetById(uuid.v4()), isNull);
     });
 
-    test('store-wide total cap evicts the globally-oldest packet', () {
-      final store = DtnStore(maxTotal: 3);
+    test('store-wide byte cap evicts the globally-oldest packet', () {
+      // Payloads are 3 bytes each, so 9 bytes holds exactly three packets.
+      final store = DtnStore(maxBytes: 9);
       final t0 = DateTime(2026, 1, 1);
       final first = sealed('a');
       store.store('ra', first, now: t0);
@@ -154,12 +178,31 @@ void main() {
 
     tearDown(() => router.dispose());
 
-    test('dtnCapacity exposes the store-wide packet ceiling', () {
-      // GrassrootsNetwork sizes its messageId -> packetIds ACK index from
-      // this. The two bounds must not drift: an index entry is dead the
-      // moment its last packet leaves the buffer, so a smaller index silently
-      // disables ACK-driven release and leaves packets to age out instead.
-      expect(router.dtnCapacity, DtnStore().maxTotal);
+    test('a non-ACK buffer exit is reported so the ACK index can forget it',
+        () {
+      // GrassrootsNetwork's messageId -> packetIds index is keyed by message
+      // while the store evicts by packet, and the index used to drain on ACK
+      // ALONE. Every expiry and eviction then left a dead entry behind until
+      // the index filled and started throwing out LIVE ones — which is what
+      // turns ACK-driven release off. The store must report every non-ACK
+      // exit, and it must do so whether or not tracing is on.
+      final seen = <String>[];
+      router.onBufferedPacketDropped = seen.add;
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 5,
+        recipientPubkey: Uint8List(32),
+        payload: Uint8List.fromList([1, 2, 3]),
+      );
+      router.storeInDtnBuffer(Uint8List(32), p);
+      router.clearDtnBuffer();
+      expect(seen, isEmpty,
+          reason: 'a wholesale clear is not a per-packet exit');
+
+      router.storeInDtnBuffer(Uint8List(32), p);
+      router.dropFromDtnBuffer([p.packetId]);
+      expect(seen, isEmpty,
+          reason: 'an ACK release is reported by the caller, not here');
     });
 
     GrassrootsPacket thirdPartySealed({int ttl = 5}) => GrassrootsPacket(
@@ -170,17 +213,26 @@ void main() {
           payload: Uint8List.fromList([9, 9, 9]),
         );
 
-    /// Deliver a sync control frame the way the wire does now: as a `secure`
-    /// packet whose trial-decrypt yields the sealed SecureFrame. The stub
-    /// stands in for the Noise session with the neighbour.
     final neighbourPubkey =
         Uint8List.fromList(List.generate(32, (i) => 200 + i % 50));
-    Future<void> deliverSyncFrame(
-        ContentType type, List<String> ids, String bleDeviceId) async {
+
+    /// Deliver a sync FILTER frame the way the wire does now: a `secure` packet
+    /// addressed to us whose trial-decrypt yields the sealed SecureFrame
+    /// carrying a GCS filter over a time window. An EMPTY filter over
+    /// [fromMs, toMs] names nothing, so the router conveys back every held
+    /// packet whose creation stamp falls in the window. The stub stands in for
+    /// the Noise session with the neighbour.
+    Future<void> deliverSyncFilter({
+      required int fromMs,
+      required int toMs,
+      String bleDeviceId = 'neighbor-1',
+      PeerTransport transport = PeerTransport.bleDirect,
+    }) async {
       final frame = SecureFrame(
-        contentType: type,
+        contentType: ContentType.syncFilter,
         messageId: uuid.v4(),
-        chunk: encodeSyncIds(ids),
+        chunk: encodeSyncFilter(
+            n: 0, fromMs: fromMs, toMs: toMs, filter: Uint8List(0)),
       );
       final sealed = GrassrootsPacket(
         type: PacketType.secure,
@@ -192,162 +244,278 @@ void main() {
           (p.copyWith(payload: frame.encode()), neighbourPubkey);
       await router.processPacket(
         sealed,
-        transport: PeerTransport.bleDirect,
-        bleDeviceId: bleDeviceId,
+        transport: transport,
+        bleDeviceId:
+            transport == PeerTransport.bleDirect ? bleDeviceId : null,
+        udpPeerId: transport == PeerTransport.udp ? 'udp-peer' : null,
       );
     }
 
-    /// Relay a third-party sealed packet through the router so it lands in
-    /// the DTN store (recipient unreachable in the empty peers state).
-    Future<GrassrootsPacket> storeViaRelay() async {
-      final p = thirdPartySealed();
-      router.onRelay = (_, {String? excludeBlePeerId}) {};
+    test('buildSyncFilter advertises what the buffer holds and round-trips',
+        () {
+      // The replacement for the id-list offer: a node advertises a GCS filter
+      // over the window it holds, and the codec round-trips through the wire.
+      final recipient = Uint8List.fromList(List.generate(32, (i) => i + 50));
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        recipientPubkey: recipient,
+        payload: Uint8List.fromList([1, 2, 3]),
+        createdAtMs: 5000,
+      );
+      router.storeInDtnBuffer(recipient, p);
+
+      final payload = router.buildSyncFilter(neighbourPubkey);
+      expect(payload, isNotNull,
+          reason: 'a non-empty buffer advertises a filter');
+      final dec = decodeSyncFilter(payload!);
+      expect(dec.n, greaterThan(0),
+          reason: 'the held packet contributes an element to the filter');
+      expect(dec.fromMs, lessThanOrEqualTo(dec.toMs));
+      expect(dec.toMs, greaterThan(0));
+      expect(dec.toMs, 5000,
+          reason: 'the window closes at the newest held creation stamp');
+    });
+
+    test('a spent packet in TRANSIT is dropped on arrival', () async {
+      // Nothing can be done with it: it cannot be forwarded, and carrying it
+      // one buffer further would only make the next node refuse it too.
+      final spent = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 0,
+        recipientPubkey: Uint8List.fromList(List.generate(32, (i) => i + 1)),
+        payload: Uint8List.fromList([9]),
+      );
+      await router.processPacket(spent,
+          transport: PeerTransport.bleDirect, bleDeviceId: 'inbound-leg');
+      expect(router.dtnBufferedCount, 0);
+      expect(router.dtnBufferedCount, 0,
+          reason: 'a packet with no budget is not worth carrying either');
+    });
+
+    test('a packet arriving at 0 IS delivered when it is addressed to us',
+        () async {
+      // Delivering is not a hop, so it is judged on the arriving value: >= 0
+      // is enough. Only forwarding subtracts.
+      var delivered = false;
+      router.onMessageReceived = (_, __, ___, ____) => delivered = true;
+      final frame = SecureFrame(
+        contentType: ContentType.message,
+        messageId: uuid.v4(),
+        chunk: Uint8List.fromList([1, 2, 3]),
+      );
+      final spent = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 0,
+        recipientPubkey: identity.publicKey,
+        payload: Uint8List.fromList([0xE0]),
+      );
+      router.trialDecrypt =
+          (p) async => (p.copyWith(payload: frame.encode()), neighbourPubkey);
+      await router.processPacket(spent,
+          transport: PeerTransport.bleDirect, bleDeviceId: 'inbound-leg');
+      expect(delivered, isTrue);
+    });
+
+    test('arriving at 2 forwards at 1 — a hop still remains', () async {
+      await router.processPacket(
+        thirdPartySealed(ttl: 2),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'inbound-leg',
+      );
+      expect(router.dtnBufferedPackets.single.ttl, 1);
+    });
+
+    test('arriving at 1 is forwarded once, at 0', () async {
+      // The last hop is still worth taking: the destination is exempt from the
+      // refusal, so a neighbour who is the recipient still accepts it.
+      await router.processPacket(
+        thirdPartySealed(ttl: 1),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'inbound-leg',
+      );
+      expect(router.dtnBufferedPackets.single.ttl, 0);
+      expect(router.dtnBufferedCount, 1,
+          reason: 'exhaustion does not delete it — it stays in custody and is '
+              're-offered whenever a link to the recipient forms');
+    });
+
+    test('a relay already at 0 is refused', () async {
+      await router.processPacket(
+        thirdPartySealed(ttl: 0),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'inbound-leg',
+      );
+      expect(router.dtnBufferedCount, 0);
+      expect(router.dtnBufferedCount, 0);
+    });
+
+    test('arriving at 3 still forwards, at 2', () async {
+      await router.processPacket(
+        thirdPartySealed(ttl: 3),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'inbound-leg',
+      );
+      expect(router.dtnBufferedPackets.single.ttl, 2);
+    });
+
+    test('conveyance sends the held packet unchanged', () async {
+      // The buffered copy already paid for its arrival. Decrementing again at
+      // conveyance would charge one hop twice and retire packets early.
+      final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: other,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
+      );
+      router.storeInDtnBuffer(other, p);
+      final sent = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => sent.add(packet);
+      // Empty filter over the packet's window: the neighbour lacks it.
+      await deliverSyncFilter(fromMs: 0, toMs: 2000, bleDeviceId: 'neighbor-1');
+      expect(sent.single.ttl, 2);
+      expect(sent.single.packetId, p.packetId);
+    });
+
+    test('an unforwardable packet never enters the buffer at all', () async {
+      // The gate is at ARRIVAL: a packet that cannot be forwarded is dropped
+      // rather than stored, which is why conveyance needs no gate of its own.
+      await router.processPacket(
+        thirdPartySealed(ttl: 0),
+        transport: PeerTransport.bleDirect,
+        bleDeviceId: 'inbound-leg',
+      );
+      expect(router.dtnBufferedCount, 0);
+    });
+
+    test('what IS buffered is the hopped copy, not the one received',
+        () async {
+      // Storing the packet as received would make the held copy a hop richer
+      // than the forwarded one, and the next carrier would inherit the error.
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 5,
+        recipientPubkey: Uint8List.fromList(List.generate(32, (i) => i + 1)),
+        payload: Uint8List.fromList([9, 9, 9]),
+        createdAtMs: 1000,
+      );
       await router.processPacket(
         p,
         transport: PeerTransport.bleDirect,
         bleDeviceId: 'inbound-leg',
       );
       expect(router.dtnBufferedCount, greaterThan(0));
-      return p;
-    }
-
-    test('buildSyncOffers is empty when carrying nothing', () {
-      expect(router.buildSyncOffers(), isEmpty);
+      final sent = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => sent.add(packet);
+      await deliverSyncFilter(fromMs: 0, toMs: 2000, bleDeviceId: 'neighbor-2');
+      expect(sent.single.ttl, p.ttl - 1,
+          reason: 'held at the post-arrival value, conveyed unchanged');
     });
 
-    test('self-originated packets enter the sync vector and leave on ACK', () {
-      final recipient = Uint8List.fromList(List.generate(32, (i) => i + 50));
-      final sealed = GrassrootsPacket(
+    test('UDX conveys a packet addressed to the peer on the other end',
+        () async {
+      // Targeted conveyance. The peer answering a UDX filter is an ENDPOINT,
+      // and handing an endpoint its own packet costs exactly those packets —
+      // so this is the part of store-carry-forward the Internet path gets. It
+      // closes the gap where a friend reachable only over the Internet never
+      // received a buffered message until a BLE encounter happened to occur.
+      final p = GrassrootsPacket(
         type: PacketType.secure,
-        recipientPubkey: recipient,
-        payload: Uint8List.fromList([1, 2, 3]),
+        ttl: 2,
+        recipientPubkey: neighbourPubkey,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
       );
-
-      // The sender buffers its own message: its own sealed packet
-      // is offered in sync like any relayed packet.
-      router.storeInDtnBuffer(recipient, sealed);
+      router.storeInDtnBuffer(neighbourPubkey, p);
+      final sent = <GrassrootsPacket>[];
+      final links = <SyncLink>[];
+      router.onSyncSend = (packet, link) {
+        sent.add(packet);
+        links.add(link);
+      };
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
+      expect(sent.single.packetId, p.packetId);
+      expect(links.single.transport, SyncTransport.udx);
       expect(
-        decodeSyncIds(router.buildSyncOffers().single),
-        contains(sealed.packetId),
+          links.single.handle,
+          neighbourPubkey
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(),
+          reason: 'a UDX handle IS the peer pubkey hex — no lookup table');
+    });
+
+    test('UDX never conveys third-party transit traffic', () async {
+      // The restriction is about VOLUME, not trust. BLE encounters are
+      // sporadic and airtime is scarce, so the mesh's open relay is bounded by
+      // the medium itself; a UDX link is continuous and fast, and answering
+      // with the whole buffer would push it at every connected friend at link
+      // speed — turning well-connected nodes into the infrastructure that
+      // removing the rendezvous servers deleted.
+      //
+      // This exact packet IS conveyed over BLE — see 'conveyance sends the
+      // held packet unchanged', which stores the same third-party recipient.
+      final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
+      final p = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: other,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
       );
-      expect(router.dtnBufferFor(recipient).single.packetId, sealed.packetId);
-      // Own packets are marked seen — a copy conveyed back is never re-relayed.
-      expect(router.isDuplicate(sealed.packetId), isTrue);
-
-      // ACK empties the buffer; nothing left to offer.
-      router.dropFromDtnBuffer([sealed.packetId]);
-      expect(router.buildSyncOffers(), isEmpty);
-    });
-
-    test('buildSyncOffers advertises buffered packets', () async {
-      final p = await storeViaRelay();
-      final offers = router.buildSyncOffers();
-      expect(offers, hasLength(1));
-      expect(decodeSyncIds(offers.first), contains(p.packetId));
-    });
-
-    test('offer -> requests exactly the unseen subset', () async {
-      final seenId = uuid.v4();
-      router.markSeen(seenId);
-      final unseen1 = uuid.v4(), unseen2 = uuid.v4();
-
-      final frames = <(ContentType, Uint8List, SyncLink)>[];
-      router.onSyncFrame = (t, payload, link) =>
-          frames.add((t, payload, link));
-
-      await deliverSyncFrame(
-          ContentType.syncOffer, [seenId, unseen1, unseen2], 'neighbor-1');
-
-      expect(frames, hasLength(1));
-      final (type, payload, link) = frames.single;
-      expect(link.bleDeviceId, 'neighbor-1');
-      expect(type, ContentType.syncRequest,
-          reason: 'the reply is sealed, not a cleartext packet type');
-      expect(decodeSyncIds(payload), unorderedEquals([unseen1, unseen2]));
-    });
-
-    test('offer with only seen ids -> no request', () async {
-      final id = uuid.v4();
-      router.markSeen(id);
-      var called = false;
-      router.onSyncFrame = (_, __, ___) => called = true;
-
-      await deliverSyncFrame(ContentType.syncOffer, [id], 'neighbor-1');
-      expect(called, isFalse);
-    });
-
-    test('request -> conveys the stored sealed packet to the requester',
-        () async {
-      final stored = await storeViaRelay();
-
-      final sent = <(GrassrootsPacket, SyncLink)>[];
-      router.onSyncSend = (packet, link) => sent.add((packet, link));
-
-      await deliverSyncFrame(
-          ContentType.syncRequest, [stored.packetId], 'neighbor-2');
-
-      expect(sent, hasLength(1));
-      final (conveyed, link) = sent.single;
-      expect(link.bleDeviceId, 'neighbor-2');
-      expect(conveyed.type, PacketType.secure);
-      expect(conveyed.packetId, stored.packetId);
-      // Buffer entry replicated, not transferred.
-      expect(router.dtnBufferedCount, greaterThan(0));
-    });
-
-    test('request for unknown/expired ids conveys nothing', () async {
+      router.storeInDtnBuffer(other, p);
       var called = false;
       router.onSyncSend = (_, __) => called = true;
-      await deliverSyncFrame(
-          ContentType.syncRequest, [uuid.v4()], 'neighbor-2');
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
       expect(called, isFalse);
     });
 
-    test('sync packets are never relayed and never delivered', () async {
-      var relayed = false;
-      router.onRelay = (_, {String? excludeBlePeerId}) => relayed = true;
-      router.onMessageReceived =
-          (_, __, ___, ____) => fail('sync must not deliver');
+    test('BLE still conveys third-party traffic the same round UDX refuses it',
+        () async {
+      // Guards the pair of rules against being collapsed into one: the mesh
+      // must keep relaying for strangers, or multi-hop reach is gone.
+      final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
+      final mine = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: neighbourPubkey,
+        payload: Uint8List.fromList([1]),
+        createdAtMs: 1000,
+      );
+      final theirs = GrassrootsPacket(
+        type: PacketType.secure,
+        ttl: 2,
+        recipientPubkey: other,
+        payload: Uint8List.fromList([2]),
+        createdAtMs: 1001,
+      );
+      router.storeInDtnBuffer(neighbourPubkey, mine);
+      router.storeInDtnBuffer(other, theirs);
 
-      await deliverSyncFrame(ContentType.syncOffer, [uuid.v4()], 'neighbor-1');
-      expect(relayed, isFalse);
+      final overUdx = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => overUdx.add(packet);
+      await deliverSyncFilter(
+          fromMs: 0, toMs: 2000, transport: PeerTransport.udp);
+
+      final overBle = <GrassrootsPacket>[];
+      router.onSyncSend = (packet, _) => overBle.add(packet);
+      await deliverSyncFilter(fromMs: 0, toMs: 2000);
+
+      expect(overUdx.map((p) => p.packetId), [mine.packetId]);
+      expect(overBle.map((p) => p.packetId),
+          containsAll([mine.packetId, theirs.packetId]),
+          reason: 'the mesh relays for recipients it has no relationship with');
     });
 
-    test('sync over UDP is ignored — the buffer is BLE-only',
-        () async {
-      // The Internet transport stays direct point-to-point: it neither
-      // relays for third parties nor reconciles buffers, so a sync frame
-      // arriving over it is never acted on.
+    test('malformed sync filter is dropped without side effects', () async {
       var called = false;
-      router.onSyncFrame = (_, __, ___) => called = true;
       router.onSyncSend = (_, __) => called = true;
       final frame = SecureFrame(
-        contentType: ContentType.syncOffer,
+        contentType: ContentType.syncFilter,
         messageId: uuid.v4(),
-        chunk: encodeSyncIds([uuid.v4()]), // an id we have never seen
-      );
-      router.trialDecrypt = (p) async =>
-          (p.copyWith(payload: frame.encode()), neighbourPubkey);
-      await router.processPacket(
-        GrassrootsPacket(
-          type: PacketType.secure,
-          ttl: 1,
-          recipientPubkey: identity.publicKey,
-          payload: Uint8List.fromList([1, 2]),
-        ),
-        transport: PeerTransport.udp,
-        udpPeerId: 'udp-peer',
-      );
-      expect(called, isFalse);
-    });
-
-    test('malformed sync payload is dropped without side effects', () async {
-      var called = false;
-      router.onSyncFrame = (_, __, ___) => called = true;
-      final frame = SecureFrame(
-        contentType: ContentType.syncOffer,
-        messageId: uuid.v4(),
-        chunk: Uint8List.fromList([7]), // count=7, no ids
+        chunk: Uint8List.fromList([7]), // shorter than a filter header
       );
       router.trialDecrypt = (p) async =>
           (p.copyWith(payload: frame.encode()), neighbourPubkey);

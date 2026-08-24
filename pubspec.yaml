@@ -74,6 +74,7 @@ dependencies:
   # runs the same op in ~5-10ms. Bundles native binaries for iOS / Android /
   # macOS / Windows / Linux.
   sodium_libs: ^3.4.4+1
+  device_info_plus: ^12.4.0
 
 dev_dependencies:
   flutter_test:
@@ -119,3 +120,13 @@ flutter:
           weight: 500
         - asset: assets/fonts/JetBrainsMono-600.ttf
           weight: 600
+
+# The BLE plugin is developed alongside this app, so builds resolve it from the
+# working copy rather than the pinned git ref: a transport change and the app
+# change that depends on it land together, and there is no window where the app
+# builds against a plugin that does not have the fix it needs. An absolute path
+# because the app is built from several git worktrees, whose depth to the plugin
+# differs.
+dependency_overrides:
+  grassroots_bluetooth_layer:
+    path: /Users/dbachar/git/technion/grassroots-bluetooth-layer

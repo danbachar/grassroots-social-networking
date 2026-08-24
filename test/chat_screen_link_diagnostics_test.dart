@@ -13,8 +13,11 @@ import 'package:grassroots_networking/src/store/store.dart';
 
 import 'helpers/sodium_test_bootstrap.dart';
 
-/// Regression: the link-diagnostics line ("N links to peer · M total") must
-/// render in the chat screen's app bar when the toggle is on.
+/// Regression: the link-diagnostics line ("2 legs · 1 ACL")
+/// must render in the chat screen's app bar when the toggle is on, and must
+/// report LEGS rather than ACLs for the pair — both GATT directions normally
+/// ride one ACL, so an ACL count alone cannot tell a converged dual-role pair
+/// from a half-open one.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -77,7 +80,7 @@ void main() {
     ));
     await tester.pump();
 
-    expect(find.text('1 link to peer · 2 total'), findsOneWidget);
+    expect(find.text('2 legs · 1 ACL'), findsOneWidget);
 
     // Tear the screen down and cancel the network's periodic timers so the
     // test zone ends with no pending timers.

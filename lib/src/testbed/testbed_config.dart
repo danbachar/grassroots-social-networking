@@ -5,20 +5,18 @@ import '../protocol/fragment_handler.dart';
 /// Default synthetic payload size: the largest that still fits ONE sealed
 /// packet at the BLE floor MTU. At this size one message *is* one packet, so
 /// message counts, delivery ratio and wire bytes all read per-packet with no
-/// hidden fragment multiplier. Anything above it is fragmented (a 184-byte
-/// message, the old default, was silently TWO packets — 132 + 52 — costing
-/// 392 wire bytes to move 184), which is worth measuring deliberately as a
-/// payload arm rather than baking into every experiment.
-const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 132
+/// hidden fragment multiplier. Anything above it is fragmented — a 184-byte
+/// message is silently TWO packets, 132 + 52, costing 392 wire bytes to move
+/// 184 — which is worth measuring deliberately as a payload arm rather than
+/// baking into every experiment.
+const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 130
 
-/// DEBUG/TESTBED ONLY. Config models for the evaluation harnesses:
-/// [BulkFlowConfig] (sustained throughput) and [FieldPlan] (scripted field
-/// experiment). Stored as nullable fields on `SettingsState` where noted,
-/// inert/off by default, and never affecting production behaviour. See
-/// `docs/testbed_experiments.md`.
+/// DEBUG/TESTBED ONLY. Config models for the evaluation harness:
+/// [FieldPlan], the scripted field experiment. Inert/off by default, and
+/// never affecting production behaviour. See `docs/testbed_experiments.md`.
 
-/// Fixed namespace for deterministic UUIDv5 message ids (bulk flows and
-/// field-plan sends). Any offline tool using this namespace + the same name
+/// Fixed namespace for deterministic UUIDv5 message ids (field-plan
+/// sends). Any offline tool using this namespace + the same name
 /// string reproduces the exact id set — the delivery-ratio denominator.
 const String workloadUuidNamespace = 'b8f4a1e2-1c3d-4b5a-9e7f-677261737372';
 
@@ -50,92 +48,7 @@ class WorkloadRosterEntry {
   int get hashCode => Object.hash(label, pubkeyHex);
 }
 
-/// One directed bulk transfer: [srcLabel] saturates toward [dstLabel].
-@immutable
-class BulkFlow {
-  final String srcLabel;
-  final String dstLabel;
-
-  const BulkFlow({required this.srcLabel, required this.dstLabel});
-
-  Map<String, dynamic> toJson() => {'src': srcLabel, 'dst': dstLabel};
-
-  factory BulkFlow.fromJson(Map<String, dynamic> json) => BulkFlow(
-        srcLabel: json['src'] as String,
-        dstLabel: json['dst'] as String,
-      );
-
-  @override
-  bool operator ==(Object other) =>
-      other is BulkFlow &&
-      other.srcLabel == srcLabel &&
-      other.dstLabel == dstLabel;
-
-  @override
-  int get hashCode => Object.hash(srcLabel, dstLabel);
-}
-
-/// Sustained-throughput workload for the data-plane evaluation (dilating
-/// clique): each listed flow keeps [inFlight] messages of [payloadBytes]
-/// outstanding — sending the next only when one is ACKed, never re-sending —
-/// for [durationMs] from Start. The same config is deployed to every device;
-/// each executes only the flows where it is the source. One flow = the
-/// distance-only baseline; all ordered pairs = the contended all-to-all run.
-@immutable
-class BulkFlowConfig {
-  final List<WorkloadRosterEntry> roster;
-  final List<BulkFlow> flows;
-  final int payloadBytes;
-  final int durationMs;
-  final int inFlight;
-
-  const BulkFlowConfig({
-    required this.roster,
-    required this.flows,
-    required this.payloadBytes,
-    required this.durationMs,
-    this.inFlight = 2,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'roster': roster.map((r) => r.toJson()).toList(),
-        'flows': flows.map((f) => f.toJson()).toList(),
-        'payloadBytes': payloadBytes,
-        'durationMs': durationMs,
-        'inFlight': inFlight,
-      };
-
-  factory BulkFlowConfig.fromJson(Map<String, dynamic> json) => BulkFlowConfig(
-        roster: (json['roster'] as List<dynamic>)
-            .map((e) => WorkloadRosterEntry.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        flows: (json['flows'] as List<dynamic>)
-            .map((e) => BulkFlow.fromJson(e as Map<String, dynamic>))
-            .toList(),
-        payloadBytes: json['payloadBytes'] as int,
-        durationMs: json['durationMs'] as int,
-        inFlight: json['inFlight'] as int? ?? 2,
-      );
-
-  @override
-  bool operator ==(Object other) =>
-      other is BulkFlowConfig &&
-      listEquals(other.roster, roster) &&
-      listEquals(other.flows, flows) &&
-      other.payloadBytes == payloadBytes &&
-      other.durationMs == durationMs &&
-      other.inFlight == inFlight;
-
-  @override
-  int get hashCode => Object.hash(Object.hashAll(roster),
-      Object.hashAll(flows), payloadBytes, durationMs, inFlight);
-}
-
-/// One step of a field-experiment plan: the experimenter walks into
-/// position, taps IN POSITION (which stamps [label] as a ground-truth
-/// marker), and the runner holds the dwell for [dwellSec] before advancing.
-/// When [bulk] is true the bulk-flow driver runs during the dwell. When
-/// [sendCount] > 0 the runner sends that many [sendBytes]-sized messages to
+/// /// [sendCount] > 0 the runner sends that many [sendBytes]-sized messages to
 /// every other roster device, spaced evenly through the dwell — the first
 /// send doubles as the handshake trigger after a session reset, so the
 /// discovered→connected→session→usable ladder runs inside the step.
@@ -143,7 +56,6 @@ class BulkFlowConfig {
 class FieldStep {
   final String label;
   final int dwellSec;
-  final bool bulk;
   final int sendCount;
   final int sendBytes;
 
@@ -154,22 +66,7 @@ class FieldStep {
   /// relayed or carried. Matching is case-insensitive on the hex prefix.
   final String sendTo;
 
-  /// Saturating send mode: instead of [sendCount] messages spread through the
-  /// dwell, push continuously for the whole dwell. Throughput measurement;
-  /// [sendCount] is ignored.
-  final bool saturate;
 
-  /// How many sends are pushed CONCURRENTLY while [saturate] is on: that many
-  /// independent lanes, each looping "fire one, await it, fire the next".
-  /// Nothing is ACK-gated — the ACK never clocks a send — so the offered load
-  /// is set purely by lane count and how fast the send path drains.
-  ///
-  /// This is the saturation knob. One lane keeps exactly one message in the
-  /// send path at a time, which in the first arm delivered 100% at every
-  /// payload size — proof the sender never outran the link, so those rates are
-  /// a LOWER BOUND on capacity, not the ceiling. Raising the lane count raises
-  /// offered load until delivery breaks, and that break is the ceiling.
-  final int sendLanes;
 
   /// Set the BLE transport up/down at this step's start (null = leave
   /// as-is). The power-baseline plan uses it to script BLE-off vs BLE-active
@@ -178,6 +75,17 @@ class FieldStep {
   /// requested state.
   final bool? bleOn;
 
+  /// Diluting-clique membership: the clique size this step belongs to. When
+  /// set, the plan is ROLE-FREE — every phone loads the identical plan, and
+  /// the runner derives this device's [bleOn] at launch from its own nickname
+  /// (join order): on iff `joinOrder <= cliqueN`. This exists because baking
+  /// the role into which preset the operator picks put the join order in two
+  /// places — the nickname and the chosen entry — and the field run lost its
+  /// whole N=2 phase to a phone that had a >=3 entry loaded. One shared plan
+  /// makes the wrong-role mistake unrepresentable. Mutually exclusive with an
+  /// explicit [bleOn]; resolved by [FieldPlan.resolvedFor].
+  final int? cliqueN;
+
   /// Per-step override of [FieldPlan.resetSessions] (null = inherit). The
   /// frontier toggler needs it: sessions must be dropped while its radio is
   /// DOWN (the off step), so every one of its joins measures cold XX
@@ -185,12 +93,29 @@ class FieldStep {
   /// and kill handshakes that legitimately began in the toggle window.
   final bool? resetSessions;
 
-  /// DEBUG raw-throughput mode: non-null selects the GATT leg ('notify',
-  /// 'write' or 'stripe') and the step pushes MTU-sized raw blobs — no seal,
-  /// no buffering, no ACK; the receiver counts bytes and drops them before the
-  /// parser. Measures the naked GATT pipe; [sendCount]/[saturate] are
-  /// ignored. Delivery accounting comes from the wire ledger alone.
-  final String? rawLeg;
+  /// Per-step override of [FieldPlan.resetDtnBuffer] (null = inherit).
+  ///
+  /// The plan-level flag fires at the start of EVERY step, which is useless
+  /// for a store-carry-forward run: clearing at `return` would delete the
+  /// very backlog that window exists to measure, so the plan has to leave it
+  /// off and the buffer then never resets at all — one arm's leftovers get
+  /// counted as the next arm's delivery. Set it on the arm's FIRST step
+  /// instead. Clearing the buffer touches nothing else: sessions and links
+  /// survive, so an arm still starts warm.
+  final bool? resetDtnBuffer;
+
+
+
+  /// Dial grid: the most central dials this phone may have IN FLIGHT during
+  /// the step — the grid's M. Null leaves the production cap in place.
+  ///
+  /// This is a CAP ON ORDINARY BEHAVIOUR, not a scripted burst. The
+  /// transport already dials greedily (every discovered peer, topped up
+  /// automatically as slots free); the step just moves the bound and counts
+  /// what gets established. Every phone runs it — there is no device under
+  /// test and no rotation — so each phone measures its own dialing at M and
+  /// the whole fleet is a sample.
+  final int? maxParallelDials;
 
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
@@ -201,53 +126,45 @@ class FieldStep {
   const FieldStep({
     required this.label,
     required this.dwellSec,
-    this.bulk = false,
     this.sendCount = 0,
     this.sendBytes = defaultSendBytes,
     this.autoAdvance = false,
-    this.saturate = false,
-    this.sendLanes = 1,
     this.sendTo = 'all',
-    this.rawLeg,
     this.bleOn,
+    this.cliqueN,
+    this.maxParallelDials,
     this.resetSessions,
+    this.resetDtnBuffer,
   });
 
   Map<String, dynamic> toJson() => {
         'label': label,
         'dwellSec': dwellSec,
-        if (bulk) 'bulk': bulk,
         if (sendCount > 0) 'sendCount': sendCount,
         // Saturating steps carry no sendCount but DO have a payload size —
         // it is the arm variable of the throughput experiment.
-        if (sendCount > 0 || saturate) 'sendBytes': sendBytes,
+        if (sendCount > 0) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
-        if (saturate) 'saturate': saturate,
-        // NOT gated on `saturate`. A step can carry a lane count while its
-        // own saturate flag is false — the mesh-scaling plan gives every
-        // step the same lanes and flips saturate per device — and gating the
-        // write dropped it on the round-trip while `==` still compared it,
-        // so a saved plan silently differed from the one built in memory.
-        if (sendLanes != 1) 'sendLanes': sendLanes,
         if (sendTo != 'all') 'sendTo': sendTo,
-        if (rawLeg != null) 'rawLeg': rawLeg,
         if (bleOn != null) 'bleOn': bleOn,
+        if (cliqueN != null) 'cliqueN': cliqueN,
+        if (maxParallelDials != null) 'maxParallelDials': maxParallelDials,
         if (resetSessions != null) 'resetSessions': resetSessions,
+        if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
         label: json['label'] as String,
         dwellSec: json['dwellSec'] as int,
-        bulk: json['bulk'] as bool? ?? false,
         sendCount: json['sendCount'] as int? ?? 0,
         sendBytes: json['sendBytes'] as int? ?? defaultSendBytes,
         autoAdvance: json['autoAdvance'] as bool? ?? false,
-        saturate: json['saturate'] as bool? ?? false,
-        sendLanes: json['sendLanes'] as int? ?? 1,
         sendTo: json['sendTo'] as String? ?? 'all',
-        rawLeg: json['rawLeg'] as String?,
         bleOn: json['bleOn'] as bool?,
+        cliqueN: json['cliqueN'] as int?,
+        maxParallelDials: json['maxParallelDials'] as int?,
         resetSessions: json['resetSessions'] as bool?,
+        resetDtnBuffer: json['resetDtnBuffer'] as bool?,
       );
 
   @override
@@ -255,26 +172,26 @@ class FieldStep {
       other is FieldStep &&
       other.label == label &&
       other.dwellSec == dwellSec &&
-      other.bulk == bulk &&
       other.sendCount == sendCount &&
       other.sendBytes == sendBytes &&
       other.autoAdvance == autoAdvance &&
-      other.saturate == saturate &&
-      other.sendLanes == sendLanes &&
       other.sendTo == sendTo &&
-      other.rawLeg == rawLeg &&
       other.bleOn == bleOn &&
-      other.resetSessions == resetSessions;
+      other.cliqueN == cliqueN &&
+      other.maxParallelDials == maxParallelDials &&
+      other.resetSessions == resetSessions &&
+      other.resetDtnBuffer == resetDtnBuffer;
 
   @override
   int get hashCode =>
-      Object.hash(label, dwellSec, bulk, sendCount, sendBytes, autoAdvance,
-          saturate, sendLanes, sendTo, rawLeg, bleOn, resetSessions);
+      Object.hash(label, dwellSec, sendCount, sendBytes, autoAdvance,
+          sendTo, bleOn, cliqueN,
+          maxParallelDials, resetSessions, resetDtnBuffer);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
 /// the runner walks the experimenter through it — markers, dwell timing,
-/// bulk-flow triggering, and the end-of-run stop/upload are all automated;
+/// and the end-of-run stop/upload are all automated;
 /// only the walking and one IN POSITION tap per step stay manual.
 @immutable
 class FieldPlan {
@@ -303,6 +220,17 @@ class FieldPlan {
   /// few seconds of re-dial per step.
   final bool resetLinks;
 
+  /// Dark gap of the per-step BLE bounce ([resetLinks]), in seconds. Null
+  /// keeps the coordinator's default (two announce cycles + 10 s, ~30 s),
+  /// which is sized for a bounce only THIS device performs: the peer has to
+  /// notice the link died, and the gap outlasts that discovery.
+  ///
+  /// Set it short only when every device bounces simultaneously at the step
+  /// boundary — then both sides dispose their transports together, no stale
+  /// path survives on either, and there is nothing to wait for. The dial
+  /// grid does exactly that, so it spends ~5 s per step here instead of ~30.
+  final int? linkResetDarkSec;
+
   /// Empty the DTN memory buffer at the start of every step (default on):
   /// without it, an overrun step's undelivered backlog survives in the buffer
   /// and drains into the NEXT step's window via the sync exchange — the
@@ -316,16 +244,29 @@ class FieldPlan {
   /// begins, in seconds. A manual tap still skips the remaining gap.
   final int autoAdvanceGapSec;
 
-  /// This phone's join order in a multi-device plan (`role` in the mesh-scale
-  /// preset), stamped into every step marker. Null for plans where order is
-  /// meaningless.
+  /// Seconds reserved BEFORE a step's start instant for the resets to run in,
+  /// under [manualJoin]. The step's own window then holds nothing but the
+  /// dwell: the marker is stamped at the start instant, not after a reset of
+  /// unpredictable length, so a step measures a full [FieldStep.dwellSec].
   ///
-  /// Without it the trace records WHICH step ran but not which slot this
-  /// device was configured to fill, so a misconfigured phone is
-  /// indistinguishable from one that failed to join: the 7-device smoke run's
-  /// `n=3` steps had only two devices in the mesh and the reason could only
-  /// be inferred from when links first appeared.
-  final int? deviceOrder;
+  /// It has to be a reservation rather than however long the resets happen to
+  /// take, because the schedule is an absolute lattice shared by every phone.
+  /// A phone that finished resetting early waits for the instant; one that
+  /// overruns stamps late, which the trace shows rather than hides.
+  ///
+  /// Zero puts the resets inside the step window, where they cost the dwell
+  /// whatever they take. A plan opts in by reserving the time its own resets
+  /// measure — the value is a property of what the plan resets, not a global.
+  final int resetBudgetSec;
+
+  /// Seconds the operator is guaranteed to walk a device to the next position
+  /// in, under [manualJoin]. A step that opens a new position lands on the
+  /// first alignment boundary at least this far past the previous dwell.
+  ///
+  /// Without it the walk is whatever the lattice leaves over — a remainder
+  /// that shrinks to seconds whenever the trials happen to fill a boundary
+  /// interval, which is not a budget anyone chose.
+  final int walkBudgetSec;
 
   /// Manual-join mode: system Bluetooth is toggled BY THE OPERATOR in the
   /// phone's settings, never by the app. The run is anchored to a shared
@@ -352,11 +293,23 @@ class FieldPlan {
   /// minutes for a five-minute test means the preflight never gets run.
   final int alignSec;
 
-  /// Whether steps take a GPS fix at placement. Off for runs whose layout is
-  /// measured by hand — at 30 m spacing a phone fix carries the geometry's
-  /// own magnitude in error, so sampling adds noise and radio wakes for a
-  /// number the tape measure already gave exactly.
-  final bool sampleGps;
+  /// Let the runner drive [FieldStep.bleOn] even though the start is
+  /// wall-clock anchored.
+  ///
+  /// [manualJoin] conflated two separate things: WHEN the run starts (a shared
+  /// instant every phone computes) and WHO works the radio. For the join
+  /// experiments the operator does it, and the runner must keep its hands off
+  /// or it would fight them. A desk plan that scripts a phone going dark needs
+  /// the same shared start but no operator at all — hands-free is the point,
+  /// since the dark window has to open on every phone at once.
+  final bool scriptedRadio;
+
+  /// The operator resets the whole OS Bluetooth stack at every position,
+  /// during the walk window — the thesis line design: each distance starts
+  /// from a stack that carries nothing over. The runner PROMPTS the toggle;
+  /// the radio observer's bt-off/bt-on markers are the record of whether it
+  /// actually happened, position by position.
+  final bool stackResetPerPosition;
 
   const FieldPlan({
     required this.expId,
@@ -365,14 +318,64 @@ class FieldPlan {
     this.roster = const [],
     this.resetSessions = true,
     this.resetLinks = false,
+    this.linkResetDarkSec,
     this.resetDtnBuffer = true,
     this.autoAdvanceGapSec = 5,
-    this.deviceOrder,
+    this.resetBudgetSec = 0,
+    this.walkBudgetSec = 0,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
-    this.sampleGps = true,
+    this.scriptedRadio = false,
+    this.stackResetPerPosition = false,
   });
+
+  /// Resolve a role-free diluting plan for THIS device: every step carrying
+  /// [FieldStep.cliqueN] gets its [FieldStep.bleOn] derived from [joinOrder]
+  /// — on iff `joinOrder <= cliqueN` — so the identical plan JSON serves every
+  /// phone and the phone's nickname is the ONLY place its join order lives.
+  /// Steps without [FieldStep.cliqueN] pass through unchanged; a plan with no
+  /// such steps returns itself.
+  FieldPlan resolvedFor(int joinOrder) {
+    if (!steps.any((s) => s.cliqueN != null)) return this;
+    return FieldPlan(
+      expId: expId,
+      steps: [
+        for (final s in steps)
+          s.cliqueN == null
+              ? s
+              : FieldStep(
+                  label: s.label,
+                  dwellSec: s.dwellSec,
+                  sendCount: s.sendCount,
+                  sendBytes: s.sendBytes,
+                  autoAdvance: s.autoAdvance,
+                  sendTo: s.sendTo,
+                  bleOn: joinOrder <= s.cliqueN!,
+                  cliqueN: s.cliqueN,
+                  // Pass-through: the dial cap is the same on every phone,
+                  // so unlike bleOn there is nothing per-device to resolve.
+                  maxParallelDials: s.maxParallelDials,
+                  resetSessions: s.resetSessions,
+                  resetDtnBuffer: s.resetDtnBuffer,
+                ),
+      ],
+      settleSec: settleSec,
+      roster: roster,
+      resetSessions: resetSessions,
+      resetLinks: resetLinks,
+      linkResetDarkSec: linkResetDarkSec,
+      resetDtnBuffer: resetDtnBuffer,
+      autoAdvanceGapSec: autoAdvanceGapSec,
+      resetBudgetSec: resetBudgetSec,
+      walkBudgetSec: walkBudgetSec,
+      manualJoin: manualJoin,
+      placementSec: placementSec,
+      alignSec: alignSec,
+      scriptedRadio: scriptedRadio,
+      stackResetPerPosition: stackResetPerPosition,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
         'expId': expId,
@@ -382,13 +385,16 @@ class FieldPlan {
           'roster': roster.map((r) => r.toJson()).toList(),
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
+        if (linkResetDarkSec != null) 'linkResetDarkSec': linkResetDarkSec,
         'resetDtnBuffer': resetDtnBuffer,
         'autoAdvanceGapSec': autoAdvanceGapSec,
-        if (deviceOrder != null) 'deviceOrder': deviceOrder,
+        if (manualJoin) 'resetBudgetSec': resetBudgetSec,
+        if (manualJoin) 'walkBudgetSec': walkBudgetSec,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
-        if (!sampleGps) 'sampleGps': false,
+        if (scriptedRadio) 'scriptedRadio': true,
+        if (stackResetPerPosition) 'stackResetPerPosition': true,
       };
 
   factory FieldPlan.fromJson(Map<String, dynamic> json) => FieldPlan(
@@ -404,13 +410,17 @@ class FieldPlan {
             const [],
         resetSessions: json['resetSessions'] as bool? ?? true,
         resetLinks: json['resetLinks'] as bool? ?? false,
+        linkResetDarkSec: json['linkResetDarkSec'] as int?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
         autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
-        deviceOrder: json['deviceOrder'] as int?,
+        resetBudgetSec: json['resetBudgetSec'] as int? ?? 0,
+        walkBudgetSec: json['walkBudgetSec'] as int? ?? 0,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
-        sampleGps: json['sampleGps'] as bool? ?? true,
+        scriptedRadio: json['scriptedRadio'] as bool? ?? false,
+        stackResetPerPosition:
+            json['stackResetPerPosition'] as bool? ?? false,
       );
 
   @override
@@ -422,17 +432,20 @@ class FieldPlan {
       listEquals(other.roster, roster) &&
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
+      other.linkResetDarkSec == linkResetDarkSec &&
       other.resetDtnBuffer == resetDtnBuffer &&
       other.autoAdvanceGapSec == autoAdvanceGapSec &&
-      other.deviceOrder == deviceOrder &&
+      other.resetBudgetSec == resetBudgetSec &&
+      other.walkBudgetSec == walkBudgetSec &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
-      other.sampleGps == sampleGps;
+      other.scriptedRadio == scriptedRadio &&
+      other.stackResetPerPosition == stackResetPerPosition;
 
   @override
   int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
-      Object.hashAll(roster), resetSessions, resetLinks, resetDtnBuffer,
-      autoAdvanceGapSec, deviceOrder, manualJoin, placementSec, alignSec,
-      sampleGps);
+      Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
+      resetDtnBuffer, autoAdvanceGapSec, resetBudgetSec, walkBudgetSec,
+      manualJoin, placementSec, alignSec, scriptedRadio);
 }

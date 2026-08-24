@@ -62,6 +62,16 @@ for s in "${DEVICES[@]}"; do
   model="$(adb -s "$s" shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
   printf '== %-18s %s\n' "$s" "$model"
 
+  # Stop Play Protect intercepting the sideload. It holds the install session
+  # open behind a "Send app for a security check?" dialog waiting for a tap,
+  # so `adb install` blocks with no output and the deploy looks hung rather
+  # than prompted. Set before the install, since the dialog appears during it.
+  # Undo with `settings put global verifier_verify_adb_installs 1`.
+  adb -s "$s" shell settings put global verifier_verify_adb_installs 0 \
+    >/dev/null 2>&1 || true
+  adb -s "$s" shell settings put global package_verifier_user_consent -1 \
+    >/dev/null 2>&1 || true
+
   if ! adb -s "$s" install -r "$APK" >/dev/null 2>&1; then
     red "   install FAILED"
     failed+=("$s ($model)")

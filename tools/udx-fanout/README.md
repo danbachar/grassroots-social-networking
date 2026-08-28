@@ -57,6 +57,40 @@ Without a phone, `bin/probe_client.dart <host> <base-port> <peers> <hold-s>`
 opens the same streams from any machine, which is how to check a deployment
 is answering before taking it to the field.
 
+## The phone side
+
+`phone/` holds the streams on a real handset, and `run-fanout.sh` sweeps the
+fan-out while sampling power. The phone reports what the streams did; the
+host records what it cost. Neither measures the other, so the two records
+stay independent and line up by timestamp.
+
+One-time scaffold, since the Android project is generated rather than
+committed:
+
+```bash
+cd phone && flutter create --platforms=android . && flutter pub get
+```
+
+Then, with the responders already up:
+
+```bash
+./run-fanout.sh --host <responder-ip> --peers 1 4 16 64 --hold 600
+```
+
+Each fan-out lands as `results/n<N>_power.csv` and `results/n<N>_phone.jsonl`.
+The cost curve is charge drawn per unit time against N; if it is linear, the
+per-peer cost is the slope and the cap is a battery budget divided by it.
+
+The script unplugs charging for the run (`cmd battery unplug`) and resets on
+exit, including on interrupt — charging masks the draw completely, so a run
+that could not unplug is reporting nothing useful and says so. It also finds
+which power file the handset exposes, because vendors differ and a missing
+one would otherwise leave an empty column that looks like a zero.
+
+Hold the screen state fixed across the sweep, and keep the handset still: a
+screen that sleeps partway through one fan-out and not another moves the
+curve more than the streams do.
+
 ## Constraints that change the answer
 
 **Host networking is required, not a convenience.** Docker's bridge
@@ -80,6 +114,11 @@ the radio out of idle and holds it in a tail state. Run Wi-Fi and cellular
 separately; a Wi-Fi-only result will understate the cost. Note that the
 wireless-adb phones lose adb when Wi-Fi drops, so the cellular arm needs a
 USB-attached phone.
+
+**The phone side is unverified on hardware.** It analyzes clean and the
+responders are tested end to end, but no handset was attached when this was
+written, so the first run should be a single peer for a short hold to
+confirm the device path before sweeping.
 
 **The responders do not speak Grassroots.** They complete a UDX handshake and
 echo. That is enough for mappings and keepalives, which are properties of the

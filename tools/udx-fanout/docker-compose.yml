@@ -1,0 +1,195 @@
+# Generated: 16 responders on UDP 41000-41015.
+# Regenerate with: ./gen-compose.py -n 16
+services:
+  peer000:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41000"
+      PEER_LABEL: "peer000"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer001:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41001"
+      PEER_LABEL: "peer001"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer002:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41002"
+      PEER_LABEL: "peer002"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer003:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41003"
+      PEER_LABEL: "peer003"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer004:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41004"
+      PEER_LABEL: "peer004"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer005:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41005"
+      PEER_LABEL: "peer005"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer006:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41006"
+      PEER_LABEL: "peer006"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer007:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41007"
+      PEER_LABEL: "peer007"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer008:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41008"
+      PEER_LABEL: "peer008"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer009:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41009"
+      PEER_LABEL: "peer009"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer010:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41010"
+      PEER_LABEL: "peer010"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer011:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41011"
+      PEER_LABEL: "peer011"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer012:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41012"
+      PEER_LABEL: "peer012"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer013:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41013"
+      PEER_LABEL: "peer013"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer014:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41014"
+      PEER_LABEL: "peer014"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}
+  peer015:
+    image: udx-fanout-responder
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      UDX_PORT: "41015"
+      PEER_LABEL: "peer015"
+      SILENCE_PROBE_S: "0"
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "3"}

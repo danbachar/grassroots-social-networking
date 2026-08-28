@@ -1,0 +1,9 @@
+name: udx_fanout_responder
+description: UDX responder used to measure how many backbone peers a phone can hold.
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  grassroots_dart_udx: ^2.1.0

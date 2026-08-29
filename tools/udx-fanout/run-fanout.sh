@@ -7,6 +7,10 @@
 # cost, and they line up by timestamp.
 set -euo pipefail
 
+# Resolve to this script's own directory: the sweep runs `flutter test` in
+# phone/, which must not depend on where it was invoked from.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 HOST=""
 SERIAL=""
 PEERS=(1 4 16 64)
@@ -62,6 +66,7 @@ done
 [ -z "$CURRENT_PATH" ] && echo "warning: no readable current_now; falling back to charge_counter deltas"
 echo "current: ${CURRENT_PATH:-none}"
 
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 mkdir -p "$OUT"
 
 sample_power() {   # $1 = csv path
@@ -97,7 +102,7 @@ for n in "${PEERS[@]}"; do
     sampler=$!
 
     set +e
-    (cd phone && flutter test integration_test/fanout_test.dart \
+    (cd "$HERE/phone" && flutter test integration_test/fanout_test.dart \
         ${SERIAL:+-d "$SERIAL"} \
         --dart-define=HOST="$HOST" \
         --dart-define=BASE_PORT="$BASE_PORT" \

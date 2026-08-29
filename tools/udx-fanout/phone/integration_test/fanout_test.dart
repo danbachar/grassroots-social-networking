@@ -57,6 +57,9 @@ void main() {
       final streams = <int, UDXStream>{};
       final echoes = <int, int>{};
       final probes = <int, int>{};
+      // Round trips, microseconds, cleared each tick. Failures alone give
+      // the cliff; these give the slope leading up to it.
+      final rtts = <int>[];
 
       for (var i = 0; i < _peers; i++) {
         final port = _basePort + i;
@@ -73,8 +76,17 @@ void main() {
             if (text.startsWith('probe ')) {
               probes[port] = (probes[port] ?? 0) + 1;
               emit('probe_recv', {'port': port, 'bytes': bytes.length});
-            } else {
-              echoes[port] = (echoes[port] ?? 0) + 1;
+              return;
+            }
+            echoes[port] = (echoes[port] ?? 0) + 1;
+            // Keepalives carry the microsecond they were sent, so the echo
+            // dates itself and no send-time table has to be kept.
+            final parts = text.split(' ');
+            if (parts.length == 3 && parts[0] == 'ka') {
+              final sentAt = int.tryParse(parts[2]);
+              if (sentAt != null) {
+                rtts.add(DateTime.now().microsecondsSinceEpoch - sentAt);
+              }
             }
           }, onError: (Object e) => emit('stream_error', {
                 'port': port,
@@ -110,19 +122,35 @@ void main() {
         await Future<void>.delayed(Duration(seconds: _keepaliveS));
         tick++;
         var sent = 0, failed = 0;
+        rtts.clear();
+        final fanStart = DateTime.now();
         for (final entry in streams.entries) {
           try {
+            final stamp = DateTime.now().microsecondsSinceEpoch;
             await entry.value
-                .add(Uint8List.fromList(utf8.encode('ka $tick')));
+                .add(Uint8List.fromList(utf8.encode('ka $tick $stamp')));
             sent++;
           } catch (e) {
             failed++;
           }
         }
+        // Let the echoes come back before reading the round trips off.
+        await Future<void>.delayed(const Duration(seconds: 3));
+        final sample = List<int>.from(rtts)..sort();
+        int pct(double q) => sample.isEmpty
+            ? -1
+            : sample[(q * (sample.length - 1)).round()] ~/ 1000;
         emit('keepalive', {
           'tick': tick,
           'sent': sent,
           'failed': failed,
+          // How long one pass over every stream took: the cost of a
+          // keepalive round grows with fan-out even when nothing fails.
+          'fanOutMs': DateTime.now().difference(fanStart).inMilliseconds,
+          'rttSamples': sample.length,
+          'rttP50Ms': pct(0.5),
+          'rttP90Ms': pct(0.9),
+          'rttMaxMs': pct(1.0),
           'echoes': echoes.values.fold<int>(0, (a, b) => a + b),
           'probes': probes.values.fold<int>(0, (a, b) => a + b),
         });

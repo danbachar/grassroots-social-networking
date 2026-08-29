@@ -55,6 +55,7 @@ ADB=(adb)
 "${ADB[@]}" get-state >/dev/null 2>&1 || { echo "no device reachable"; exit 1; }
 DEVICE=$("${ADB[@]}" shell getprop ro.product.model | tr -d '\r')
 echo "device: $DEVICE"
+ON_POWER=0
 
 # Which power file this handset exposes; they differ by vendor and a missing
 # one silently yields an empty column, so find it once and say which it is.
@@ -84,17 +85,27 @@ sample_power() {   # $1 = csv path
     done
 }
 
-restore() {
-    echo "restoring charging state"
-    "${ADB[@]}" shell cmd battery reset >/dev/null 2>&1 || true
+# Charging masks the draw entirely, so the handset has to be on battery.
+# It is unplugged by hand, over wireless adb, rather than with `battery
+# unplug`: simulating the unplug reconfigures USB on some devices and takes
+# adb down mid-run, which loses the run AND strands the phone in a state
+# where it will not charge.
+check_on_battery() {
+    local dump powered
+    dump=$("${ADB[@]}" shell dumpsys battery 2>/dev/null | tr -d '\r')
+    powered=$(awk -F': ' '/powered/ && $2 == "true" {print $1}' <<<"$dump")
+    if [ -n "$powered" ]; then
+        echo "WARNING: still on power ($(tr -d ' ' <<<"$powered" | paste -sd, -))."
+        echo "         Charge counters will not fall and the power column is"
+        echo "         meaningless. Unplug the cable and rerun."
+        return 1
+    fi
+    return 0
 }
-trap restore EXIT
 
 for n in "${PEERS[@]}"; do
     echo "=== fan-out $n ==="
-    # Charging masks draw entirely; unplug for the run and reset afterwards.
-    "${ADB[@]}" shell cmd battery unplug >/dev/null 2>&1 \
-        || echo "warning: could not unplug; current readings include charge"
+    check_on_battery || ON_POWER=1
 
     csv="$OUT/n${n}_power.csv"
     log="$OUT/n${n}_phone.jsonl"
@@ -114,7 +125,6 @@ for n in "${PEERS[@]}"; do
 
     kill "$sampler" 2>/dev/null || true
     wait "$sampler" 2>/dev/null || true
-    "${ADB[@]}" shell cmd battery reset >/dev/null 2>&1 || true
 
     opened=$(grep -o '"opened":[0-9]*' "$log" | tail -1 | cut -d: -f2)
     echo "fan-out $n: exit $rc, opened ${opened:-?}/$n -> $csv"
@@ -123,3 +133,5 @@ done
 
 echo
 echo "results in $OUT/; pair each n<N>_power.csv with n<N>_phone.jsonl by timestamp"
+[ "$ON_POWER" = 1 ] && echo "NOTE: at least one point ran on power; its power column is not usable."
+exit 0

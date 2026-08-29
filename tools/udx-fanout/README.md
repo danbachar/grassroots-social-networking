@@ -36,21 +36,31 @@ cost at that interval.
 Linux host, public IP, `docker compose`:
 
 ```bash
-./gen-compose.py -n 16 && docker compose up -d --build
+./gen-compose.py -n 128 && docker compose up -d --build
+sudo ufw allow 41000:41127/udp
 ```
 
-Open UDP `41000-41015` to the phone. Then, from the phone, open one stream
+Deploy the responders once at the widest fan-out you intend to test, and
+sweep the *phone* against them — the handset is what is under test, and a
+responder that is never dialled costs nothing.
+
+All 128 peers are one process, not 128 containers. Measured: **21 MB
+resident with all 128 streams live** (16 MB idle), against roughly 1.3 GB
+for a container per peer, which a 2 GB host does not have. A peer is a UDP
+socket and a multiplexer, not a runtime, and the phone cannot tell the
+difference — its NAT keys on destination address and port, and those are
+distinct either way. `--shards K` splits the range across K containers
+where crash isolation is worth the memory. Then, from the phone, open one stream
 per port and hold. Read the answer with:
 
 ```bash
 docker compose logs --no-color | ./analyze.py
 ```
 
-Sweep `-n 1 4 8 16 32 64 128` in separate runs, recording phone-side battery
-across each. For the lifetime run instead:
+For the lifetime run, redeploy with a probe window:
 
 ```bash
-./gen-compose.py -n 4 --silence-probe 45 && docker compose up -d --build
+./gen-compose.py -n 128 --silence-probe 45 && docker compose up -d --build
 ```
 
 Without a phone, `bin/probe_client.dart <host> <base-port> <peers> <hold-s>`

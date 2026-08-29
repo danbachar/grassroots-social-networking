@@ -10,6 +10,8 @@ services:
       UDX_PORTS: "41000-41127"
       PEER_PREFIX: "peer"
       SILENCE_PROBE_S: "0"
+      REPORT_S: "10"
+      ECHO: "false"
     logging:
       driver: json-file
       options: {max-size: "50m", max-file: "3"}

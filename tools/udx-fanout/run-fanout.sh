@@ -16,6 +16,8 @@ SERIAL=""
 PEERS=(1 4 16 64)
 HOLD_S=600
 KEEPALIVE_S=20
+CHUNK_BYTES=0
+REPORT_S=10
 BASE_PORT=41000
 SAMPLE_S=5
 OUT="results"
@@ -27,6 +29,10 @@ usage() {
     echo "  --peers N...       Fan-out values to sweep (default: ${PEERS[*]})"
     echo "  --hold N           Seconds to hold each fan-out (default: $HOLD_S)"
     echo "  --keepalive N      Seconds between keepalives (default: $KEEPALIVE_S)"
+    echo "  --chunk N          Bytes per write, turning the hold into a throughput"
+    echo "                     run: every stream writes flat out and the report is"
+    echo "                     goodput and its spread. 0 (default) holds idle."
+    echo "  --report N         Seconds between throughput reports (default: $REPORT_S)"
     echo "  --base-port N      First responder port (default: $BASE_PORT)"
     echo "  --sample N         Seconds between power samples (default: $SAMPLE_S)"
     echo "  --out DIR          Where results land (default: $OUT)"
@@ -39,6 +45,8 @@ while [[ $# -gt 0 ]]; do
         --peers) shift; PEERS=(); while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do PEERS+=("$1"); shift; done ;;
         --hold) HOLD_S="$2"; shift 2 ;;
         --keepalive) KEEPALIVE_S="$2"; shift 2 ;;
+        --chunk) CHUNK_BYTES="$2"; shift 2 ;;
+        --report) REPORT_S="$2"; shift 2 ;;
         --base-port) BASE_PORT="$2"; shift 2 ;;
         --sample) SAMPLE_S="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
@@ -119,7 +127,9 @@ for n in "${PEERS[@]}"; do
         --dart-define=BASE_PORT="$BASE_PORT" \
         --dart-define=PEERS="$n" \
         --dart-define=HOLD_S="$HOLD_S" \
-        --dart-define=KEEPALIVE_S="$KEEPALIVE_S") 2>&1 | tee "$log"
+        --dart-define=KEEPALIVE_S="$KEEPALIVE_S" \
+        --dart-define=CHUNK_BYTES="$CHUNK_BYTES" \
+        --dart-define=REPORT_S="$REPORT_S") 2>&1 | tee "$log"
     rc=$?
     set -e
 

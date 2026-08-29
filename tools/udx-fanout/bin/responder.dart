@@ -58,6 +58,10 @@ List<int> parsePorts(String spec) {
 int _env(String name, int fallback) =>
     int.tryParse(Platform.environment[name] ?? '') ?? fallback;
 
+/// Bytes each port has taken in, for the throughput report.
+final Map<int, int> _bytesIn = {};
+final Map<int, int> _lastBytesIn = {};
+
 Future<void> main(List<String> args) async {
   final spec = Platform.environment['UDX_PORTS'] ??
       Platform.environment['UDX_PORT'] ??
@@ -88,6 +92,38 @@ Future<void> main(List<String> args) async {
     }
   }
 
+  final reportS = _env('REPORT_S', 0);
+  if (reportS > 0) {
+    // Per-datagram lines would be the load, at throughput rates. Report
+    // rates on a timer instead, and say how the slowest stream is doing
+    // next to the fastest — an aggregate alone hides one peer starving.
+    Timer.periodic(Duration(seconds: reportS), (_) {
+      final rates = <int>[];
+      var total = 0, active = 0;
+      for (final e in _bytesIn.entries) {
+        final delta = e.value - (_lastBytesIn[e.key] ?? 0);
+        _lastBytesIn[e.key] = e.value;
+        total += e.value;
+        if (delta > 0) {
+          active++;
+          rates.add(delta ~/ reportS);
+        }
+      }
+      rates.sort();
+      int at(double q) =>
+          rates.isEmpty ? 0 : rates[(q * (rates.length - 1)).round()];
+      emit('all', 'throughput', {
+        'windowS': reportS,
+        'activeStreams': active,
+        'aggregateBps': rates.fold<int>(0, (a, b) => a + b),
+        'perStreamMinBps': rates.isEmpty ? 0 : rates.first,
+        'perStreamP50Bps': at(0.5),
+        'perStreamMaxBps': rates.isEmpty ? 0 : rates.last,
+        'totalBytes': total,
+      });
+    });
+  }
+
   emit('all', 'ready', {
     'bound': bound,
     'requested': ports.length,
@@ -116,6 +152,7 @@ Future<void> serve(
         'bytes': data.length,
       });
 
+  _bytesIn[port] = 0;
   mux.connections.listen((socket) {
     final src = '${socket.remoteAddress.address}:${socket.remotePort}';
     emit(label, 'open', {'src': src, 'port': port});
@@ -145,7 +182,13 @@ Future<void> serve(
 
       stream.data.listen((bytes) async {
         received += bytes.length;
-        emit(label, 'data', {'bytes': bytes.length, 'total': received});
+        _bytesIn[port] = (_bytesIn[port] ?? 0) + bytes.length;
+        if (silenceProbe > 0 || received == bytes.length) {
+          // At throughput rates a line per datagram would BE the load, so
+          // only the first datagram and the probe runs are logged; volume
+          // is carried by the periodic report.
+          emit(label, 'data', {'bytes': bytes.length, 'total': received});
+        }
         armProbe();
         if (echo) {
           try {

@@ -27,6 +27,12 @@ p.add_argument("--shards", type=int, default=1,
 p.add_argument("--silence-probe", type=int, default=0,
                help="seconds of silence before an unsolicited probe; "
                     "0 disables. Set this for the mapping-lifetime run.")
+p.add_argument("--report", type=int, default=10,
+               help="seconds between throughput reports; 0 disables")
+p.add_argument("--echo", action="store_true",
+               help="echo received bytes back. Off by default: under a "
+                    "throughput run an echo doubles the traffic and prices "
+                    "the downlink too, which is a different question.")
 p.add_argument("-o", "--out", default="docker-compose.yml")
 a = p.parse_args()
 
@@ -50,6 +56,8 @@ for i in range(a.shards):
       UDX_PORTS: "{lo}-{hi}"
       PEER_PREFIX: "peer"
       SILENCE_PROBE_S: "{a.silence_probe}"
+      REPORT_S: "{a.report}"
+      ECHO: "{'true' if a.echo else 'false'}"
     logging:
       driver: json-file
       options: {{max-size: "50m", max-file: "3"}}""")

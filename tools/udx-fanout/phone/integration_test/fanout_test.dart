@@ -134,10 +134,21 @@ void main() {
         'peersProbed': probes.length,
       });
 
+      // Tear the whole thing down explicitly, and give the close packets
+      // time to leave before the process exits. A repeat that starts while
+      // the responder still holds the previous run's sockets is not an
+      // independent run — it inherits their state and their flow control.
       for (final s in streams.values) {
-        await s.close();
+        try {
+          await s.close();
+        } catch (_) {
+          // already gone; the point is that nothing is left open
+        }
       }
       mux.close();
+      raw.close();
+      await Future<void>.delayed(const Duration(seconds: 2));
+      emit('closed', {'streams': streams.length});
     });
   }, timeout: Timeout(Duration(seconds: _holdS + 300)));
 }

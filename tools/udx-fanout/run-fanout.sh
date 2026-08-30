@@ -1,3 +1,40 @@
+for n in "${PEERS[@]}"; do
+  for rep in $(seq 1 "$REPS"); do
+    echo "=== fan-out $n, run $rep/$REPS ==="
+    check_on_battery || ON_POWER=1
+
+    csv="$OUT/n${n}_r${rep}_power.csv"
+    log="$OUT/n${n}_r${rep}_phone.jsonl"
+    sample_power "$csv" &
+    sampler=$!
+
+    # Each run is its own `flutter test` process, so its UDP socket, its
+    # multiplexer and every stream on it are created and destroyed inside
+    # that process. Repeats therefore share nothing but the handset — no
+    # inherited flow-control state, no sockets left half-open.
+    set +e
+    (cd "$HERE/phone" && flutter test integration_test/fanout_test.dart \
+        ${SERIAL:+-d "$SERIAL"} \
+        --dart-define=HOST="$HOST" \
+        --dart-define=BASE_PORT="$BASE_PORT" \
+        --dart-define=PEERS="$n" \
+        --dart-define=HOLD_S="$HOLD_S" \
+        --dart-define=KEEPALIVE_S="$KEEPALIVE_S" \
+        --dart-define=CHUNK_BYTES="$CHUNK_BYTES" \
+        --dart-define=REPORT_S="$REPORT_S") 2>&1 | tee "$log"
+    rc=$?
+    set -e
+
+    kill "$sampler" 2>/dev/null || true
+    wait "$sampler" 2>/dev/null || true
+
+    opened=$(grep -o '"opened":[0-9]*' "$log" | tail -1 | cut -d: -f2)
+    closed=$(grep -c '"ev":"closed"' "$log")
+    bps=$(grep -o '"aggregateBps":[0-9]*' "$log" | tail -1 | cut -d: -f2)
+    echo "n=$n run=$rep: exit $rc, opened ${opened:-?}/$n, closed=${closed}, ${bps:-?} B/s"
+    sleep "$SETTLE_S"
+  done
+done
 #!/usr/bin/env bash
 # Sweeps fan-out on a handset: for each N, hold N UDX streams while sampling
 # power, then move on.
@@ -18,6 +55,8 @@ HOLD_S=600
 KEEPALIVE_S=20
 CHUNK_BYTES=0
 REPORT_S=10
+REPS=1
+SETTLE_S=20
 BASE_PORT=41000
 SAMPLE_S=5
 OUT="results"
@@ -33,6 +72,10 @@ usage() {
     echo "                     run: every stream writes flat out and the report is"
     echo "                     goodput and its spread. 0 (default) holds idle."
     echo "  --report N         Seconds between throughput reports (default: $REPORT_S)"
+    echo "  --reps N           Independent runs per fan-out (default: $REPS). Each is"
+    echo "                     its own process, so sockets are built and torn down"
+    echo "                     fresh and runs share no transport state."
+    echo "  --settle N         Seconds between runs (default: $SETTLE_S)"
     echo "  --base-port N      First responder port (default: $BASE_PORT)"
     echo "  --sample N         Seconds between power samples (default: $SAMPLE_S)"
     echo "  --out DIR          Where results land (default: $OUT)"
@@ -47,6 +90,8 @@ while [[ $# -gt 0 ]]; do
         --keepalive) KEEPALIVE_S="$2"; shift 2 ;;
         --chunk) CHUNK_BYTES="$2"; shift 2 ;;
         --report) REPORT_S="$2"; shift 2 ;;
+        --reps) REPS="$2"; shift 2 ;;
+        --settle) SETTLE_S="$2"; shift 2 ;;
         --base-port) BASE_PORT="$2"; shift 2 ;;
         --sample) SAMPLE_S="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;

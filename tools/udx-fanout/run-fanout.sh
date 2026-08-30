@@ -1,40 +1,3 @@
-for n in "${PEERS[@]}"; do
-  for rep in $(seq 1 "$REPS"); do
-    echo "=== fan-out $n, run $rep/$REPS ==="
-    check_on_battery || ON_POWER=1
-
-    csv="$OUT/n${n}_r${rep}_power.csv"
-    log="$OUT/n${n}_r${rep}_phone.jsonl"
-    sample_power "$csv" &
-    sampler=$!
-
-    # Each run is its own `flutter test` process, so its UDP socket, its
-    # multiplexer and every stream on it are created and destroyed inside
-    # that process. Repeats therefore share nothing but the handset — no
-    # inherited flow-control state, no sockets left half-open.
-    set +e
-    (cd "$HERE/phone" && flutter test integration_test/fanout_test.dart \
-        ${SERIAL:+-d "$SERIAL"} \
-        --dart-define=HOST="$HOST" \
-        --dart-define=BASE_PORT="$BASE_PORT" \
-        --dart-define=PEERS="$n" \
-        --dart-define=HOLD_S="$HOLD_S" \
-        --dart-define=KEEPALIVE_S="$KEEPALIVE_S" \
-        --dart-define=CHUNK_BYTES="$CHUNK_BYTES" \
-        --dart-define=REPORT_S="$REPORT_S") 2>&1 | tee "$log"
-    rc=$?
-    set -e
-
-    kill "$sampler" 2>/dev/null || true
-    wait "$sampler" 2>/dev/null || true
-
-    opened=$(grep -o '"opened":[0-9]*' "$log" | tail -1 | cut -d: -f2)
-    closed=$(grep -c '"ev":"closed"' "$log")
-    bps=$(grep -o '"aggregateBps":[0-9]*' "$log" | tail -1 | cut -d: -f2)
-    echo "n=$n run=$rep: exit $rc, opened ${opened:-?}/$n, closed=${closed}, ${bps:-?} B/s"
-    sleep "$SETTLE_S"
-  done
-done
 #!/usr/bin/env bash
 # Sweeps fan-out on a handset: for each N, hold N UDX streams while sampling
 # power, then move on.
@@ -157,14 +120,19 @@ check_on_battery() {
 }
 
 for n in "${PEERS[@]}"; do
-    echo "=== fan-out $n ==="
+  for rep in $(seq 1 "$REPS"); do
+    echo "=== fan-out $n, run $rep/$REPS ==="
     check_on_battery || ON_POWER=1
 
-    csv="$OUT/n${n}_power.csv"
-    log="$OUT/n${n}_phone.jsonl"
+    csv="$OUT/n${n}_r${rep}_power.csv"
+    log="$OUT/n${n}_r${rep}_phone.jsonl"
     sample_power "$csv" &
     sampler=$!
 
+    # Each run is its own `flutter test` process, so its UDP socket, its
+    # multiplexer and every stream on it are created and destroyed inside
+    # that process. Repeats therefore share nothing but the handset — no
+    # inherited flow-control state, no sockets left half-open.
     set +e
     (cd "$HERE/phone" && flutter test integration_test/fanout_test.dart \
         ${SERIAL:+-d "$SERIAL"} \
@@ -182,8 +150,11 @@ for n in "${PEERS[@]}"; do
     wait "$sampler" 2>/dev/null || true
 
     opened=$(grep -o '"opened":[0-9]*' "$log" | tail -1 | cut -d: -f2)
-    echo "fan-out $n: exit $rc, opened ${opened:-?}/$n -> $csv"
-    sleep 30   # let the radio settle before the next point
+    closed=$(grep -c '"ev":"closed"' "$log")
+    bps=$(grep -o '"aggregateBps":[0-9]*' "$log" | tail -1 | cut -d: -f2)
+    echo "n=$n run=$rep: exit $rc, opened ${opened:-?}/$n, closed=${closed}, ${bps:-?} B/s"
+    sleep "$SETTLE_S"
+  done
 done
 
 echo

@@ -23,6 +23,8 @@ SETTLE_S=20
 BASE_PORT=41000
 SAMPLE_S=5
 OUT="results"
+TRANSPORT="udx"
+ISOLATES=1
 
 usage() {
     echo "Usage: $0 --host IP [OPTIONS]"
@@ -42,6 +44,8 @@ usage() {
     echo "  --base-port N      First responder port (default: $BASE_PORT)"
     echo "  --sample N         Seconds between power samples (default: $SAMPLE_S)"
     echo "  --out DIR          Where results land (default: $OUT)"
+    echo "  --transport T      udx (default) or udp (pure UDP, no UDX at all)"
+    echo "  --isolates N       Worker isolates to split PEERS across (default: 1)."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -58,12 +62,19 @@ while [[ $# -gt 0 ]]; do
         --base-port) BASE_PORT="$2"; shift 2 ;;
         --sample) SAMPLE_S="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
+        --transport) TRANSPORT="$2"; shift 2 ;;
+        --isolates) ISOLATES="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
 
 [ -z "$HOST" ] && { echo "--host is required"; usage; exit 1; }
+case "$TRANSPORT" in
+    udx) TEST_FILE="integration_test/fanout_test.dart" ;;
+    udp) TEST_FILE="integration_test/fanout_udp_test.dart" ;;
+    *) echo "--transport must be udx or udp"; exit 1 ;;
+esac
 
 ADB=(adb)
 [ -n "$SERIAL" ] && ADB=(adb -s "$SERIAL")
@@ -134,7 +145,7 @@ for n in "${PEERS[@]}"; do
     # that process. Repeats therefore share nothing but the handset — no
     # inherited flow-control state, no sockets left half-open.
     set +e
-    (cd "$HERE/phone" && flutter test integration_test/fanout_test.dart \
+    (cd "$HERE/phone" && flutter test "$TEST_FILE" \
         ${SERIAL:+-d "$SERIAL"} \
         --dart-define=HOST="$HOST" \
         --dart-define=BASE_PORT="$BASE_PORT" \
@@ -142,7 +153,8 @@ for n in "${PEERS[@]}"; do
         --dart-define=HOLD_S="$HOLD_S" \
         --dart-define=KEEPALIVE_S="$KEEPALIVE_S" \
         --dart-define=CHUNK_BYTES="$CHUNK_BYTES" \
-        --dart-define=REPORT_S="$REPORT_S") 2>&1 | tee "$log"
+        --dart-define=REPORT_S="$REPORT_S" \
+        --dart-define=ISOLATES="$ISOLATES") 2>&1 | tee "$log"
     rc=$?
     set -e
 

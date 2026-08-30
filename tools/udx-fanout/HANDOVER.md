@@ -50,7 +50,12 @@ isolates, not what is currently shipped.
 | 7 | 325.1 | 1,561.3 |
 | 8 | 328.1 | 1,552.8 |
 
-Both shapes peak around N=3-4 and decline afterward — fan-out has a real
+The two shapes differ in where they peak. The isolate-split curve peaks
+at N=4. The single-isolate curve — the one production ships — peaks at
+**N=1** and declines monotonically to N=6 (390.9 down to 320.1), with a
+slight recovery at 7-8 that stays below its N=1 value. There is no
+efficient range at 3-4 in the shipped shape: the first additional peer
+already costs throughput. Both shapes decline afterward — fan-out has a real
 per-stream cost regardless of isolate count, isolates just raise the
 whole curve. Neither shape shows a cliff or starved streams; the
 decline is fair degradation, not failure (0 stalled streams, 0 write
@@ -88,7 +93,7 @@ acknowledgment and retry, which is what UDX exists for.
 
 - **Current production shape** (single-isolate): use the first column
   above as the realistic per-node UDX capacity today. It peaks at
-  ~346-390 kB/s aggregate and *declines* as peer count grows past ~4 —
+  390.9 kB/s with a single peer and *declines* from the second one on —
   a node holding a full-mesh backbone at N=46+ is on the flat/declining
   tail of this curve, well past its efficient range.
 - **Isolate-split ceiling**: the second column is what's achievable if
@@ -106,3 +111,112 @@ acknowledgment and retry, which is what UDX exists for.
   The Internet backbone arm's real conditions are strictly worse than
   what's measured here — treat these numbers as an optimistic ceiling
   for the WAN case, not a prediction of it.
+
+## What is built
+
+`tools/udx-fanout/`, in the app repo on branch
+`claude/grassroots-mesh-simulation-95bcfb`.
+
+- `bin/responder.dart` — N UDX peers, one per UDP port, all in ONE
+  process, speaking the app's own stack (`grassroots_dart_udx`).
+  `UDX_PORTS` takes a range. Sinks by default; `ECHO=true` echoes.
+  `REPORT_S` reports aggregate and per-stream rates on a timer.
+  `SILENCE_PROBE_S` is the mapping-lifetime run. Each bind is guarded and
+  the `ready` line names any port it could not take.
+- `bin/udp_responder.dart` — the raw UDP counterpart.
+- `bin/probe_client.dart` — opens the same streams from any machine.
+  Check a deployment with this before involving a phone.
+- `phone/` — a Flutter `integration_test` that runs on the handset.
+  `CHUNK_BYTES>0` writes flat out; `CHUNK_BYTES=0` holds idle and
+  keepalives, which is the mapping-lifetime and latency run. `ISOLATES`
+  splits the write loop across worker isolates.
+- `run-fanout.sh` — sweeps fan-out and repeats, sampling power alongside.
+  `--transport udx|udp`, `--isolates`, `--reps`, `--chunk`.
+- `summarize.py`, `analyze.py`, `analyze_udp_delivery.py`.
+
+Each run is its own `flutter test` process, so its socket, multiplexer
+and streams are built and destroyed inside it: repeats share no transport
+state. The phone closes everything explicitly and waits before exiting,
+and logs `closed` so it can be confirmed.
+
+## What is NOT measured yet
+
+Everything above is LAN. The Internet leg has never been run in sink
+mode, and two questions are open because of it.
+
+**The NAT question, which decides whether a wide backbone is cheap at
+all.** Each responder logs the source address and port it sees, which is
+the phone's mapping after its NAT rewrote it. Every responder reporting
+the SAME port means the whole fan-out costs ONE mapping and one
+keepalive; a DIFFERENT port per responder means N mappings and N
+keepalives. That distinction belongs to the carrier, not the app, and a
+same-subnet LAN run cannot answer it — there is no NAT in the path, so
+those source ports are just local ephemerals. `analyze.py` reads it out
+of a WAN run's `open` lines.
+
+**Mapping lifetime.** `--silence-probe T` makes a responder go quiet for
+T seconds after the last byte it received, then send unsolicited data. A
+`probe_recv` line on the phone means the mapping survived T seconds of
+silence; its absence is the finding. Binary-search T for the keepalive
+interval every peer has to pay for. Run it with `--chunk 0` and a long
+`--keepalive`, so the phone is genuinely idle.
+
+## Deploying the Internet leg
+
+SSH to `trace-server` works again — the Hetzner Cloud Firewall was
+missing its inbound TCP 22 rule, which is why it timed out while 443 and
+the UDP range answered. The responders at 178.105.61.162 (ports
+41000-41127) are still the ECHO build and have never been redeployed from
+current source, so the WAN numbers that exist are all from a responder
+that echoed every byte back and doubled the radio load.
+
+```bash
+rsync -a --delete --exclude .dart_tool --exclude build --exclude android \
+  --exclude .metadata tools/udx-fanout/ trace-server:~/udx-fanout/
+ssh trace-server 'cd ~/udx-fanout && ./gen-compose.py -n 8 && \
+  docker compose up -d --build && sleep 20 && \
+  docker compose logs --no-color --tail 200 | grep ready'
+```
+
+Expect `"bound":8,"requested":8,"unavailable":[]`. **Do not run one
+container per peer** — 128 of them needs ~1.3 GB and that host has ~1.1
+GB free while running the trace server. One process serving 128 ports
+measures 21 MB. Host networking is required: Docker's bridge rewrites
+inbound UDP source addresses, which erases the NAT measurement.
+
+## Practical notes
+
+- Phone is a **Nexus 5X, Android 8.1**, serial `0253914a45ebaeb0`, also
+  reachable over wireless adb at `192.168.1.13:5555`. It exposes **no
+  readable `current_now`** at any path tried, so power can only come from
+  `charge_counter` deltas.
+- **Never use `cmd battery unplug` on it.** It reconfigures USB, takes
+  adb down mid-run, and leaves the phone believing it is unplugged after
+  adb is gone — so the reset never lands and it sits there not charging.
+  Unplug by hand over wireless adb instead; the script only checks and
+  warns.
+- Its Wi-Fi is often left disabled by BLE testbed runs: `svc wifi enable`.
+- Do not disable Wi-Fi on the Pixel 7a or the two Galaxys — they are
+  wireless-adb only and you will lose them.
+- Run nothing heavy on the Mac without checking what else is on it; it
+  has 10 cores and 16 GB and other work shares them.
+- Standing rules: never `git push` without asking, never delete anything
+  on the trace-upload server, and launch long compute only when asked.
+
+## Why the number matters
+
+The simulator's aggregation arm reaches oracle-level delivery — 0.9931 at
+480 nodes against the oracle's 0.9998 — at less than half the oracle's
+relay cost (5.7 relays per delivery against 12.3). But its backbone is a
+full mesh, and the measured degree distribution is bimodal, not spread:
+members hold zero UDX links and every leader holds exactly *(leaders −
+1)*, which is **44 at 160 nodes, 109 at 320, 168 at 480**, growing
+linearly with the network. The relay split says almost exactly one UDX
+transmission per message (p25 through p99 all equal 1), so a leader is
+not lightly using a wide mesh — any given message needs one specific peer
+out of those 168.
+
+Against that, the measurement above says throughput per peer is already
+falling by the second peer and has not flattened by eight. That gap is
+the case for capping backbone degree and adding multi-hop forwarding
+between leaders, and it is now measured from both ends.

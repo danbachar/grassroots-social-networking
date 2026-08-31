@@ -282,11 +282,10 @@ Future<void> keepaliveLoad(Map<int, UDXStream> streams, Map<int, int> echoes,
 /// progress. Everything here must be safe to pass across an isolate
 /// boundary — plain data only, no UDX objects.
 class _WorkerInit {
-  _WorkerInit(this.sendPort, this.workerIndex, this.ports, this.deadlineMs);
+  _WorkerInit(this.sendPort, this.workerIndex, this.ports);
   final SendPort sendPort;
   final int workerIndex;
   final List<int> ports;
-  final int deadlineMs;
 }
 
 /// A worker's tick: cumulative bytes written per port since the worker
@@ -320,10 +319,10 @@ Future<void> runMultiIsolate() async {
     slices[i % workerCount].add(allPorts[i]);
   }
 
-  final deadline = DateTime.now().add(Duration(seconds: _holdS));
   final receive = ReceivePort();
   final done = <int>{};
   final isolates = <Isolate>[];
+  final workerCommandPorts = <int, SendPort>{};
 
   // Live, merged view: port -> cumulative bytes / errors, kept current by
   // whichever worker last reported. The coordinator's own report timer
@@ -355,6 +354,8 @@ Future<void> runMultiIsolate() async {
     } else if (message is Map && message['ev'] == 'opened_worker') {
       openedOk += message['ok'] as int;
       openedWorkers.add(message['isolate'] as int);
+      workerCommandPorts[message['isolate'] as int] =
+          message['commandPort'] as SendPort;
       if (openedWorkers.length == workerCount && !openedCompleter.isCompleted) {
         openedCompleter.complete();
       }
@@ -372,13 +373,18 @@ Future<void> runMultiIsolate() async {
   for (var w = 0; w < workerCount; w++) {
     final iso = await Isolate.spawn(
       _pushWorkerMain,
-      _WorkerInit(receive.sendPort, w, slices[w], deadline.millisecondsSinceEpoch),
+      _WorkerInit(receive.sendPort, w, slices[w]),
     );
     isolates.add(iso);
   }
 
-  // Workers open their streams concurrently; wait for every worker to
-  // report in, capped so one wedged worker cannot hang the run.
+  // Workers open their streams concurrently but do NOT start writing yet —
+  // each blocks on its own command port until told to go. Without this, an
+  // early isolate's full-throttle write loop competes for scheduling with
+  // isolates still mid-handshake, and can starve them for tens of seconds:
+  // measured once, with 20 isolates spawned unthrottled, the last two took
+  // an extra 38s to complete their handshake, eating the entire hold
+  // window before the write phase could start at all.
   await openedCompleter.future
       .timeout(Duration(seconds: _connectTimeoutS + 15), onTimeout: () {});
 
@@ -390,6 +396,14 @@ Future<void> runMultiIsolate() async {
     }
     receive.close();
     return;
+  }
+
+  // Deadline starts now, once every worker that opened is ready to write —
+  // not at spawn time. Anchoring it earlier would let slow-to-open workers
+  // eat into everyone's write budget, the same bug the go-signal fixes.
+  final deadline = DateTime.now().add(Duration(seconds: _holdS));
+  for (final entry in workerCommandPorts.entries) {
+    entry.value.send({'deadlineMs': deadline.millisecondsSinceEpoch});
   }
 
   while (DateTime.now().isBefore(deadline)) {
@@ -449,7 +463,9 @@ Future<void> runMultiIsolate() async {
 /// cumulative progress back to the coordinator every second.
 Future<void> _pushWorkerMain(_WorkerInit init) async {
   final sendPort = init.sendPort;
-  final deadline = DateTime.fromMillisecondsSinceEpoch(init.deadlineMs);
+  // Own inbox for the coordinator's go-signal, so this worker cannot start
+  // writing until every other worker has also finished opening.
+  final commandPort = ReceivePort();
 
   final raw = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
   final udx = UDX();
@@ -487,9 +503,15 @@ Future<void> _pushWorkerMain(_WorkerInit init) async {
     'isolate': init.workerIndex,
     'ok': streams.length,
     'requested': init.ports.length,
+    'commandPort': commandPort.sendPort,
   });
 
   if (streams.isNotEmpty) {
+    final goMsg = await commandPort.first as Map;
+    final deadline =
+        DateTime.fromMillisecondsSinceEpoch(goMsg['deadlineMs'] as int);
+    commandPort.close();
+
     final chunk = Uint8List(_chunkBytes);
     for (var i = 0; i < chunk.length; i++) {
       chunk[i] = i & 0xff;

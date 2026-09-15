@@ -164,6 +164,16 @@ class TransportsState {
   /// showLinkDiagnostics setting has the poll running).
   final List<BleLinkDiagnostic> bleLinks;
 
+  /// The SYSTEM Bluetooth adapter's power state, or null when it has not
+  /// been learned. The one radio fact only the operator can change, and the
+  /// only one the app cannot fix for itself.
+  ///
+  /// Null is meaningful and must stay reachable: a screen that renders a
+  /// remembered value as a live status shows a warning the operator has
+  /// already acted on, and an alarm that is wrong is one they learn to
+  /// ignore — including on the run where the adapter really is off.
+  final bool? systemBtOn;
+
   const TransportsState({
     this.bleState = TransportState.uninitialized,
     this.udpState = TransportState.uninitialized,
@@ -177,6 +187,7 @@ class TransportsState {
     this.lastUnsolicitedInboundAt,
     this.publicAddressDiscoveryFailed = false,
     this.bleLinks = const [],
+    this.systemBtOn,
   });
 
   static const TransportsState initial = TransportsState();
@@ -228,6 +239,9 @@ class TransportsState {
     DateTime? lastUnsolicitedInboundAt,
     bool? publicAddressDiscoveryFailed,
     List<BleLinkDiagnostic>? bleLinks,
+    // Projected, so it must be settable BACK to null when the fact is lost.
+    bool? systemBtOn,
+    bool clearSystemBtOn = false,
   }) {
     return TransportsState(
       bleState: bleState ?? this.bleState,
@@ -245,6 +259,8 @@ class TransportsState {
       publicAddressDiscoveryFailed:
           publicAddressDiscoveryFailed ?? this.publicAddressDiscoveryFailed,
       bleLinks: bleLinks ?? this.bleLinks,
+      systemBtOn:
+          clearSystemBtOn ? null : (systemBtOn ?? this.systemBtOn),
     );
   }
 

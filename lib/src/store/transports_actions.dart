@@ -5,6 +5,14 @@ import 'transports_state.dart';
 abstract class TransportAction {}
 
 /// Update BLE transport lifecycle state
+/// The SYSTEM Bluetooth adapter changed, or its state became unknown
+/// (null) because the service that reported it went away.
+class SystemBtStateChangedAction extends TransportAction {
+  final bool? on;
+
+  SystemBtStateChangedAction(this.on);
+}
+
 class BleTransportStateChangedAction extends TransportAction {
   final TransportState state;
   final String? error;

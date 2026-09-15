@@ -108,6 +108,13 @@ def synthetic() -> pd.DataFrame:
     # A converge step: no cap, so it is not a cell and must not become one.
     rows.append(marker(dev, t, "N=8 converge", popN=8, order=1))
     rows += establishment(dev, t + 500, 9, "peer9", 0, 7, 8)
+    t += DWELL + GAP
+    # The mirror image: maxParallel with no popN. advertisementCapture sets
+    # maxParallelDials: 0 purely to suppress dialing while measuring raw ADV
+    # capture -- there is no clique population to report -- so this must not
+    # become a (pop_n=0) cell either.
+    rows.append(marker(dev, t, "cap t1", maxParallel=0, rep=1, order=1))
+    rows.append(cell(dev, t + DWELL, "cap t1", 0, 0, 1, 0))
     rows.append(marker(dev, t + DWELL, "end"))
     return pd.DataFrame(rows)
 
@@ -137,6 +144,11 @@ def main() -> int:
     results.append(check(
         "an uncapped converge step is not a cell",
         not (dial.step == "N=8 converge").any(),
+        f"steps={sorted(dial.step.unique())}"))
+    results.append(check(
+        "a suppression-only step (maxParallel, no popN) is not a cell "
+        "either",
+        not (dial.step == "cap t1").any(),
         f"steps={sorted(dial.step.unique())}"))
     results.append(check(
         "populations survive the window join",

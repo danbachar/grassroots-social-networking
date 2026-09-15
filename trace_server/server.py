@@ -46,6 +46,7 @@ import gzip
 import hmac
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -155,7 +156,8 @@ class Store:
                 message_id TEXT,
                 recipient  TEXT,
                 kind       TEXT,              -- data|ack, known at the originator
-                reason     TEXT
+                reason     TEXT,
+                via        TEXT               -- ble|udp on direct/convey custody
             );
             CREATE INDEX IF NOT EXISTS idx_pev_route ON packet_events(exp, packet_id, t);
             CREATE INDEX IF NOT EXISTS idx_pev_event ON packet_events(exp, event);
@@ -201,9 +203,20 @@ class Store:
             );
             """
         )
+        # A database created before the via column existed gains it here;
+        # a fresh one already has it from the script above. Asked rather than
+        # attempted-and-swallowed: catching OperationalError hides every
+        # reason the ALTER can fail, and a failure that is not "column exists"
+        # leaves the column absent while every later packet_events insert
+        # names it — the route index then raises, rolls back, and this
+        # process serves 500s for the rest of its life.
         # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a
         # column added after a database was created has to be applied here or
         # every insert fails against the deployed db.
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(packet_events)")}
+        if "via" not in cols:
+            self._conn.execute("ALTER TABLE packet_events ADD COLUMN via TEXT")
         have = {r[1] for r in self._conn.execute("PRAGMA table_info(uploads)")}
         if "model" not in have:
             self._conn.execute("ALTER TABLE uploads ADD COLUMN model TEXT")
@@ -366,6 +379,10 @@ class Store:
 
         def emit(row: tuple) -> None:
             nonlocal total
+            # The table is 17 columns; older emit sites pass fewer. Pad with
+            # NULLs so every site stays positional without repeating itself.
+            if len(row) < 17:
+                row = row + (None,) * (17 - len(row))
             pending.append(row)
             total += 1
             if len(pending) >= 20000:
@@ -375,7 +392,7 @@ class Store:
             if not pending:
                 return
             wconn.executemany(
-                "INSERT INTO packet_events VALUES (" + ",".join("?" * 16) + ")",
+                "INSERT INTO packet_events VALUES (" + ",".join("?" * 17) + ")",
                 pending)
             wconn.commit()
             pending.clear()
@@ -446,7 +463,7 @@ class Store:
                     pid = str(pid)
                     ev = r.get("event")
                     if rtype == "relay":
-                        name = {"aired": "aired", "dup": "dup"}.get(ev, "relay")
+                        name = "dup" if ev == "dup" else "relay"
                         emit((exp, pid, t, device_id, name, r.get("fromPeer"),
                               None, r.get("ttlIn"), r.get("ttlOut"), r.get("hop"),
                               r.get("dwellMs"), 1 if r.get("carried") else 0,
@@ -454,7 +471,8 @@ class Store:
                     elif rtype == "custody":
                         emit((exp, pid, t, device_id, ev or "custody", None,
                               r.get("toDevice"), None, None, None, None, None,
-                              None, r.get("recipient"), None, r.get("reason")))
+                              None, r.get("recipient"), None, r.get("reason"),
+                              r.get("via")))
                     elif rtype == "packetDup":
                         emit((exp, pid, t, device_id, "packetDup", None, None,
                               None, None, None, None, None, None, None, None,
@@ -508,10 +526,27 @@ class Store:
         return {"exp": exp, "events": total, "packets": packets,
                 "builtAt": _utc_now_iso()}
 
+    # One term per condition the packet table can answer. Each compiles to
+    # SQL twice: as itself and as its negation — a real NOT, not a second
+    # enum value pretending to be one.
+    _COND_SQL = {
+        "relayed":   ("relays > 0",                 "relays = 0"),
+        "delivered": ("(delivers > 0 OR acked > 0)", "(delivers = 0 AND acked = 0)"),
+        "carried":   ("conveys > 0",                "conveys = 0"),
+    }
+    _COND_RE = re.compile(r"^(!?)(relayed|delivered|carried|seen>=(\d+))$")
+
     def packets(self, exp: str, kind: Optional[str] = None,
-                outcome: Optional[str] = None, q: Optional[str] = None,
-                min_hops: int = 0, limit: int = 300) -> List[Dict[str, Any]]:
-        """One row per packet: who minted it, how far it got, how it ended."""
+                cond: Optional[str] = None, mode: str = "and",
+                q: Optional[str] = None, limit: int = 300) -> List[Dict[str, Any]]:
+        """One row per packet: who minted it, how far it got, how it ended.
+
+        `cond` is a comma list of terms, each optionally negated with a
+        leading `!`: relayed, delivered, carried, seen>=N. `mode` joins them
+        with AND (every term holds) or OR (any term holds). Kind and the id
+        search always AND on top — they narrow which packets are considered,
+        the terms say what must be true of them.
+        """
         sql = ("SELECT packet_id, t0, t1, kind, origin, message_id, recipient, "
                "       nodes, relays, delivers, acked, conveys, drops, ttl_min "
                "  FROM packet_summary WHERE exp = ?")
@@ -522,15 +557,28 @@ class Store:
         if kind in ("data", "ack"):
             sql += " AND kind = ?"
             params.append(kind)
-        if outcome == "delivered":
-            sql += " AND (delivers > 0 OR acked > 0)"
-        elif outcome == "undelivered":
-            sql += " AND delivers = 0 AND acked = 0"
-        elif outcome == "multihop":
-            sql += " AND relays > 0"
-        if min_hops:
-            sql += " AND nodes >= ?"
-            params.append(min_hops + 1)
+        if mode not in ("and", "or"):
+            raise ValueError(f"mode must be 'and' or 'or', not {mode!r}")
+        terms: List[str] = []
+        for raw in (cond or "").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            m = self._COND_RE.match(raw)
+            if not m:
+                raise ValueError(f"unknown condition: {raw}")
+            neg, name, n = m.group(1) == "!", m.group(2), m.group(3)
+            if n is not None:
+                count = int(n)
+                if count > 1_000_000:
+                    raise ValueError(f"seen>= is out of range: {count}")
+                terms.append(f"nodes {'<' if neg else '>='} ?")
+                params.append(count)
+            else:
+                terms.append(self._COND_SQL[name][1 if neg else 0])
+        if terms:
+            joiner = " OR " if mode == "or" else " AND "
+            sql += " AND (" + joiner.join(terms) + ")"
         sql += " ORDER BY nodes DESC, t0 ASC LIMIT ?"
         params.append(max(1, min(limit, 2000)))
         with self._lock:
@@ -723,8 +771,9 @@ class GeometryIn(BaseModel):
 
 
 @app.get("/v1/packets")
-def packets(exp: str, kind: Optional[str] = None, outcome: Optional[str] = None,
-            q: Optional[str] = None, minHops: int = 0, limit: int = 300,
+def packets(exp: str, kind: Optional[str] = None, cond: Optional[str] = None,
+            mode: str = "and", q: Optional[str] = None, limit: int = 300,
+            outcome: Optional[str] = None, minHops: Optional[int] = None,
             authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     """Packets of one experiment, summarised — the pick-list for a route view.
 
@@ -737,12 +786,25 @@ def packets(exp: str, kind: Optional[str] = None, outcome: Optional[str] = None,
     _check_auth(authorization)
     if not exp:
         raise HTTPException(status_code=400, detail="exp is required")
+    # outcome/minHops were replaced by the composable cond terms. FastAPI
+    # would drop them silently and answer with an UNFILTERED list, so a saved
+    # URL or a notebook would go on reading numbers that no longer mean what
+    # they say. Refuse instead.
+    if outcome is not None or minHops is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="outcome/minHops are gone; use cond= with terms "
+                   "relayed, delivered, carried, seen>=N (prefix ! to "
+                   "negate) and mode=and|or")
     state = STORE.packet_index_state(exp)
     if not state:
         return {"exp": exp, "index": None, "packets": []}
-    return {"exp": exp, "index": state,
-            "packets": STORE.packets(exp, kind=kind, outcome=outcome, q=q,
-                                     min_hops=minHops, limit=limit)}
+    try:
+        rows = STORE.packets(exp, kind=kind, cond=cond, mode=mode, q=q,
+                             limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"exp": exp, "index": state, "packets": rows}
 
 
 @app.post("/v1/packets/index")

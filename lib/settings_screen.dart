@@ -44,10 +44,37 @@ class SettingsScreen extends StatefulWidget {
   final ExperimentRecorder? experimentRecorder;
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
+  /// Drop EVERY Noise session. Forwarded to the testbed, and also driven by
+  /// the session table's "Clear all" — behind a confirmation in both places,
+  /// because a purge is unrecoverable mid-run (see [onResetSessionWith]).
   final VoidCallback? onResetSessions;
+
+  /// Drop the Noise session with exactly this peer.
+  ///
+  /// Routed as a callback rather than by reaching into `GrassrootsNetwork`
+  /// from the widget, for the same reason every other hook here is: the
+  /// screen renders store state and reports intent, and the coordinator is
+  /// the only thing allowed to touch the session manager — it is what
+  /// guarantees the manager forgets the peer BEFORE the store is told.
+  ///
+  /// Destructive in a way that is easy to underestimate. A packet may not
+  /// exist before a session with its target does, and the send path refuses
+  /// rather than establishes, so a purged session is not a round trip the
+  /// next message pays — it is every message to that peer failing at
+  /// creation until the two devices are in radio range and have handshaked
+  /// again. Under the ring-radius gate a non-neighbour can never re-handshake
+  /// at all, so a purge mid-run kills that peer for the rest of the run.
+  /// Hence the confirmation on every path that reaches it.
+  final void Function(Uint8List peer)? onResetSessionWith;
   final VoidCallback? onResetDtnBuffer;
+
+  /// DEBUG/TESTBED. Arm or disarm the ring-radius link gate.
+  final Future<void> Function(List<String> rosterHex, int? radius)?
+      onSetRingGate;
+
+  /// DEBUG/TESTBED. Sever every GATT link, keeping sessions and DTN state.
+  final Future<void> Function()? onSeverLinks;
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
-  final int Function()? bleWireBytes;
   final bool Function()? bleUsable;
   final bool Function()? bleUndiscoverable;
   final Stream<bool>? bleUsableChanges;
@@ -56,17 +83,25 @@ class SettingsScreen extends StatefulWidget {
   /// Sessions in the Noise table, forwarded to the testbed.
   final int Function()? sessionTableCount;
   final Future<void> Function(bool on)? onSetBle;
-  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+  final Future<void> Function(int? darkSec,
+      {Future<void> Function()? whileDark, int? untilMs})?
       onResetLinks;
+
   final bool Function(Uint8List peer)? linkSettled;
 
   /// Whether a Noise session exists with this peer — what a send is gated on.
   final bool Function(Uint8List peer)? sessionUp;
+  final bool? Function()? systemBtOn;
+  final Future<void> Function()? refreshSystemBt;
   final Stream<Uint8List>? sessionEvents;
   final Stream<Uint8List>? linkSettledEvents;
 
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
+
+  /// Record every advertisement sighting (see
+  /// FieldPlan.traceEveryAdvertisement).
+  final void Function(bool every)? onSetTraceEveryAdvertisement;
   final int Function()? establishmentCount;
   final VoidCallback? onResetEstablishmentCount;
 
@@ -83,9 +118,11 @@ class SettingsScreen extends StatefulWidget {
     this.experimentRecorder,
     this.sendMessage,
     this.onResetSessions,
+    this.onResetSessionWith,
     this.onResetDtnBuffer,
+    this.onSetRingGate,
+    this.onSeverLinks,
     this.onCryptoBench,
-    this.bleWireBytes,
     this.bleUsable,
     this.bleUndiscoverable,
     this.bleUsableChanges,
@@ -95,9 +132,12 @@ class SettingsScreen extends StatefulWidget {
     this.onResetLinks,
     this.linkSettled,
     this.sessionUp,
+    this.systemBtOn,
+    this.refreshSystemBt,
     this.sessionEvents,
     this.linkSettledEvents,
     this.onSetDialParallelism,
+    this.onSetTraceEveryAdvertisement,
     this.establishmentCount,
     this.onResetEstablishmentCount,
   });
@@ -111,6 +151,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _udpEnabled;
   bool _isRetryingPublicAddressDiscovery = false;
   StreamSubscription<AppState>? _storeSubscription;
+
+  /// Ring radius entry. Free numeric input rather than a fixed set of choices:
+  /// the meaningful radii depend on the roster a plan brings, and a control
+  /// built from whatever roster happens to be loaded offers the wrong ones the
+  /// moment that roster changes — or none at all when there is none.
+  final TextEditingController _ringRadiusController = TextEditingController();
 
   @override
   void initState() {
@@ -135,6 +181,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     _storeSubscription?.cancel();
+    _ringRadiusController.dispose();
     super.dispose();
   }
 
@@ -183,6 +230,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // Debug: BLE role mode (auto / central-only / peripheral-only).
           if (_bluetoothEnabled && widget.onBleRoleModeChanged != null)
             _buildBleRoleModeSelector(),
+          if (widget.onSetRingGate != null) _buildRingRadiusSelector(),
 
           if (_bluetoothEnabled) _buildColdCallTrustSelector(),
 
@@ -258,6 +306,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const Divider(height: 32),
 
+          // Noise session table (debug)
+          _buildSessionTableSection(),
+
+          const Divider(height: 32),
+
           // Debug Logs
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -328,8 +381,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                                                       sendMessage: widget.sendMessage,
                       onResetSessions: widget.onResetSessions,
                       onResetDtnBuffer: widget.onResetDtnBuffer,
+                      onSetRingGate: widget.onSetRingGate,
+                      onSeverLinks: widget.onSeverLinks,
                       onCryptoBench: widget.onCryptoBench,
-                      bleWireBytes: widget.bleWireBytes,
                       bleUsable: widget.bleUsable,
       bleUndiscoverable: widget.bleUndiscoverable,
                       bleUsableChanges: widget.bleUsableChanges,
@@ -339,9 +393,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
                       sessionUp: widget.sessionUp,
+                      systemBtOn: widget.systemBtOn,
+                      refreshSystemBt: widget.refreshSystemBt,
                       sessionEvents: widget.sessionEvents,
                       linkSettledEvents: widget.linkSettledEvents,
                       onSetDialParallelism: widget.onSetDialParallelism,
+                      onSetTraceEveryAdvertisement:
+                          widget.onSetTraceEveryAdvertisement,
                       establishmentCount: widget.establishmentCount,
                       onResetEstablishmentCount:
                           widget.onResetEstablishmentCount,
@@ -447,6 +505,113 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  /// DEBUG/TESTBED. The ring-radius link gate: which radius is armed, and the
+  /// switch that disarms it.
+  ///
+  /// Deliberately says NOTHING about the roster — not its size, not this
+  /// device's position in it, not which peers the current radius reaches. A
+  /// radius is a standing policy; the roster is whatever plan happens to be
+  /// loaded at this instant. Describing one in terms of the other made the
+  /// panel read as a live topology view, which it is not: it went stale the
+  /// moment a different plan loaded, and it offered a set of radii derived
+  /// from however many phones were on the desk that evening.
+  ///
+  /// Visible because the gate is PERSISTED and enforced on both ends. Without a
+  /// control here an armed radius survives an app restart, a device reboot, a
+  /// Bluetooth stack restart and a transport toggle, and the only symptom is
+  /// that two particular phones will not link — which reads exactly like a dead
+  /// radio and cost an evening before this existed. Worse, it is
+  /// self-perpetuating: the ring sweep's own warm-up needs every pair to
+  /// handshake, and a gate left armed refuses the very links that warm-up
+  /// depends on, so the run can never start again.
+  ///
+  /// The roster is not editable here. It arrives with a plan and is hardware,
+  /// not policy; this screen only says which of it is currently reachable and
+  /// lets the constraint be lifted.
+  Widget _buildRingRadiusSelector() {
+    final radius = widget.store.state.settings.ringRadius;
+
+    Future<void> apply(int? next) async {
+      await widget.onSetRingGate
+          ?.call(widget.store.state.settings.ringRoster, next);
+      widget.onSettingsChanged?.call();
+      _ringRadiusController.text = next?.toString() ?? '';
+      if (mounted) setState(() {});
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.bug_report_outlined,
+                  size: 16, color: GlColors.warning),
+              SizedBox(width: 6),
+              Text(
+                'Ring radius (debug)',
+                style: TextStyle(
+                  fontSize: GlType.textSm,
+                  fontWeight: FontWeight.w600,
+                  color: GlColors.warning,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: GlSpace.s1),
+          Text(
+            radius == null
+                ? 'Off. Link formation is unconstrained.'
+                : 'Armed at $radius: a link may only span $radius hop(s) '
+                    'around the ring, which is ordered by sorted pubkey. '
+                    'Peers further round are refused, in both directions.',
+            style: const TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              SizedBox(
+                width: 96,
+                child: TextField(
+                  controller: _ringRadiusController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'radius',
+                    hintText: 'off',
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  onSubmitted: (v) async {
+                    // Blank, zero or nonsense all mean off. A radius of zero
+                    // would permit no link at all, which is never what anyone
+                    // wants from a text field and is better spelled "off".
+                    final parsed = int.tryParse(v.trim());
+                    await apply(parsed == null || parsed <= 0 ? null : parsed);
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              TextButton(
+                onPressed: () async {
+                  final parsed =
+                      int.tryParse(_ringRadiusController.text.trim());
+                  await apply(parsed == null || parsed <= 0 ? null : parsed);
+                },
+                child: const Text('Apply'),
+              ),
+              TextButton(
+                onPressed: radius == null ? null : () => apply(null),
+                child: const Text('Off'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildBleRoleModeSelector() {
     final mode = widget.store.state.settings.bleRoleMode;
     return Padding(
@@ -535,6 +700,239 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
+  }
+
+  /// Every Noise session this device currently holds, one row each, with a
+  /// per-row purge and a purge-everything button.
+  ///
+  /// Read from the SESSIONS slice and NOT from the peer list, and the two are
+  /// genuinely different sets — this is the whole reason the section is worth
+  /// having. A session is keyed by identity and lives until an explicit
+  /// reset; a peer record is presence-scoped, and the stale sweep deletes a
+  /// quiet non-friend from `peersList` after ten silent announce cycles while
+  /// its session survives untouched. That peer is still perfectly sendable —
+  /// `hasSession` short-circuits the establish, the message seals and goes to
+  /// the DTN buffer — so a table driven off `peersList` would hide exactly
+  /// the sessions whose existence is least obvious from anywhere else in the
+  /// UI. Iterating the session slice and looking the peer record up
+  /// OPTIONALLY (falling back to the pubkey prefix for a name) is what makes
+  /// those rows visible.
+  ///
+  /// Rows are ordered by pubkey hex, not by recency. Recency is the more
+  /// interesting sort and it was the first instinct, but each row carries a
+  /// destructive button: a list that reorders when a handshake completes
+  /// moves a delete target under the operator's finger between the glance and
+  /// the tap, and the thing they would hit by mistake is unrecoverable
+  /// mid-run. A deterministic order costs nothing and cannot do that.
+  Widget _buildSessionTableSection() {
+    final sessions = widget.store.state.sessions;
+    final hexes = sessions.peerHexes.toList()..sort();
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.vpn_key_outlined, size: 16, color: GlColors.warning),
+              SizedBox(width: 6),
+              Text(
+                'Noise sessions (debug)',
+                style: TextStyle(
+                  fontSize: GlType.textSm,
+                  fontWeight: FontWeight.w600,
+                  color: GlColors.warning,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: GlSpace.s1),
+          const Text(
+            'Peers this device can seal a message to right now. A session '
+            'outlives the link that formed it, so a peer here may be out of '
+            'range and still sendable — the message is carried. A peer that '
+            'is NOT here cannot be messaged at all: a packet is never created '
+            'without a session, and only a fresh handshake at direct range '
+            'brings one back.',
+            style: TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
+          ),
+          const SizedBox(height: GlSpace.s2),
+          Text(
+            hexes.isEmpty
+                ? 'No sessions — nothing can be messaged from this device.'
+                : '${hexes.length} session${hexes.length == 1 ? '' : 's'}',
+            style: const TextStyle(
+              fontSize: GlType.textXs,
+              color: GlColors.textStrong,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: GlSpace.s2),
+          for (final hex in hexes)
+            _buildSessionRow(hex, sessions.establishedAtMs[hex]!, now),
+          if (hexes.isNotEmpty) ...[
+            const SizedBox(height: GlSpace.s2),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: widget.onResetSessions == null
+                    ? null
+                    : () => _confirmClearAllSessions(hexes.length),
+                icon: const Icon(Icons.delete_forever_outlined, size: 16),
+                label: const Text('Clear all sessions'),
+                style: TextButton.styleFrom(
+                  foregroundColor: GlColors.danger,
+                  textStyle: const TextStyle(fontSize: GlType.textSm),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// One session row. [hex] is the peer's lowercase pubkey hex — the session
+  /// slice's key and the ONLY identifier guaranteed to exist here, since the
+  /// peer record it names may have been swept.
+  Widget _buildSessionRow(String hex, int establishedAtMs, int nowMs) {
+    final peer = widget.store.state.peers.getPeerByPubkeyHex(hex);
+    final nickname = peer?.nickname ?? '';
+    final named = nickname.isNotEmpty;
+    final prefix = hex.length >= 16 ? hex.substring(0, 16) : hex;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  // No peer record is not an error state and must not read
+                  // like one: the sweep drops a quiet non-friend's record
+                  // while its session stays live and sendable. The pubkey is
+                  // the identity; the nickname was only ever cosmetic.
+                  named ? nickname : prefix,
+                  style: TextStyle(
+                    fontSize: GlType.textSm,
+                    fontWeight: FontWeight.w600,
+                    color: named ? GlColors.textStrong : GlColors.textMuted,
+                  ),
+                ),
+                if (named)
+                  Text(
+                    prefix,
+                    style: GlType.monoStyle(GlType.text2xs,
+                        color: GlColors.textSubtle),
+                  ),
+                Text(
+                  '${_sessionAgeLabel(nowMs - establishedAtMs)}'
+                  '${named ? '' : ' · no peer record'}',
+                  style: const TextStyle(
+                      fontSize: GlType.text2xs, color: GlColors.textSubtle),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            onPressed: widget.onResetSessionWith == null
+                ? null
+                : () => _confirmResetSessionWith(hex, named ? nickname : null),
+            icon: const Icon(Icons.delete_outline, size: 18),
+            color: GlColors.danger,
+            tooltip: 'Drop this session',
+            visualDensity: VisualDensity.compact,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// How long ago the session established, coarsened as it ages. The exact
+  /// millisecond is never the question being asked here — "did this form in
+  /// this stage or the last one" is — so seconds resolution near zero and
+  /// minutes beyond it is what the label carries.
+  String _sessionAgeLabel(int ageMs) {
+    if (ageMs < 0) return 'established just now';
+    final seconds = ageMs ~/ 1000;
+    if (seconds < 60) return 'established ${seconds}s ago';
+    final minutes = seconds ~/ 60;
+    if (minutes < 60) return 'established ${minutes}m ago';
+    final hours = minutes ~/ 60;
+    if (hours < 24) return 'established ${hours}h ${minutes % 60}m ago';
+    return 'established ${hours ~/ 24}d ${hours % 24}h ago';
+  }
+
+  /// Peer pubkey hex back to the bytes the coordinator keys on. The session
+  /// slice stores hex because it is a map key; the session manager and the
+  /// action both take the raw key, so exactly one conversion belongs here.
+  /// A malformed key is not tolerated — it cannot be a session key, and
+  /// silently skipping it would leave a delete button that does nothing.
+  static Uint8List _pubkeyBytes(String hex) => Uint8List.fromList([
+        for (var i = 0; i < hex.length; i += 2)
+          int.parse(hex.substring(i, i + 2), radix: 16),
+      ]);
+
+  Future<void> _confirmResetSessionWith(String hex, String? nickname) async {
+    final who = nickname ?? hex.substring(0, hex.length >= 16 ? 16 : hex.length);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Drop this session?'),
+        content: Text(
+          'The Noise session with $who is deleted from this device. Until '
+          'the two devices are in direct range and handshake again, every '
+          'message to this peer FAILS at creation — no packet is made, so '
+          'nothing is buffered or carried. If a link gate is active and this '
+          'peer is not a current neighbour, they cannot re-handshake at all.',
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Drop')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    widget.onResetSessionWith?.call(_pubkeyBytes(hex));
+  }
+
+  Future<void> _confirmClearAllSessions(int count) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear ALL sessions?'),
+        content: Text(
+          'All $count Noise session(s) are deleted from this device.\n\n'
+          'If an experiment is running, this ruins the run. Every later '
+          'message to a peer that is not a direct neighbour fails at '
+          'creation — no packet exists without a session — and under a link '
+          'gate those peers can never re-handshake, so the failures are '
+          'silent and permanent for the rest of the run. Stop and restart the '
+          'run rather than trying to recover it.',
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              style: FilledButton.styleFrom(backgroundColor: GlColors.danger),
+              child: const Text('Clear all')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    widget.onResetSessions?.call();
   }
 
   Widget _buildFacilitateInvitesSection() {

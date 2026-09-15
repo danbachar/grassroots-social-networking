@@ -30,10 +30,9 @@ class FragmentHandler {
   /// actually negotiates rather than merely the one requested. Against a peer
   /// that settles lower, a full-width fragment truncates. Nothing in the
   /// traces reports a negotiated value — MTU is recorded only alongside a
-  /// drop — so the way to hold this number honest is the ATT-ceiling probe
-  /// (`Raw link: ATT ceiling probe` — see [FieldPlanPresets.rawLink]), which
-  /// walks the write size across the boundary and finds where the peer stops
-  /// parsing.
+  /// drop — so the way to hold this number honest is an ATT-ceiling probe
+  /// that walks the write size across the boundary and finds where the peer
+  /// stops parsing.
   static const int _bleFloorMtu = 247;
   static const int _packetFixedOverhead =
       GrassrootsPacket.headerSize + 25 + 21; // = 106
@@ -45,12 +44,18 @@ class FragmentHandler {
   /// single frame carries no more than a fragment does).
   static const int fragmentThreshold = maxFragmentPayload;
 
-  /// Inter-fragment send delay (avoids overwhelming the BLE buffer).
+  /// Spacing between consecutive fragment writes on one link, applied by
+  /// [send] — the only way fragments reach the air.
+  ///
+  /// The radio's buffer drains slower than a send loop fills it, and an
+  /// overflowed write is refused — costing the whole message, since one
+  /// missing fragment never reassembles.
   static const Duration fragmentDelay = Duration(milliseconds: 20);
 
   /// Timeout for an incomplete reassembly. Must outlast the slowest transfer
-  /// we allow: a capped file at ~138 B/fragment × 20 ms/fragment. Sized for
-  /// the ~1 MB attachment cap (~8k fragments ≈ 160 s) plus slack.
+  /// we allow: a capped file at [maxFragmentPayload] per fragment,
+  /// [fragmentDelay] apart. Sized for the ~1 MB attachment cap (~7.6k
+  /// fragments ≈ 152 s) plus slack.
   static const Duration reassemblyTimeout = Duration(minutes: 4);
 
   final Map<String, _ReassemblyState> _reassemblyBuffer = {};
@@ -68,8 +73,8 @@ class FragmentHandler {
   int get reassemblyCount => _reassemblyBuffer.length;
 
   /// Bytes currently held across all partial reassemblies.
-  int get reassemblyBytes => _reassemblyBuffer.values
-      .fold(0, (sum, s) => sum + s.bufferedBytes);
+  int get reassemblyBytes =>
+      _reassemblyBuffer.values.fold(0, (sum, s) => sum + s.bufferedBytes);
 
   FragmentHandler() {
     _startCleanupTimer();
@@ -83,8 +88,8 @@ class FragmentHandler {
   ///
   /// A payload at or below the chunk budget yields a single frame
   /// (`fragCount == 1`); larger payloads are chunked at the budget. The caller
-  /// seals each frame into its own [PacketType.secure] packet and floods them
-  /// [fragmentDelay] apart.
+  /// seals each frame into its own [PacketType.secure] packet and puts them
+  /// on the air through [send].
   ///
   /// [chunkBudget] overrides the chunk size AND the single-vs-multi threshold.
   /// Null (the default) is the sealed end-to-end path, sized to the floor MTU
@@ -127,6 +132,33 @@ class FragmentHandler {
       ));
     }
     return frames;
+  }
+
+  /// Hand [parts] to [write] one at a time, spacing consecutive writes that
+  /// reached a radio [fragmentDelay] apart.
+  ///
+  /// EVERY fragmented send goes through here — a sealed application message,
+  /// a cleartext neighbour-local ANNOUNCE, a Noise handshake. The layer that
+  /// splits a payload is the layer that meters it back out, so nothing above
+  /// decides whether its own kind of message is short enough to skip the
+  /// spacing. A caller that loops over [framesFor]'s output itself is a bug:
+  /// the burst it lets through is indistinguishable from any other.
+  ///
+  /// [write] reports whether the part reached a radio buffer. False covers a
+  /// refused write, a part that was only buffered for later conveyance, and a
+  /// flow-controlled stream that meters itself — none of which leave anything
+  /// to drain, so none of them are waited on. Nothing is waited on after the
+  /// last part either.
+  Future<void> send<P>(
+    List<P> parts,
+    Future<bool> Function(P part) write,
+  ) async {
+    for (var i = 0; i < parts.length; i++) {
+      final reachedRadio = await write(parts[i]);
+      if (reachedRadio && i < parts.length - 1) {
+        await Future.delayed(fragmentDelay);
+      }
+    }
   }
 
   /// Accept a decrypted [frame]. Returns the complete payload when the logical
@@ -183,8 +215,7 @@ class _ReassemblyState {
 
   int get chunkCount => _chunks.length;
 
-  int get bufferedBytes =>
-      _chunks.values.fold(0, (sum, c) => sum + c.length);
+  int get bufferedBytes => _chunks.values.fold(0, (sum, c) => sum + c.length);
 
   bool get isComplete => _chunks.length == totalFragments;
 

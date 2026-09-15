@@ -180,6 +180,7 @@ abstract class TransportService {
   ///
   /// Returns true if the data was sent (or queued) successfully.
   /// Note: This doesn't guarantee delivery for unreliable transports.
+  ///
   Future<bool> sendToPeer(String peerId, Uint8List data);
 
   /// Broadcast data to all connected peers. Returns the number of peers it was

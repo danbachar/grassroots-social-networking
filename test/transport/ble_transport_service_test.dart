@@ -2379,21 +2379,106 @@ void main() {
       hostApi.calls.clear();
     }
 
-    test('the caller is answered at once; the write goes out on the MTU',
-        () async {
+    test('the one-leg-per-peer picker prefers a leg that can CARRY the frame '
+        'over the notify preference', () async {
+      // Roughly three quarters of pairs hold one leg at the ATT default and
+      // one at 517 at some point, and the default one lingers for a median
+      // 1.5 s (p90 11-34 s under load). Preferring notify blindly picks the
+      // small one and spends the packet.
+      BlePath leg(String id, BleRole role, int mtu) => BlePath(
+            pathId: id,
+            role: role,
+            state: BlePathState.ready,
+            rssi: -50,
+            mtu: mtu,
+            canSend: true,
+          );
+      final key = Uint8List.fromList(List.filled(32, 9));
+      Uint8List? pubkeyFor(String _) => key;
+      final legs = [
+        leg('peripheral:P', BleRole.peripheral, 23),
+        leg('central:P', BleRole.central, 517),
+      ];
+
+      // Small frame: both legs carry it, so the notify preference decides.
+      var picked = BleTransportService.selectBroadcastTargets(
+          ready: legs, pubkeyFor: pubkeyFor, bytes: 10);
+      expect(picked.single.pathId, 'peripheral:P',
+          reason: 'notify is still preferred when the frame fits both');
+
+      // Handshake-sized: only the wide leg can carry it.
+      picked = BleTransportService.selectBroadcastTargets(
+          ready: legs, pubkeyFor: pubkeyFor, bytes: 113);
+      expect(picked.single.pathId, 'central:P',
+          reason: 'being able to send at all outranks the notify preference');
+
+      // No size given: unchanged behaviour.
+      picked = BleTransportService.selectBroadcastTargets(
+          ready: legs, pubkeyFor: pubkeyFor);
+      expect(picked.single.pathId, 'peripheral:P');
+    });
+
+    test('a frame too big for the chosen leg goes out on the pair\'s wider '
+        'leg instead of being spent on the small one', () async {
+      // The measured field state: a pair holding one leg at the ATT default
+      // and one at 517 in the same instant. A handshake frame is 86-113
+      // bytes, so the default leg refuses it, and with no fallback found the
+      // write is HELD for an MTU exchange the other leg already completed —
+      // leaving the peer sessionless while its partner keeps sending.
+      final peer = await _makeIdentity('WidePeer');
+      for (final leg in [
+        ('peripheral:WIDE', BleRole.peripheral, 23),
+        ('central:WIDE', BleRole.central, 517),
+      ]) {
+        callbacks.pushPath(BlePath(
+          pathId: leg.$1,
+          role: leg.$2,
+          state: BlePathState.ready,
+          rssi: null,
+          mtu: leg.$3,
+          canSend: true,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'WidePeer',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:WIDE',
+        bleCentralDeviceId: 'central:WIDE',
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+
+      // Handshake-sized, far past the small leg's 20 usable bytes.
+      final ok = await transport.sendToPeer(
+          'peripheral:WIDE', Uint8List.fromList(List.filled(113, 7)));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(ok, isTrue, reason: 'the pair could carry this frame');
+      final sends = hostApi.calls.where((c) => c.startsWith('send:')).toList();
+      expect(sends, hasLength(1), reason: 'exactly one leg is written');
+      expect(sends.single, contains('central:WIDE'),
+          reason: 'the wider leg carries it; the 23-byte leg is never tried');
+    });
+
+    test('a write onto a leg whose MTU has not landed is refused NOW, and '
+        'named apart from a genuine oversize', () async {
       await singleLegAtDefault();
 
-      // 113 bytes is the first Noise handshake message that was refused four
-      // times per reconnection in the field: too big for 20 usable bytes,
-      // nowhere else to go. The caller must NOT be held while the leg
-      // negotiates — the announce loop and the flood iterate peers serially,
-      // and one cold leg awaiting its MTU would stall every peer behind it.
-      final aired = await transport.broadcast(Uint8List(113))
+      // 113 bytes is the first Noise handshake message: too big for 20
+      // usable bytes, and this pair has nowhere else to put it. The write is
+      // refused immediately rather than held — holding it would be a
+      // sender-side retry queue, which this design does not have. The DTN
+      // buffer and the sync exchange are what redeliver an unplaced packet.
+      final aired = await transport
+          .broadcast(Uint8List(113))
           .timeout(const Duration(milliseconds: 500));
-      expect(aired, 0, reason: 'same immediate answer a refusal always gave');
-      expect(hostApi.calls, isEmpty);
+      expect(aired, 0, reason: 'refused, and the caller is told at once');
+      expect(hostApi.calls, isEmpty, reason: 'nothing is spent on the air');
 
-      // The MTU arrives ~95 ms later on hardware; deliver it now.
+      // And when the MTU does land, nothing fires retroactively: the packet
+      // is not owed a second life by this layer.
       callbacks.pushPath(BlePath(
         pathId: 'peripheral:PAIR',
         role: BleRole.peripheral,
@@ -2403,22 +2488,18 @@ void main() {
         canSend: true,
       ));
       await Future<void>.delayed(Duration.zero);
-
-      expect(hostApi.calls, ['send:peripheral:PAIR:113'],
-          reason: 'the held write goes out the moment the leg can carry it');
+      expect(hostApi.calls, isEmpty,
+          reason: 'no held queue drains behind the caller\'s back');
     });
 
-    test('a leg that never negotiates gets the write anyway, once', () async {
+    test('a small write still goes out on a default-MTU leg', () async {
       await singleLegAtDefault();
-
-      expect(await transport.broadcast(Uint8List(113)), 0);
-
-      // No MTU ever arrives. The deadline sends rather than holding forever;
-      // at 20 usable bytes the attempt is refused, which is the pre-deferral
-      // outcome — deferral may only ever turn a certain loss into a chance.
-      await Future<void>.delayed(const Duration(milliseconds: 3400));
-      expect(hostApi.calls, isEmpty,
-          reason: 'refused by the size check before reaching the stack');
+      // The refusal is about SIZE, not about the leg being young: 20 usable
+      // bytes still carry anything that fits.
+      final aired = await transport.broadcast(Uint8List(12));
+      await Future<void>.delayed(Duration.zero);
+      expect(aired, 1);
+      expect(hostApi.calls, ['send:peripheral:PAIR:12']);
     });
 
     test('disposal cancels a held write instead of leaking its timer',
@@ -2439,6 +2520,355 @@ void main() {
       await singleLegAtDefault();
       expect(await transport.broadcast(Uint8List(16)), 1);
       expect(hostApi.calls, ['send:peripheral:PAIR:16']);
+    });
+  });
+  /// The ring-radius link gate (DEBUG/TESTBED). See
+  /// `lib/src/testbed/ring_topology.dart` for what the ring is.
+  ///
+  /// The dial tests drive [BleTransportService.connectToDevice] directly rather
+  /// than through an advertisement. That is deliberate: `connectToDevice` is
+  /// THE dial choke point, and going through a sighting would also drag in the
+  /// first-mover election, whose UUID ordering is independent of the ring's
+  /// pubkey ordering and would make which peer can be tested a matter of luck.
+  /// The advertisement path is covered by the rest of this suite, which passes
+  /// unchanged and is itself the proof that the gate is inert when unarmed.
+  group('BleTransportService — ring-radius gate', () {
+    late _RecordingHostApi hostApi;
+    late FakeGrassrootsBluetoothCallbacks callbacks;
+    late Store<AppState> store;
+    late _CapturingTrace trace;
+    late BleTransportService transport;
+    late GrassrootsIdentity self;
+    // The ring, in ring order (sorted pubkey hex). `self` is one of them.
+    late List<GrassrootsIdentity> ring;
+
+    String hexOf(GrassrootsIdentity id) =>
+        id.publicKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+    setUp(() async {
+      hostApi = _RecordingHostApi();
+      callbacks = FakeGrassrootsBluetoothCallbacks();
+      final ble =
+          GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
+      store = Store<AppState>(appReducer, initialState: AppState.initial);
+      store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      trace = _CapturingTrace();
+      await trace.startExperiment('ring-gate');
+
+      final members = [
+        for (var i = 0; i < 4; i++) await _makeIdentity('Ring$i'),
+      ]..sort((a, b) => hexOf(a).compareTo(hexOf(b)));
+      ring = members;
+      self = members.first; // ring position 0
+
+      transport = BleTransportService(
+        identity: self,
+        store: store,
+        grassrootsBluetooth: ble,
+        trace: trace,
+      );
+      await transport.initialize();
+    });
+
+    tearDown(() async {
+      await transport.dispose();
+    });
+
+    void armRing({required int? radius}) {
+      store.dispatch(SetRingGateAction(
+        rosterHex: ring.map(hexOf).toList(),
+        radius: radius,
+      ));
+    }
+
+    /// Ring positions relative to `self` at index 0 on a 4-ring:
+    /// 1 and 3 are the neighbours, 2 is the opposite peer (distance 2).
+    GrassrootsIdentity neighbour() => ring[1];
+    GrassrootsIdentity opposite() => ring[2];
+
+    Future<bool> dial(GrassrootsIdentity peer, {String mac = 'MACX'}) =>
+        transport.connectToDevice('central:$mac',
+            serviceUuidOverride: peer.bleServiceUuid);
+
+    List<Map<String, dynamic>> skipsWithReason(String reason) => trace.records
+        .where((r) => r['event'] == 'dialSkip' && r['reason'] == reason)
+        .toList();
+
+    test('refuses a dial to the opposite peer at r=1', () async {
+      armRing(radius: 1);
+      hostApi.calls.clear();
+
+      expect(await dial(opposite()), isFalse);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'a peer two hops around the ring must not be dialed at r=1');
+      expect(skipsWithReason('ringRadius'), hasLength(1),
+          reason: 'the refusal must be attributable in the trace');
+    });
+
+    test('allows a dial to either ring neighbour at r=1', () async {
+      armRing(radius: 1);
+      hostApi.calls.clear();
+
+      expect(await dial(neighbour(), mac: 'NEAR1'), isTrue);
+      expect(await dial(ring[3], mac: 'NEAR2'), isTrue,
+          reason: 'the wrap-around neighbour is adjacent too');
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), hasLength(2));
+      expect(skipsWithReason('ringRadius'), isEmpty);
+    });
+
+    test('at r=2 the 4-ring is complete, so the opposite peer is allowed',
+        () async {
+      armRing(radius: 2);
+      hostApi.calls.clear();
+
+      expect(await dial(opposite()), isTrue);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), hasLength(1));
+    });
+
+    test('refuses an off-roster peer while armed, under its own reason',
+        () async {
+      armRing(radius: 2); // complete graph for the roster — yet a stranger
+      final stranger = await _makeIdentity('Stranger');
+      hostApi.calls.clear();
+
+      expect(await dial(stranger), isFalse);
+
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+          reason: 'a device outside the experiment would relay and collapse '
+              'the diameter the ring exists to create');
+      // Separable from an ordinary radius refusal: a misdeployed roster must
+      // not be mistaken for the gate working as intended.
+      expect(skipsWithReason('ringOffRoster'), hasLength(1));
+      expect(skipsWithReason('ringRadius'), isEmpty);
+    });
+
+    test('is inert with no radius: the same stranger dials fine', () async {
+      armRing(radius: null);
+      final stranger = await _makeIdentity('Stranger');
+      hostApi.calls.clear();
+
+      expect(await dial(stranger), isTrue);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), hasLength(1));
+    });
+
+    test('is inert on a device that is not itself on the roster', () async {
+      // A bystander handed a roster it is not in must not have its radio
+      // constrained: the testbed knob may not leak into ordinary use.
+      store.dispatch(SetRingGateAction(
+        rosterHex: ring.skip(1).map(hexOf).toList(), // self excluded
+        radius: 1,
+      ));
+      hostApi.calls.clear();
+
+      expect(await dial(opposite()), isTrue);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')), hasLength(1));
+    });
+
+    group('inbound backstop', () {
+      Future<void> inboundLeg(String mac) async {
+        callbacks.pushPath(BlePath(
+          pathId: 'peripheral:$mac',
+          role: BleRole.peripheral,
+          state: BlePathState.ready,
+          rssi: -55,
+          mtu: 247,
+          canSend: true,
+        ));
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      test('drops an inbound leg from a peer outside the radius', () async {
+        armRing(radius: 1);
+        await inboundLeg('FAR');
+        hostApi.calls.clear();
+
+        transport.onPeerIdentified('peripheral:FAR', opposite().publicKey);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(hostApi.calls, contains('disconnect:peripheral:FAR'));
+        expect(
+            trace.records.where((r) => r['event'] == 'ringDrop'), hasLength(1));
+      });
+
+      test('keeps an inbound leg from a ring neighbour', () async {
+        armRing(radius: 1);
+        await inboundLeg('NEAR');
+        hostApi.calls.clear();
+
+        transport.onPeerIdentified('peripheral:NEAR', neighbour().publicKey);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+        expect(trace.records.where((r) => r['event'] == 'ringDrop'), isEmpty);
+      });
+
+      test('never gates ANNOUNCE: the peer record survives the dropped link',
+          () async {
+        armRing(radius: 1);
+        await inboundLeg('FAR');
+        // What the router does with an ANNOUNCE before the transport is told
+        // who is on the path. The gate must take the LINK and nothing else:
+        // identity, the peer record and any eager handshake are untouched.
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: opposite().publicKey,
+          nickname: 'Opposite',
+          transport: PeerTransport.bleDirect,
+          blePeripheralDeviceId: 'peripheral:FAR',
+        ));
+        await Future<void>.delayed(Duration.zero);
+
+        transport.onPeerIdentified('peripheral:FAR', opposite().publicKey);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(hostApi.calls, contains('disconnect:peripheral:FAR'));
+        expect(store.state.peers.getPeerByPubkeyHex(hexOf(opposite())),
+            isNotNull,
+            reason: 'the ring gate refuses links, never ANNOUNCE processing');
+      });
+    });
+
+    group('prune on shrink', () {
+      /// Bring up BOTH legs of the pair with `peer`, identified, so
+      /// `_pairViewFor` resolves the identity and the prune can find them.
+      Future<void> dualRoleWith(GrassrootsIdentity peer, String mac) async {
+        for (final role in [BleRole.central, BleRole.peripheral]) {
+          callbacks.pushPath(BlePath(
+            pathId: '${role.name}:$mac',
+            role: role,
+            state: BlePathState.ready,
+            rssi: -55,
+            mtu: 247,
+            canSend: true,
+          ));
+        }
+        await Future<void>.delayed(Duration.zero);
+        store.dispatch(PeerAnnounceReceivedAction(
+          publicKey: peer.publicKey,
+          nickname: 'Peer',
+          transport: PeerTransport.bleDirect,
+          bleCentralDeviceId: 'central:$mac',
+          blePeripheralDeviceId: 'peripheral:$mac',
+        ));
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      test('shrinking to r=1 drops BOTH legs of the now-far pair', () async {
+        armRing(radius: 2); // complete: the opposite peer is allowed
+        await dualRoleWith(opposite(), 'OPP');
+        hostApi.calls.clear();
+
+        armRing(radius: 1); // the opposite peer is now two hops away
+        await transport.applyRingGateChange();
+
+        // A dual-role pair is ONE neighbour; leaving either leg up leaves the
+        // pair adjacent and the measured diameter wrong.
+        expect(hostApi.calls, contains('disconnect:central:OPP'));
+        expect(hostApi.calls, contains('disconnect:peripheral:OPP'));
+        expect(trace.records.where((r) => r['event'] == 'ringPrune'),
+            hasLength(2));
+      });
+
+      test('widening prunes nothing', () async {
+        armRing(radius: 1);
+        await dualRoleWith(neighbour(), 'NB');
+        hostApi.calls.clear();
+
+        armRing(radius: 2);
+        await transport.applyRingGateChange();
+
+        expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+      });
+
+      test('leaves an allowed pair alone, keeping both legs', () async {
+        armRing(radius: 1);
+        await dualRoleWith(neighbour(), 'NB');
+        hostApi.calls.clear();
+
+        await transport.applyRingGateChange();
+
+        expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+            reason: 'the dual-role mandate: an allowed pair keeps both legs');
+      });
+    });
+
+    group('severAllLinks', () {
+      Future<void> twoLiveLinks() async {
+        for (final mac in ['L1', 'L2']) {
+          callbacks.pushPath(BlePath(
+            pathId: 'central:$mac',
+            role: BleRole.central,
+            state: BlePathState.ready,
+            rssi: -55,
+            mtu: 247,
+            canSend: true,
+          ));
+        }
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      test('disconnects every path', () async {
+        await transport.start();
+        await twoLiveLinks();
+        hostApi.calls.clear();
+
+        await transport.severAllLinks();
+
+        expect(hostApi.calls, contains('disconnect:central:L1'));
+        expect(hostApi.calls, contains('disconnect:central:L2'));
+      });
+
+      test('leaves discovery running — it does NOT stop scan or advertising',
+          () async {
+        await transport.start();
+        await twoLiveLinks();
+        final stateBefore = store.state.transports.bleState;
+        hostApi.calls.clear();
+
+        await transport.severAllLinks();
+
+        // Discovery is load-bearing at every instant: suspending it during
+        // dwells collapsed delivery from ~75% to ~26%, because these links
+        // churn constantly and scanning is what re-establishes them.
+        expect(hostApi.calls, isNot(contains('stopScan')));
+        expect(hostApi.calls, isNot(contains('stopAdvertising')));
+        expect(store.state.transports.bleState, stateBefore);
+      });
+
+      test('the transport still dials afterwards — _stopped was not set',
+          () async {
+        await transport.start();
+        await twoLiveLinks();
+        await transport.severAllLinks();
+        hostApi.calls.clear();
+
+        // The sharpest assertion available: a severed transport that cannot
+        // dial again is [stop] wearing a different name, and the ring sweep
+        // would measure a mesh that never comes back.
+        armRing(radius: null);
+        expect(await dial(await _makeIdentity('Later'), mac: 'AFTER'), isTrue);
+        expect(hostApi.calls, contains('connect:AFTER'));
+      });
+
+      test('dispatches nothing: the plugin reports the disconnects', () async {
+        await transport.start();
+        await twoLiveLinks();
+        final discoveredBefore = store.state.peers.discoveredBlePeers.length;
+        var dispatches = 0;
+        final unsubscribe = store.onChange.listen((_) => dispatches++);
+        addTearDown(unsubscribe.cancel);
+
+        await transport.severAllLinks();
+        await Future<void>.delayed(Duration.zero);
+
+        // A manual dispatch here would be a Redux inference rather than a
+        // projection of a transport fact, and would double-count once the
+        // plugin's own path events arrive.
+        expect(dispatches, 0);
+        expect(store.state.peers.discoveredBlePeers.length, discoveredBefore,
+            reason: 'unlike the BLE bounce, the sever does not clear discovery');
+      });
     });
   });
 }

@@ -304,5 +304,82 @@ void main() {
         ]);
       });
     });
+    group('ring-radius gate (testbed)', () {
+      test('is disarmed in the initial state, so production is never gated', () {
+        expect(SettingsState.initial.ringRadius, isNull);
+        expect(SettingsState.initial.ringRoster, isEmpty);
+      });
+
+      test('sorts the roster, so dispatch order cannot change the ring', () {
+        final a = settingsReducer(
+          SettingsState.initial,
+          SetRingGateAction(rosterHex: ['cc33', 'aa11', 'bb22'], radius: 1),
+        );
+        final b = settingsReducer(
+          SettingsState.initial,
+          SetRingGateAction(rosterHex: ['bb22', 'cc33', 'aa11'], radius: 1),
+        );
+        expect(a.ringRoster, ['aa11', 'bb22', 'cc33']);
+        expect(a.ringRoster, b.ringRoster);
+      });
+
+      test('lowercases and de-duplicates the roster', () {
+        final s = settingsReducer(
+          SettingsState.initial,
+          SetRingGateAction(rosterHex: ['BB22', 'aa11', 'bb22'], radius: 2),
+        );
+        expect(s.ringRoster, ['aa11', 'bb22']);
+      });
+
+      test('a null radius disarms the gate while keeping the roster', () {
+        final armed = settingsReducer(
+          SettingsState.initial,
+          SetRingGateAction(rosterHex: ['aa11', 'bb22'], radius: 2),
+        );
+        expect(armed.ringRadius, 2);
+        final disarmed = settingsReducer(
+          armed,
+          SetRingGateAction(rosterHex: ['aa11', 'bb22'], radius: null),
+        );
+        // The sentinel in copyWith is what makes this expressible: "not passed"
+        // and "passed null" mean opposite things for a nullable field.
+        expect(disarmed.ringRadius, isNull);
+        expect(disarmed.ringRoster, ['aa11', 'bb22']);
+      });
+
+      test('survives a JSON round trip, still in ring order', () {
+        final armed = settingsReducer(
+          SettingsState.initial,
+          SetRingGateAction(rosterHex: ['cc33', 'aa11'], radius: 3),
+        );
+        final revived = SettingsState.fromJson(armed.toJson());
+        expect(revived, equals(armed));
+        expect(revived.ringRoster, ['aa11', 'cc33']);
+        expect(revived.ringRadius, 3);
+      });
+
+      test('hydrating a settings blob with no ring keys leaves it disarmed', () {
+        final revived = SettingsState.fromJson({
+          'bluetoothEnabled': true,
+          'udpEnabled': true,
+        });
+        expect(revived.ringRadius, isNull);
+        expect(revived.ringRoster, isEmpty);
+      });
+
+      test('leaves every other setting alone', () {
+        final before = SettingsState.initial.copyWith(
+          coldCallTrustLevel: ColdCallTrustLevel.closed,
+          showLinkDiagnostics: true,
+        );
+        final after = settingsReducer(
+          before,
+          SetRingGateAction(rosterHex: ['aa11', 'bb22'], radius: 1),
+        );
+        expect(after.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(after.showLinkDiagnostics, isTrue);
+        expect(after.bluetoothEnabled, before.bluetoothEnabled);
+      });
+    });
   });
 }

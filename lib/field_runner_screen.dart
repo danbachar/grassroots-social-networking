@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'src/testbed/field_runner.dart';
 import 'src/testbed/testbed_config.dart';
@@ -44,8 +43,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     if (mounted) setState(() {});
   }
 
-  String _mmss(int sec) =>
-      '${(sec ~/ 60).toString().padLeft(2, '0')}:'
+  String _mmss(int sec) => '${(sec ~/ 60).toString().padLeft(2, '0')}:'
       '${(sec % 60).toString().padLeft(2, '0')}';
 
   /// Hours only once there are hours: a whole run is four digits of minutes
@@ -58,24 +56,41 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         '${(sec % 60).toString().padLeft(2, '0')}';
   }
 
-  Future<void> _confirmAbort() async {
-    final confirmed = await showDialog<bool>(
+  /// Stopping a run mid-flight: two outcomes, and the difference is the
+  /// data.
+  ///
+  /// END NOW keeps everything recorded so far — the steps already walked are
+  /// usually the point of stopping, and a partial sweep is still a result.
+  /// ABORT deletes this run's file, which is right when the run was set up
+  /// wrong and its records would otherwise upload alongside real ones under
+  /// the same id.
+  Future<void> _confirmStop() async {
+    final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Abort the run?'),
-        content: const Text('An "aborted" marker is stamped and the recording '
-            'stops. Files stay on the device.'),
+        title: const Text('Stop the run?'),
+        content: const Text(
+          'End now: recording stops and everything walked so far is KEPT on '
+          'the device, ready to upload from the testbed screen.\n\n'
+          'Abort: an "aborted" marker is stamped and this run\'s file is '
+          'DELETED. Use it when the run was set up wrong.',
+        ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
+              onPressed: () => Navigator.pop(ctx, 'run'),
               child: const Text('Keep running')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'abort'),
+            child: const Text('Abort', style: TextStyle(color: Colors.red)),
+          ),
           FilledButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Abort')),
+              onPressed: () => Navigator.pop(ctx, 'finish'),
+              child: const Text('End now')),
         ],
       ),
     );
-    if (confirmed == true) await widget.runner.abort();
+    if (choice == 'finish') await widget.runner.forceFinish();
+    if (choice == 'abort') await widget.runner.abort();
   }
 
   @override
@@ -99,7 +114,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
             if (runner.isRunning)
               IconButton(
                 icon: const Icon(Icons.close),
-                onPressed: () async => _confirmAbort(),
+                onPressed: () async => _confirmStop(),
               ),
           ],
         ),
@@ -118,7 +133,8 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               Container(
                 width: double.infinity,
                 color: Colors.red.shade900,
-                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                padding:
+                    const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
                 child: const Row(children: [
                   Icon(Icons.wifi_tethering_off, color: Colors.white, size: 30),
                   SizedBox(width: 12),
@@ -136,42 +152,44 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               ),
             Expanded(
               child: LayoutBuilder(
-            builder: (context, constraints) => SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(minHeight: constraints.maxHeight - 48),
-                child: switch (runner.phase) {
-                  _ when runner.finishing => _finishing(runner),
-                  _ when runner.resetting => _resetting(step),
-                  FieldPhase.placement => _placement(runner),
-                  _ when runner.waitingToJoin => _waitingToJoin(runner),
-                  FieldPhase.positioning => runner.manualJoin
-                      ? _manualGap(step!, runner)
-                      : _positioning(step!, runner),
-                  // A dwell the operator has to act in is an instruction;
-                  // one they do not is just time left on the run.
-                  // Measuring and walking are different instructions — one
-                  // means stand still, the other means go — so they cannot
-                  // share a headline. The dwell names itself; the walk window
-                  // (positioning) carries the big MOVE countdown.
-                  FieldPhase.dwelling => runner.radioAction != null
-                      ? _radioPrompt(runner.radioAction!, runner.remainingSec)
-                      : _measuring(step!, runner),
-                  FieldPhase.settling => _countdown(
-                      'SETTLING',
-                      runner.remainingSec,
-                      'letting late ACKs land',
-                      Colors.blue,
-                      // Escape hatch: the settle window is the last thing
-                      // between a finished run and its files, and a phone
-                      // that looks stuck here holds up everyone else.
-                      onSkip: () async => widget.runner.forceFinish(),
-                      skipLabel: 'Finish now'),
-                  FieldPhase.finished => _finished(runner),
-                },
+                builder: (context, constraints) => SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: ConstrainedBox(
+                    constraints:
+                        BoxConstraints(minHeight: constraints.maxHeight - 48),
+                    child: switch (runner.phase) {
+                      _ when runner.finishing => _finishing(runner),
+                      _ when runner.resetting => _resetting(step),
+                      FieldPhase.placement => _placement(runner),
+                      _ when runner.waitingToJoin => _waitingToJoin(runner),
+                      FieldPhase.positioning => runner.manualJoin
+                          ? _manualGap(step!, runner)
+                          : _positioning(step!, runner),
+                      // A dwell the operator has to act in is an instruction;
+                      // one they do not is just time left on the run.
+                      // Measuring and walking are different instructions — one
+                      // means stand still, the other means go — so they cannot
+                      // share a headline. The dwell names itself; the walk window
+                      // (positioning) carries the big MOVE countdown.
+                      FieldPhase.dwelling => runner.radioAction != null
+                          ? _radioPrompt(
+                              runner.radioAction!, runner.remainingSec)
+                          : _measuring(step!, runner),
+                      FieldPhase.settling => _countdown(
+                          'SETTLING',
+                          runner.remainingSec,
+                          'letting late ACKs land',
+                          Colors.blue,
+                          // Escape hatch: the settle window is the last thing
+                          // between a finished run and its files, and a phone
+                          // that looks stuck here holds up everyone else.
+                          onSkip: () async => widget.runner.forceFinish(),
+                          skipLabel: 'Finish now'),
+                      FieldPhase.finished => _finished(runner),
+                    },
+                  ),
+                ),
               ),
-            ),
-          ),
             ),
           ]),
         ),
@@ -200,10 +218,15 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     return '${two(d.hour)}:${two(d.minute)}:${two(d.second)}';
   }
 
-  /// "BLUETOOTH ON in 12:30 (at 14:52:30)" for a phone that joins later.
+  /// "BLUETOOTH ON in 12:30 (at 14:52:30)" for a phone that joins later,
+  /// counted to its join window's open rather than to the join. It is shown
+  /// only when the radio has not been seen up: with a scripted plan the app
+  /// raises its own transport, so this is a warning that the SYSTEM adapter
+  /// is off — the one thing the app cannot fix — and the window is the last
+  /// stretch in which fixing it still saves the join.
   String _joinEta(FieldRunner runner) {
-    final at = runner.myJoinAtMs;
-    if (at == null || !runner.joinsLater) return '';
+    final at = runner.joinWindowOpensAtMs;
+    if (at == null) return '';
     final rem = at - DateTime.now().millisecondsSinceEpoch;
     return 'BLUETOOTH ON in ${_mmss(rem <= 0 ? 0 : rem ~/ 1000)}'
         ' (at ${_hhmmss(at)})';
@@ -247,7 +270,27 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         //         fontWeight: FontWeight.w600)),
         const SizedBox(height: 18),
         if (runner.wantsStackReset) _stackResetPrompt(runner),
-        Text(_mmss(runner.remainingSec),
+        // The number is labeled by what this phone will DO at it: a founder
+        // sends when the first dwell opens; a later joiner's next act is
+        // the Bluetooth toggle, at its join window's open.
+        //
+        // Except on a scripted-radio plan, where the runner works the
+        // transport itself and the OS toggle must stay ON throughout. Asking
+        // a joiner there to turn Bluetooth on invites them to turn it off
+        // first, which is the one thing that makes its join land in nothing.
+        Text(
+            widget.plan.scriptedRadio
+                ? (later ? 'THIS PHONE JOINS IN' : 'EXPERIMENT SENDS IN')
+                : (later ? 'TURN ON BLUETOOTH IN' : 'EXPERIMENT SENDS IN'),
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white54, fontSize: 22)),
+        Text(
+            _mmss(
+                (((later ? runner.joinWindowOpensAtMs : runner.startTargetMs) ??
+                            (DateTime.now().millisecondsSinceEpoch +
+                                runner.remainingSec * 1000)) -
+                        DateTime.now().millisecondsSinceEpoch) ~/
+                    1000),
             textAlign: TextAlign.center,
             style: const TextStyle(
                 color: Colors.white,
@@ -270,13 +313,20 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   fontWeight: FontWeight.w800))
         else
           Text(
-              later
-                  ? 'keep Bluetooth OFF — this phone joins at '
-                      '${runner.myJoinAtMs == null ? "its step" : _hhmmss(runner.myJoinAtMs!)}'
-                  : 'Bluetooth stays ON on this phone',
+              widget.plan.scriptedRadio
+                  ? (later
+                      ? 'leave Bluetooth ON — this phone joins itself at '
+                          '${runner.myJoinAtMs == null ? "its step" : _hhmmss(runner.myJoinAtMs!)}'
+                      : 'Bluetooth stays ON on this phone')
+                  : (later
+                      ? 'keep Bluetooth OFF — this phone joins at '
+                          '${runner.myJoinAtMs == null ? "its step" : _hhmmss(runner.myJoinAtMs!)}'
+                      : 'Bluetooth stays ON on this phone'),
               textAlign: TextAlign.center,
               style: TextStyle(
-                  color: later ? Colors.orangeAccent : Colors.white54,
+                  color: later && !widget.plan.scriptedRadio
+                      ? Colors.orangeAccent
+                      : Colors.white54,
                   fontSize: 18,
                   fontWeight: FontWeight.w600)),
       ],
@@ -290,14 +340,102 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   /// wears the same ENABLE BT face as every other radio window.
   Widget _waitingToJoin(FieldRunner runner) {
     final joinAt = runner.myJoinAtMs;
-    final windowAt = joinAt == null
-        ? null
-        : joinAt - widget.plan.autoAdvanceGapSec * 1000;
+    // Null is the coordinator saying the toggle's state has never been
+    // learned — a query that failed or a platform that has none. Anything
+    // else is either event-fed from a live service or a direct read the
+    // plugin's platform side answers even while this phone is dark, so the
+    // status is a fact and can be rendered as one. That includes the case
+    // that matters most: a join with the toggle off, where the transport
+    // parks unusable and the warning has to appear.
+    final btObservable = runner.systemBt != null;
+    final btReady = runner.systemBt == true;
+    // Before the window: count to its opening, which is when to act. Inside
+    // it, and once Bluetooth reads ready, count to the join itself — a
+    // countdown to an instant already past would sit frozen at 00:00.
+    final windowAt = btReady || !btObservable || runner.joinWindowOpen
+        ? joinAt
+        : (runner.joinWindowOpensAtMs ?? joinAt);
     if (widget.plan.scriptedRadio) {
-      return _untilEnd(runner,
-          note: windowAt == null
-              ? null
-              : 'joins itself at ${_hhmmss(windowAt)}');
+      final btOff = runner.systemBt == false;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // The join is scripted, but the OS toggle is the operator's: a
+          // phone counting down with system Bluetooth off will join into
+          // nothing, and the warning has to land BEFORE that instant.
+          if (btOff)
+            Container(
+              color: Colors.red.shade900,
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+              child: const Text(
+                  'BLUETOOTH IS OFF\nturn it on before this phone joins',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 20,
+                      fontWeight: FontWeight.w800)),
+            )
+          else if (!btObservable)
+            Container(
+              color: Colors.blueGrey.shade800,
+              padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+              child: const Text(
+                  'LEAVE BLUETOOTH ON\nthis phone joins on its own',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600)),
+            ),
+          // The one number a waiting phone's operator cares about is when
+          // THIS phone joins — not when the whole run ends. The run-end
+          // countdown belongs to phones that are already in.
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                  btReady || !btObservable
+                      ? 'JOINS IN'
+                      : runner.joinWindowOpen
+                          ? 'TURN ON BLUETOOTH NOW'
+                          : 'TURN ON BLUETOOTH IN',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      color: btObservable && runner.joinWindowOpen && !btReady
+                          ? Colors.orangeAccent
+                          : Colors.white54,
+                      fontSize: 24,
+                      fontWeight:
+                          btObservable && runner.joinWindowOpen && !btReady
+                              ? FontWeight.w800
+                              : FontWeight.normal)),
+              const SizedBox(height: 8),
+              FittedBox(
+                child: Text(
+                    windowAt == null
+                        ? '—'
+                        : _mmss(((windowAt -
+                                    DateTime.now().millisecondsSinceEpoch) ~/
+                                1000)
+                            .clamp(0, 359999)),
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 96,
+                        fontWeight: FontWeight.w800)),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                  '${windowAt == null ? '' : 'at ${_hhmmss(windowAt)}'}'
+                  '${joinAt == null || btReady ? '' : ' — joins at ${_hhmmss(joinAt)}'}'
+                  '${btReady ? ' — bluetooth ready' : ''}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 22)),
+            ],
+          ),
+        ],
+      );
     }
     final remaining = windowAt == null
         ? 0
@@ -359,7 +497,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   ///
   /// The next position rides along as a footnote so the operator knows where
   /// they are headed, but the instruction to GO is the walk window's alone —
-  /// a headline that says MOVE while the trial is still running reads as an
+  /// a headline that says MOVE while the run is still running reads as an
   /// instruction to move.
   Widget _measuring(FieldStep step, FieldRunner runner) {
     final move = runner.nextMove;
@@ -367,6 +505,23 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        if (runner.radioSuspect) ...[
+          Container(
+            color: Colors.red.shade900,
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+            child: Text(
+                runner.radioSuspectReason == 'adapterOff'
+                    ? 'BLUETOOTH IS OFF\nturn it on to join'
+                    : 'NO PEERS — RADIO SUSPECT\ncheck Bluetooth on this '
+                        'phone',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800)),
+          ),
+          const SizedBox(height: 14),
+        ],
         const Icon(Icons.wifi_tethering, color: Colors.tealAccent, size: 64),
         const SizedBox(height: 14),
         const Text('MEASURING',
@@ -383,7 +538,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   fontSize: 96,
                   fontWeight: FontWeight.w800)),
         ),
-        Text('${_mmss(runner.remainingSec)} left in this trial',
+        Text('${_mmss(runner.remainingSec)} left in this run',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white54, fontSize: 22)),
         Text(
@@ -393,7 +548,8 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
             style: const TextStyle(color: Colors.white38, fontSize: 16)),
         if (move != null) ...[
           const SizedBox(height: 18),
-          Text('then walk to ${move.label} — starts ${_hhmmss(move.startsAtMs)}',
+          Text(
+              'then walk to ${move.label} — starts ${_hhmmss(move.startsAtMs)}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.orangeAccent, fontSize: 20)),
         ],
@@ -424,8 +580,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         Icon(late ? Icons.directions_run : Icons.directions_walk,
             color: late ? Colors.redAccent : Colors.orangeAccent, size: 64),
         const SizedBox(height: 14),
-        Text(
-          'WALK WINDOW',
+        Text('WALK WINDOW',
             textAlign: TextAlign.center,
             style: const TextStyle(
                 color: Colors.white54,
@@ -453,10 +608,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
         Text('at ${_hhmmss(move.startsAtMs)}',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.white54, fontSize: 20)),
-        Text(
-            urgent
-                ? 'STAND AT ${move.label} NOW'
-                : '',
+        Text(urgent ? 'STAND AT ${move.label} NOW' : '',
             textAlign: TextAlign.center,
             style: TextStyle(
                 color: urgent ? Colors.redAccent : Colors.white38,
@@ -545,9 +697,9 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     return _betweenTrials(step, runner);
   }
 
-  /// The gap between two trials at the SAME position. It wears the dwell's
+  /// The gap between two runs at the SAME position. It wears the dwell's
   /// instruction, not the walk's: nothing about moving, and no reset card —
-  /// the position was reset before its first trial and must not be touched
+  /// the position was reset before its first run and must not be touched
   /// again until it is done.
   Widget _betweenTrials(FieldStep step, FieldRunner runner) => Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -717,7 +869,8 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white, fontSize: 20)),
           const SizedBox(height: 16),
-          const Text('The recorded data is NOT usable. Fix the radio and '
+          const Text(
+              'The recorded data is NOT usable. Fix the radio and '
               'start over.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Colors.white70, fontSize: 18)),
@@ -735,15 +888,17 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
   Widget _resetting(FieldStep? step) => Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          const Icon(Icons.bluetooth_disabled,
-              color: Colors.white54, size: 72),
+          const Icon(Icons.bluetooth_disabled, color: Colors.white54, size: 72),
           const SizedBox(height: 24),
           const Text('RESETTING BLE',
               textAlign: TextAlign.center,
               style: TextStyle(
-                  color: Colors.white, fontSize: 40, fontWeight: FontWeight.w800)),
+                  color: Colors.white,
+                  fontSize: 40,
+                  fontWeight: FontWeight.w800)),
           const SizedBox(height: 12),
-          Text('going dark so the peer drops us, then reconnecting…'
+          Text(
+              'going dark so the peer drops us, then reconnecting…'
               '${step != null ? '\nnext: ${step.label}' : ''}',
               textAlign: TextAlign.center,
               style: const TextStyle(color: Colors.white38, fontSize: 16)),
@@ -751,14 +906,32 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
       );
 
   Widget _positioning(FieldStep step, FieldRunner runner) {
-    final auto = step.autoAdvance;
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(auto ? 'AUTO-ADVANCING' : 'WALK TO',
+        // The warning must survive the dwell it was raised in: a drain
+        // screen without it hides the one instruction the operator needs.
+        if (runner.radioSuspect) ...[
+          Container(
+            color: Colors.red.shade900,
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 16),
+            child: Text(
+                runner.radioSuspectReason == 'adapterOff'
+                    ? 'BLUETOOTH IS OFF\nturn it on to join'
+                    : 'NO PEERS — RADIO SUSPECT\ncheck Bluetooth on this '
+                        'phone',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800)),
+          ),
+          const SizedBox(height: 14),
+        ],
+        const Text('NEXT',
             textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white54, fontSize: 24)),
+            style: TextStyle(color: Colors.white54, fontSize: 24)),
         const SizedBox(height: 8),
         FittedBox(
           child: Text(step.label,
@@ -768,30 +941,13 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   fontSize: 72,
                   fontWeight: FontWeight.w800)),
         ),
-        if (auto) ...[
-          const SizedBox(height: 8),
-          Text('starts in ${runner.remainingSec}s',
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70, fontSize: 22)),
-        ],
-        const SizedBox(height: 48),
-        SizedBox(
-          height: 140,
-          child: FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Colors.green,
-              textStyle:
-                  const TextStyle(fontSize: 40, fontWeight: FontWeight.w800),
-            ),
-            onPressed: () async {
-              await HapticFeedback.heavyImpact();
-              await runner.inPosition();
-            },
-            child: Text(auto ? 'START NOW' : 'IN POSITION'),
-          ),
-        ),
+        const SizedBox(height: 8),
+        Text('starts in ${_mmss(runner.remainingSec)}',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, fontSize: 22)),
         const SizedBox(height: 16),
-        Text('dwell ${_mmss(step.dwellSec)}'
+        Text(
+            'dwell ${_mmss(step.dwellSec)}'
             '${step.sendCount > 0 ? ' + ${step.sendCount} sends' : ''}'
             '${runner.sentCount > 0 ? ' — ${runner.sentCount} sent' : ''}',
             textAlign: TextAlign.center,

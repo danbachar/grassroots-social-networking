@@ -11,13 +11,17 @@ import 'signaling_actions.dart';
 import 'signaling_reducer.dart';
 import 'transports_actions.dart';
 import 'transports_reducer.dart';
+import 'sessions_reducer.dart';
 
 /// Root reducer that handles all actions
 AppState appReducer(AppState state, dynamic action) {
-  // Handle peer actions via peersReducer
+  // Handle peer actions via peersReducer. Session facts ride the same
+  // action hierarchy but land in their OWN slice, whose lifetime is the
+  // session's, not the record's.
   if (action is PeerAction) {
     return state.copyWith(
       peers: peersReducer(state.peers, action),
+      sessions: sessionsReducer(state.sessions, action),
     );
   }
 

@@ -174,6 +174,38 @@ class PeerNoiseSessionEstablishedAction extends PeerAction {
   PeerNoiseSessionEstablishedAction(this.publicKey);
 }
 
+/// The Noise session with THIS ONE peer was dropped — the operator purged it
+/// from the settings session table.
+///
+/// The sibling of [AllNoiseSessionsResetAction], and reported the same way:
+/// the session manager forgets the peer first, then this lands, so the store
+/// projects a fact that is already true rather than an intention. Dispatching
+/// it without having called `NoiseSessionManager.reset` would invert that —
+/// the projection would claim the peer is unsealable while `hasSession` still
+/// says otherwise, and the send path (which asks the manager, not the store)
+/// would keep sealing to a peer the UI has already written off.
+///
+/// Removing the key is the whole effect: it is NOT replaced with a tombstone
+/// or a zero timestamp. `SessionsState.has` is what a composer is gated on,
+/// and a peer whose session is gone is indistinguishable from one never met —
+/// which is exactly the truth after a purge.
+///
+/// The peer RECORD is untouched, deliberately. Sessions and peer records have
+/// different lifetimes (see [SessionsState]) and this slice is independent of
+/// the peer slice in both directions: purging a session must not evict the
+/// peer, just as the stale sweep evicting a peer must not purge its session.
+class PeerNoiseSessionResetAction extends PeerAction {
+  final Uint8List publicKey;
+
+  PeerNoiseSessionResetAction(this.publicKey);
+}
+
+/// The testbed purge dropped EVERY Noise session ([resetAllSessions]) — the
+/// projection must fall with the fact, or the send path's target list keeps
+/// offering peers that can no longer be sealed to. Lands in the SESSIONS
+/// slice, which empties.
+class AllNoiseSessionsResetAction extends PeerAction {}
+
 /// A verified UDP packet was received from a peer.
 ///
 /// Updates UDP-specific freshness so stale UDX sessions can be aged out even

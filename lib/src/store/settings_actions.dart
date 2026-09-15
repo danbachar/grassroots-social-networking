@@ -65,3 +65,21 @@ class SetShowLinkDiagnosticsAction extends SettingsAction {
 
   SetShowLinkDiagnosticsAction(this.enabled);
 }
+
+/// DEBUG/TESTBED ONLY. Arm or disarm the ring-radius link gate.
+///
+/// A null [radius] disarms it, which is the production state and the state the
+/// operator warms the mesh up in — every pair must be able to handshake before
+/// the topology is constrained, because a packet may not exist before a session
+/// with its target does and sessions form only over a direct link.
+///
+/// The roster is normalised into ring order by the reducer, not here: ring
+/// order has to be a property of the state rather than of the caller, or two
+/// phones handed the same roster in different orders would derive different
+/// neighbours and the topology would not be a ring.
+class SetRingGateAction extends SettingsAction {
+  final List<String> rosterHex;
+  final int? radius;
+
+  SetRingGateAction({required this.rosterHex, this.radius});
+}

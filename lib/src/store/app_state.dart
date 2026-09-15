@@ -5,6 +5,7 @@ import 'friendships_state.dart';
 import 'settings_state.dart';
 import 'signaling_state.dart';
 import 'transports_state.dart';
+import 'sessions_state.dart';
 
 /// Main application state for redux
 @immutable
@@ -27,6 +28,10 @@ class AppState {
   /// Signaling state (address registration, hole-punch attempts)
   final SignalingState signaling;
 
+  /// Noise sessions held, as facts (with whom, since when). Independent of
+  /// [peers]: a session outlives its peer's record.
+  final SessionsState sessions;
+
   const AppState({
     this.transports = const TransportsState(),
     this.peers = const PeersState(),
@@ -34,6 +39,7 @@ class AppState {
     this.friendships = const FriendshipsState(),
     this.settings = const SettingsState(),
     this.signaling = const SignalingState(),
+    this.sessions = const SessionsState(),
   });
 
   /// Initial state
@@ -66,6 +72,7 @@ class AppState {
     FriendshipsState? friendships,
     SettingsState? settings,
     SignalingState? signaling,
+    SessionsState? sessions,
   }) {
     return AppState(
       transports: transports ?? this.transports,
@@ -74,6 +81,7 @@ class AppState {
       friendships: friendships ?? this.friendships,
       settings: settings ?? this.settings,
       signaling: signaling ?? this.signaling,
+      sessions: sessions ?? this.sessions,
     );
   }
 
@@ -87,7 +95,8 @@ class AppState {
           messages == other.messages &&
           friendships == other.friendships &&
           settings == other.settings &&
-          signaling == other.signaling;
+          signaling == other.signaling &&
+          sessions == other.sessions;
 
   @override
   int get hashCode => Object.hash(
@@ -97,5 +106,6 @@ class AppState {
         friendships,
         settings,
         signaling,
+        sessions,
       );
 }

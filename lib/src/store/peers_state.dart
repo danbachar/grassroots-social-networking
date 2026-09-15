@@ -184,16 +184,6 @@ class PeerState {
   /// handshake itself): a peer is only [isReachable] once authenticated.
   final bool bleAuthenticated;
 
-  /// Whether we hold an end-to-end Noise session with this peer.
-  ///
-  /// Transport-independent, and NOT the same as [isReachable]: a session is
-  /// keyed by identity and survives the link that formed it, so this stays
-  /// true after the peer walks out of range. That is the point — sealing needs
-  /// a session, not a live path, and a message to an absent peer is exactly
-  /// what the DTN buffer carries. Sending is gated on this, never on
-  /// reachability.
-  final bool hasNoiseSession;
-
   const PeerState({
     required this.publicKey,
     required this.nickname,
@@ -213,7 +203,6 @@ class PeerState {
     this.lastDirectReachAt,
     this.hasLiveUdpConnection = false,
     this.bleAuthenticated = false,
-    this.hasNoiseSession = false,
   });
 
   /// Hex representation of public key (for map keys)
@@ -318,7 +307,6 @@ class PeerState {
     bool clearLastDirectReachAt = false,
     bool? hasLiveUdpConnection,
     bool? bleAuthenticated,
-    bool? hasNoiseSession,
   }) {
     return PeerState(
       publicKey: publicKey ?? this.publicKey,
@@ -342,7 +330,6 @@ class PeerState {
           : lastDirectReachAt ?? this.lastDirectReachAt,
       hasLiveUdpConnection: hasLiveUdpConnection ?? this.hasLiveUdpConnection,
       bleAuthenticated: bleAuthenticated ?? this.bleAuthenticated,
-      hasNoiseSession: hasNoiseSession ?? this.hasNoiseSession,
     );
   }
 
@@ -416,18 +403,6 @@ class PeersState {
 
   /// All identified peers as list
   List<PeerState> get peersList => peers.values.toList();
-
-  /// Peers a message can actually be addressed to: those with a live Noise
-  /// session.
-  ///
-  /// Being known and being reachable are different facts and arrive at
-  /// different times — a verified ANNOUNCE puts a peer in [peersList] while
-  /// the handshake with it is still ahead, so there is a real window where
-  /// its identity is established and nothing can be sent to it. A session is
-  /// keyed by identity rather than by any link, so this survives a transport
-  /// dropping underneath it.
-  List<PeerState> get sessionPeers =>
-      peers.values.where((p) => p.hasNoiseSession).toList();
 
   /// Connected peers only
   List<PeerState> get connectedPeers =>

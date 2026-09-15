@@ -15,6 +15,8 @@ import 'signaling/invite.dart';
 import 'signaling/signaling_service.dart';
 import 'transport/address_utils.dart';
 import 'transport/ble_transport_service.dart';
+import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer.dart'
+    as ble;
 import 'transport/connection_service.dart';
 import 'transport/hole_punch_service.dart';
 import 'transport/public_address_discovery.dart';
@@ -504,6 +506,21 @@ class GrassrootsNetwork {
   void Function(String? oldAddress, String? newAddress)?
       onConnectivityStatusChanged;
 
+  // ===== Collaborators =====
+  //
+  // The coordinator owns the router and the session table, and a harness
+  // needs both to drive the send path for real: the router because
+  // [MessageRouter.directSend] is what answers "is there a live link right
+  // now", which otherwise requires a started transport and a physical radio,
+  // and the session manager because a packet may not exist before a session
+  // with its target does, so a handshake has to be completed first.
+
+  @visibleForTesting
+  MessageRouter get messageRouter => _messageRouter;
+
+  @visibleForTesting
+  NoiseSessionManager get noiseSessions => _noiseSessions;
+
   // ===== Convenience accessors for Redux state =====
 
   PeersState get _peersState => store.state.peers;
@@ -533,6 +550,9 @@ class GrassrootsNetwork {
       identity: identity,
       sodium: sodium,
       trace: trace,
+      // One announce cycle: pairing is ANNOUNCE-driven, so an attempt gets a
+      // full cycle to finish and the very next ANNOUNCE supersedes it.
+      handshakeRetryAfter: config.announceInterval,
     );
     _messageRouter = MessageRouter(
       identity: identity,
@@ -763,6 +783,9 @@ class GrassrootsNetwork {
         store: store,
         localName: config.localName ?? identity.nickname,
         trace: trace,
+        // The OS toggle is the one radio state the app cannot change; cache
+        // every transition so screens can ask the operator at the right time.
+        onAdapterState: (on) => store.dispatch(SystemBtStateChangedAction(on)),
       );
       // Wire-ledger content split: only we know what our sealed packets carry.
       _bleService!.secureContentResolver =
@@ -772,6 +795,9 @@ class GrassrootsNetwork {
       // at the production cap.
       _bleService!.setDialParallelism(
           maxParallel: _dialProbeMaxParallel, popN: _dialProbePopN);
+      // Same reason as the cap above: a bounce mid-test must not hand the
+      // remaining steps a different trace rate from the earlier ones.
+      _bleService!.setTraceEveryAdvertisement(_traceEveryAdvertisement);
 
       // Wire up callbacks BEFORE initialize — the connectionStream is a
       // broadcast stream that drops events with no listener. BLE connections
@@ -784,6 +810,7 @@ class GrassrootsNetwork {
       if (!success) {
         debugPrint('BLE service initialization returned false');
         _bleService = null;
+        store.dispatch(SystemBtStateChangedAction(null));
         return false;
       }
 
@@ -793,6 +820,7 @@ class GrassrootsNetwork {
       debugPrint('Failed to initialize BLE transport: $e');
       debugPrint('Stack trace: $stack');
       _bleService = null;
+      store.dispatch(SystemBtStateChangedAction(null));
       return false;
     } finally {
       _bleInitInFlight = false;
@@ -1244,6 +1272,7 @@ class GrassrootsNetwork {
         // Session kept: end-to-end Noise sessions are path-independent.
         await _bleService!.dispose();
         _bleService = null;
+        store.dispatch(SystemBtStateChangedAction(null));
       }
       // The dispose above is what makes `uninitialized` true; say so here,
       // next to it, rather than inside _initializeBle where it also applied
@@ -1261,6 +1290,7 @@ class GrassrootsNetwork {
       if (_bleService != null) {
         await _bleService!.dispose();
         _bleService = null;
+        store.dispatch(SystemBtStateChangedAction(null));
       }
       // Session kept: end-to-end Noise sessions are path-independent.
 
@@ -1344,6 +1374,14 @@ class GrassrootsNetwork {
       if (_udpAvailable) {
         await _reconnectUdpFriends(reason: 'settings-enabled-cold-start');
       }
+    }
+
+    // A scripted bring-up the toggle refused comes up NOW, at the settings
+    // event itself: the field runner asked for the radio and was denied
+    // while Bluetooth was disabled in settings; the moment the operator
+    // enables it, the request is honoured with no polling anywhere.
+    if (_testbedBleWanted == true && _bleAvailable && _bleService == null) {
+      await setBleActiveForTestbed(true);
     }
   }
 
@@ -1580,11 +1618,36 @@ class GrassrootsNetwork {
     // buffer when it is not — one path for every packet type, no per-type
     // delivery logic here. A fragmented message can split across outcomes;
     // [via] is the transport that carried the first written fragment.
-    PeerTransport? via;
-    for (final p in sealedPackets) {
-      via ??= await _messageRouter.dispatchOutbound(recipientPubkey, p);
-    }
+    //
+    // The stamp is taken BEFORE the dispatch await: under load the write
+    // sits in the transport queue for seconds, and a stamp taken after it
+    // lands in the wrong run's segment — a congested cell's tail then
+    // reads as a burst at the start of the next one. Stamp the event, not
+    // the completion.
     final wireMs = DateTime.now().millisecondsSinceEpoch;
+    PeerTransport? via;
+    await _fragmentHandler.send(sealedPackets, (p) async {
+      final sent = await _messageRouter.dispatchOutbound(recipientPubkey, p);
+      via ??= sent;
+      // Reached a radio only on a BLE write that landed: a packet the router
+      // buffered for later conveyance never left memory, and UDX is a
+      // flow-controlled stream. A megabyte is ~7.6k fragments, and over BLE
+      // that arrives faster than the controller drains — the overflow is
+      // refused, and one missing fragment costs the whole message.
+      return sent == PeerTransport.bleDirect;
+    });
+    // The SECOND stamp: the transport accepted the write. The gap between
+    // the two stamps is the transmit queue, per message — the congestion
+    // term itself — and deliveredAt minus THIS is the wire's own round
+    // trip with the local queue excluded. One stamp alone loses one of the
+    // two: the entry stamp merges queue into air, the acceptance stamp
+    // mis-attributes a congested run's tail to its successor.
+    //
+    // On a fragmented BLE send the gap also contains the pacing above —
+    // (fragments − 1) × [FragmentHandler.fragmentDelay] of deliberate
+    // sleep. Subtract it before reading the gap as queueing; the `sealed`
+    // record carries the fragment count for exactly that.
+    final acceptedMs = DateTime.now().millisecondsSinceEpoch;
     // aired: at least one packet is on the air now. Otherwise everything
     // sits in the DTN buffer and leaves when a neighbour's sync filter
     // shows it missing.
@@ -1597,6 +1660,7 @@ class GrassrootsNetwork {
           : MessageTransport.ble,
       aired: via != null,
       atMs: wireMs,
+      acceptedMs: via != null ? acceptedMs : null,
     );
     return true;
   }
@@ -1650,6 +1714,7 @@ class GrassrootsNetwork {
     required MessageTransport transport,
     required bool aired,
     required int atMs,
+    int? acceptedMs,
   }) {
     // The buffer entry exists either way; `aired` only drives the status shown.
     store.dispatch(aired
@@ -1679,6 +1744,10 @@ class GrassrootsNetwork {
         // send that exists only in this node's DTN buffer until a sync
         // exchange, which the trace has to be able to tell apart.
         'aired': aired,
+        // When the transport accepted the write; minus [atMs] = the transmit
+        // queue this message paid. Absent on a buffered send, where nothing
+        // was accepted.
+        if (acceptedMs != null) 'acceptedMs': acceptedMs,
       }));
     }
   }
@@ -1789,9 +1858,96 @@ class GrassrootsNetwork {
     _dtnMessageOfPacket.clear();
   }
 
+  /// DEBUG/TESTBED ONLY. Arm or disarm the ring-radius link gate.
+  ///
+  /// A null [radius] disarms it. Arming or shrinking prunes the links the new
+  /// radius disallows; widening prunes nothing and lets the newly permitted
+  /// links form from the next sighting.
+  ///
+  /// The roster and radius go to Redux rather than onto a field here, and that
+  /// is load-bearing: a BLE bounce builds a fresh [BleTransportService], and
+  /// anything held as a mutable field on this coordinator has to be re-applied
+  /// to that new service by hand (see [setDialParallelismForTestbed], which
+  /// exists only for that reason). State in the store survives the rebuild, so
+  /// the gate cannot silently disarm itself mid-run.
+  Future<void> setRingGateForTestbed({
+    required List<String> rosterHex,
+    int? radius,
+  }) async {
+    debugPrint(
+        '[testbed] Ring gate → radius=$radius roster=${rosterHex.length}');
+    store.dispatch(SetRingGateAction(rosterHex: rosterHex, radius: radius));
+    await _bleService?.applyRingGateChange();
+  }
+
+  /// DEBUG/TESTBED ONLY. Sever every GATT link, keeping everything else.
+  ///
+  /// Deliberately NOT [resetAllBleLinks]: that disposes the whole transport
+  /// behind a dark window, and the state it would take with it — Noise sessions
+  /// and the DTN buffer — is exactly what the ring experiment measures ACROSS
+  /// stages. A packet may not exist before a session with its target does, so a
+  /// stage that cleaned sessions could never address a non-neighbour again.
+  ///
+  /// Touches neither [resetAllSessions] nor [clearDtnBuffer]. The seen-set is
+  /// already safe: it is cleared only when the router is disposed.
+  Future<void> severAllBleLinks() async {
+    debugPrint('[testbed] Severing all BLE links (sessions and DTN kept)');
+    await _bleService?.severAllLinks();
+  }
+
   void resetAllSessions() {
     debugPrint('[testbed] Dropping all Noise sessions');
     _noiseSessions.resetAll();
+    // The store projects the fact: no session survives the purge, so no
+    // peer may keep claiming one.
+    store.dispatch(AllNoiseSessionsResetAction());
+  }
+
+  /// DEBUG/TESTBED ONLY. Drop the Noise session with exactly [pubkey],
+  /// leaving every other session — and all DTN state — alone.
+  ///
+  /// The narrow sibling of [resetAllSessions], and it exists because the
+  /// blanket version is the wrong tool for almost every question an operator
+  /// actually has. Re-testing one pair's handshake, or clearing a session a
+  /// peer's own restart has already half-forgotten, needs one entry gone;
+  /// taking the whole table to get it costs every other pair on the device,
+  /// and on a fleet mid-run that is not a recoverable cost (see below).
+  ///
+  /// **Order is load-bearing and is not a style choice.** The manager forgets
+  /// the peer FIRST, then the store is told. Redux here is a strict
+  /// projection of facts the session layer emits, never an inference and
+  /// never an intention, so the dispatch must describe a world that is
+  /// already true. Dispatching first would open a window in which
+  /// `SessionsState.has` says no while `NoiseSessionManager.hasSession` still
+  /// says yes — and since the send path asks the MANAGER while the UI asks
+  /// the STORE, that is a window in which a composer is greyed out for a peer
+  /// we would happily have sealed to.
+  ///
+  /// **What this actually destroys.** A packet may not exist before a session
+  /// with its target does: the send path checks `hasSession` and returns
+  /// without ever calling `createMessagePacket` when there is none. It does
+  /// not establish sessions — it only refuses. Sessions form solely over a
+  /// direct link, during the Noise handshake that an accepted ANNOUNCE
+  /// drives. So a purge does not cost a round trip the next send will quietly
+  /// pay; it costs every message to that peer until the two devices are back
+  /// in each other's radio range and have handshaked again. Under the ring
+  /// gate it is worse: a non-neighbour can NEVER re-handshake, because the
+  /// allowlist refuses the very link the handshake needs, so a session purged
+  /// mid-run is gone for the remainder of that run and every later message to
+  /// the peer fails at creation — silently, with nothing on the air to show
+  /// for it. The measured consequence is a dead run, hours of fleet time, and
+  /// it is why the settings-screen callers of this and of [resetAllSessions]
+  /// both confirm before firing.
+  ///
+  /// The peer record is deliberately untouched: a session and a peer record
+  /// have different lifetimes, and this call is about one of them.
+  void resetSessionWith(Uint8List pubkey) {
+    final hex = pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    debugPrint('[testbed] Dropping Noise session with '
+        '${hex.substring(0, hex.length < 16 ? hex.length : 16)}');
+    _noiseSessions.reset(pubkey);
+    // Only now is the fact true, so only now may the store project it.
+    store.dispatch(PeerNoiseSessionResetAction(pubkey));
   }
 
   /// DEBUG/TESTBED ONLY. Whether the pair with [pubkey] is fully settled for
@@ -1886,11 +2042,15 @@ class GrassrootsNetwork {
   /// transport gone — the only moment at which state can be cleared with no
   /// chance of a peer re-establishing it, since pairing is eager and a
   /// handshake completes on its own as soon as the radio is back.
-  Future<void> resetAllBleLinks({int? darkSec, void Function()? whileDark}) async {
+  Future<void> resetAllBleLinks(
+      {int? darkSec,
+      Future<void> Function()? whileDark,
+      int? untilMs}) async {
     if (_bleService == null) return;
     debugPrint('[testbed] BLE bounce: disposing transport (going dark)');
     await _bleService!.dispose();
     _bleService = null;
+    store.dispatch(SystemBtStateChangedAction(null));
     store.dispatch(
         BleTransportStateChangedAction(TransportState.uninitialized));
     store.dispatch(ClearDiscoveredBlePeersAction());
@@ -1909,9 +2069,46 @@ class GrassrootsNetwork {
     final darkGap = darkSec != null
         ? Duration(seconds: darkSec)
         : config.announceInterval * 2 + const Duration(seconds: 10);
+    // The window is a DEADLINE, not a delay: [whileDark] runs first and the
+    // remainder is padding, so the radio returns [darkGap] after it went
+    // down no matter how long the purge and the trace flush take. Running
+    // the delay first instead made the window `darkGap + whileDark`, which
+    // is unbounded — a device with a large trace buffer or slow storage
+    // stretches its own window, eats into the step's reset budget, and can
+    // enter the step with no radio at all. Steps are wall-clock anchored, so
+    // that shows up as a phone whose radio returns late into a dwell every
+    // other phone started on time.
+    //
+    // Doing the purge at the START of the window rather than the end is
+    // safe, and the ordering the resets want: the transport is disposed for
+    // the WHOLE window, so no handshake can complete at any point inside it,
+    // early or late. Only a purge BEFORE the window is unsafe — that one
+    // hands the step a session eager pairing rebuilt while the radio was
+    // still up.
+    // [untilMs] is the WALL-CLOCK instant the radio is scheduled to come
+    // back, and it is what keeps a fleet in one lattice. Every device opens
+    // its reset slot at the same absolute instant, but the work before this
+    // point — the buffer clear, the transport teardown — takes its own time
+    // on each handset, so a window measured from "now" ends at a different
+    // instant on every phone and the drift lands on the step that follows.
+    // Anchored absolutely, teardown variance is absorbed by the padding
+    // instead. Falls back to a relative window when the caller has no
+    // schedule to anchor to (the settings screen's manual bounce).
+    final darkUntil = untilMs != null
+        ? DateTime.fromMillisecondsSinceEpoch(untilMs)
+        : DateTime.now().add(darkGap);
     debugPrint('[testbed] BLE bounce: staying dark ${darkGap.inSeconds}s');
-    await Future<void>.delayed(darkGap);
-    whileDark?.call();
+    // Awaited: the dark window is the only moment nothing can transmit
+    // or receive, so work that must not compete with traffic — the
+    // trace flush — has to COMPLETE here, not merely start here.
+    await whileDark?.call();
+    final darkLeft = darkUntil.difference(DateTime.now());
+    if (darkLeft > Duration.zero) {
+      await Future<void>.delayed(darkLeft);
+    } else {
+      debugPrint('[testbed] BLE bounce: dark work overran the '
+          '${darkGap.inSeconds}s window by ${-darkLeft.inMilliseconds}ms');
+    }
     if (!_isBleEnabledInSettings) return; // user turned BLE off meanwhile
     debugPrint('[testbed] BLE bounce: re-initializing transport');
 
@@ -1983,18 +2180,78 @@ class GrassrootsNetwork {
     }
   }
 
+  /// The SYSTEM Bluetooth adapter's state, projected from
+  /// [TransportsState.systemBtOn] — a transport fact, held where transport
+  /// facts live rather than in a field beside the store.
+  ///
+  /// A live service feeds it from adapter events. A phone the plan keeps
+  /// dark has no service and therefore no events, but the platform side of
+  /// the plugin outlives the service, so [refreshSystemBt] can still ask it
+  /// directly. It is cleared to null whenever a service goes away, so a
+  /// reader sees either something emitted or an explicit unknown — never a
+  /// memory of what some earlier service saw.
+  bool? get systemBtOn => store.state.transports.systemBtOn;
+
+  /// Re-read the adapter. With a live service the cached value is already
+  /// event-fresh; without one this is a bare host-API call — no instance,
+  /// no callback channel, no lifecycle — which is what lets a dark phone
+  /// answer the only question its operator has.
+  Future<bool?> refreshSystemBt() async {
+    if (_bleService == null) {
+      try {
+        final st = await ble.GrassrootsBluetooth.queryAdapterState();
+        store.dispatch(
+            SystemBtStateChangedAction(st == ble.BleAdapterState.poweredOn));
+      } catch (_) {
+        // No platform (tests) or a channel refusal: unknown, not stale.
+        store.dispatch(SystemBtStateChangedAction(null));
+      }
+    }
+    return systemBtOn;
+  }
+
+  /// The last radio state a field plan scripted, or null outside a run.
+  /// A bring-up the settings toggle refused is honoured the moment the
+  /// toggle allows it (see the settings-change handler) — event-driven,
+  /// so the runner needs no retry loop.
+  bool? _testbedBleWanted;
+
   /// DEBUG/TESTBED ONLY. Hold the BLE transport down or bring it back up,
-  /// WITHOUT touching the user's settings toggle. The power-baseline plan
-  /// scripts BLE-off vs BLE-active segments with it. Bringing it up respects
+  /// WITHOUT touching the user's settings toggle. The field runner scripts
+  /// BLE-off vs BLE-active segments with it. Bringing it up respects
   /// the settings toggle (a user-disabled radio stays down); taking it down
   /// is the same teardown as the settings path, with no dark-gap wait — the
   /// off segment IS the dark.
   Future<void> setBleActiveForTestbed(bool on) async {
+    _testbedBleWanted = on;
     if (!on) {
       if (_bleService == null) return;
       debugPrint('[testbed] BLE down (scripted segment)');
+      // Every live leg dies with the service, and the dispose cancels the
+      // path subscription before the plugin can say so — state each death
+      // here, or the topology keeps ghost edges for legs that ended the
+      // moment the radio went dark.
+      if (trace?.active ?? false) {
+        for (final peer in _peersState.peersList) {
+          for (final legId in [
+            peer.bleCentralDeviceId,
+            peer.blePeripheralDeviceId
+          ]) {
+            if (legId == null) continue;
+            unawaited(trace!.log({
+              'type': 'link',
+              't': DateTime.now().millisecondsSinceEpoch,
+              'event': 'drop',
+              'peer': peer.pubkeyHex,
+              'path': legId,
+              'reason': 'radioOff',
+            }));
+          }
+        }
+      }
       await _bleService!.dispose();
       _bleService = null;
+      store.dispatch(SystemBtStateChangedAction(null));
       store.dispatch(
           BleTransportStateChangedAction(TransportState.uninitialized));
       store.dispatch(ClearDiscoveredBlePeersAction());
@@ -2032,6 +2289,18 @@ class GrassrootsNetwork {
     _dialProbePopN = popN;
     _bleService?.setDialParallelism(maxParallel: maxParallel, popN: popN);
   }
+
+  /// DEBUG/TESTBED ONLY. Record every advertisement sighting rather than
+  /// ~1/s per path, for the length of a test.
+  void setTraceEveryAdvertisementForTestbed(bool every) {
+    _traceEveryAdvertisement = every;
+    _bleService?.setTraceEveryAdvertisement(every);
+  }
+
+  /// Survives a BLE bounce: the transport is rebuilt mid-test and would
+  /// otherwise come back on the production rate, silently changing the
+  /// sighting count partway through a run.
+  bool _traceEveryAdvertisement = false;
 
   /// What the last permission evaluation returned, stamped into the bounce
   /// record so a failed restart names its own cause instead of needing a log.
@@ -2151,8 +2420,8 @@ class GrassrootsNetwork {
         'transport': 'ble',
       });
       // Same as ACKs: the router writes the sealed receipt directly when the
-      // sender is a connected neighbour, and buffers it otherwise (age-expiry
-      // only — nothing ACKs a receipt).
+      // sender is a connected neighbour, and buffers it either way (nothing
+      // ACKs a receipt, so the buffered entry leaves only by age expiry).
       await _messageRouter.dispatchOutbound(senderPubkey, sealed);
       return true;
     }
@@ -2559,10 +2828,11 @@ class GrassrootsNetwork {
         recipientPubkey: recipientPubkey,
       );
       var sent = true;
-      for (final bytes in packets) {
+      await _fragmentHandler.send(packets, (bytes) async {
         final ok = await service.sendToPeer(id, bytes);
         sent = sent && ok;
-      }
+        return ok;
+      });
       return sent;
     }
 
@@ -4005,15 +4275,15 @@ class GrassrootsNetwork {
         // The ACK is recipient-addressed traffic like everything else — the
         // router writes it directly when the original sender is a connected
         // neighbour (a direct-delivered message is confirmed in milliseconds,
-        // not at the next sync round), and buffers it otherwise (nothing ACKs
-        // an ACK, so a buffered entry leaves only by age expiry).
+        // not at the next sync round), and buffers it either way (nothing
+        // ACKs an ACK, so a buffered entry leaves only by age expiry).
         final direct =
             await _messageRouter.dispatchOutbound(senderPubkey, sealed);
         // The receiving side says "ACK received"; without its counterpart a
         // confirmation that never arrives cannot be told apart from one that
         // was never sent, and only the trace knew the difference.
         debugPrint('ACK sent for message $messageId '
-            '(${direct != null ? 'direct over ${direct.name}' : 'buffered — no live path'})');
+            '(${direct != null ? 'direct over ${direct.name}, buffered pending age-expiry' : 'buffered — no live path'})');
       }
     };
 
@@ -4809,6 +5079,10 @@ class GrassrootsNetwork {
     _storeSubscription = null;
     _announceTimer?.cancel();
     _scanTimer?.cancel();
+    for (final t in _syncPacers.values) {
+      t.cancel();
+    }
+    _syncPacers.clear();
 
     // Wait for any in-flight transport update to finish before disposing
     if (_transportUpdateLock != null) {
@@ -4943,6 +5217,13 @@ class GrassrootsNetwork {
   /// were offered the same buffer twice per round. An offer is a statement
   /// about a peer, so identity is its natural key. Entries are pruned by age.
   final Map<String, DateTime> _lastSyncOfferAt = {};
+
+  /// The in-flight paced rounds, keyed like [_lastSyncOfferAt] by
+  /// (transport, peer). A new round for a peer replaces its predecessor
+  /// rather than racing it, and every one of these is cancelled on dispose —
+  /// a periodic timer that outlives the network keeps sealing frames against
+  /// a torn-down session.
+  final Map<String, Timer> _syncPacers = {};
   /// Collapses the two connect events a dual-role pair fires (one per leg)
   /// into a single offer round — they arrive milliseconds apart.
   ///
@@ -4989,13 +5270,55 @@ class GrassrootsNetwork {
     final last = _lastSyncOfferAt[key];
     if (last != null && now.difference(last) < _syncOfferDebounce) return;
 
-    final payload = _messageRouter.buildSyncFilter(link.peerPubkey);
-    if (payload == null) return; // nothing to advertise this round
+    // Size the round to the ground the cursor has to cover. One frame names
+    // at most GcsFilter.maxElements ids, so a node that saw more than that
+    // since its last round cannot describe itself in one — it advertises a
+    // shrinking slice of its own traffic and is sent only what falls in that
+    // slice. The frames are separate whole filters over their own windows;
+    // the router builds the whole round from one snapshot so the sweep can
+    // never wrap between two frames of the same round.
+    final state = _messageRouter.syncCursorState(link.peerPubkey);
+    final frames = _messageRouter.buildSyncRound(link.peerPubkey);
     _lastSyncOfferAt[key] = now;
-    debugPrint('[sync] Advertising a ${payload.length}-byte seen-filter to '
+    // PACED, not fired together — and the reason is what the frames PROVOKE,
+    // not what they cost. A filter is small and goes out on whichever leg
+    // this link names (a refused write retries the pair's other leg), but
+    // each one can pull up to MessageRouter._maxConveyPerFilter packets back.
+    // Ten filters handed over at once therefore ask one peer for up to ten
+    // times that many conveyances in a single moment, and conveyances DO go
+    // out on the pair's peripheral/notify leg, which has no queue behind it.
+    // Spreading the filters across the announce interval spreads the answers
+    // with them. The next round for this peer is an announce interval away,
+    // so a paced round always finishes before its successor starts.
+    _syncPacers.remove(key)?.cancel();
+    unawaited(_sealAndSendSyncFrame(ContentType.syncFilter, frames.first, link));
+    if (frames.length > 1) {
+      final spacing = Duration(
+          milliseconds: config.announceInterval.inMilliseconds ~/ frames.length);
+      var next = 1;
+      _syncPacers[key] = Timer.periodic(spacing, (t) {
+        if (next >= frames.length) {
+          t.cancel();
+          _syncPacers.remove(key);
+          return;
+        }
+        unawaited(_sealAndSendSyncFrame(
+            ContentType.syncFilter, frames[next++], link));
+      });
+    }
+    debugPrint('[sync] Advertising ${frames.length} seen-filter frame(s) to '
         '${link.handle} over ${link.transport.name} '
-        '(${_messageRouter.dtnBufferedCount} carried)');
-    unawaited(_sealAndSendSyncFrame(ContentType.syncFilter, payload, link));
+        '(${state.pending} of ${state.total} seen ids to cover, '
+        '${_messageRouter.dtnBufferedCount} carried)');
+    // What a round actually managed to advertise. Without this the filter's
+    // reach can only be guessed at from delivery outcomes.
+    trace?.logSync(
+      peer: _pubkeyToHex(link.peerPubkey),
+      transport: link.transport.name,
+      frames: frames.length,
+      pending: state.pending,
+      seenTotal: state.total,
+    );
   }
 
   /// Seal a sync control frame to the link's peer and send it back over the
@@ -5064,10 +5387,11 @@ class GrassrootsNetwork {
       budget: _bleService!.usableFragmentBudgetFor(deviceId),
     );
     var sent = true;
-    for (final bytes in packets) {
+    await _fragmentHandler.send(packets, (bytes) async {
       final ok = await _bleService!.sendToPeer(deviceId, bytes);
       sent = sent && ok;
-    }
+      return ok;
+    });
     if (sent) {
       if (isFriend) {
         _bleFriendAnnounceSent.add(deviceId);
@@ -5140,7 +5464,9 @@ class GrassrootsNetwork {
 
   /// Serialize [payload] as one-or-more neighbour-local packets of [type]
   /// (ttl 1), fragmented at [budget] so no single write overflows the leg's
-  /// MTU. Each fragment rides its own packet (distinct packetId) with a
+  /// MTU. Callers put the result on the air through
+  /// [FragmentHandler.send], never a loop of their own. Each fragment
+  /// rides its own packet (distinct packetId) with a
   /// cleartext [SecureFrame] as its payload; the neighbour reassembles by the
   /// frame's globally-unique messageId. [contentType] stays at its default —
   /// it is vestigial here, since the outer `packet.type` routes these and
@@ -5224,10 +5550,11 @@ class GrassrootsNetwork {
           recipientPubkey: friendPubkey,
         );
         var bleSent = true;
-        for (final bytes in packets) {
+        await _fragmentHandler.send(packets, (bytes) async {
           final ok = await _bleService!.sendToPeer(peerId, bytes);
           bleSent = bleSent && ok;
-        }
+          return ok;
+        });
         sent = bleSent;
       }
     }
@@ -5353,13 +5680,23 @@ class GrassrootsNetwork {
       // linked with (20s connecting-wedge on iOS, GATT-133 churn on
       // Android). Tearing the radio down first makes the recovery dial a
       // legitimate first link.
-      final centralId = peer.bleCentralDeviceId;
-      if (centralId != null) {
-        unawaited(_bleService?.disconnectDevice(centralId, forget: true));
-      }
-      final peripheralId = peer.blePeripheralDeviceId;
-      if (peripheralId != null) {
-        unawaited(_bleService?.disconnectDevice(peripheralId, forget: true));
+      // Each leg's death is a LINK event with its path, not only a loss
+      // record: the topology reconstruction retires edges on link drops,
+      // and a silently-dead path may never echo one from the plugin — the
+      // sweep is the app's own conclusion, so the sweep states it.
+      for (final legId in [peer.bleCentralDeviceId, peer.blePeripheralDeviceId]) {
+        if (legId == null) continue;
+        if (trace?.active ?? false) {
+          unawaited(trace!.log({
+            'type': 'link',
+            't': DateTime.now().millisecondsSinceEpoch,
+            'event': 'drop',
+            'peer': pubkeyHex,
+            'path': legId,
+            'reason': 'staleSweep',
+          }));
+        }
+        unawaited(_bleService?.disconnectDevice(legId, forget: true));
       }
       // role: null clears both central and peripheral attachments.
       store.dispatch(PeerBleDisconnectedAction(peer.publicKey));

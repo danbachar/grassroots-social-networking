@@ -9,6 +9,10 @@
 #
 # Never uninstalls. An uninstall wipes the Ed25519 identity and any recording
 # not yet uploaded, and there is no recovering either.
+#
+# Each phone's Bluetooth stack is cycled before its install — a stack left up
+# for hours goes deaf on these devices. SKIP_BT_RESET=1 skips it for a quick
+# reinstall that is not about to be run.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,7 +61,7 @@ printf 'APK  %s (%s)\n' "${APK#"$REPO"/}" \
 printf 'Built %s\n' "$(date -r "$APK" '+%Y-%m-%d %H:%M')"
 printf 'Deploying to %d device(s)\n\n' "${#DEVICES[@]}"
 
-ok=0; failed=(); wireless=()
+ok=0; failed=(); wireless=(); btoff=()
 for s in "${DEVICES[@]}"; do
   model="$(adb -s "$s" shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
   printf '== %-18s %s\n' "$s" "$model"
@@ -71,6 +75,41 @@ for s in "${DEVICES[@]}"; do
     >/dev/null 2>&1 || true
   adb -s "$s" shell settings put global package_verifier_user_consent -1 \
     >/dev/null 2>&1 || true
+
+  # Cycle the Bluetooth stack BEFORE installing.
+  #
+  # A long-lived Bluedroid stack goes deaf on these phones: on 2026-08-25 a
+  # Nexus 5X at 1h43m of stack uptime discovered exactly one peer — the one it
+  # was already linked to — for a whole run, was never seen by the other six,
+  # and cost that run its N=2 pairing. Every other phone's stack had crashed
+  # and been restarted by Android during the previous run; that one's had not.
+  #
+  # The app is stopped FIRST and left stopped: it survives a stack restart and
+  # resumes its connect loop within seconds, refilling the native GATT table
+  # the reset exists to free. Installing next is what keeps it stopped — the
+  # install is also the settle time, and relaunching against a half-up adapter
+  # is what made an earlier attempt fail.
+  #
+  # Verified by the stack's pid changing, never by the adapter state string: a
+  # disable settles in BLE_ON rather than OFF while ble_scan_always_enabled is
+  # set, so a check for "OFF" reports a false failure. `svc bluetooth` and
+  # `cmd bluetooth_manager` are not usable here — the first needs a permission
+  # the shell user lacks below Android 16, the second returns 0 while doing
+  # nothing below Android 13.
+  if [[ "${SKIP_BT_RESET:-0}" != "1" ]]; then
+    pid_before="$(adb -s "$s" shell pidof com.android.bluetooth 2>/dev/null | tr -d '\r')"
+    adb -s "$s" shell am force-stop "$PKG" >/dev/null 2>&1 || true
+    adb -s "$s" shell am force-stop com.android.bluetooth >/dev/null 2>&1 || true
+    sleep 3
+    pid_after="$(adb -s "$s" shell pidof com.android.bluetooth 2>/dev/null | tr -d '\r')"
+    if [[ -n "$pid_before" && "$pid_before" == "$pid_after" ]]; then
+      ylw "   Bluetooth stack did NOT restart (pid $pid_before) — reset it by"
+      ylw "   hand before the run, or this phone may go deaf mid-run"
+    else
+      printf '   bluetooth stack reset (pid %s -> %s)\n' \
+        "${pid_before:-none}" "${pid_after:-restarting}"
+    fi
+  fi
 
   if ! adb -s "$s" install -r "$APK" >/dev/null 2>&1; then
     red "   install FAILED"
@@ -101,6 +140,19 @@ for s in "${DEVICES[@]}"; do
     wireless+=("$s ($model)")
   fi
 
+  # System Bluetooth must be ON before the run: the app can turn its own
+  # transport on and off, but it cannot turn the adapter on, and a phone whose
+  # adapter is off joins nothing. On 2026-08-25 one Pixel sat with its adapter
+  # off through its whole join step — the app raised radio-suspect 20 s in and
+  # the operator reached it 89 s later, by which time that clique size had
+  # been measured with one phone missing. Read from the settings key, which
+  # both dumpsys formats agree on, rather than parsing dumpsys per platform.
+  bt_on="$(adb -s "$s" shell settings get global bluetooth_on 2>/dev/null | tr -d '\r')"
+  if [[ "$bt_on" != "1" ]]; then
+    red "   SYSTEM BLUETOOTH IS OFF — turn it on before the run"
+    btoff+=("$s ($model)")
+  fi
+
   batt="$(adb -s "$s" shell dumpsys battery 2>/dev/null | awk '/level:/{print $2}' | tr -d '\r')"
   printf '   ready — battery %s%%\n' "${batt:-?}"
   (( ok++ ))
@@ -114,6 +166,12 @@ if (( ${#failed[@]} )); then
 fi
 grn "$ok/${#DEVICES[@]} deployed and configured."
 echo
+if (( ${#btoff[@]} )); then
+  red "System Bluetooth is OFF on these — the app cannot turn it on, and a"
+  red "phone whose adapter is off will join nothing:"
+  printf '  %s\n' "${btoff[@]}"
+  echo
+fi
 if (( ${#wireless[@]} )); then
   ylw "Reached over wireless debugging — deploy these by USB and turn Wi-Fi OFF"
   ylw "before the run, or expect them to scan all day and never connect:"

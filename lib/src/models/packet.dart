@@ -44,6 +44,24 @@ class GrassrootsPacket {
 
   static const int defaultTtl = 7;
 
+  /// The packetId of an encoded packet, without decoding the rest of it.
+  ///
+  /// Null when the bytes are too short to hold a header, or malformed. Reading
+  /// the id off the wire is what lets a record that only ever sees raw bytes —
+  /// the wire ledger, a transport-level drop — name the packet it is about,
+  /// so its fate can be joined against the packet index afterwards. That join
+  /// is the only way to tell a dropped control frame from a dropped message:
+  /// both are `secure` on the wire, and the content type is inside the seal.
+  static String? packetIdFromBytes(Uint8List data) {
+    if (data.length < headerSize) return null;
+    try {
+      return bytesToUuid(
+          data.sublist(packetIdOffset, packetIdOffset + 16));
+    } catch (_) {
+      return null;
+    }
+  }
+
   static const _uuid = Uuid();
 
   /// When the ORIGINATOR created this packet, in Unix MILLISECONDS.

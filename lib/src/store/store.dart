@@ -5,6 +5,7 @@ export 'app_state.dart';
 export 'actions.dart';
 export 'reducers.dart';
 export 'peers_state.dart';
+export 'sessions_state.dart';
 export 'peers_actions.dart';
 export 'peers_reducer.dart';
 export 'messages_state.dart';

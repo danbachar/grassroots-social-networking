@@ -1,25 +1,34 @@
 """Control-plane line-sweep figures for the thesis.
 
 Fetches line-sweep uploads from the trace server, joins the pair by message
-id, and writes the chapter's figures next to this script as PDF + PNG, plus
-summary.csv.
+id, and writes the chapter's figures as PDF + PNG, plus summary.csv.
 
     python3 analyze.py                       # newest pair on the server
     python3 analyze.py --list                # candidate uploads, then exit
-    python3 analyze.py --uploads A B         # pin the two upload ids
+    python3 analyze.py --exp line-20 --out ../line-20     # one run, own dir
+    python3 analyze.py --devices 7244,07e4   # a file name two pairs reused
     python3 analyze.py --until '2026-08-22 10:49:48'    # cut the window (UTC)
+    python3 analyze.py --max-d 120           # positions kept (default 100 m)
 
 Figures:
     fig_establishment   per-trial stack-cold establishment, per device
     fig_delivery        delivered fraction per direction
-    fig_stages          bt-on -> discovered / GATT / session / usable
+    fig_stages          bt-on -> advertisement / GATT / identified /
+                        session / settled / usable
     fig_control_bytes   control-plane bytes a trial by class, data overlaid
     fig_power           discharge current during the dwell
-    fig_path_loss       conn-RSSI medians + log-distance fit, Pixel overlay
+    fig_path_loss       conn-RSSI medians + log-distance fit
 
-Establishment is anchored at the bt-on marker; in this build links-reset and
-bt-on stamp within the same second, so the numbers compare directly with the
-July Pixel run's links-reset anchor.
+Establishment is anchored at the trial's own bt-on marker, which the cadence
+stamps ~2 s ahead of the step marker. A trial whose nearest bt-on is older
+than BT_ANCHOR_MAX_MS has no cold anchor — the stack was up for the whole
+interval, usually an operator reset taken before walking to the next mark —
+and is left out of the establishment and stage figures. Its session and its
+messages still count.
+
+Runs are NOT pooled. Each invocation reads one run, because the build differs
+between runs and a difference between builds would otherwise be read as a
+difference between distances.
 
 Delivery is measured from whichever side recorded it. A sender's own file is
 authoritative (it holds sent and the end-to-end ackRx). Where a sender's file
@@ -39,7 +48,13 @@ DB = "/mnt/HC_Volume_106351660/data/traces.db"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, ".cache")
 STEP = re.compile(r"^d=(\d+) t(\d+)$")
-PIXEL_FIT = (-36.6, -18.2)      # July Pixel comparator (line-field/README.md)
+# How stale a `bt-on` may be and still anchor the trial that follows it. The
+# per-trial cadence stamps the radio up ~2 s before the step marker; a gap
+# far beyond that means the reset belongs to an earlier trial and the stack
+# has been up ever since — usually the operator resetting before walking to
+# the next mark. Anchoring there reports a stack that was up the whole walk
+# as a minutes-long cold establishment.
+BT_ANCHOR_MAX_MS = 30_000
 # The plane split follows one test: does the traffic exist when no user
 # message does? ANNOUNCE, the handshake and the sync filter all flow on the
 # announce cycle regardless of load — control plane. End-to-end ACKs exist
@@ -128,7 +143,11 @@ def trials_of(ev):
                 break
             elif STEP.match(l2):
                 break
-        out.append(dict(d=int(m.group(1)), tr=int(m.group(2)), t0=t, bt=bt,
+        # A trial with no fresh anchor is not a cold establishment and is
+        # left out of the establishment and stage figures. Its delivery still
+        # counts — the messages flowed either way.
+        cold = bt if bt is not None and t - bt <= BT_ANCHOR_MAX_MS else None
+        out.append(dict(d=int(m.group(1)), tr=int(m.group(2)), t0=t, bt=cold,
                         sess=sess, end=end if end else t + 30000))
     return out
 
@@ -140,6 +159,13 @@ def main():
                     "for a file name reused by a different pair")
     ap.add_argument("--until", help="UTC cutoff 'YYYY-MM-DD HH:MM:SS'")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--out", default=HERE,
+                    help="directory the figures and summary.csv are written to")
+    ap.add_argument("--max-d", type=float, default=float("inf"),
+                    help="drop positions beyond this distance (m); the "
+                         "default keeps every position, because a default "
+                         "that silently drops the longest rungs makes a "
+                         "sweep look shorter than it was")
     args = ap.parse_args()
 
     like = f"exp_{args.exp}.jsonl%" if args.exp else "exp_line-%"
@@ -170,7 +196,12 @@ def main():
         print(f"loading {r['device_id'][:8]}: {r['n']} records across "
               f"{r['chunks']} chunks ...", flush=True)
         dev, ev = parse(fetch(fname, r["device_id"]), until_ms)
-        sides.append(dict(u=fname, dev=dev, ev=ev, tw=trials_of(ev)))
+        every = trials_of(ev)
+    tw = [w for w in every if w["d"] <= args.max_d]
+    if len(tw) != len(every):
+        print(f"  --max-d {args.max_d}: dropped {len(every) - len(tw)} of "
+              f"{len(every)} runs beyond that distance", file=sys.stderr)
+        sides.append(dict(u=fname, dev=dev, ev=ev, tw=tw))
         print(f"  {dev[:8]}: {len(ev)} records, {len(sides[-1]['tw'])} trials")
     if len({s["dev"] for s in sides}) != 2:
         sys.exit("both uploads are the same device — pick one per phone")
@@ -195,6 +226,20 @@ def main():
         s.update(sent=sent, ack=ack, recv=recv, recv_ids=recv_ids)
         s["rssi"] = [(t, b["rssi"]) for t, ty, b in s["ev"]
                      if ty == "rssi" and b.get("src") == "conn" and b.get("peer") == other]
+        # The scan's own sightings. A sighting is anonymous until an
+        # ANNOUNCE binds the path, so records without a peer field count:
+        # the run is a two-device field with a UUID-filtered scan, and
+        # discarding them would drop exactly the pre-identity part this
+        # rung exists to measure.
+        s["adv"] = [t for t, ty, b in s["ev"]
+                    if ty == "rssi" and b.get("src") == "adv"
+                    and b.get("peer") in (other, None)]
+        # The app's own settled edge: `isPeerLinkSettled` — a Noise session
+        # for the peer plus a live leg in each GATT role. Taking the marker
+        # rather than recomputing it from leg events keeps the figure and the
+        # predicate from drifting apart.
+        s["settled"] = [t for t, ty, b in s["ev"]
+                        if ty == "marker" and b.get("label") == "link-settled"]
         s["wire"] = [(t, b.get("txBytes") or {}) for t, ty, b in s["ev"] if ty == "wire"]
         s["power"] = [(t, b) for t, ty, b in s["ev"] if ty == "power"]
         s["link"] = [(t, b) for t, ty, b in s["ev"] if ty == "link"]
@@ -222,12 +267,22 @@ def main():
                              "connected", "session", "usable"):
                     continue
                 # Peer-scope everything that names a peer. gattConnected does
-                # not: a GATT link exists before identity does, so a leg the
-                # PEER dialled lands before its advertisement is ever seen.
+                # not: it fires before identity exists, on either leg.
                 if b.get("peer") and b["peer"] != other:
                     continue
                 if w["bt"] and w["bt"] <= t < e and n not in st:
                     st[n] = (t - w["bt"]) / 1000
+            # `settled` is a property of the PAIR, not of a leg: one Noise
+            # session for the peer — sessions are keyed by identity, so there
+            # is never one per leg — plus a live leg in each GATT role.
+            for name, src in (("advertised", s["adv"]),
+                              ("settled", s["settled"])):
+                # The scan's first sighting is the only rung measured off the
+                # radio; every later one is a packet, and a packet needs the
+                # link the sighting leads to.
+                hit = [t for t in src if w["bt"] and w["bt"] <= t < e]
+                if hit:
+                    st[name] = (min(hit) - w["bt"]) / 1000
             w["stages"] = st
 
     # Per-message outcome against the RSSI at the moment it was sent.
@@ -316,10 +371,14 @@ def main():
     plt.rcParams.update({"font.size": 11, "figure.dpi": 110})
     COL = ["#2b6cb0", "#dd6b20"]
 
+    os.makedirs(args.out, exist_ok=True)
+
     def save(fig, name):
         fig.tight_layout()
-        fig.savefig(os.path.join(HERE, f"{name}.pdf"))
-        fig.savefig(os.path.join(HERE, f"{name}.png"), dpi=300)
+        fig.savefig(os.path.join(args.out, f"{name}.pdf"),
+                    bbox_inches="tight")
+        fig.savefig(os.path.join(args.out, f"{name}.png"), dpi=300,
+                    bbox_inches="tight")
         plt.close(fig)
         print(f"wrote {name}.pdf/.png")
 
@@ -330,8 +389,12 @@ def main():
     for s, col, off in zip(sides, COL, (-jit, jit)):
         xs = [w["d"] + off for w in s["tw"] if w["estab"] is not None]
         ys = [w["estab"] for w in s["tw"] if w["estab"] is not None]
-        ax.scatter(xs, ys, s=15, alpha=0.55, color=col, zorder=3,
-                   label=f"{s['dev'][:8]} ({len(ys)}/{len(s['tw'])} sessions)")
+        # Sessions and TIMED sessions are different counts: a trial whose
+        # radio-up anchor is stale still paired, it just cannot be timed.
+        n_sess = sum(1 for w in s["tw"] if w["sess"])
+        lbl = f"{s['dev'][:8]} ({n_sess}/{len(s['tw'])} sessions"
+        lbl += f", {len(ys)} timed)" if len(ys) != n_sess else ")"
+        ax.scatter(xs, ys, s=15, alpha=0.55, color=col, zorder=3, label=lbl)
         mx = [(d, statistics.median([w["estab"] for w in at(s, d)
                                      if w["estab"] is not None]))
               for d in ds if any(w["estab"] is not None for w in at(s, d))]
@@ -374,11 +437,11 @@ def main():
     # 3 — stages
     fig, ax = plt.subplots(figsize=(7.6, 4.3))
     for stage, col, name in (
-            ("gattConnected", "#2b6cb0", "GATT link up (anonymous)"),
-            ("discovered", "#718096", "peer ANNOUNCE seen"),
-            ("identified", "#b7791f", "identified (ANNOUNCE bound to the path)"),
-            ("connected", "#6b46c1", "path ready (MTU negotiated, subscribed)"),
+            ("advertised", "#718096", "peer advertisement seen (scan)"),
+            ("gattConnected", "#2b6cb0", "GATT link up"),
+            ("identified", "#b7791f", "identified (ANNOUNCE verified)"),
             ("session", "#c53030", "Noise session"),
+            ("settled", "#6b46c1", "pair settled (session + both legs ready)"),
             ("usable", "#2f855a", "pair usable (first payload acked)")):
         xs, ys = [], []
         for dist in ds:
@@ -390,11 +453,10 @@ def main():
         if xs:
             print(f"stage {stage:14s} median-of-medians "
                   f"{statistics.median(ys):.2f} s")
-            # discovered and identified are near-coincident — the same
-            # ANNOUNCE both reveals and authenticates the peer — so the
-            # earlier one is drawn dashed with open markers to stay visible
-            # under the later one.
-            if stage == "discovered":
+            # The radio rung is drawn dashed with open markers: it is the
+            # one measurement here that is not a packet, and the ladder is
+            # easier to read when that distinction is visible.
+            if stage == "advertised":
                 ax.plot(xs, ys, "o--", ms=8, mfc="none", mew=1.6, lw=1.2,
                         color=col, label=name)
             else:
@@ -402,13 +464,38 @@ def main():
     ax.set_xlabel("distance (m)")
     ax.set_ylabel("median seconds after bt-on")
     ax.set_title("Control-plane stages to a usable pair")
-    ax.text(0.01, -0.235, "GATT can precede discovery: the leg the peer dials "
-            "lands before its advertisement is seen.", transform=ax.transAxes,
-            fontsize=8, color="#4a5568")
     ax.set_xticks(ds)
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8.5, loc="upper center", bbox_to_anchor=(0.5, -0.16),
+              ncol=3, frameon=False)
+    ax.text(0.0, -0.42, "Only the advertisement is measured off the radio; "
+            "every later rung is a packet, and rides the link below it.",
+            transform=ax.transAxes, fontsize=8, color="#4a5568")
     save(fig, "fig_stages")
+
+    # How often the ladder actually holds, per trial rather than per median:
+    # a median can order two rungs that no single trial ever ordered that way.
+    order = ["advertised", "gattConnected", "identified", "session",
+             "settled", "usable"]
+    # Only runs whose bt anchor survived BT_ANCHOR_MAX_MS can carry stage
+    # times at all — every assignment into `stages` is guarded on w["bt"].
+    # Counting the rest as runs that FAILED to reach a rung reports a stage
+    # every timeable run did reach as, say, 7/10.
+    timeable = [w for s_ in sides for w in s_["tw"] if w["bt"]]
+    trials = [w["stages"] for w in timeable]
+    skipped = sum(len(s_["tw"]) for s_ in sides) - len(timeable)
+    print("\nrung order, per run (both devices)"
+          + (f" — {skipped} run(s) without a usable bt anchor excluded"
+             if skipped else "") + ":")
+    for a, b in zip(order, order[1:]):
+        both = [st for st in trials if a in st and b in st]
+        ok = sum(1 for st in both if st[a] <= st[b])
+        gap = sorted(st[b] - st[a] for st in both)
+        print(f"  {a:>13s} <= {b:<13s} {ok:>3d}/{len(both):<3d} runs"
+              + (f"   median gap {gap[len(gap) // 2]:+.2f} s" if gap else ""))
+    for st_name in order:
+        have = sum(1 for st in trials if st_name in st)
+        print(f"  {st_name:>13s} reached in {have}/{len(trials)} runs")
 
     # 4 — control bytes by class, with the data plane overlaid
     present = [c for c in CTRL_ORDER
@@ -431,15 +518,27 @@ def main():
         dat.append(statistics.median(v) / 1000 if v else 0)
         v = [w["wire"].get(ACK_CLASS, 0) for s in sides for w in at(s, dist)]
         ack.append(statistics.median(v) / 1000 if v else 0)
-    ax.plot(ds, dat, "k^--", ms=5, lw=1.2, label="payload (data plane)")
-    ax.plot(ds, ack, "kv:", ms=5, lw=1.2, label="acks (data plane)")
+    # At an application load the data plane is an order of magnitude above
+    # the control plane, and sharing one linear axis leaves the control
+    # stack unreadable or the data lines off the top. The second axis keeps
+    # both legible; its zero is shared, so the shapes still compare.
+    twin = max(dat + ack) > 2 * max(bottom.values())
+    ax2 = ax.twinx() if twin else ax
+    ax2.plot(ds, dat, "k^--", ms=5, lw=1.2, label="payload (data plane)")
+    ax2.plot(ds, ack, "kv:", ms=5, lw=1.2, label="acks (data plane)")
     ax.set_xlabel("distance (m)")
-    ax.set_ylabel("kB transmitted per trial (median)")
+    ax.set_ylabel("control plane, kB per trial (median)")
     ax.set_title("Control plane on the wire, by packet class")
     ax.set_xticks(ds)
     ax.grid(alpha=0.25, axis="y")
     ax.set_ylim(0, max(bottom.values()) * 1.34)
-    ax.legend(fontsize=9, ncol=3, loc="upper center", framealpha=0.95)
+    if twin:
+        ax2.set_ylim(0, max(dat + ack) * 1.34)
+        ax2.set_ylabel("data plane, kB per trial (median)")
+    handles = ax.get_legend_handles_labels()
+    extra = ax2.get_legend_handles_labels() if twin else ([], [])
+    ax.legend(handles[0] + extra[0], handles[1] + extra[1],
+              fontsize=9, ncol=3, loc="upper center", framealpha=0.95)
     ctrl_tot = statistics.median(list(bottom.values()))
     dat_tot = statistics.median(dat)
     if dat_tot:
@@ -487,8 +586,6 @@ def main():
         dd = [min(med) * 10 ** (i / 40) for i in range(46)]
         ax.plot(dd, [A + sl * math.log10(x) for x in dd], color=COL[0], lw=1.3,
                 label=f"fit: {A:.1f} − {-sl:.1f}·log₁₀d   n={n:.2f}, σ={sigma:.1f} dB")
-        ax.plot(dd, [PIXEL_FIT[0] + PIXEL_FIT[1] * math.log10(x) for x in dd],
-                "--", color="#c53030", lw=1.2, label="Pixel 10 Pro, July (n=1.82)")
     ax.scatter(list(med), list(med.values()), color=COL[0], zorder=3,
                label="median conn-RSSI")
     ax.set_xscale("log")
@@ -641,19 +738,21 @@ def main():
 
     # summary
     A_, B_ = sides[0]["dev"][:8], sides[1]["dev"][:8]
-    with open(os.path.join(HERE, "summary.csv"), "w", newline="") as f:
+    with open(os.path.join(args.out, "summary.csv"), "w", newline="") as f:
         wr = csv.writer(f)
-        wr.writerow(["distance_m", "trials", "sessions", "estab_median_s",
-                     "estab_max_s", f"{A_}_to_{B_}_delivered", f"{A_}_to_{B_}_offered",
+        wr.writerow(["distance_m", "trials", "sessions", "estab_n",
+                     "estab_median_s", "estab_max_s", f"{A_}_to_{B_}_delivered", f"{A_}_to_{B_}_offered",
                      f"{B_}_to_{A_}_delivered", f"{B_}_to_{A_}_offered",
                      "reverse_inferred", "rssi_median_dBm",
                      "ctrl_kB_per_trial", "data_incl_acks_kB_per_trial", "mA_median"])
-        print(f"\n{'d':>5} {'sessions':>9} {'estab':>7} {'A→B':>10} {'B→A':>12} "
+        print(f"\n{'d':>5} {'sessions':>9} {'timed':>7} {'estab':>7} "
+              f"{'A→B':>10} {'B→A':>12} "
               f"{'rssi':>6} {'ctrl kB':>8}")
         tot = collections.Counter()
         for dist in ds:
             ws = [w for s in sides for w in at(s, dist)]
             est = [w["estab"] for w in ws if w["estab"] is not None]
+            sess = [w for w in ws if w["sess"] is not None]
             rssi = [x for w in ws for x in w["rssi"]]
             fwd = direction(sides[0], sides[1], dist)
             rev = direction(sides[1], sides[0], dist)
@@ -665,7 +764,7 @@ def main():
                 [(w["wire"].get(DATA_CLASS, 0)
                   + w["wire"].get(ACK_CLASS, 0)) / 1000 for w in ws]) if ws else 0
             mas = [w["mA"] for w in ws if w["mA"]]
-            wr.writerow([dist, len(ws), len(est),
+            wr.writerow([dist, len(ws), len(sess), len(est),
                          round(statistics.median(est), 2) if est else "",
                          round(max(est), 2) if est else "",
                          fwd[0] if fwd[0] is not None else "", fwd[1] or "",
@@ -678,7 +777,8 @@ def main():
             tot["rev_g"] += rev[0] or 0; tot["rev_o"] += rev[1] or 0
             e_txt = f"{statistics.median(est):7.2f}" if est else f"{'-':>7}"
             r_txt = f"{rev[0]}/{rev[1]}{'*' if rev[2] else ''}" if rev[0] is not None else "-"
-            print(f"{dist:>5} {len(est):>4}/{len(ws):<4} {e_txt} "
+            print(f"{dist:>5} {len(sess):>4}/{len(ws):<4} "
+                  f"{len(est):>7} {e_txt} "
                   f"{str(fwd[0]) + '/' + str(fwd[1]):>10} {r_txt:>12} "
                   f"{statistics.median(rssi) if rssi else float('nan'):>6.1f} "
                   f"{ctrl:>8.2f}")

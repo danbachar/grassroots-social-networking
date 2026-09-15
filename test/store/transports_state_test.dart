@@ -1,4 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grassroots_networking/src/store/transports_actions.dart';
+import 'package:grassroots_networking/src/store/transports_reducer.dart';
 import 'package:grassroots_networking/src/store/transports_state.dart';
 
 /// A pair's connection is described by two different numbers, and the one that
@@ -67,6 +69,34 @@ void main() {
       ], const [null, null]);
       expect(t.legs, 0);
       expect(t.acls, 0);
+    });
+  });
+
+  group('systemBtOn — the OS toggle, projected not remembered', () {
+    test('an emitted state is projected, and losing the source clears it', () {
+      // Null has to stay REACHABLE. A screen that renders a remembered
+      // value as a live status warns about a toggle the operator already
+      // flipped, and an alarm that is wrong is one they learn to ignore —
+      // including on the run where the adapter really is off.
+      var s = transportsReducer(
+          TransportsState.initial, SystemBtStateChangedAction(true));
+      expect(s.systemBtOn, isTrue);
+
+      s = transportsReducer(s, SystemBtStateChangedAction(false));
+      expect(s.systemBtOn, isFalse);
+
+      s = transportsReducer(s, SystemBtStateChangedAction(null));
+      expect(s.systemBtOn, isNull,
+          reason: 'the service that reported it went away; unknown, not '
+              'the last thing it said');
+    });
+
+    test('an unrelated transport action leaves it alone', () {
+      var s = transportsReducer(
+          TransportsState.initial, SystemBtStateChangedAction(true));
+      s = transportsReducer(s, BleScanningChangedAction(true));
+      expect(s.systemBtOn, isTrue);
+      expect(s.bleScanning, isTrue);
     });
   });
 }

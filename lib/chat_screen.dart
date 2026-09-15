@@ -58,9 +58,10 @@ class _ChatScreenState extends State<ChatScreen> {
   StreamSubscription<AppState>? _storeSubscription;
   final ImagePicker _imagePicker = ImagePicker();
 
-  /// True while a picture is being compressed and queued for send. Drives the
-  /// indeterminate progress bar above the composer (BLE fragmentation can
-  /// take seconds per image).
+  /// True while a picture is being compressed and sent. Drives the
+  /// indeterminate progress bar above the composer, and the send is awaited,
+  /// so the bar covers the paced BLE transmission too: the ~100 KB
+  /// compression target is ~740 fragments 20 ms apart, about 15 s.
   bool _sendingMedia = false;
 
   /// True when the list is scrolled far enough up that the latest message is
@@ -262,10 +263,10 @@ class _ChatScreenState extends State<ChatScreen> {
   /// carried. What we cannot do is compose for a peer we have never
   /// handshaked with, because sealing needs a session and no packet may exist
   /// without one.
-  bool get _hasSession =>
-      widget.store.state.peers.getPeerByPubkey(widget.peer.publicKey)
-          ?.hasNoiseSession ??
-      false;
+  bool get _hasSession => widget.store.state.sessions.has(widget
+      .peer.publicKey
+      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+      .join());
 
   void _sendMessage() {
     final text = _messageController.text.trim();
@@ -279,9 +280,10 @@ class _ChatScreenState extends State<ChatScreen> {
     _messageController.clear();
 
     // Generate message ID upfront so we can show the message immediately
-    // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
-// and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
-// would corrupt either format.
+    // Full UUID — the messageId becomes a 16-byte packet id on the wire and
+    // is packed into the SecureFrame header by SecureFrame._uuidToBytes,
+    // which throws on anything that is not 32 hex digits. An 8-char prefix
+    // would corrupt one and be rejected by the other.
     final messageId = _uuid.v4();
 
     // Save to conversation immediately so the message appears in the UI
@@ -393,8 +395,10 @@ class _ChatScreenState extends State<ChatScreen> {
       final raw = await picked.readAsBytes();
       debugPrint('[picture-send] raw bytes: ${raw.length}');
 
-      // Aggressive compression: BLE moves ~15 KB/s with 20ms inter-fragment
-      // delays, so unconstrained photos take minutes. Target ~100 KB.
+      // Aggressive compression: the inter-fragment pacing alone caps BLE at
+      // ~6.7 KB/s (138 B per fragment, 20 ms apart — see FragmentHandler),
+      // and the write itself is on top of that, so an uncompressed photo
+      // takes minutes. Target ~100 KB, about 15 s.
       final compressed = await compressForBle(raw);
       debugPrint(
           '[picture-send] compressed: ${compressed.length} bytes (was ${raw.length})');
@@ -404,9 +408,10 @@ class _ChatScreenState extends State<ChatScreen> {
       final mediaFile = await writeMediaFile(compressed, mime);
       debugPrint('[picture-send] wrote ${mediaFile.path}');
 
-      // Full UUID — messageId is encoded as a 16-byte packet id on the wire,
-// and as a 36-char string in the FRAGMENT_START header. An 8-char prefix
-// would corrupt either format.
+      // Full UUID — the messageId becomes a 16-byte packet id on the wire and
+    // is packed into the SecureFrame header by SecureFrame._uuidToBytes,
+    // which throws on anything that is not 32 hex digits. An 8-char prefix
+    // would corrupt one and be rejected by the other.
       final messageId = _uuid.v4();
 
       widget.store.dispatch(SaveChatMessageAction(
@@ -468,9 +473,10 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  /// BLE fragments at ~132 B every 20 ms (see FragmentHandler), and the
-  /// receiver drops a partial reassembly after 4 min — so a transfer must
-  /// finish well inside that. 1 MB ≈ 8k fragments ≈ 160 s, comfortably under.
+  /// BLE fragments at 138 B every 20 ms (FragmentHandler.maxFragmentPayload
+  /// and .fragmentDelay), and the receiver drops a partial reassembly after
+  /// 4 min — so a transfer must finish well inside that. 1 MB ≈ 7.6k
+  /// fragments ≈ 152 s of pacing, under the timeout but not by much.
   /// Bigger files won't complete over BLE (the link won't hold long enough),
   /// so we cap rather than let them fail silently.
   static const int _maxFileBytes = 1 * 1024 * 1024;

@@ -9,6 +9,11 @@ TransportsState transportsReducer(
     return state.copyWith(bleState: action.state, bleError: action.error);
   }
 
+  if (action is SystemBtStateChangedAction) {
+    return state.copyWith(
+        systemBtOn: action.on, clearSystemBtOn: action.on == null);
+  }
+
   if (action is UdpTransportStateChangedAction) {
     return state.copyWith(udpState: action.state, udpError: action.error);
   }

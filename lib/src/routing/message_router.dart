@@ -91,7 +91,7 @@ class MessageRouter {
   /// Store-carry-forward cache: packets held for recipients not currently in
   /// range. Conveyed ONLY through the sync exchange — a peer advertises a
   /// compact filter of what it has SEEN and we answer with what that filter
-  /// lacks. Nothing is ever pushed blindly on connect (see [buildSyncFilter]).
+  /// lacks. Nothing is ever pushed blindly on connect (see [buildSyncRound]).
   /// Over BLE we answer with anything we hold; over UDX, only with packets
   /// addressed to that peer (see [SyncTransport]).
   final DtnStore _dtnStore = DtnStore();
@@ -482,7 +482,17 @@ class MessageRouter {
       // sync-offer filter will refuse to re-request this packet: for the
       // pre-session race this is a REAL loss window until a bloom rotation,
       // and this record is its only evidence.
-      _traceDrop('decrypt', 'noSession', {
+      // NOT called `noSession`, which it was until it wasted an evening. That
+      // name says "we hold no session with this peer", and a run full of them
+      // reads as a mesh whose pairing has collapsed. The measured truth is the
+      // opposite: in a 4-phone ring run every one of the 1,200 of these sat
+      // alongside a session record showing `attempts: 3, sessions: 3` — the
+      // table was full and all three were tried. They are second copies of
+      // packets already delivered, which this design produces on purpose,
+      // since a direct-written packet stays conveyable over the sync exchange
+      // until it is ACKed. `noSession` is still the right word on the SEND
+      // side, where it does mean a session is missing; here it never was.
+      _traceDrop('decrypt', 'undecryptable', {
         'packetId': packet.packetId,
         'transport': transport == PeerTransport.udp ? 'udp' : 'ble',
       });
@@ -979,41 +989,45 @@ class MessageRouter {
   /// the packet here; the ROUTER decides how it travels. There is no
   /// per-content-type delivery path.
   ///
-  /// The decision is by CONNECTIVITY, exclusive:
-  ///  - Recipient is a directly connected neighbour and the write got in →
-  ///    the packet went on the air now and is NOT buffered. Direct delivery
-  ///    is not the blind push the no-flood rule forbids: that rule is about
-  ///    RELAYED packets, where a holder cannot know what a neighbour already
-  ///    has. A just-created packet is one the recipient definitionally lacks.
-  ///  - Otherwise (no live leg, BLE down, or the write was refused) → the
-  ///    packet enters the DTN buffer and leaves via a future sync exchange —
-  ///    store-carry-forward is FOR the recipient that cannot be reached right
-  ///    now.
+  /// A direct write is attempted first when the recipient is a connected
+  /// neighbour (BLE leg preferred, else a live UDX connection). But a write
+  /// succeeding at the transport level is proof the bytes crossed the air,
+  /// not proof the recipient's app layer processed them — a receiver whose
+  /// own path-readiness bookkeeping lags can accept the radio transaction
+  /// and still drop the payload, with nothing to tell the sender. So the
+  /// packet is buffered EITHER WAY. This is not the blind push the no-flood
+  /// rule forbids: that rule is about RELAYED packets, where a holder cannot
+  /// know what a neighbour already has, while a just-created packet is one
+  /// the recipient definitionally lacks — and a peer that already has it
+  /// (the direct write really did land) advertises as much in its own
+  /// seen-filter, so the buffered copy is never re-offered to them. Only the
+  /// end-to-end ACK ([dropFromDtnBuffer]) retires the entry; until then the
+  /// sync exchange can still convey a copy over another path, or to a relay,
+  /// catching the direct write's apparent success turning out to have been
+  /// silent loss on the far end.
   ///
   /// Either way the packet enters our seen-set, so a copy conveyed back to us
   /// is never re-relayed as a fresh sighting.
   ///
-  /// Returns whether the packet went on the air now (false = buffered).
+  /// Returns the transport the packet went out on now, if any (null = no
+  /// live path, buffer-only). A non-null return is NOT "delivered" — the
+  /// packet is buffered regardless, pending the ACK.
   Future<PeerTransport?> dispatchOutbound(
       Uint8List recipientPubkey, GrassrootsPacket sealedPacket) async {
     final send = directSend;
     final via = send == null ? null : await send(recipientPubkey, sealedPacket);
-    if (via != null) {
-      _seenPackets.add(sealedPacket.packetId, sealedPacket.createdAtMs);
-      if (trace?.active ?? false) {
-        unawaited(trace!.log({
-          'type': 'custody',
-          't': DateTime.now().millisecondsSinceEpoch,
-          'event': 'direct',
-          'packetId': sealedPacket.packetId,
-          'recipient': _pubkeyToHex(recipientPubkey),
-          'via': via == PeerTransport.udp ? 'udp' : 'ble',
-        }));
-      }
-      return via;
+    if (via != null && (trace?.active ?? false)) {
+      unawaited(trace!.log({
+        'type': 'custody',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'direct',
+        'packetId': sealedPacket.packetId,
+        'recipient': _pubkeyToHex(recipientPubkey),
+        'via': via == PeerTransport.udp ? 'udp' : 'ble',
+      }));
     }
     storeInDtnBuffer(recipientPubkey, sealedPacket);
-    return null;
+    return via;
   }
 
   /// Drop [packetIds] from the DTN memory buffer — the recipient ACKed the
@@ -1069,14 +1083,49 @@ class MessageRouter {
   // sealed end-to-end and no buffer entry is ever *transferred*, only
   // replicated.
 
-  /// How far this node's buffer sweep has advanced, in originator-stamped
-  /// creation-milliseconds. Each round advertises the oldest held packets at
-  /// or after the cursor (up to one filter's worth), then advances the cursor
-  /// past them; when it passes the newest held packet it wraps to 0 and
-  /// re-sweeps. One global position, not per-peer: consecutive neighbours in
-  /// the same announce round get consecutive slices, which spreads coverage
-  /// across the fleet rather than sending everyone the same slice.
-  int _syncCursorMs = 0;
+  /// How far the sweep has advanced FOR EACH PEER, in originator-stamped
+  /// creation-milliseconds, with the time each cursor was last used.
+  ///
+  /// Per peer, not one position shared across the fleet. A shared cursor
+  /// hands consecutive neighbours consecutive slices, so a holder is only
+  /// ever asked about the slices that happened to land on it: a node
+  /// carrying packets whose ids fall in a window that only ever went to
+  /// someone else is never asked and never conveys them. Coverage of the
+  /// (peer x slice) space is then accidental, which is what a conveyance
+  /// path cannot afford — it showed up as delivery that depended almost
+  /// entirely on WHICH peer a packet was addressed to.
+  ///
+  /// A cursor per peer means every neighbour is eventually told about the
+  /// whole seen-set. The cost is airtime: the peers no longer share one
+  /// sweep, so each round is sized independently and a cycle can carry up to
+  /// [_maxSyncFramesPerRound] frames per neighbour instead of that many in
+  /// total. It is paid only when there is a backlog to describe — a
+  /// converged pair still exchanges one small frame and falls silent.
+  final Map<String, ({int cursorMs, int usedMs})> _syncCursors = {};
+
+  /// A cursor is kept only while its peer is someone we still sync with.
+  /// Unbounded per-peer state grows with every peer ever met, and the reason
+  /// to drop a stale one is not just size: a peer returning after this long
+  /// should be swept from the start, which is exactly what a missing cursor
+  /// does.
+  static const Duration _syncCursorLifetime = Duration(minutes: 10);
+
+  /// Age every sync cursor by [by], so the lifetime rule can be exercised
+  /// without a fake clock reaching into the router. Test-only.
+  @visibleForTesting
+  void debugAgeSyncCursors(Duration by) {
+    for (final k in _syncCursors.keys.toList()) {
+      final v = _syncCursors[k]!;
+      _syncCursors[k] = (cursorMs: v.cursorMs,
+                         usedMs: v.usedMs - by.inMilliseconds);
+    }
+  }
+
+  int _cursorFor(String peerHex, int nowMs) {
+    _syncCursors.removeWhere((_, v) =>
+        nowMs - v.usedMs > _syncCursorLifetime.inMilliseconds);
+    return _syncCursors[peerHex]?.cursorMs ?? 0;
+  }
 
   /// Most packets one filter response may convey before it stops and lets the
   /// rest ride the next round. A single filter must not be able to pull a
@@ -1114,29 +1163,125 @@ class MessageRouter {
   /// still advertises an empty filter over all time, so a neighbour pushes it
   /// the backlog it lacks; that is exactly the fresh/emptied node that
   /// store-carry-forward exists to fill.
-  Uint8List? buildSyncFilter(Uint8List peerPubkey) {
-    var from = _syncCursorMs;
-    var ids = _seenPackets.windowFrom(from, limit: GcsFilter.maxElements);
+  /// Ceiling on one round's frames.
+  ///
+  /// Ten, so a round spreads to about one frame a second across the announce
+  /// interval rather than arriving as a burst the notify leg has to absorb at
+  /// once. Every frame is a separate unacknowledged GATT write on a leg with
+  /// no queue behind it, so the pacing matters as much as the count.
+  ///
+  /// Each peer sweeps independently, so this bounds a round with ONE
+  /// neighbour and a cycle costs it per neighbour: at a clique of seven, up
+  /// to 6 x 10 = 60 frames a cycle. That is the price of every neighbour
+  /// eventually hearing about the whole seen-set instead of whichever slice
+  /// happened to land on it, and it is paid only against a backlog — with
+  /// nothing new to say a round is one small frame per peer, as before. At
+  /// four, the busiest runs at seven phones covered under half the ground
+  /// they owed; ten covers a round of ~1000 ids, which is what a clique of
+  /// seven creates in one announce interval at this load.
+  ///
+  /// The remainder is never lost — the cursor keeps its place and the next
+  /// cycle continues the sweep.
+  static const int _maxSyncFramesPerRound = 10;
+
+  /// Ids seen since the cursor, and the whole seen-set — the two numbers that
+  /// say what fraction of itself a node managed to advertise. Traced per
+  /// round, because without them the filter's reach can only be inferred.
+  ({int pending, int total}) syncCursorState(Uint8List peerPubkey) {
+    final now = _nowMs();
+    return (pending: _seenPackets.countFrom(_cursorFor(_pubkeyToHex(peerPubkey), now)),
+            total: _seenPackets.length);
+  }
+
+  /// The seen-filter frames for one round with one peer.
+  ///
+  /// A round is built from ONE snapshot of the seen-set and sliced into
+  /// frames, rather than by calling a single-frame builder in a loop. That is
+  /// not a refactor: a loop re-reads the cursor between frames, and a frame
+  /// whose window lands inside a single millisecond group consumes more ids
+  /// than it names — so the loop could exhaust the ground mid-round, take the
+  /// wrap-to-oldest branch, and re-advertise a window it had already sent in
+  /// the same round while skipping the ids it had jumped. Slicing a snapshot
+  /// cannot do that: the round stops when the snapshot runs out, and the
+  /// cursor moves once, forward, at the end.
+  ///
+  /// Each frame is a whole standalone filter over its own window, so losing
+  /// one costs its slice and not the round — which is what makes this
+  /// different from making a single filter bigger.
+  ///
+  /// A node that has genuinely seen nothing returns ONE empty filter over all
+  /// time: that is the fresh or emptied node asking for the whole backlog.
+  /// The list is never empty — a node with nothing new to say still has to
+  /// ask, or a quiet node that is MISSING packets would never be sent them.
+  List<Uint8List> buildSyncRound(Uint8List peerPubkey) {
+    final nowMs = _nowMs();
+    final peerHex = _pubkeyToHex(peerPubkey);
+    final cursor = _cursorFor(peerHex, nowMs);
+    final pending = _seenPackets.countFrom(cursor);
+    var want = pending <= GcsFilter.maxElements
+        ? 1
+        : (pending + GcsFilter.maxElements - 1) ~/ GcsFilter.maxElements;
+    if (want > _maxSyncFramesPerRound) want = _maxSyncFramesPerRound;
+
+    var from = cursor;
+    var ids = _seenPackets.windowFrom(from,
+        limit: GcsFilter.maxElements * want);
     if (ids.isEmpty) {
-      // Swept past the newest seen packet (or have seen none): wrap and try
-      // from the oldest so the sweep is continuous.
+      // Swept past the newest seen packet: wrap to the oldest so the sweep is
+      // continuous. This happens BEFORE any frame is built, never between two
+      // frames of one round.
       from = 0;
-      ids = _seenPackets.windowFrom(0, limit: GcsFilter.maxElements);
+      ids = _seenPackets.windowFrom(0, limit: GcsFilter.maxElements * want);
     }
     if (ids.isEmpty) {
       // Genuinely seen nothing (a fresh node). Advertise "I have nothing,
-      // across all time" so a neighbour sends whatever it carries; its own
-      // rate cap bounds the round. Leave the cursor at 0.
-      _syncCursorMs = 0;
-      return encodeSyncFilter(
-          n: 0, fromMs: 0, toMs: _nowMs(), filter: Uint8List(0));
+      // across all time" so a neighbour sends whatever it carries.
+      _syncCursors[peerHex] = (cursorMs: 0, usedMs: nowMs);
+      return [encodeSyncFilter(n: 0, fromMs: 0, toMs: nowMs,
+                               filter: Uint8List(0))];
     }
-    final toMs = ids.last.createdAtMs;
-    final built = GcsFilter.build([for (final e in ids) e.id]);
-    // Advance past this slice; wrap when it reaches the end on the next call.
-    _syncCursorMs = toMs + 1;
-    return encodeSyncFilter(
-        n: built.n, fromMs: from, toMs: toMs, filter: built.data);
+
+    final frames = <Uint8List>[];
+    var start = 0;
+    var windowFrom = from;
+    var oneMillisecond = false;
+    while (start < ids.length && frames.length < want) {
+      var end = start + GcsFilter.maxElements;
+      if (end >= ids.length) {
+        end = ids.length;
+      } else {
+        // Cut on a whole-millisecond boundary: a cut inside a group sharing
+        // one stamp would make the ids left out look unseen and pull them
+        // straight back. Identical to SeenPackets.windowFrom's own rule.
+        final boundary = ids[end - 1].createdAtMs;
+        while (end > start && ids[end - 1].createdAtMs == boundary) {
+          end--;
+        }
+        // Unless the whole slice is one millisecond: name what fits and
+        // accept that one stamp may re-list, rather than stall the sweep.
+        if (end == start) {
+          end = start + GcsFilter.maxElements;
+          oneMillisecond = true;
+        }
+      }
+      final slice = ids.sublist(start, end);
+      final toMs = slice.last.createdAtMs;
+      final built = GcsFilter.build([for (final e in slice) e.id]);
+      frames.add(encodeSyncFilter(
+          n: built.n, fromMs: windowFrom, toMs: toMs, filter: built.data));
+      start = end;
+      windowFrom = toMs + 1;
+      // A slice that filled up inside ONE millisecond has to end the round.
+      // Every window opens after the previous one closes, so a second slice
+      // out of the same stamp could only carry the window [toMs + 1, toMs] —
+      // inverted, and naming the same instant twice. The rest of that
+      // millisecond is skipped rather than re-listed, which is the same
+      // trade the single-frame sweep has always made.
+      if (oneMillisecond) break;
+    }
+    // One forward move, past everything this round named — for THIS peer.
+    _syncCursors[peerHex] = (cursorMs: windowFrom, usedMs: nowMs);
+    return frames;
   }
 
   int _nowMs() => DateTime.now().millisecondsSinceEpoch;

@@ -1,0 +1,29 @@
+% Build wrapper: compiles the Testbed chapter on its own, so the chapter can be
+% read and reviewed without the thesis around it.
+%
+%     latexmk -pdf testbed-standalone.tex
+%
+% Citations and cross-chapter references resolve in the thesis, not here: the
+% bibliography and the other chapters' labels live there, so \cite renders as
+% [?] and \ref to another chapter as ??. That is expected for this build and is
+% not a defect in the chapter.
+\documentclass[11pt,a4paper]{report}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{microtype}
+\graphicspath{{./}}
+
+% Stand in for the thesis bibliography so an unresolved key prints as a marker
+% rather than stopping the build.
+\newcommand{\missingcite}[1]{[?]}
+\let\origcite\cite
+\renewcommand{\cite}[1]{\missingcite{#1}}
+
+\begin{document}
+\input{testbed.tex}
+\end{document}

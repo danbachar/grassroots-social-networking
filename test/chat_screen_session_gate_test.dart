@@ -41,8 +41,9 @@ void main() {
       );
 
   Future<(Store<AppState>, GrassrootsIdentity, GrassrootsNetwork)> setUpChat(
-    PeerState peer,
-  ) async {
+    PeerState peer, {
+    required bool withSession,
+  }) async {
     final sodium = await initTestSodium();
     final keyPair = await Ed25519().newKeyPair();
     final identity = await GrassrootsIdentity.create(
@@ -53,6 +54,9 @@ void main() {
       appReducer,
       initialState: AppState(
         peers: PeersState.initial.copyWith(peers: {peer.pubkeyHex: peer}),
+        sessions: withSession
+            ? SessionsState(establishedAtMs: {peer.pubkeyHex: 1})
+            : const SessionsState(),
       ),
     );
     final grassroots = GrassrootsNetwork(
@@ -64,7 +68,6 @@ void main() {
   }
 
   PeerState peerWith({
-    required bool hasNoiseSession,
     required PeerConnectionState connectionState,
   }) =>
       PeerState(
@@ -72,16 +75,15 @@ void main() {
         nickname: 'peer',
         connectionState: connectionState,
         transport: PeerTransport.bleDirect,
-        hasNoiseSession: hasNoiseSession,
       );
 
   testWidgets('without a session the composer is disabled and says why',
       (tester) async {
     final peer = peerWith(
-      hasNoiseSession: false,
       connectionState: PeerConnectionState.connected,
     );
-    final (store, identity, grassroots) = await setUpChat(peer);
+    final (store, identity, grassroots) =
+        await setUpChat(peer, withSession: false);
     await tester.pumpWidget(await buildChat(store, peer, identity, grassroots));
     await tester.pump();
 
@@ -108,10 +110,10 @@ void main() {
     // The store-carry-forward case: session held, peer gone. Sealing needs the
     // session, not a live path, so this must stay composable.
     final peer = peerWith(
-      hasNoiseSession: true,
       connectionState: PeerConnectionState.disconnected,
     );
-    final (store, identity, grassroots) = await setUpChat(peer);
+    final (store, identity, grassroots) =
+        await setUpChat(peer, withSession: true);
     await tester.pumpWidget(await buildChat(store, peer, identity, grassroots));
     await tester.pump();
 

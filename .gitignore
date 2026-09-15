@@ -78,3 +78,13 @@ docs/overleaf_handoff.zip
 docs/architecture-overview.*
 docs/experiment_log.md
 .claude/
+
+# Analysis artefacts and local trace copies. These are large (the analysis tree
+# is ~571 MB and line200.pkl alone is 318 MB, over GitHub's 100 MB per-file
+# limit) and are all reproducible from traces.db via analyze.py.
+trace_server/analysis/
+trace_server/*.pkl
+trace_server/traces.db
+
+# Standalone chapter build product.
+docs/testbed.pdf

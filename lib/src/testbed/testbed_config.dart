@@ -6,23 +6,30 @@ import '../protocol/fragment_handler.dart';
 /// packet at the BLE floor MTU. At this size one message *is* one packet, so
 /// message counts, delivery ratio and wire bytes all read per-packet with no
 /// hidden fragment multiplier. Anything above it is fragmented — a 184-byte
-/// message is silently TWO packets, 132 + 52, costing 392 wire bytes to move
+/// message is silently TWO packets, 138 + 46, costing 396 wire bytes to move
 /// 184 — which is worth measuring deliberately as a payload arm rather than
 /// baking into every experiment.
-const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 130
+const int defaultSendBytes = FragmentHandler.fragmentThreshold; // 138
 
 /// DEBUG/TESTBED ONLY. Config models for the evaluation harness:
 /// [FieldPlan], the scripted field experiment. Inert/off by default, and
 /// never affecting production behaviour. See `docs/testbed_experiments.md`.
 
-/// Fixed namespace for deterministic UUIDv5 message ids (field-plan
-/// sends). Any offline tool using this namespace + the same name
-/// string reproduces the exact id set — the delivery-ratio denominator.
-const String workloadUuidNamespace = 'b8f4a1e2-1c3d-4b5a-9e7f-677261737372';
-
 /// One label→identity binding in the workload roster. The same roster file is
 /// deployed to every device; a device finds its own row by matching
 /// [pubkeyHex] against its identity.
+/// Refuse a JSON object that carries a key the type does not know. A pasted
+/// plan with a typo'd field otherwise parses clean and runs on the default —
+/// the wrong plan, silently.
+void _rejectUnknownKeys(
+    Map<String, dynamic> json, Set<String> known, String where) {
+  for (final k in json.keys) {
+    if (!known.contains(k)) {
+      throw FormatException("unknown field '$k' in $where");
+    }
+  }
+}
+
 @immutable
 class WorkloadRosterEntry {
   final String label;
@@ -32,11 +39,13 @@ class WorkloadRosterEntry {
 
   Map<String, dynamic> toJson() => {'label': label, 'pubkeyHex': pubkeyHex};
 
-  factory WorkloadRosterEntry.fromJson(Map<String, dynamic> json) =>
-      WorkloadRosterEntry(
-        label: json['label'] as String,
-        pubkeyHex: (json['pubkeyHex'] as String).toLowerCase(),
-      );
+  factory WorkloadRosterEntry.fromJson(Map<String, dynamic> json) {
+    _rejectUnknownKeys(json, const {'label', 'pubkeyHex'}, 'roster entry');
+    return WorkloadRosterEntry(
+      label: json['label'] as String,
+      pubkeyHex: (json['pubkeyHex'] as String).toLowerCase(),
+    );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -48,7 +57,7 @@ class WorkloadRosterEntry {
   int get hashCode => Object.hash(label, pubkeyHex);
 }
 
-/// /// [sendCount] > 0 the runner sends that many [sendBytes]-sized messages to
+/// [sendCount] > 0 the runner sends that many [sendBytes]-sized messages to
 /// every other roster device, spaced evenly through the dwell — the first
 /// send doubles as the handshake trigger after a session reset, so the
 /// discovered→connected→session→usable ladder runs inside the step.
@@ -69,10 +78,9 @@ class FieldStep {
 
 
   /// Set the BLE transport up/down at this step's start (null = leave
-  /// as-is). The power-baseline plan uses it to script BLE-off vs BLE-active
-  /// segments hands-free; the user's settings toggle is not touched. Applied
-  /// before the step marker, so the segment's power samples all see the
-  /// requested state.
+  /// as-is). It scripts BLE-off vs BLE-active segments hands-free; the user's
+  /// settings toggle is not touched. Applied before the step marker, so the
+  /// segment's power samples all see the requested state.
   final bool? bleOn;
 
   /// Diluting-clique membership: the clique size this step belongs to. When
@@ -92,6 +100,13 @@ class FieldStep {
   /// handshakes — a plan-wide reset would also fire at the join step's start
   /// and kill handshakes that legitimately began in the toggle window.
   final bool? resetSessions;
+
+  /// Per-step override of [FieldPlan.resetLinks] (null = inherit). The
+  /// diluting test's FIRST run sets it: one link bounce at the test's
+  /// start, paired with the one session purge riding its dark window, so
+  /// nothing from staging — links or sessions — survives into the test.
+  /// Every later run inherits the plan's false and the mesh stays warm.
+  final bool? resetLinks;
 
   /// Per-step override of [FieldPlan.resetDtnBuffer] (null = inherit).
   ///
@@ -119,9 +134,55 @@ class FieldStep {
 
   /// Begin this step automatically without the IN POSITION tap. Set by the
   /// plan builders when the step's distance equals the previous step's (a
-  /// repeat trial at the same position — nothing to walk to). A step at a new
+  /// repeat run at the same position — nothing to walk to). A step at a new
   /// distance leaves this false so the runner waits for the tap.
   final bool autoAdvance;
+
+  /// DEBUG/TESTBED. The ring-radius gate's radius for this step: a node may
+  /// hold links only to peers within this many hops around the ring (see
+  /// `testbed/ring_topology.dart`). Null leaves the gate unarmed, which is
+  /// what a warm-up or any non-ring step wants.
+  final int? ringRadius;
+
+  /// DEBUG/TESTBED. Sever every GATT link at this step's start, keeping Noise
+  /// sessions, DTN buffers and seen-sets.
+  ///
+  /// NOT [resetLinks], which bounces the whole BLE transport behind a dark
+  /// window and takes discovery down with it. The ring sweep needs the links to
+  /// re-form under the step's new radius while the state that survives link
+  /// loss — sessions above all — is carried across stages untouched.
+  final bool? severLinks;
+
+  /// This stage exists only to let the mesh reach a state — it measures
+  /// nothing, sends nothing, and therefore has no tail to drain.
+  ///
+  /// A measured step is followed by a drain because its own late arrivals and
+  /// acknowledgements are still landing; that is the whole reason
+  /// [FieldPlan.gapAfterSec] derives one from the dwell. A settle aired no
+  /// message, so there is nothing in flight to wait for and the stage is
+  /// exactly as long as its dwell.
+  ///
+  /// Declared explicitly rather than inferred from `sendCount == 0`, which was
+  /// tried and reverted: sendCount is what THIS device sends, and in a
+  /// role-free plan a phone that has not joined yet has none while every other
+  /// phone is sending. Zeroing that phone's drain slid it off the absolute
+  /// lattice the whole fleet shares, with nothing on screen to say so.
+  final bool settle;
+
+  /// DEBUG/TESTBED. Give every peer this device holds a session with its OWN
+  /// send timer, instead of firing one round at all of them together.
+  ///
+  /// [sendCount] keeps its per-destination meaning either way; what changes is
+  /// the shape of the traffic. A round that fires every target puts N-1
+  /// messages on the queue in a single instant, and on a ring — where a node
+  /// may hold two links carrying transit for everyone — that burst is what
+  /// saturates. Per-pair timers, phase-staggered, give each pair exactly its
+  /// own cadence while the device's aggregate comes out evenly spread.
+  ///
+  /// It also ties the offered load to the sessions actually held rather than
+  /// to the roster: a peer with no session gets no timer, so the pairs that do
+  /// exist keep their cadence instead of pacing around a gap.
+  final bool perPairPacing;
 
   const FieldStep({
     required this.label,
@@ -134,15 +195,18 @@ class FieldStep {
     this.cliqueN,
     this.maxParallelDials,
     this.resetSessions,
+    this.resetLinks,
     this.resetDtnBuffer,
+    this.ringRadius,
+    this.severLinks,
+    this.perPairPacing = false,
+    this.settle = false,
   });
 
   Map<String, dynamic> toJson() => {
         'label': label,
         'dwellSec': dwellSec,
         if (sendCount > 0) 'sendCount': sendCount,
-        // Saturating steps carry no sendCount but DO have a payload size —
-        // it is the arm variable of the throughput experiment.
         if (sendCount > 0) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
         if (sendTo != 'all') 'sendTo': sendTo,
@@ -150,10 +214,25 @@ class FieldStep {
         if (cliqueN != null) 'cliqueN': cliqueN,
         if (maxParallelDials != null) 'maxParallelDials': maxParallelDials,
         if (resetSessions != null) 'resetSessions': resetSessions,
+        if (resetLinks != null) 'resetLinks': resetLinks,
         if (resetDtnBuffer != null) 'resetDtnBuffer': resetDtnBuffer,
+        if (ringRadius != null) 'ringRadius': ringRadius,
+        if (severLinks != null) 'severLinks': severLinks,
+        if (perPairPacing) 'perPairPacing': perPairPacing,
+        if (settle) 'settle': settle,
       };
 
-  factory FieldStep.fromJson(Map<String, dynamic> json) => FieldStep(
+  factory FieldStep.fromJson(Map<String, dynamic> json) {
+    _rejectUnknownKeys(
+        json,
+        const {
+          'label', 'dwellSec', 'sendCount', 'sendBytes', 'autoAdvance',
+          'sendTo', 'bleOn', 'cliqueN', 'maxParallelDials', 'resetSessions',
+          'resetLinks', 'resetDtnBuffer', 'ringRadius', 'severLinks',
+          'perPairPacing', 'settle',
+        },
+        "step '${json['label'] ?? '?'}'");
+    return FieldStep(
         label: json['label'] as String,
         dwellSec: json['dwellSec'] as int,
         sendCount: json['sendCount'] as int? ?? 0,
@@ -164,8 +243,14 @@ class FieldStep {
         cliqueN: json['cliqueN'] as int?,
         maxParallelDials: json['maxParallelDials'] as int?,
         resetSessions: json['resetSessions'] as bool?,
+        resetLinks: json['resetLinks'] as bool?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool?,
+        ringRadius: json['ringRadius'] as int?,
+        severLinks: json['severLinks'] as bool?,
+        perPairPacing: json['perPairPacing'] as bool? ?? false,
+        settle: json['settle'] as bool? ?? false,
       );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -180,13 +265,19 @@ class FieldStep {
       other.cliqueN == cliqueN &&
       other.maxParallelDials == maxParallelDials &&
       other.resetSessions == resetSessions &&
-      other.resetDtnBuffer == resetDtnBuffer;
+      other.resetLinks == resetLinks &&
+      other.resetDtnBuffer == resetDtnBuffer &&
+      other.ringRadius == ringRadius &&
+      other.severLinks == severLinks &&
+      other.perPairPacing == perPairPacing &&
+      other.settle == settle;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, sendCount, sendBytes, autoAdvance,
           sendTo, bleOn, cliqueN,
-          maxParallelDials, resetSessions, resetDtnBuffer);
+          maxParallelDials, resetSessions, resetLinks, resetDtnBuffer,
+          ringRadius, severLinks, perPairPacing, settle);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -197,10 +288,6 @@ class FieldStep {
 class FieldPlan {
   final String expId;
   final List<FieldStep> steps;
-
-  /// Post-plan settle window before the recording stops — lets late ACKs and
-  /// buffered-packet deliveries land inside the trace.
-  final int settleSec;
 
   /// Label→identity bindings for per-step sends. A device finds its own row
   /// by pubkey and sends to every OTHER row; a device not in the roster is
@@ -216,7 +303,7 @@ class FieldPlan {
 
   /// Also tear down every BLE link at the start of every step (default off):
   /// the step then re-runs discovery + connect too, making each distance a
-  /// fully independent discovered→connected→session→usable trial. Costs a
+  /// fully independent discovered→connected→session→usable run. Costs a
   /// few seconds of re-dial per step.
   final bool resetLinks;
 
@@ -240,9 +327,22 @@ class FieldPlan {
   /// the buffer surviving across steps (store-carry-forward, multi-hop).
   final bool resetDtnBuffer;
 
-  /// Settle gap before an auto-advancing step ([FieldStep.autoAdvance])
-  /// begins, in seconds. A manual tap still skips the remaining gap.
-  final int autoAdvanceGapSec;
+  /// The quiet drain that follows [step], in seconds — DERIVED, never a
+  /// parameter. A warm plan (links kept) drains for one dwell so a run's
+  /// tail (late arrivals, ACKs) lands inside its own segment; a plan that
+  /// resets links between steps drains zero, because the reset itself is
+  /// what cuts the tail and a gap would only record events belonging to no
+  /// segment.
+  ///
+  /// A [FieldStep.settle] stage drains zero: it aired no message, so nothing
+  /// is in flight to wait for and the stage lasts exactly its dwell. That is
+  /// declared on the step, never inferred from `sendCount == 0` — see the
+  /// field's own comment for the lattice bug that inference caused.
+  ///
+  /// [drainSec] overrides the derivation for every sending step.
+  int gapAfterSec(FieldStep step) => resetLinks || step.settle
+      ? 0
+      : (drainSec ?? step.dwellSec);
 
   /// Seconds reserved BEFORE a step's start instant for the resets to run in,
   /// under [manualJoin]. The step's own window then holds nothing but the
@@ -257,14 +357,40 @@ class FieldPlan {
   /// Zero puts the resets inside the step window, where they cost the dwell
   /// whatever they take. A plan opts in by reserving the time its own resets
   /// measure — the value is a property of what the plan resets, not a global.
+  ///
+  /// The slot is charged only ahead of steps that bounce links (per-step
+  /// [FieldStep.resetLinks] or the plan-wide flag) — the one reset slow
+  /// enough to need it. The buffer clear and session purge are store writes;
+  /// a plan that bounces once must not pay the slot before every run.
   final int resetBudgetSec;
+
+  /// Lattice gap ahead of every step that grows the clique (its cliqueN
+  /// differs from the previous step's): the previous N's last run drains,
+  /// then EVERY device waits this long, then the new N's first dwell opens.
+  ///
+  /// It is bring-up time for the joining phone's radio. On a scripted-radio
+  /// plan that phone's BLE transport is DISPOSED until its step opens, so at
+  /// the boundary it has to be built, start advertising, be discovered, and
+  /// complete a Noise handshake before a send to it can go anywhere. Measured
+  /// at seven phones: linked 0.6 s and receiving 2.2 s after its instant. The
+  /// gap buys that out of the drain rather than out of the dwell, so the
+  /// joining run measures a mesh rather than an establishment.
+  ///
+  /// Every device waits it, not just the joiner — the schedule is one shared
+  /// lattice, and a gap only some phones took would put them in different
+  /// steps. It is also the last stretch in which a phone whose SYSTEM
+  /// Bluetooth is off can be noticed and fixed: the app can raise and drop
+  /// its own transport, but it cannot turn the adapter on.
+  ///
+  /// Zero on plans without clique growth.
+  final int joinGapSec;
 
   /// Seconds the operator is guaranteed to walk a device to the next position
   /// in, under [manualJoin]. A step that opens a new position lands on the
   /// first alignment boundary at least this far past the previous dwell.
   ///
   /// Without it the walk is whatever the lattice leaves over — a remainder
-  /// that shrinks to seconds whenever the trials happen to fill a boundary
+  /// that shrinks to seconds whenever the runs happen to fill a boundary
   /// interval, which is not a budget anyone chose.
   final int walkBudgetSec;
 
@@ -296,13 +422,30 @@ class FieldPlan {
   /// Let the runner drive [FieldStep.bleOn] even though the start is
   /// wall-clock anchored.
   ///
-  /// [manualJoin] conflated two separate things: WHEN the run starts (a shared
+  /// [manualJoin] conflated two separate things: WHEN the test starts (a shared
   /// instant every phone computes) and WHO works the radio. For the join
   /// experiments the operator does it, and the runner must keep its hands off
   /// or it would fight them. A desk plan that scripts a phone going dark needs
   /// the same shared start but no operator at all — hands-free is the point,
   /// since the dark window has to open on every phone at once.
   final bool scriptedRadio;
+
+  /// Record EVERY advertisement sighting, instead of at most one per path
+  /// per ~900 ms.
+  ///
+  /// The transport rate-limits `rssi` trace records because a busy mesh
+  /// sees many sightings a second and the clique runs do not need them.
+  /// A line sweep does: RSSI against distance IS its measurement, and each
+  /// sighting is also one trial of "was this beacon received", which is the
+  /// reception-rate curve — the thing that keeps falling after RSSI has
+  /// flattened into the receiver floor. Under the limiter that curve cannot
+  /// be computed at all, because the sighting count measures the limiter.
+  ///
+  /// Off by default so ordinary app use never pays for it; every testbed
+  /// preset turns it on. Phones advertise at ~100 ms, so this can be ~10x
+  /// the `rssi` records — tens of KB per step against a flush already
+  /// several hundred KB, and the flush lands between measurement windows.
+  final bool traceEveryAdvertisement;
 
   /// The operator resets the whole OS Bluetooth stack at every position,
   /// during the walk window — the thesis line design: each distance starts
@@ -311,23 +454,64 @@ class FieldPlan {
   /// actually happened, position by position.
   final bool stackResetPerPosition;
 
+  /// DEBUG/TESTBED. Plan-wide default for [FieldStep.severLinks].
+  final bool severLinks;
+
+  /// The drain after each sending step, in seconds. Null keeps the derivation
+  /// (one dwell), which is right whenever a run's tail is short relative to
+  /// its window.
+  ///
+  /// Decoupled because the ring sweep's tail is not short. A carried packet
+  /// advances at most ONE HOP per sync round, and rounds ride the 10 s
+  /// announce, so a delivery that has to cross the mesh cannot be quick: at
+  /// diameter TWO the 4-phone smoke measured relayed deliveries at p50 42 s,
+  /// p90 68 s, with a tail past 500 s. A 60 s drain clipped it — 103 of 400
+  /// far-pair messages were still in flight when the window shut, and only
+  /// arrived once a later stage widened the radius and handed them a direct
+  /// link. Those are censored, not lost, and a censored tail that varies with
+  /// radius is exactly the bias uniform windows exist to prevent.
+  ///
+  /// Lengthening the dwell instead would not do: that is the SEND window, so
+  /// it would change the offered load rather than the time allowed to deliver
+  /// it.
+  final int? drainSec;
+
+  /// DEBUG/TESTBED. Refuse to start unless this device already holds at least
+  /// this many Noise sessions.
+  ///
+  /// The ring sweep's warm-up is an OPERATOR precondition, not a runner phase:
+  /// under the ring gate non-neighbours can never handshake, so every pair must
+  /// have a session BEFORE the topology is constrained, and the operator brings
+  /// the fleet there by toggling Bluetooth on subsets until every phone reads a
+  /// full session table. A phase that waited on the count instead would end at
+  /// a different instant on every phone and break the one absolute schedule
+  /// every device shares.
+  ///
+  /// This is the guard that stops a half-warmed fleet silently starting a
+  /// five-hour run whose non-neighbour messages could never be created at all.
+  /// Zero (the default) disables it.
+  final int minSessionsToLaunch;
+
   const FieldPlan({
     required this.expId,
     required this.steps,
-    this.settleSec = 30,
     this.roster = const [],
     this.resetSessions = true,
     this.resetLinks = false,
     this.linkResetDarkSec,
     this.resetDtnBuffer = true,
-    this.autoAdvanceGapSec = 5,
     this.resetBudgetSec = 0,
+    this.joinGapSec = 0,
     this.walkBudgetSec = 0,
     this.manualJoin = false,
     this.placementSec = 300,
     this.alignSec = 600,
     this.scriptedRadio = false,
+    this.traceEveryAdvertisement = false,
     this.stackResetPerPosition = false,
+    this.severLinks = false,
+    this.drainSec,
+    this.minSessionsToLaunch = 0,
   });
 
   /// Resolve a role-free diluting plan for THIS device: every step carrying
@@ -336,6 +520,12 @@ class FieldPlan {
   /// phone and the phone's nickname is the ONLY place its join order lives.
   /// Steps without [FieldStep.cliqueN] pass through unchanged; a plan with no
   /// such steps returns itself.
+  ///
+  /// Every field but `bleOn` is carried over. A field added to [FieldStep]
+  /// and forgotten here is dropped on EVERY phone, silently — the plan the
+  /// runner executes is this rebuild, not the preset. The round-trip test
+  /// compares the two step by step so the omission fails a test instead of
+  /// a field day.
   FieldPlan resolvedFor(int joinOrder) {
     if (!steps.any((s) => s.cliqueN != null)) return this;
     return FieldPlan(
@@ -357,52 +547,80 @@ class FieldPlan {
                   // so unlike bleOn there is nothing per-device to resolve.
                   maxParallelDials: s.maxParallelDials,
                   resetSessions: s.resetSessions,
+                  resetLinks: s.resetLinks,
                   resetDtnBuffer: s.resetDtnBuffer,
+                  // Pass-through, like maxParallelDials: the ring topology is
+                  // a fleet-wide property and every phone derives its own
+                  // position from the roster, so there is nothing per-device
+                  // to resolve here. Dropping them would silently disarm the
+                  // gate on every phone that resolved a plan.
+                  ringRadius: s.ringRadius,
+                  severLinks: s.severLinks,
+                  perPairPacing: s.perPairPacing,
+                  settle: s.settle,
                 ),
       ],
-      settleSec: settleSec,
       roster: roster,
       resetSessions: resetSessions,
       resetLinks: resetLinks,
       linkResetDarkSec: linkResetDarkSec,
       resetDtnBuffer: resetDtnBuffer,
-      autoAdvanceGapSec: autoAdvanceGapSec,
       resetBudgetSec: resetBudgetSec,
+      joinGapSec: joinGapSec,
       walkBudgetSec: walkBudgetSec,
       manualJoin: manualJoin,
       placementSec: placementSec,
       alignSec: alignSec,
       scriptedRadio: scriptedRadio,
+      traceEveryAdvertisement: traceEveryAdvertisement,
       stackResetPerPosition: stackResetPerPosition,
+      severLinks: severLinks,
+      drainSec: drainSec,
+      minSessionsToLaunch: minSessionsToLaunch,
     );
   }
 
   Map<String, dynamic> toJson() => {
         'expId': expId,
         'steps': steps.map((s) => s.toJson()).toList(),
-        'settleSec': settleSec,
         if (roster.isNotEmpty)
           'roster': roster.map((r) => r.toJson()).toList(),
         'resetSessions': resetSessions,
         if (resetLinks) 'resetLinks': resetLinks,
         if (linkResetDarkSec != null) 'linkResetDarkSec': linkResetDarkSec,
         'resetDtnBuffer': resetDtnBuffer,
-        'autoAdvanceGapSec': autoAdvanceGapSec,
         if (manualJoin) 'resetBudgetSec': resetBudgetSec,
+        if (joinGapSec != 0) 'joinGapSec': joinGapSec,
         if (manualJoin) 'walkBudgetSec': walkBudgetSec,
         if (manualJoin) 'manualJoin': true,
         if (manualJoin) 'placementSec': placementSec,
         if (manualJoin) 'alignSec': alignSec,
         if (scriptedRadio) 'scriptedRadio': true,
+        if (traceEveryAdvertisement) 'traceEveryAdvertisement': true,
         if (stackResetPerPosition) 'stackResetPerPosition': true,
+        if (severLinks) 'severLinks': severLinks,
+        if (drainSec != null) 'drainSec': drainSec,
+        if (minSessionsToLaunch > 0)
+          'minSessionsToLaunch': minSessionsToLaunch,
       };
 
-  factory FieldPlan.fromJson(Map<String, dynamic> json) => FieldPlan(
+  factory FieldPlan.fromJson(Map<String, dynamic> json) {
+    _rejectUnknownKeys(
+        json,
+        const {
+          'expId', 'steps', 'roster', 'resetSessions',
+          'resetLinks', 'linkResetDarkSec', 'resetDtnBuffer',
+          'resetBudgetSec', 'joinGapSec', 'walkBudgetSec',
+          'manualJoin', 'placementSec', 'alignSec', 'scriptedRadio',
+          'traceEveryAdvertisement', 'stackResetPerPosition', 'severLinks',
+          'minSessionsToLaunch', 'drainSec',
+        },
+        'plan');
+    return FieldPlan(
         expId: json['expId'] as String,
         steps: (json['steps'] as List<dynamic>)
             .map((e) => FieldStep.fromJson(e as Map<String, dynamic>))
             .toList(),
-        settleSec: json['settleSec'] as int? ?? 30,
         roster: (json['roster'] as List<dynamic>?)
                 ?.map((e) =>
                     WorkloadRosterEntry.fromJson(e as Map<String, dynamic>))
@@ -412,40 +630,51 @@ class FieldPlan {
         resetLinks: json['resetLinks'] as bool? ?? false,
         linkResetDarkSec: json['linkResetDarkSec'] as int?,
         resetDtnBuffer: json['resetDtnBuffer'] as bool? ?? true,
-        autoAdvanceGapSec: json['autoAdvanceGapSec'] as int? ?? 5,
         resetBudgetSec: json['resetBudgetSec'] as int? ?? 0,
+        joinGapSec: json['joinGapSec'] as int? ?? 0,
         walkBudgetSec: json['walkBudgetSec'] as int? ?? 0,
         manualJoin: json['manualJoin'] as bool? ?? false,
         placementSec: json['placementSec'] as int? ?? 300,
         alignSec: json['alignSec'] as int? ?? 600,
         scriptedRadio: json['scriptedRadio'] as bool? ?? false,
+        traceEveryAdvertisement:
+            json['traceEveryAdvertisement'] as bool? ?? false,
         stackResetPerPosition:
             json['stackResetPerPosition'] as bool? ?? false,
+        severLinks: json['severLinks'] as bool? ?? false,
+        drainSec: json['drainSec'] as int?,
+        minSessionsToLaunch: json['minSessionsToLaunch'] as int? ?? 0,
       );
+  }
 
   @override
   bool operator ==(Object other) =>
       other is FieldPlan &&
       other.expId == expId &&
       listEquals(other.steps, steps) &&
-      other.settleSec == settleSec &&
       listEquals(other.roster, roster) &&
       other.resetSessions == resetSessions &&
       other.resetLinks == resetLinks &&
       other.linkResetDarkSec == linkResetDarkSec &&
       other.resetDtnBuffer == resetDtnBuffer &&
-      other.autoAdvanceGapSec == autoAdvanceGapSec &&
       other.resetBudgetSec == resetBudgetSec &&
+      other.joinGapSec == joinGapSec &&
       other.walkBudgetSec == walkBudgetSec &&
       other.manualJoin == manualJoin &&
       other.placementSec == placementSec &&
       other.alignSec == alignSec &&
       other.scriptedRadio == scriptedRadio &&
-      other.stackResetPerPosition == stackResetPerPosition;
+      other.traceEveryAdvertisement == traceEveryAdvertisement &&
+      other.stackResetPerPosition == stackResetPerPosition &&
+      other.severLinks == severLinks &&
+      other.drainSec == drainSec &&
+      other.minSessionsToLaunch == minSessionsToLaunch;
 
   @override
-  int get hashCode => Object.hash(expId, Object.hashAll(steps), settleSec,
+  int get hashCode => Object.hash(expId, Object.hashAll(steps),
       Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
-      resetDtnBuffer, autoAdvanceGapSec, resetBudgetSec, walkBudgetSec,
-      manualJoin, placementSec, alignSec, scriptedRadio);
+      resetDtnBuffer, resetBudgetSec, joinGapSec, walkBudgetSec,
+      manualJoin, placementSec, alignSec, scriptedRadio,
+      traceEveryAdvertisement, stackResetPerPosition, severLinks,
+      minSessionsToLaunch, drainSec);
 }

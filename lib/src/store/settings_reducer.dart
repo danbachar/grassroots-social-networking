@@ -1,3 +1,4 @@
+import '../testbed/ring_topology.dart';
 import 'settings_state.dart';
 import 'settings_actions.dart';
 
@@ -47,6 +48,16 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
 
   if (action is SetShowLinkDiagnosticsAction) {
     return state.copyWith(showLinkDiagnostics: action.enabled);
+  }
+
+  if (action is SetRingGateAction) {
+    // [ringOrder] is applied HERE rather than at the dispatch site: the sort IS
+    // the ring, so it has to hold for every roster that reaches the state, from
+    // whatever caller and in whatever order it arrived.
+    return state.copyWith(
+      ringRoster: ringOrder(action.rosterHex),
+      ringRadius: action.radius,
+    );
   }
 
 

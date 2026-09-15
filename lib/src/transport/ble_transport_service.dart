@@ -11,6 +11,7 @@ import '../models/identity.dart';
 import '../models/packet.dart';
 import '../models/secure_frame.dart';
 import '../store/store.dart';
+import '../testbed/ring_topology.dart';
 import '../trace/experiment_recorder.dart';
 import '../trace/wire_ledger.dart';
 import 'transport_service.dart';
@@ -91,6 +92,11 @@ class BleTransportService extends TransportService {
 
   // Subscriptions to plugin event streams
   StreamSubscription<ble.BleAdapterState>? _adapterSub;
+
+  /// Reports every SYSTEM adapter transition (and the state at init) upward:
+  /// the OS toggle is the one radio state the app cannot change itself, so
+  /// the coordinator caches it for the screens that must ask the operator.
+  final void Function(bool on)? onAdapterState;
   StreamSubscription<ble.BleAdvertisement>? _advertisementSub;
   StreamSubscription<ble.BleAdvertisingState>? _advertisingStateSub;
   StreamSubscription<ble.BleScanState>? _scanStateSub;
@@ -132,6 +138,7 @@ class BleTransportService extends TransportService {
   /// mode stops scanning.
   Timer? _scanWatchdog;
   DateTime _lastAdvertisementAt = DateTime.now();
+
   static const Duration _scanWatchdogInterval = Duration(seconds: 10);
 
   /// Debug: periodic OS-level link (ACL) snapshot poll, projected into Redux
@@ -197,6 +204,7 @@ class BleTransportService extends TransportService {
     this.scanSilenceRestart = const Duration(seconds: 30),
     this.trace,
     ble.GrassrootsBluetooth? grassrootsBluetooth,
+    this.onAdapterState,
   }) : _ble = grassrootsBluetooth ?? ble.GrassrootsBluetooth();
 
   /// Optional trace logger for the evaluation instrumentation: per-sample
@@ -232,21 +240,6 @@ class BleTransportService extends TransportService {
   /// keyed by pathId. Released by [_onPathChanged] the moment that leg
   /// reports a bigger MTU, or by their own timer if it never does.
   ///
-  /// A leg starts at the 23-byte ATT default and the peer's central side is
-  /// what raises it, so a peripheral leg cannot make that happen. The Noise
-  /// handshake is dispatched as soon as an ANNOUNCE is verified, which is
-  /// routinely before the MTU lands, and a handshake message does not fit in
-  /// 20 bytes. Refusing it outright cost three wasted writes and a whole
-  /// re-handshake per encounter; waiting forever would cost the pairing
-  /// entirely, which is why every deferral carries a deadline and then goes
-  /// out regardless.
-  final Map<String, List<_DeferredWrite>> _awaitingMtu = {};
-
-  /// How long a write waits for its leg to report an MTU before being sent
-  /// anyway. Long enough to cover a negotiation that is merely slow, short
-  /// enough that a peer which never negotiates still gets a handshake.
-  static const Duration _mtuWait = Duration(seconds: 3);
-
   /// How long the higher-sorting peer holds its first dial toward an
   /// identity, giving the deterministic initiator its uncontested window.
   ///
@@ -307,9 +300,24 @@ class BleTransportService extends TransportService {
   }
 
   /// Rate-limit for per-peer `rssi` trace records (adv sightings can arrive
-  /// many times per second).
+  /// many times per second — phones advertise at ~100 ms).
+  ///
+  /// Zero records EVERY sighting, which is what a line sweep needs: RSSI
+  /// against distance is its measurement, and each sighting is one trial of
+  /// "was this beacon received" — the reception-rate curve, which the
+  /// limiter makes uncomputable because the count then measures the limiter
+  /// rather than the radio. Set from [FieldPlan.traceEveryAdvertisement];
+  /// the default keeps ordinary app use cheap.
   final Map<String, int> _lastRssiTraceMs = {};
-  static const int _rssiTraceMinIntervalMs = 900;
+  int _rssiTraceMinIntervalMs = 900;
+
+  /// TESTBED ONLY. Record every advertisement sighting rather than ~1/s per
+  /// path. Costs trace volume and nothing else — the records are buffered in
+  /// memory and written at step boundaries, never inside a dwell.
+  void setTraceEveryAdvertisement(bool every) {
+    _rssiTraceMinIntervalMs = every ? 0 : 900;
+    debugPrint('[ble] rssi trace interval -> ${_rssiTraceMinIntervalMs}ms');
+  }
 
   bool get _tracing => trace?.active ?? false;
 
@@ -711,6 +719,10 @@ class BleTransportService extends TransportService {
       // GATT services and active scan are re-attached and the plugin's
       // `willRestoreState` handler rebuilds its in-process tables.
       await _ble.initialize(verboseLogging: true, restoreState: true);
+      // The system radio's state at birth, reported through the same hook as
+      // every later transition — the coordinator's cache starts true.
+      unawaited(_ble.adapterState().then((st) =>
+          onAdapterState?.call(st == ble.BleAdapterState.poweredOn)));
 
       _setState(TransportState.ready);
       return true;
@@ -1102,6 +1114,80 @@ class BleTransportService extends TransportService {
     }
   }
 
+  /// DEBUG/TESTBED ONLY. Apply a ring-radius change by pruning the links it
+  /// just disallowed.
+  ///
+  /// Widening only ADDS permission, so nothing is pruned and the new links form
+  /// on their own from the next sighting. Shrinking has to tear down what is no
+  /// longer allowed, because the dial gate only refuses NEW dials — an existing
+  /// leg would otherwise survive the change and quietly keep the old topology's
+  /// diameter, which is precisely the quantity under measurement.
+  ///
+  /// Both legs of a disallowed pair go: a dual-role pair is ONE neighbour, and
+  /// leaving either leg up leaves the pair adjacent.
+  ///
+  /// Unlike [applyTrustModeChange] this does NOT restart the scan. Scan targets
+  /// are not narrowed by the ring gate — discovery stays wide and continuous,
+  /// because freezing it is measurably catastrophic (delivery collapsed from
+  /// ~75% to ~26% when discovery was suspended during dwells) and because the
+  /// gate's job is to refuse links, not to stop looking.
+  Future<void> applyRingGateChange() async {
+    final settings = store.state.settings;
+    final disallowed = ringDisallowedPeers(
+      ring: settings.ringRoster,
+      selfHex: _selfRingHex,
+      radius: settings.ringRadius,
+    );
+    if (disallowed.isEmpty) return;
+    for (final peerHex in disallowed) {
+      final pubkey = _hexToPubkey(peerHex);
+      if (pubkey == null) continue;
+      final pair = _pairViewFor(GrassrootsIdentity.deriveServiceUuidForSlot(
+          pubkey, GrassrootsIdentity.currentBleSlot()));
+      for (final pathId in [
+        pair.liveCentralPathId,
+        pair.livePeripheralPathId,
+      ]) {
+        if (pathId == null) continue;
+        final path = _paths[pathId];
+        final role = _roleFromPathId(pathId);
+        if (path != null && role != null) _traceLink('ringPrune', path, role);
+        await disconnectDevice(pathId);
+      }
+    }
+  }
+
+  /// DEBUG/TESTBED ONLY. Sever every GATT link and leave everything else
+  /// standing.
+  ///
+  /// This is NOT [stop], and it is not the coordinator's BLE bounce. The
+  /// transport stays active, the scanner and the advertiser keep running, no
+  /// watchdog is cancelled and [_stopped] is not set — so the mesh starts
+  /// re-forming immediately, under whatever radius is armed at that moment.
+  ///
+  /// It is the primitive the ring sweep needs between stages, where the BLE
+  /// bounce is exactly the wrong tool: the bounce disposes the whole transport
+  /// and clears discovery, and the sessions and DTN buffers it would take with
+  /// it are the state the experiment measures ACROSS stages. A packet may not
+  /// exist before a session with its target does, so a stage that cleaned
+  /// sessions could never address a non-neighbour again.
+  ///
+  /// Dispatches nothing. The service is alive, so the plugin reports each
+  /// disconnect and [_onPathChanged] projects it into Redux — which is the only
+  /// legal way a transport fact reaches the store. ([resetAllBleLinks] has to
+  /// dispatch by hand only because it disposes the service first, so no plugin
+  /// events will ever arrive.)
+  Future<void> severAllLinks() async {
+    final pathIds = _paths.keys.toList(growable: false);
+    for (final pathId in pathIds) {
+      try {
+        await _ble.disconnect(pathId, forget: true);
+      } catch (_) {
+        // A path already gone is the outcome we wanted anyway.
+      }
+    }
+  }
+
   /// Apply a runtime role-mode change. Stops the current scan/advertise and
   /// restarts under the new mode. Existing live paths are left untouched —
   /// the plugin's path stream will tear them down naturally if the OS
@@ -1188,19 +1274,35 @@ class BleTransportService extends TransportService {
   /// False stops the write, so the caller can try the pair's other leg. The
   /// refusal is still recorded, so how often this happens and to whom stays
   /// visible in the run.
-  bool _checkWritable(Uint8List data, ble.BlePath path, String site) {
+  /// Null when [data] fits [path], else the reason it does not — the same
+  /// string the drop record carries, so a caller that recovers on the pair's
+  /// other leg can report what it recovered FROM.
+  String? _checkWritable(Uint8List data, ble.BlePath path, String site) {
     final usable = path.mtu - 3;
-    if (data.length <= usable) return true;
+    if (data.length <= usable) return null;
+    // A leg still at the ATT default has not failed — its MTU exchange has
+    // not landed yet (median 1.5 s, p90 11-34 s under load). It is named
+    // separately from a genuine oversize so the two are not read as one
+    // fault: `mtuPending` is a packet that arrived too early for its leg,
+    // `oversized` is one too large for a leg that finished negotiating.
+    //
+    // Either way the write is REFUSED, loudly and now. Holding it would be a
+    // sender-side retry queue, which this design does not have: a packet
+    // that cannot be placed is reported failed and redelivered by the DTN
+    // buffer through the sync exchange, like every other undelivered packet.
+    final pending = path.mtu <= _defaultAttMtu;
     debugPrint('[ble-mtu] REFUSED $site ${data.length}B > ${usable}B usable '
-        '(mtu ${path.mtu}) on ${path.pathId} — not written; the caller falls '
-        'back to the pair\'s other leg');
-    _traceDrop(site, 'oversized', {
+        '(mtu ${path.mtu}) on ${path.pathId}'
+        '${pending ? " — MTU not negotiated yet" : ""}');
+    _traceDrop(site, pending ? 'mtuPending' : 'oversized', {
+      if (GrassrootsPacket.packetIdFromBytes(data) != null)
+        'packetId': GrassrootsPacket.packetIdFromBytes(data),
       'path': path.pathId,
       'bytes': data.length,
       'usable': usable,
       'mtu': path.mtu,
     });
-    return false;
+    return pending ? 'mtuPending' : 'oversized';
   }
 
   /// The neighbour-fragment chunk budget for [deviceId], sized to that leg's
@@ -1231,8 +1333,11 @@ class BleTransportService extends TransportService {
       // A refused write gets a record: an unlogged false is the silent-est send
       // failure in the codebase. Sync conveyances and directed sends vanish
       // here when a path dies mid-operation.
-      _traceDrop('bleSend', path == null ? 'noPath' : 'notReady',
-          {'path': peerId});
+      _traceDrop('bleSend', path == null ? 'noPath' : 'notReady', {
+        if (GrassrootsPacket.packetIdFromBytes(data) != null)
+          'packetId': GrassrootsPacket.packetIdFromBytes(data),
+        'path': peerId,
+      });
       return false;
     }
     return _writeToPeer(path, data, 'bleSend');
@@ -1256,77 +1361,66 @@ class BleTransportService extends TransportService {
   /// prefers.
   Future<bool> _writeToPeer(
       ble.BlePath path, Uint8List data, String site) async {
-    if (await _writeLeg(path, data, site)) return true;
+    // A leg that provably cannot carry this frame does not get to be tried
+    // first. The two legs negotiate their MTUs separately, so a pair can
+    // hold one at the ATT default (20 usable bytes) and one at 517 at the
+    // same instant; writing into the small one refuses the packet, and when
+    // no fallback is found it is HELD for an MTU exchange that already
+    // happened on the other leg. A handshake frame is 86-113 bytes, so it is
+    // the first thing a default-MTU leg kills — and the peer is then left
+    // sessionless while its partner keeps sending, which is a session
+    // outage produced entirely by picking the wrong leg.
+    //
+    // Checked before the write rather than after a refusal, because a
+    // refusal costs the packet: there is no sender-side retry queue to catch
+    // it. A write that cannot be placed is reported failed, and the DTN
+    // buffer plus the sync exchange are what redeliver it.
+    if (data.length > path.mtu - 3) {
+      final wider = otherLegFor(
+        path: path,
+        ready: _readyPaths,
+        pubkeyFor: getPubkeyForPeerId,
+        bytes: data.length,
+      );
+      if (wider != null) {
+        if (await _writeLeg(wider, data, '$site:widerLeg') == null) {
+          _traceRetry(site, {
+            'path': path.pathId,
+            'via': wider.pathId,
+            'reason': 'mtuTooSmall',
+            'mtu': path.mtu,
+            'viaMtu': wider.mtu,
+            'bytes': data.length,
+            if (GrassrootsPacket.packetIdFromBytes(data) != null)
+              'packetId': GrassrootsPacket.packetIdFromBytes(data),
+          });
+          return true;
+        }
+        // The wider leg refused for its own reasons; fall through and let the
+        // original path have its attempt, deferral included.
+      }
+    }
+    final refusedBecause = await _writeLeg(path, data, site);
+    if (refusedBecause == null) return true;
     final other = otherLegFor(
       path: path,
       ready: _readyPaths,
       pubkeyFor: getPubkeyForPeerId,
       bytes: data.length,
     );
-    // Nothing else to try, and the leg we have is still at the ATT default:
-    // the write is not too big for the link, only for the link SO FAR. Hold
-    // it until the MTU lands rather than spending the packet on a leg that
-    // cannot carry it.
-    if (other == null && path.mtu <= _defaultAttMtu) {
-      return _deferUntilMtu(path, data, site);
-    }
     if (other == null) return false;
-    if (!await _writeLeg(other, data, '$site:otherLeg')) return false;
-    _traceRetry(site, {'path': path.pathId, 'via': other.pathId});
-    return true;
-  }
-
-  /// Hold [data] until [path] reports a bigger MTU, then write it.
-  ///
-  /// Reports failure to the caller IMMEDIATELY -- the same answer a refused
-  /// write gave before deferral existed -- and flushes in the background when
-  /// the MTU lands. Callers iterate peers serially (the announce loop, the
-  /// flood), so awaiting the MTU here would let one cold leg hold up every
-  /// peer behind it for the full deadline; nothing upstream acts on the
-  /// success either, since a buffered packet leaves custody only on ACK. The
-  /// deadline is the safety valve: a leg whose peer never negotiates still
-  /// gets the attempt, refused exactly as before, so deferral can only turn
-  /// a certain loss into a chance of delivery.
-  bool _deferUntilMtu(ble.BlePath path, Uint8List data, String site) {
-    final pending = _DeferredWrite(data, site);
-    _awaitingMtu.putIfAbsent(path.pathId, () => []).add(pending);
-    _traceDrop(site, 'awaitingMtu', {
+    if (await _writeLeg(other, data, '$site:otherLeg') != null) return false;
+    _traceRetry(site, {
       'path': path.pathId,
-      'bytes': data.length,
-      'mtu': path.mtu,
+      'via': other.pathId,
+      // WHAT the other leg rescued. Without it a site's rescues cannot be
+      // matched to the refusals they cancel, and a drop table can only
+      // report refusals and rescues as separate totals.
+      'reason': refusedBecause,
+      if (GrassrootsPacket.packetIdFromBytes(data) != null)
+        'packetId': GrassrootsPacket.packetIdFromBytes(data),
     });
-    pending.deadline = Timer(_mtuWait, () {
-      if (_awaitingMtu[path.pathId]?.remove(pending) ?? false) {
-        unawaited(_flushDeferred(path.pathId, [pending], timedOut: true));
-      }
-    });
-    return false;
-  }
-
-  /// Send everything that was waiting on [pathId] now that its leg can carry
-  /// it. A path that dropped instead of negotiating loses its writes — the
-  /// caller was already told they failed, and the DTN buffer is what carries
-  /// a packet past a dead leg, not this queue.
-  Future<void> _flushDeferred(String pathId, List<_DeferredWrite> waiting,
-      {bool timedOut = false}) async {
-    final path = _paths[pathId];
-    for (final w in waiting) {
-      w.deadline?.cancel();
-      if (path == null || !_isReady(path)) continue;
-      if (timedOut) {
-        debugPrint('[ble-mtu] ${w.site} waited ${_mtuWait.inSeconds}s on '
-            '$pathId without an MTU — sending anyway');
-      }
-      await _writeLeg(path, w.data, w.site);
-    }
-  }
-
-  /// Release anything held for [path] once its MTU rises above the default.
-  void _releaseOnMtu(ble.BlePath path) {
-    if (path.mtu <= _defaultAttMtu) return;
-    final waiting = _awaitingMtu.remove(path.pathId);
-    if (waiting == null || waiting.isEmpty) return;
-    unawaited(_flushDeferred(path.pathId, waiting));
+    return true;
   }
 
   /// Evict a dead address and dial the identity's newest other sighting now.
@@ -1372,7 +1466,10 @@ class BleTransportService extends TransportService {
   }
 
   /// One write attempt on one leg. False means the bytes did not get in.
-  Future<bool> _writeLeg(
+  /// Write [data] on one leg. Null when it went out, else the reason it did
+  /// not — the caller retries the pair's other leg and names this reason on
+  /// the retry record, so a rescued write is attributable to what refused it.
+  Future<String?> _writeLeg(
       ble.BlePath path, Uint8List data, String site) async {
     try {
       // Do not air a write this leg would truncate. The peer would get a
@@ -1380,14 +1477,46 @@ class BleTransportService extends TransportService {
       // reporting it as sent hides the one remedy that exists: a pair holds
       // two legs, they negotiate their MTUs separately, and the other may
       // carry what this one cannot.
-      if (!_checkWritable(data, path, site)) return false;
-      await _ble.send(path.pathId, data);
+      final unwritable = _checkWritable(data, path, site);
+      if (unwritable != null) return unwritable;
+      // Our CENTRAL leg writes with a response, and this await now waits for
+      // it: the plugin completes the send from onCharacteristicWrite, so a
+      // normal return means the peer's ATT layer acknowledged the bytes.
+      //
+      // The reason is a measured failure, not neatness. A GATT link can die
+      // without either stack noticing for tens of seconds, and an
+      // unacknowledged write into that gap is accepted locally and lost —
+      // 100 messages on one pair in one run, every one recorded as sent
+      // (2026-08-25). Worse, because the send path prefers a live link over
+      // custody, those packets were never buffered, so store-carry-forward
+      // had nothing to redeliver. Waiting for the acknowledgement turns that
+      // silence into a throw, which retries the pair's other leg and then
+      // falls back to carrying the packet.
+      //
+      // The peripheral leg stays unacknowledged: a notification has no ATT
+      // response to wait for, and asking for one means indications, which is
+      // a different characteristic and another round trip per packet.
+      await _ble.send(
+        path.pathId,
+        data,
+        // _roleFromPathId returns THIS layer's BleRole, not the plugin's
+        // ble.BleRole — two unrelated enums that both have a `central`.
+        // Comparing across them is always false, which silently made every
+        // central write unacknowledged.
+        writeMode: _roleFromPathId(path.pathId) == BleRole.central
+            ? ble.BleWriteMode.withResponse
+            : ble.BleWriteMode.withoutResponse,
+      );
       if (_tracing) _wireLedger.onTx(data);
-      return true;
+      return null;
     } catch (e) {
       debugPrint('send() failed for ${path.pathId}: $e');
-      _traceDrop(site, 'writeFailed', {'path': path.pathId});
-      return false;
+      _traceDrop(site, 'writeFailed', {
+        if (GrassrootsPacket.packetIdFromBytes(data) != null)
+          'packetId': GrassrootsPacket.packetIdFromBytes(data),
+        'path': path.pathId,
+      });
+      return 'writeFailed';
     }
   }
 
@@ -1436,6 +1565,7 @@ class BleTransportService extends TransportService {
       ready: ready,
       pubkeyFor: getPubkeyForPeerId,
       excludePeerIds: excludePeerIds,
+      bytes: data.length,
     );
     var sent = 0;
     for (final path in targets) {
@@ -1475,6 +1605,31 @@ class BleTransportService extends TransportService {
         pubkey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     if (role != null) _traceLink('identified', path, role);
     if (role != null) _dropDuplicateLegFor(pathId, role);
+
+    // DEBUG/TESTBED: the ring gate's inbound backstop. Inert unless armed.
+    //
+    // There is no accept hook to refuse an inbound connection at: Android's
+    // GATT server reports a link only once it is already up, and the address
+    // it reports is an RPA that rotates far too fast to key a decision on
+    // (measured: ~90 tracked path entries against ten live legs over a
+    // seven-minute run). So identity is the earliest point a decision can be
+    // made, and this runs AFTER the router has applied the ANNOUNCE — the peer
+    // record, the identity and any eager handshake all land untouched. The gate
+    // takes the LINK and nothing else, which is the whole of its remit.
+    //
+    // Applies to both roles: a central leg opened before the gate armed, or
+    // before the peer was identified, has to go the same way.
+    if (role != null) {
+      final verdict = _ringVerdictForHex(_peerHexByPath[pathId]);
+      if (!verdict.allowsLink) {
+        _traceLink('ringDrop', path, role);
+        // Tolerate a path already gone: [_dropDuplicateLegFor] above may have
+        // disconnected it first, and disconnectDevice swallows that.
+        unawaited(disconnectDevice(pathId));
+        return;
+      }
+    }
+
     if (!_isReady(path)) return;
     if (role != BleRole.peripheral) return;
 
@@ -1666,6 +1821,7 @@ class BleTransportService extends TransportService {
     required Iterable<ble.BlePath> ready,
     required Uint8List? Function(String pathId) pubkeyFor,
     Set<String>? excludePeerIds,
+    int? bytes,
   }) {
     final excludedKeys = <String>{};
     for (final peerId in excludePeerIds ?? const <String>{}) {
@@ -1684,10 +1840,27 @@ class BleTransportService extends TransportService {
       }
       final key = _pubkeyHex(pubkey);
       if (excludedKeys.contains(key)) continue;
+      // A leg whose MTU has not landed yet is not a candidate for a frame
+      // it cannot carry — the preference for notify comes SECOND to being
+      // able to send at all. The two legs negotiate separately, so roughly
+      // three quarters of pairs hold one at the 20-byte ATT default and one
+      // at 517 at some point, and the default one stays there for a median
+      // 1.5 s and a p90 of 11-34 s under load. Picking it spends the packet:
+      // the write is refused and then held for an exchange the other leg has
+      // already completed.
+      final fits = bytes == null || bytes <= path.mtu - 3;
       final existing = chosen[key];
-      if (existing == null ||
-          (existing.role != ble.BleRole.peripheral &&
-              path.role == ble.BleRole.peripheral)) {
+      if (existing == null) {
+        chosen[key] = path;
+        continue;
+      }
+      final existingFits = bytes == null || bytes <= existing.mtu - 3;
+      if (existingFits != fits) {
+        if (fits) chosen[key] = path;
+        continue;
+      }
+      if (existing.role != ble.BleRole.peripheral &&
+          path.role == ble.BleRole.peripheral) {
         chosen[key] = path;
       }
     }
@@ -1731,15 +1904,6 @@ class BleTransportService extends TransportService {
   @override
   Future<void> dispose() async {
     await stop();
-    // Cancel every held write's deadline before anything closes: a timer
-    // firing after dispose would flush into a transport that no longer
-    // exists.
-    for (final waiting in _awaitingMtu.values) {
-      for (final w in waiting) {
-        w.deadline?.cancel();
-      }
-    }
-    _awaitingMtu.clear();
     _wireLedgerTimer?.cancel();
     _wireLedgerTimer = null;
     await _adapterSub?.cancel();
@@ -1800,6 +1964,18 @@ class BleTransportService extends TransportService {
       _traceDialSkip(pathId, 'pairHasCentral');
       return false;
     }
+    // DEBUG/TESTBED: the ring-radius gate. Inert unless a radius is armed.
+    // Placed here — after the one-central-leg guard, before the trust check —
+    // because it is the cheaper and more decisive identity-scoped refusal, and
+    // because refusing a dial is the POSITIVE half of the gate: it is where we
+    // know who the peer is (from the advertised UUID) and can allow only ring
+    // neighbours. The inbound half in [onPeerIdentified] is the backstop.
+    final ringVerdictForDial =
+        _ringVerdictForHex(_ringHexForServiceUuid(serviceUuid));
+    if (!ringVerdictForDial.allowsLink) {
+      _traceDialSkip(pathId, ringVerdictForDial.traceReason!);
+      return false;
+    }
     // EXPERIMENT: the iOS "cannot open the second link toward a non-iOS peer"
     // veto has been removed. We now dial the reverse central leg even when
     // we are iOS and already hold an inbound peripheral leg from a non-iOS
@@ -1850,6 +2026,7 @@ class BleTransportService extends TransportService {
           'transport': 'ble',
           'path': pathId,
           'via': via,
+          ..._linkBudget(selfPath: pathId),
           if (sightingRssi != null) 'rssi': sightingRssi,
           if (discovered != null) ...{
             'entryAgeMs': now.difference(discovered.lastSeen).inMilliseconds,
@@ -1950,6 +2127,7 @@ class BleTransportService extends TransportService {
   // ===== Plugin event handlers =====
 
   void _onAdapterStateChanged(ble.BleAdapterState adapterState) {
+    onAdapterState?.call(adapterState == ble.BleAdapterState.poweredOn);
     if (adapterState != ble.BleAdapterState.poweredOn) {
       // The plugin already stops scan/advertising and tears down paths on
       // adapter-off; mirror that into Redux by dropping back to `ready` so
@@ -2362,7 +2540,6 @@ class BleTransportService extends TransportService {
     }
     final previous = _paths[path.pathId];
     _paths[path.pathId] = path;
-    _releaseOnMtu(path);
 
     // Stamp when a path first became live-but-not-ready, so [_reapStuck] can
     // tell a slow handshake from one that will never finish. FIRST moment
@@ -2483,6 +2660,10 @@ class BleTransportService extends TransportService {
               'event': 'dialFailed',
               'transport': 'ble',
               'path': path.pathId,
+              // What the controller was already carrying when this dial was
+              // refused. A GATT 133 says only "generic failure"; this is
+              // what lets the 133 rate be read against concurrency.
+              ..._linkBudget(selfPath: path.pathId),
               if (path.error != null) 'error': path.error,
             }));
           }
@@ -2622,6 +2803,78 @@ class BleTransportService extends TransportService {
 
   Iterable<ble.BlePath> get _readyPaths => _paths.values.where(_isReady);
 
+  /// The link budget at this instant, for stamping on a dial record.
+  ///
+  /// A GATT 133 says only "generic failure"; it does not say whether the
+  /// controller had a connection slot left. Reading the pool size is not
+  /// possible — `dumpsys` reports live counts per GATT client, never the
+  /// ceiling, and no system property carries it — so the ceiling has to be
+  /// found by watching what the device was already holding each time a dial
+  /// failed. Stamped on `dialIssued` as well as `dialFailed`, because the
+  /// failures only mean something against the distribution of budgets that
+  /// dials were ISSUED at: 133s at 11 live legs when every dial is issued at
+  /// 11 says nothing, while 133s clustered at the high end of a broad
+  /// issuing distribution is the ceiling showing itself.
+  ///
+  /// `legsReady` is the LIVE leg count — paths that are `ready` and can be
+  /// written to. It is the only field here that answers "how many GATT
+  /// connections is this device actually carrying", and the one to reach
+  /// for by default.
+  ///
+  /// `pathsTracked` is the size of the path TABLE, which is a different and
+  /// much larger number: `_paths.remove` runs only on a plugin-reported
+  /// failed/disconnected event, so a path that dies without one lingers,
+  /// and RPA rotation mints a fresh pathId per address — measured at roughly
+  /// ninety tracked entries against ten live legs over a seven-minute run.
+  /// Useful for watching that accumulation; useless as a connection count,
+  /// and named so nobody reads it as one. Its central/peripheral split has
+  /// the same caveat, and both count the subject path of a `dialFailed`
+  /// (it is in the map by then) but not of a `dialIssued`.
+  ///
+  /// `dialsInFlight` excludes the dial the record is ABOUT, so it means the
+  /// same thing on `dialIssued` and `dialFailed` — dials to OTHER peers
+  /// outstanding at that instant. The subject dial is in `_dialingNow` at
+  /// issue time and gone by failure time, so without the exclusion the two
+  /// records would disagree by one and neither would say so.
+  Map<String, int> _linkBudget({String? selfPath}) {
+    var central = 0, peripheral = 0, ready = 0;
+    for (final p in _paths.values) {
+      if (p.role == ble.BleRole.central) {
+        central++;
+      } else {
+        peripheral++;
+      }
+      if (_isReady(p)) ready++;
+    }
+    final dialing = _dialingNow.length -
+        (selfPath != null && _dialingNow.contains(selfPath) ? 1 : 0);
+    return {
+      'legsReady': ready,
+      'pathsTracked': _paths.length,
+      'pathsTrackedCentral': central,
+      'pathsTrackedPeripheral': peripheral,
+      'dialsInFlight': dialing,
+    };
+  }
+
+  /// The FRIEND whose derived service UUID matches [serviceUuid], or null.
+  ///
+  /// Friend-scoped on purpose, and it must stay that way. The advertised
+  /// UUID rotates every slot precisely so a beacon is not a durable handle
+  /// for tracking someone. The derivation cannot be inverted, but it can be
+  /// MATCHED — compute the expected UUID for a pubkey you hold and compare —
+  /// so whoever knows a pubkey can recognise that person silently, across
+  /// every rotation, forever. Friends have granted exactly that. A peer we
+  /// merely exchanged ANNOUNCE with once has not, and widening this to all
+  /// known peers would let anyone who ever received someone's ANNOUNCE track
+  /// them from then on, with no approval and nothing to notice.
+  ///
+  /// This does cost measurement: a non-friend's beacon stays anonymous until
+  /// a signed ANNOUNCE maps its path, which leaves roughly half the
+  /// advertisement sightings in a testbed run without a peer. Per-peer
+  /// discovery statistics have to be recovered some other way — the run's
+  /// own identity map, applied offline — never by making the live app
+  /// recognise more people than it is allowed to.
   Uint8List? _friendPubkeyForDerivedServiceUuid(String serviceUuid) {
     for (final peer in _peersState.friends) {
       if (GrassrootsIdentity.serviceUuidMatchesPubkey(
@@ -2630,6 +2883,76 @@ class BleTransportService extends TransportService {
       }
     }
     return null;
+  }
+
+  // ===== Ring-radius link gate (DEBUG/TESTBED ONLY) =====================
+  //
+  // Inert unless `settings.ringRadius` is set, which only the testbed runner
+  // does. See `testbed/ring_topology.dart` for what the ring is and why.
+
+  /// This device's own pubkey, lowercase hex — its position in the ring.
+  String get _selfRingHex =>
+      identity.publicKey.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+  /// The ROSTER identity behind [serviceUuid], or null if it belongs to nobody
+  /// on the roster.
+  ///
+  /// Deliberately separate from [_friendPubkeyForDerivedServiceUuid]. That one
+  /// is a privacy grant scoped to friends, and widening it would let anyone who
+  /// ever received an ANNOUNCE track a device across rotations forever. This
+  /// resolves a roster the OPERATOR deployed to a fleet under test, and it has
+  /// to resolve a peer BEFORE any ANNOUNCE has identified it, because the gate
+  /// must refuse the DIAL and the dial precedes the ANNOUNCE.
+  ///
+  /// The pubkey is never on the air, but the advertised service UUID is a
+  /// derivable function of it, so matching the roster against the UUID recovers
+  /// the identity pre-identification. At eleven roster entries with slot
+  /// rotation pinned off that is at most eleven SHA-256 per sighting, behind
+  /// the `pairHasCentral` short-circuit that already absorbs repeat sightings.
+  String? _ringHexForServiceUuid(String serviceUuid) {
+    final roster = store.state.settings.ringRoster;
+    if (roster.isEmpty) return null;
+    for (final hex in roster) {
+      final pubkey = _hexToPubkey(hex);
+      if (pubkey == null) continue;
+      if (GrassrootsIdentity.serviceUuidMatchesPubkey(serviceUuid, pubkey)) {
+        return hex;
+      }
+    }
+    return null;
+  }
+
+  static Uint8List? _hexToPubkey(String hex) {
+    if (hex.length != 64) return null;
+    final bytes = Uint8List(32);
+    for (var i = 0; i < 32; i++) {
+      final byte = int.tryParse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+      if (byte == null) return null;
+      bytes[i] = byte;
+    }
+    return bytes;
+  }
+
+  /// The gate's verdict on a peer identified by pubkey hex.
+  RingVerdict _ringVerdictForHex(String? peerHex) {
+    final settings = store.state.settings;
+    if (settings.ringRadius == null) return RingVerdict.inactive;
+    if (peerHex == null) {
+      // The gate is armed and this peer resolves to nobody on the roster.
+      // Same verdict as an explicit off-roster hex: not in the experiment.
+      return ringVerdict(
+        ring: settings.ringRoster,
+        selfHex: _selfRingHex,
+        peerHex: '',
+        radius: settings.ringRadius,
+      );
+    }
+    return ringVerdict(
+      ring: settings.ringRoster,
+      selfHex: _selfRingHex,
+      peerHex: peerHex,
+      radius: settings.ringRadius,
+    );
   }
 
   BleRole? _roleFromPathId(String pathId) {
@@ -2686,13 +3009,3 @@ class _PairView {
   });
 }
 
-/// One write held back until its leg negotiates an MTU: the bytes, the trace
-/// site they belong to, and the timer that sends them anyway if no MTU ever
-/// arrives.
-class _DeferredWrite {
-  final Uint8List data;
-  final String site;
-  Timer? deadline;
-
-  _DeferredWrite(this.data, this.site);
-}

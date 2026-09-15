@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import '../testbed/ring_topology.dart';
+
 
 /// Available transport protocols
 enum TransportProtocol {
@@ -92,6 +94,31 @@ class SettingsState {
 
   // ===== Testbed harnesses (debug-only; null/off in production) =====
 
+  /// Ring-radius experiment: the roster of participating pubkeys, in RING
+  /// ORDER — lowercase hex, sorted ascending, de-duplicated.
+  ///
+  /// The sort IS the ring (see `testbed/ring_topology.dart`): ordering by
+  /// pubkey is what lets every phone derive the same ring from the same roster
+  /// with no coordination and no assigned positions. Normalisation is applied
+  /// by the reducer and by [fromJson] — the only two write paths — so ring
+  /// order is an invariant of the state rather than a property of whoever
+  /// supplied the list.
+  ///
+  /// Empty in production, which leaves [ringRadius] nothing to constrain.
+  final List<String> ringRoster;
+
+  /// Ring-radius experiment: the greatest ring distance a BLE link may span.
+  ///
+  /// **Null means the gate is not armed** — the production value, and also the
+  /// state the operator warms the mesh up in, where every pair has to be able
+  /// to handshake. Persisted like every other settings field: a stale radius is
+  /// visible in the testbed UI and inert without a roster, which is a smaller
+  /// cost than carving out a separate unpersisted slice.
+  ///
+  /// It lives here beside [coldCallTrustLevel], not in `TransportsState`,
+  /// because it is POLICY: Redux transport state is a strict projection of
+  /// facts the transports report, never an input to them.
+  final int? ringRadius;
 
   const SettingsState({
     this.bluetoothEnabled = true,
@@ -104,6 +131,8 @@ class SettingsState {
     this.coldCallTrustLevel = ColdCallTrustLevel.open,
     this.facilitateInvites = false,
     this.showLinkDiagnostics = false,
+    this.ringRoster = const [],
+    this.ringRadius,
   });
 
   static const SettingsState initial = SettingsState();
@@ -139,7 +168,9 @@ class SettingsState {
     ColdCallTrustLevel? coldCallTrustLevel,
     bool? facilitateInvites,
     bool? showLinkDiagnostics,
+    List<String>? ringRoster,
     // Use Object? + sentinel so callers can pass null to clear.
+    Object? ringRadius = _unset,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -149,6 +180,11 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel ?? this.coldCallTrustLevel,
       facilitateInvites: facilitateInvites ?? this.facilitateInvites,
       showLinkDiagnostics: showLinkDiagnostics ?? this.showLinkDiagnostics,
+      ringRoster: ringRoster ?? this.ringRoster,
+      // Disarming the gate is `ringRadius: null`, which is why this one needs
+      // the sentinel: "not passed" and "passed null" mean opposite things.
+      ringRadius:
+          identical(ringRadius, _unset) ? this.ringRadius : ringRadius as int?,
     );
   }
 
@@ -160,6 +196,8 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
         'showLinkDiagnostics': showLinkDiagnostics,
+        'ringRoster': ringRoster,
+        'ringRadius': ringRadius,
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -188,6 +226,13 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
+      // Re-normalised on the way in: hydration is a write path, and a roster
+      // that came back in a different order would give this phone different
+      // ring neighbours than the one that wrote it.
+      ringRoster:
+          ringOrder((json['ringRoster'] as List<dynamic>?)?.cast<String>() ??
+              const <String>[]),
+      ringRadius: json['ringRadius'] as int?,
     );
   }
 
@@ -202,7 +247,9 @@ class SettingsState {
           bleRoleMode == other.bleRoleMode &&
           coldCallTrustLevel == other.coldCallTrustLevel &&
           facilitateInvites == other.facilitateInvites &&
-          showLinkDiagnostics == other.showLinkDiagnostics;
+          showLinkDiagnostics == other.showLinkDiagnostics &&
+          listEquals(ringRoster, other.ringRoster) &&
+          ringRadius == other.ringRadius;
 
   @override
   int get hashCode => Object.hash(
@@ -213,6 +260,8 @@ class SettingsState {
         coldCallTrustLevel,
         facilitateInvites,
         showLinkDiagnostics,
+        Object.hashAll(ringRoster),
+        ringRadius,
       );
 
   @override
@@ -221,3 +270,4 @@ class SettingsState {
 }
 
 /// Sentinel for copyWith — distinguishes "not passed" from "passed null".
+const Object _unset = Object();

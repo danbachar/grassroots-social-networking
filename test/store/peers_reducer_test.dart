@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:grassroots_networking/src/store/store.dart';
 import 'package:grassroots_networking/src/store/peers_state.dart';
 import 'package:grassroots_networking/src/store/peers_actions.dart';
 import 'package:grassroots_networking/src/store/peers_reducer.dart';
@@ -346,6 +347,68 @@ void main() {
   // =========================================================================
   // PeerAnnounceReceivedAction — split BLE device IDs
   // =========================================================================
+
+  group('sessions slice (its own lifetime, not the record\'s)', () {
+    test('a session survives its peer\'s record being pruned', () {
+      var app = AppState.initial;
+      app = appReducer(
+          app,
+          PeerAnnounceReceivedAction(
+            publicKey: _testPubkey(1),
+            nickname: 'p1',
+            rssi: -50,
+            transport: PeerTransport.bleDirect,
+            bleCentralDeviceId: 'ble-1',
+          ));
+      app = appReducer(app, PeerNoiseSessionEstablishedAction(_testPubkey(1)));
+      expect(app.sessions.count, 1);
+
+      // The stale sweep takes the whole record. The session fact is not
+      // the record's passenger any more — targeting by session must keep
+      // working for a peer that merely went quiet.
+      app = appReducer(app, PeerRemovedAction(_testPubkey(1)));
+      expect(app.peers.peers, isEmpty);
+      expect(app.sessions.count, 1,
+          reason: 'a session is keyed by identity and outlives presence');
+
+      // Re-announce: record returns; the slice needs no re-assertion.
+      app = appReducer(
+          app,
+          PeerAnnounceReceivedAction(
+            publicKey: _testPubkey(1),
+            nickname: 'p1',
+            rssi: -50,
+            transport: PeerTransport.bleDirect,
+            bleCentralDeviceId: 'ble-1',
+          ));
+      expect(app.sessions.count, 1);
+    });
+
+    test('the testbed purge empties the slice and only the slice', () {
+      var app = AppState.initial;
+      for (var i = 1; i <= 3; i++) {
+        app = appReducer(
+            app,
+            PeerAnnounceReceivedAction(
+              publicKey: _testPubkey(i),
+              nickname: 'p$i',
+              rssi: -50,
+              transport: PeerTransport.bleDirect,
+              bleCentralDeviceId: 'ble-$i',
+            ));
+        app =
+            appReducer(app, PeerNoiseSessionEstablishedAction(_testPubkey(i)));
+      }
+      expect(app.sessions.count, 3);
+
+      app = appReducer(app, AllNoiseSessionsResetAction());
+
+      expect(app.sessions.count, 0);
+      expect(app.peers.peers.length, 3,
+          reason: 'the purge drops sessions, never peers — the records and '
+              'their addresses survive for re-establishment');
+    });
+  });
 
   group('PeerAnnounceReceivedAction', () {
     test('creates new peer with central BLE device ID', () {

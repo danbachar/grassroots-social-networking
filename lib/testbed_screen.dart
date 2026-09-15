@@ -16,8 +16,8 @@ import 'src/trace/experiment_recorder.dart';
 import 'src/trace/trace_config.dart';
 
 /// DEBUG/TESTBED ONLY screen for the evaluation in
-/// `docs/testbed_experiments.md`: experiment recording, the scripted field
-/// runner, and the bulk-flow config it triggers. Inert in production.
+/// `docs/testbed_experiments.md`: experiment recording and the scripted
+/// field runner. Inert in production.
 class TestbedScreen extends StatefulWidget {
   final Store<AppState> store;
 
@@ -41,15 +41,23 @@ class TestbedScreen extends StatefulWidget {
   final Future<String?> Function(Uint8List recipient, Uint8List payload,
       {String? messageId})? sendMessage;
   final VoidCallback? onResetSessions;
-  final Future<void> Function(int? darkSec, {void Function()? whileDark})?
+  final Future<void> Function(int? darkSec,
+      {Future<void> Function()? whileDark, int? untilMs})?
       onResetLinks;
+
   final VoidCallback? onResetDtnBuffer;
+
+  /// DEBUG/TESTBED. Arm or disarm the ring-radius link gate.
+  final Future<void> Function(List<String> rosterHex, int? radius)?
+      onSetRingGate;
+
+  /// DEBUG/TESTBED. Sever every GATT link, keeping sessions and DTN state.
+  final Future<void> Function()? onSeverLinks;
 
   /// Runs the on-device crypto bench (failed-AEAD and handshake cost).
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
 
   /// Monotonic BLE tx+rx bytes — the field runner's dead-radio watchdog.
-  final int Function()? bleWireBytes;
 
   /// Whether the BLE transport is up — the watchdog's primary signal, valid
   /// even when the radio is deliberately alone.
@@ -64,11 +72,17 @@ class TestbedScreen extends StatefulWidget {
 
   /// Whether a Noise session exists with this peer — what a send is gated on.
   final bool Function(Uint8List peer)? sessionUp;
+  final bool? Function()? systemBtOn;
+  final Future<void> Function()? refreshSystemBt;
   final Stream<Uint8List>? sessionEvents;
   final Stream<Uint8List>? linkSettledEvents;
 
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
+
+  /// Record every advertisement sighting (see
+  /// FieldPlan.traceEveryAdvertisement).
+  final void Function(bool every)? onSetTraceEveryAdvertisement;
   final int Function()? establishmentCount;
   final VoidCallback? onResetEstablishmentCount;
 
@@ -89,17 +103,21 @@ class TestbedScreen extends StatefulWidget {
     this.onResetSessions,
     this.onResetLinks,
     this.onResetDtnBuffer,
+    this.onSetRingGate,
+    this.onSeverLinks,
     this.onCryptoBench,
-    this.bleWireBytes,
     this.bleUsable,
     this.bleUndiscoverable,
     this.bleUsableChanges,
     this.onSetBle,
     this.linkSettled,
     this.sessionUp,
+    this.systemBtOn,
+    this.refreshSystemBt,
     this.sessionEvents,
     this.linkSettledEvents,
     this.onSetDialParallelism,
+    this.onSetTraceEveryAdvertisement,
     this.establishmentCount,
     this.onResetEstablishmentCount,
     this.sessionPeerCount,
@@ -342,16 +360,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onResetSessions: widget.onResetSessions,
       onResetLinks: widget.onResetLinks,
       onResetDtnBuffer: widget.onResetDtnBuffer,
+      onSetRingGate: widget.onSetRingGate,
+      onSeverLinks: widget.onSeverLinks,
       onSetBle: widget.onSetBle,
-      bleWireBytes: widget.bleWireBytes,
       bleUsable: widget.bleUsable,
       bleUndiscoverable: widget.bleUndiscoverable,
       bleUsableChanges: widget.bleUsableChanges,
       linkSettled: widget.linkSettled,
       sessionUp: widget.sessionUp,
+      systemBtOn: widget.systemBtOn,
+      refreshSystemBt: widget.refreshSystemBt,
       sessionEvents: widget.sessionEvents,
       linkSettledEvents: widget.linkSettledEvents,
       onSetDialParallelism: widget.onSetDialParallelism,
+      onSetTraceEveryAdvertisement: widget.onSetTraceEveryAdvertisement,
       establishmentCount: widget.establishmentCount,
       onResetEstablishmentCount: widget.onResetEstablishmentCount,
       // Rosterless plans target every peer a message can be addressed to —
@@ -359,10 +381,17 @@ class _TestbedScreenState extends State<TestbedScreen> {
       // The two are different sets: a verified ANNOUNCE makes a peer known
       // while its handshake is still ahead, and addressing it then produces a
       // refusal that the run would otherwise record as a delivery failure.
-      knownPeers: () => widget.store.state.peers.sessionPeers
-          .map((p) => p.publicKey)
-          .where((pk) => pk.length == 32)
-          .toList(),
+      // Read from the SESSIONS slice, whose lifetime is the session's own: a
+      // peer whose record the stale sweep took is still sendable, and a
+      // record-bound flag once read every such peer as a stranger.
+      knownPeers: () => [
+        for (final hex in widget.store.state.sessions.peerHexes)
+          if (hex.length == 64)
+            Uint8List.fromList([
+              for (var i = 0; i < 64; i += 2)
+                int.parse(hex.substring(i, i + 2), radix: 16),
+            ]),
+      ],
       onWindowElapsed: () => HapticFeedback.heavyImpact(),
       // A token-less build must SAY so at the end of a run. Wiring this to
       // null instead let a finished plan report nothing at all, which is how
@@ -411,7 +440,6 @@ class _TestbedScreenState extends State<TestbedScreen> {
     final recorder = widget.experimentRecorder;
     if (recorder == null) return;
     final runner = _makeRunner(recorder);
-    // Saturating steps refill their window on each end-to-end ACK.
     final route = MaterialPageRoute<void>(
       fullscreenDialog: true,
       builder: (_) => FieldRunnerScreen(
@@ -667,6 +695,8 @@ class _TestbedScreenState extends State<TestbedScreen> {
               setState(() => _selectedPreset = name);
               if (name == FieldPlanPresets.lineSweepPresetName) {
                 _applySweep();
+              } else if (name == FieldPlanPresets.dilutingSmokePresetName) {
+                _applyDilute();
               } else {
                 _setPlan(FieldPlanPresets.presets[name]!);
               }
@@ -674,6 +704,30 @@ class _TestbedScreenState extends State<TestbedScreen> {
           ),
         ),
       ]),
+      if (_selectedPreset == FieldPlanPresets.dilutingSmokePresetName) ...[
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: _sweepPicker(
+              label: 'Runs per clique size',
+              value: _diluteReps,
+              options: const [1, 2, 3, 4, 5, 6, 8, 10],
+              suffix: '',
+              onPick: (r) {
+                setState(() => _diluteReps = r);
+                _applyDilute();
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '${_dilutePlan.steps.length} runs · ${_diluteDuration()}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ]),
+      ],
       if (_selectedPreset == FieldPlanPresets.lineSweepPresetName) ...[
         const SizedBox(height: 8),
         Row(children: [
@@ -740,7 +794,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 isDense: true,
-                labelText: 'Dwell (s per trial)',
+                labelText: 'Dwell (s per run)',
               ),
               onChanged: (text) {
                 final v = int.tryParse(text.trim());
@@ -758,7 +812,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
               decoration: const InputDecoration(
                 border: OutlineInputBorder(),
                 isDense: true,
-                labelText: 'Messages per trial',
+                labelText: 'Messages per run',
               ),
               onChanged: (text) {
                 final v = int.tryParse(text.trim());
@@ -785,7 +839,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
           '($_sweepStartDistance–$_sweepMaxDistance m every '
           '$_sweepStepMetres m) x $_sweepTrials — '
           '${_sweepDuration()}, walking included\n'
-          '$_sweepSendCount messages per trial each way over '
+          '$_sweepSendCount messages per run each way over '
           '${_sweepDwellSec}s '
           '(${(_sweepSendCount / _sweepDwellSec).toStringAsFixed(1)}/s, '
           '${_sweepSendCount * _sweepTrials} a position), '
@@ -842,11 +896,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
   late final TextEditingController _sweepSendsController =
       TextEditingController(text: '$_sweepSendCount');
 
+  /// Runs per clique size for the diluting smoke test. Held here for the
+  /// same reason the sweep's pickers are: changing it rebuilds the plan, and
+  /// the JSON is the output of that choice rather than its home.
+  int _diluteReps = 5;
+
+  FieldPlan get _dilutePlan => FieldPlanPresets.dilutingSmoke(reps: _diluteReps);
+
+  void _applyDilute() => _setPlan(_dilutePlan);
+
   FieldPlan get _sweepPlan => FieldPlanPresets.lineSweepUpTo(
         startDistance: _sweepStartDistance,
         maxDistance: _sweepMaxDistance,
         stepMetres: _sweepStepMetres,
-        trials: _sweepTrials,
+        runs: _sweepTrials,
         dwellSec: _sweepDwellSec,
         sendCount: _sweepSendCount,
         receiverPrefix: _sweepReceiverController.text,
@@ -906,11 +969,20 @@ class _TestbedScreenState extends State<TestbedScreen> {
         },
       );
 
-  String _sweepDuration() {
-    final plan = _sweepPlan;
+  String _sweepDuration() => _planDuration(_sweepPlan);
+
+  String _diluteDuration() => _planDuration(_dilutePlan);
+
+  /// How long a plan runs, placement included.
+  ///
+  /// Read off the plan's own wall-clock schedule rather than multiplied out
+  /// by hand: steps round up to alignment boundaries and a clique growth
+  /// reserves a join gap, so the arithmetic is not steps x dwell.
+  String _planDuration(FieldPlan plan) {
     final starts = FieldRunner.stepStarts(plan, 0);
+    final last = plan.steps.last;
     final ms = starts.last +
-        (plan.steps.last.dwellSec + plan.settleSec) * 1000 +
+        (last.dwellSec + plan.gapAfterSec(last)) * 1000 +
         plan.placementSec * 1000;
     final m = ms ~/ 60000;
     return m >= 60 ? '${m ~/ 60} h ${m % 60} min' : '$m min';

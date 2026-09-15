@@ -424,6 +424,31 @@ class ExperimentRecorder {
     await _onPowerReading(reading);
   }
 
+  /// One sync round: how many filter frames went to [peer], how many seen
+  /// ids the cursor still had to cover, and how large the seen-set was.
+  ///
+  /// [pending] over [seenTotal] is the reach of the exchange — the share of
+  /// its own history a node managed to advertise. Delivery outcomes alone
+  /// cannot separate "the holder had nothing" from "the asker never asked
+  /// for it", and that is the distinction this record exists to make.
+  Future<void> logSync({
+    required String peer,
+    required String transport,
+    required int frames,
+    required int pending,
+    required int seenTotal,
+  }) =>
+      log({
+        'type': 'sync',
+        'event': 'filter',
+        'peer': peer,
+        'transport': transport,
+        'frames': frames,
+        'pending': pending,
+        'seenTotal': seenTotal,
+        't': DateTime.now().millisecondsSinceEpoch,
+      });
+
   /// Free-form ground-truth annotation (distance step, direction, note),
   /// stamped by the experimenter from the testbed screen. [extra] carries the
   /// step's own configuration — the fields the analyzer would otherwise have
@@ -663,10 +688,10 @@ class ExperimentRecorder {
   ///
   /// Delete the recording of a run that aborted.
   ///
-  /// [startExperiment] APPENDS to an existing file of the same id, so the dead
-  /// run cannot simply be left in place: its step labels and re-minted message
-  /// ids would interleave with the next arm's records in one upload, and every
-  /// reader downstream would have to know to cut them out.
+  /// [startExperiment] refuses a reused id by suffixing to a free one, so a
+  /// dead run left in place would still hold the base id hostage: the next
+  /// launch under the same name lands on a suffix, and the fleet's uploads
+  /// stop sharing one file name.
   ///
   /// A failed run is deleted rather than kept under a separate id: the file
   /// would upload alongside real runs, carry the same experiment id prefix,

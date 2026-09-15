@@ -34,6 +34,58 @@ void main() {
       });
     });
 
+    group('send', () {
+      // The metering loop lives here precisely so no caller writes its own.
+      // The bug this pins: a caller whose loop was `via ??= await write(p)`
+      // stopped dispatching the moment one write reported a live link, so
+      // every fragment after the first was neither written nor buffered and
+      // the message could never reassemble.
+      test('writes every part, whatever the earlier writes reported', () async {
+        final written = <int>[];
+        await handler.send([1, 2, 3, 4, 5], (part) async {
+          written.add(part);
+          return true; // every write lands — the case that used to stop early
+        });
+        expect(written, [1, 2, 3, 4, 5]);
+      });
+
+      test('a part that never reached a radio does not stop the rest',
+          () async {
+        final written = <int>[];
+        await handler.send([1, 2, 3], (part) async {
+          written.add(part);
+          return false; // buffered, refused, or a stream that meters itself
+        });
+        expect(written, [1, 2, 3]);
+      });
+
+      test('spaces parts that reached a radio, and does not wait on the last',
+          () async {
+        final sw = Stopwatch()..start();
+        await handler.send([1, 2, 3], (_) async => true);
+        sw.stop();
+        // Two gaps for three parts: nothing is waited on after the last.
+        expect(sw.elapsed, greaterThanOrEqualTo(FragmentHandler.fragmentDelay * 2));
+        expect(sw.elapsed, lessThan(FragmentHandler.fragmentDelay * 3));
+      });
+
+      test('does not wait on a part that reached no radio', () async {
+        final sw = Stopwatch()..start();
+        await handler.send(List.filled(20, 0), (_) async => false);
+        sw.stop();
+        expect(sw.elapsed, lessThan(FragmentHandler.fragmentDelay));
+      });
+
+      test('an empty part list writes nothing and waits on nothing', () async {
+        var calls = 0;
+        await handler.send(<int>[], (_) async {
+          calls++;
+          return true;
+        });
+        expect(calls, 0);
+      });
+    });
+
     group('framesFor', () {
       test('yields a single frame for payload that need not fragment', () {
         final small = Uint8List(100);

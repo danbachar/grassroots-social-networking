@@ -64,6 +64,19 @@ class SeenPackets {
     return _seen.containsKey(packetId);
   }
 
+  /// How many seen ids sit at or after [fromMs] — the ground a sync cursor
+  /// still has to cover. Counted rather than materialised: the caller only
+  /// wants the size, and building the sorted slice to measure it is the
+  /// expensive half of [windowFrom].
+  int countFrom(int fromMs, {DateTime? now}) {
+    _pruneExpired(now ?? DateTime.now());
+    var n = 0;
+    for (final e in _seen.values) {
+      if (e.createdAtMs >= fromMs) n++;
+    }
+    return n;
+  }
+
   /// The seen packetIds whose ORIGINATOR-stamped creation time is at or after
   /// [fromMs], oldest first, capped at [limit] — the slice advertised in one
   /// GCS sync filter. Scoped by creation time, and cut on a whole-millisecond

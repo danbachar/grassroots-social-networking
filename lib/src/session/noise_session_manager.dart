@@ -74,6 +74,18 @@ class NoiseSessionManager {
 
   final Duration handshakeTimeout;
 
+  /// How long an unfinished handshake may block a fresh attempt.
+  ///
+  /// One announce cycle. Pairing is driven by ANNOUNCE, so this is the
+  /// shortest deadline that gives an attempt a full cycle to finish and
+  /// still lets the very next ANNOUNCE supersede it. Without a deadline the
+  /// in-flight guard is absolute: one stalled handshake refuses every
+  /// subsequent attempt for the life of the process while eager pairing
+  /// fires on every cycle and is rejected each time, so the peer stays
+  /// sessionless and its traffic fails to decrypt with nothing recorded as
+  /// having gone wrong.
+  final Duration handshakeRetryAfter;
+
   /// Optional trace sink for the session-cap sizing experiment (null in tests
   /// and when recording is off).
   final ExperimentRecorder? trace;
@@ -92,6 +104,7 @@ class NoiseSessionManager {
     required this.identity,
     required this.sodium,
     this.handshakeTimeout = const Duration(seconds: 5),
+    this.handshakeRetryAfter = const Duration(seconds: 10),
     this.trace,
   });
 
@@ -109,9 +122,17 @@ class NoiseSessionManager {
   /// the caller should simply wait for the existing handshake.
   Future<Uint8List?> startHandshake(Uint8List remotePubkey) async {
     final hex = _hex(remotePubkey);
+    _reapDeadHandshakes();
     final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
-    if (entry.session != null || entry.handshake != null || entry.starting) {
-      return null;
+    if (entry.session != null || entry.starting) return null;
+    if (entry.handshake != null && !_handshakeIsStale(entry)) return null;
+    if (entry.handshake != null) {
+      // Superseded: the attempt in flight has had its cycle and produced
+      // nothing, so this ANNOUNCE starts a new one rather than bouncing off
+      // it. Any waiter fails fast instead of hanging to its own timeout.
+      entry.complete(false);
+      entry.handshake = null;
+      _traceHandshakeDrop('superseded', hex);
     }
     // Reserve BEFORE the first await: concurrent callers (one per BLE leg
     // delivering the same ANNOUNCE) must not both reach the async work.
@@ -127,6 +148,7 @@ class NoiseSessionManager {
       entry
         ..session = null
         ..handshake = handshake
+        ..handshakeStartedAtMs = DateTime.now().millisecondsSinceEpoch
         ..completer = Completer<bool>();
       return _encodeHandshakePayload(_NoiseHandshakeMessage.message1, body);
     } finally {
@@ -259,6 +281,14 @@ class NoiseSessionManager {
   /// Mark [hex] most-recently-used. A Dart map keeps insertion order and
   /// assigning to an existing key does NOT move it, so the entry is removed
   /// and re-inserted to land at the MRU end.
+  /// Whether the attempt in [entry] has had its cycle without finishing.
+  bool _handshakeIsStale(_SessionEntry entry) {
+    final began = entry.handshakeStartedAtMs;
+    if (began == null) return true;
+    return DateTime.now().millisecondsSinceEpoch - began >=
+        handshakeRetryAfter.inMilliseconds;
+  }
+
   void _touch(String hex) {
     final entry = _entries.remove(hex);
     if (entry != null) _entries[hex] = entry;
@@ -270,6 +300,11 @@ class NoiseSessionManager {
   /// caller is awaiting, so without this they accumulate for the life of the
   /// process. Any waiter is released with `false` so it fails fast rather
   /// than hanging to its own timeout.
+  ///
+  /// Called when a handshake completes AND when one is attempted: a sweep
+  /// that runs only on success cannot clean up a fleet where the stalls are
+  /// the thing going wrong — it fired zero times across an hour of seven
+  /// phones while eighteen entries sat unfinished.
   void _reapDeadHandshakes() {
     final cutoffMs = DateTime.now().millisecondsSinceEpoch -
         handshakeTimeout.inMilliseconds * 2;
@@ -380,6 +415,7 @@ class NoiseSessionManager {
     entry
       ..session = null
       ..handshake = handshake
+      ..handshakeStartedAtMs = DateTime.now().millisecondsSinceEpoch
       ..completer = Completer<bool>();
     return NoiseHandshakeResult(
       responsePayload: _encodeHandshakePayload(
@@ -413,7 +449,8 @@ class NoiseSessionManager {
     final session = await handshake.splitForInitiator();
     entry
       ..session = session
-      ..handshake = null;
+      ..handshake = null
+      ..handshakeStartedAtMs = null;
     entry.complete(true);
     _onSessionEstablished(remoteHex);
     return NoiseHandshakeResult(
@@ -448,7 +485,8 @@ class NoiseSessionManager {
     final session = await handshake.splitForResponder();
     entry
       ..session = session
-      ..handshake = null;
+      ..handshake = null
+      ..handshakeStartedAtMs = null;
     entry.complete(true);
     _onSessionEstablished(remoteHex);
     return const NoiseHandshakeResult(sessionEstablished: true);
@@ -519,6 +557,11 @@ class _SessionEntry {
   /// When this entry was created, used to reap handshakes that never finished
   /// and that nobody is awaiting. Sessions are exempt — they age out by LRU.
   final int createdAtMs = DateTime.now().millisecondsSinceEpoch;
+
+  /// When the handshake currently in [handshake] began — NOT when the entry
+  /// appeared. A peer met at startup keeps its entry for the whole run, so
+  /// entry age says nothing about whether the attempt in flight is stale.
+  int? handshakeStartedAtMs;
 
   /// Synchronous in-flight reservation for [NoiseSessionManager.startHandshake].
   /// The dual-leg BLE pair delivers a peer's ANNOUNCE twice within

@@ -1,0 +1,44 @@
+% Testbed hardware inventory.
+%
+% The Android columns Units / Device / SoC / OS / API are read off the devices
+% themselves (`getprop ro.product.model`, `ro.board.platform`,
+% `ro.build.version.release`, `ro.build.version.sdk`); the SoC column gives the
+% commercial name for the platform id the device reports (msm8992 = Snapdragon
+% 808, gs201 = Tensor G2, and so on). The Bluetooth column is the vendor
+% specification, not a device reading -- Android exposes no controller version
+% to an app. Where a capability IS device-reported it is stated as such in the
+% notes.
+%
+% Requires: booktabs.
+\begin{table}[t]
+  \centering
+  \small
+  \caption[Testbed hardware]{%
+    The measurement fleet: eleven Android handsets plus two iOS devices used
+    for the cross-platform dual-role checks. Spanning Android~8.1 to~16 is
+    deliberate -- background scanning, advertising limits and the foreground
+    service contract all changed across that range, and the fleet has to
+    contain a device on either side of each change. The Bluetooth column is
+    the vendor specification; every other column is read from the device.}
+  \label{tab:testbed-hardware}
+  \begin{tabular}{@{}clllcc l@{}}
+    \toprule
+    \textbf{Units} & \textbf{Device} & \textbf{SoC} & \textbf{OS} &
+    \textbf{API} & \textbf{BT} & \textbf{Role in the fleet} \\
+    \midrule
+    \multicolumn{7}{@{}l}{\emph{Android}} \\
+    4 & LG Nexus 5X       & Snapdragon 808 & Android 8.1 & 27 & 4.2 & Oldest radios; join first \\
+    1 & Samsung Galaxy S10e & Exynos 9820  & Android 12  & 31 & 5.0 & \\
+    1 & Huawei Mate 20    & Kirin 980      & Android 9   & 28 & 5.0 & No Google services \\
+    1 & Google Pixel 2    & Snapdragon 835 & Android 11  & 30 & 5.0 & \\
+    1 & Google Pixel 10 Pro & Tensor G5    & Android 16  & 36 & 6.0 & Reports LE channel sounding \\
+    1 & Samsung Galaxy A72 & Snapdragon 720G & Android 14 & 34 & 5.0 & Wireless \texttt{adb} only \\
+    1 & Samsung Galaxy Note20 & Exynos 990 & Android 13  & 33 & 5.0 & Wireless \texttt{adb} only \\
+    1 & Google Pixel 7a   & Tensor G2      & Android 15  & 35 & 5.3 & Wireless \texttt{adb}; wireless charge only \\
+    \midrule
+    \multicolumn{7}{@{}l}{\emph{iOS}} \\
+    1 & Apple iPhone \textit{TBD} & \textit{TBD} & iOS \textit{TBD} & --- & \textit{TBD} & Central-first leg ordering \\
+    1 & Apple iPad \textit{TBD}   & \textit{TBD} & iPadOS \textit{TBD} & --- & \textit{TBD} & iOS$\leftrightarrow$iOS reverse leg \\
+    \bottomrule
+  \end{tabular}
+\end{table}

@@ -402,6 +402,55 @@ void main() {
           reason: 'the dead handshake was reaped, so a fresh one can start');
     });
 
+    test('a stalled handshake stops blocking the next attempt after one '
+        'retry deadline', () async {
+      // The in-flight guard used to be absolute: one attempt that never
+      // finished refused every later one for the life of the process, while
+      // eager pairing fired on every ANNOUNCE and was rejected each time —
+      // so the peer stayed sessionless and its traffic failed to decrypt
+      // with nothing recorded as having gone wrong.
+      final hubId = await identity('Hub');
+      final hub = NoiseSessionManager(
+        identity: hubId,
+        sodium: sodium,
+        handshakeTimeout: const Duration(seconds: 5),
+        handshakeRetryAfter: const Duration(milliseconds: 40),
+      );
+      final peer = await identity('Peer');
+
+      expect(await hub.startHandshake(peer.publicKey), isNotNull);
+      // Inside the deadline the attempt in flight still owns the peer, so a
+      // second ANNOUNCE must not put a rival msg1 on the air.
+      expect(await hub.startHandshake(peer.publicKey), isNull,
+          reason: 'concurrent starts are still refused');
+
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(await hub.startHandshake(peer.publicKey), isNotNull,
+          reason: 'past the deadline the stalled attempt is superseded, and '
+              'the next ANNOUNCE genuinely retries');
+      expect(hub.hasSession(peer.publicKey), isFalse);
+    });
+
+    test('a live session is never superseded by the retry deadline',
+        () async {
+      // The deadline must free a STALLED attempt, never a working session:
+      // re-handshaking a peer we can already talk to is exactly what makes
+      // both sides briefly unable to talk.
+      final hubId = await identity('Hub');
+      final hub = NoiseSessionManager(
+        identity: hubId,
+        sodium: sodium,
+        handshakeRetryAfter: const Duration(milliseconds: 20),
+      );
+      final peers = await meetPeers(hub, hubId, 1);
+      expect(hub.hasSession(peers.first.publicKey), isTrue);
+
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(await hub.startHandshake(peers.first.publicKey), isNull,
+          reason: 'a session is not a stalled handshake');
+      expect(hub.hasSession(peers.first.publicKey), isTrue);
+    });
+
     test('trialDecrypt tries most-recently-used first', () async {
       final hubId = await identity('Hub');
       final hub = NoiseSessionManager(identity: hubId, sodium: sodium);

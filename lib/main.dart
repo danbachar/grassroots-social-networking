@@ -1614,10 +1614,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           const Divider(height: GlSpace.s5),
         ],
 
-        // Nearby peers section header
+        // Nearby peers section header. The Noise session count rides alongside
+        // the peer count because the two answer different questions, and the
+        // gap between them is the interesting one: a session is keyed by
+        // identity and SURVIVES the link, so a peer that has gone quiet drops
+        // out of the nearby list while staying perfectly sendable.
+        //
+        // It is also the ring sweep's readiness instrument. That experiment's
+        // warm-up is an operator precondition — under the ring gate a
+        // non-neighbour can never handshake, so every pair must already hold a
+        // session before the topology is constrained — and this is how the
+        // operator watches the fleet get there while toggling Bluetooth on
+        // subsets: launch once every phone reads a full session table.
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: GlSpace.s4),
-          child: EyebrowLabel('Nearby · ${_peers.length}'),
+          child: EyebrowLabel('Nearby · ${_peers.length}  ·  '
+              '${appStore.state.sessions.establishedAtMs.length} sessions'),
         ),
         const SizedBox(height: GlSpace.s2),
 
@@ -2517,16 +2529,23 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           sendMessage: _grassroots?.send,
           onResetSessions:
               _grassroots == null ? null : () => _grassroots!.resetAllSessions(),
+          onResetSessionWith: _grassroots == null
+              ? null
+              : (peer) => _grassroots!.resetSessionWith(peer),
           onResetLinks: _grassroots == null
               ? null
-              : (darkSec, {whileDark}) => _grassroots!
-                  .resetAllBleLinks(darkSec: darkSec, whileDark: whileDark),
+              : (darkSec, {whileDark, untilMs}) => _grassroots!.resetAllBleLinks(
+                  darkSec: darkSec, whileDark: whileDark, untilMs: untilMs),
           onResetDtnBuffer:
               _grassroots == null ? null : () => _grassroots!.clearDtnBuffer(),
+          onSetRingGate: _grassroots == null
+              ? null
+              : (rosterHex, radius) => _grassroots!.setRingGateForTestbed(
+                  rosterHex: rosterHex, radius: radius),
+          onSeverLinks:
+              _grassroots == null ? null : () => _grassroots!.severAllBleLinks(),
           onCryptoBench:
               _grassroots == null ? null : () => _grassroots!.runCryptoBench(),
-          bleWireBytes:
-              _grassroots == null ? null : () => _grassroots!.bleWireBytes,
           bleUsable:
               _grassroots == null ? null : () => _grassroots!.bleUsable,
           bleUndiscoverable: _grassroots == null
@@ -2542,6 +2561,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           sessionUp: _grassroots == null
               ? null
               : (peer) => _grassroots!.hasNoiseSessionWith(peer),
+          systemBtOn: () => _grassroots?.systemBtOn,
+          refreshSystemBt: () async {
+            await _grassroots?.refreshSystemBt();
+          },
           sessionEvents: _grassroots?.noiseSessionEstablished,
           linkSettledEvents: _grassroots?.peerLinkSettled,
           onSetDialParallelism: _grassroots == null
@@ -2549,6 +2572,10 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               : ({int? maxParallel, int? popN}) =>
                   _grassroots!.setDialParallelismForTestbed(
                       maxParallel: maxParallel, popN: popN),
+          onSetTraceEveryAdvertisement: _grassroots == null
+              ? null
+              : (every) =>
+                  _grassroots!.setTraceEveryAdvertisementForTestbed(every),
           establishmentCount: _grassroots == null
               ? null
               : () => _grassroots!.bleEstablishmentCount,

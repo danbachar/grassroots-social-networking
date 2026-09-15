@@ -64,16 +64,8 @@ class WireLedger {
   /// 16 bytes as a UUID, it did not throw — it just returned an id that
   /// matched nothing, and the whole tx `secure:*` split disappeared without a
   /// single failure anywhere.
-  static String? _packetIdOf(Uint8List data) {
-    if (data.length < GrassrootsPacket.headerSize) return null;
-    try {
-      return GrassrootsPacket.bytesToUuid(data.sublist(
-          GrassrootsPacket.packetIdOffset,
-          GrassrootsPacket.packetIdOffset + 16));
-    } catch (_) {
-      return null;
-    }
-  }
+  static String? _packetIdOf(Uint8List data) =>
+      GrassrootsPacket.packetIdFromBytes(data);
 
   void _count(Map<String, int> bytes, Map<String, int> packets, Uint8List data,
       {bool tx = false}) {

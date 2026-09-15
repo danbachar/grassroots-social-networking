@@ -200,6 +200,19 @@
   .scrub-line { stroke: var(--ink-1); stroke-width: 1.5; }
   #timelineWrap { cursor: crosshair; position: relative; }
 
+  /* Tri-state condition chips: off, must hold, must NOT hold. */
+  .cond { display: inline-flex; align-items: center; gap: 5px; padding: 6px 11px;
+          border-radius: 16px; border: 1px solid var(--line); background: var(--surface-2);
+          color: var(--ink-2); cursor: pointer; user-select: none;
+          font: 500 12px ui-monospace, Menlo, monospace; }
+  .cond::before { content: "· "; color: var(--ink-3); }
+  .cond[data-state="must"] { border-color: var(--accent); color: var(--accent); }
+  .cond[data-state="must"]::before { content: "✓ "; }
+  .cond[data-state="not"] { border-color: var(--critical); color: var(--critical); }
+  .cond[data-state="not"]::before { content: "✗ not "; }
+  .cond select { font: inherit; color: inherit; background: var(--surface-1);
+                 border: 1px solid var(--line); border-radius: 5px; }
+
   .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 10px; font-size: 13px; color: var(--ink-2); }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 14px; height: 3px; border-radius: 2px; background: var(--accent); }
@@ -386,6 +399,7 @@
       </details>
       <div class="legend">
         <span><i class="swatch" style="height:4px"></i>two legs (dual-role pair)</span>
+        <span><i class="swatch" style="height:4px;background:var(--critical)"></i>contradicts a radio-off stamp</span>
         <span><i class="swatch" style="height:2px"></i>one leg only</span>
         <span><i class="swatch dash"></i>one side sees it, the other does not</span>
       </div>
@@ -422,22 +436,21 @@
             <option value="ack">ack</option>
           </select>
         </label>
-        <label class="mono" style="font-size:12px;color:var(--ink-3)">OUTCOME
-          <select id="pktOutcome">
-            <option value="">any</option>
-            <option value="multihop">relayed at least once</option>
-            <option value="delivered">reached the recipient</option>
-            <option value="undelivered">never arrived</option>
+        <label class="mono" style="font-size:12px;color:var(--ink-3)">MATCH
+          <select id="pktMode">
+            <option value="and">all of</option>
+            <option value="or">any of</option>
           </select>
         </label>
-        <label class="mono" style="font-size:12px;color:var(--ink-3)">SEEN&nbsp;BY&nbsp;&ge;
-          <select id="pktMinHops">
-            <option value="0">1 node</option>
-            <option value="1">2 nodes</option>
-            <option value="2">3 nodes</option>
-            <option value="3">4 nodes</option>
-          </select>
-        </label>
+        <!-- Click cycles each condition: off, must hold, must not hold. -->
+        <span class="cond" id="condRelayed" data-state="off" role="button" tabindex="0">relayed at least once</span>
+        <span class="cond" id="condDelivered" data-state="off" role="button" tabindex="0">reached the recipient</span>
+        <span class="cond" id="condCarried" data-state="off" role="button" tabindex="0">carried on a sync</span>
+        <span class="cond" id="condSeen" data-state="off" role="button" tabindex="0">seen by &ge;
+          <select id="pktSeenN">
+            <option>2</option><option selected>3</option><option>4</option>
+            <option>5</option><option>6</option><option>7</option>
+          </select> nodes</span>
         <input id="pktQuery" type="text" placeholder="packet or message id"
                spellcheck="false" style="flex:1 1 180px;min-width:140px;padding:7px 9px;
                border-radius:7px;border:1px solid var(--line);background:var(--surface-2);
@@ -466,6 +479,20 @@
           <span><i class="swatch"></i>a hop, from the neighbour that handed it over</span>
           <span><i class="swatch dash"></i>carried, then conveyed on a later meeting</span>
           <span>ring = minted here &middot; double ring = delivered here</span>
+        </div>
+        <div id="routeTopoWrap" style="margin-top:20px">
+          <p class="eyebrow">The mesh while it travelled</p>
+          <p class="note" id="routeTopoNote"></p>
+          <div class="row" id="routeTopoCtl" style="margin:10px 0;align-items:center">
+            <button id="rtPlay">&#10074;&#10074; pause</button>
+            <button id="rtPrev">&#10216; sighting</button>
+            <button id="rtNext">sighting &#10217;</button>
+            <input type="range" id="rtScrub" min="0" max="1000" value="0"
+                   style="flex:1 1 200px" aria-label="Scrub through the packet's lifetime">
+            <span class="mono" id="rtReadout" style="font-size:12px;color:var(--ink-2)"></span>
+          </div>
+          <svg id="routeTopoSvg" viewBox="0 0 460 400" style="max-width:520px"
+               role="img" aria-label="The mesh topology at the scrubbed sighting"></svg>
         </div>
       </div>
     </section>
@@ -549,11 +576,16 @@
       }).sort((a, b) => a.t - b.t);
 
       const steps = [];
+      const radio = [];   // bt-on / bt-off stamps: the observed radio truth
       let order = null, batteryFloor = null;
       for (const m of f.markers) {
         if (typeof m.order === "number") order = m.order;
         const lab = m.label;
         if (typeof lab !== "string") continue;
+        if (lab === "bt-on" || lab === "bt-off") {
+          radio.push({ t: m.t, up: lab === "bt-on" });
+          continue;
+        }
         // The recorder stamps this the moment a run stops itself on the
         // battery floor. Reading it beats inferring a dropout from a tail
         // that simply stops.
@@ -590,6 +622,7 @@
         ? fixes.reduce((a, b) => ((b.accM ?? 1e9) < (a.accM ?? 1e9) ? b : a))
         : null;
       return { idx: i, file: f.name, order, exp, steps, events, bounds,
+               radio: radio.sort((a, b) => a.t - b.t),
                batteryFloor, fix, rawFixes: (f.locations || []).length,
                // The upload envelope's deviceId IS the node's public key, so
                // when the recording came from the server this is known rather
@@ -730,6 +763,20 @@
         if (p.order === a) rec.legsA = paths.size; else rec.legsB = paths.size;
       }
     }
+    // The viewer does not resolve contradictions, it displays them: an
+    // edge whose endpoint's own bt-off stamp says the radio is dark is
+    // link evidence the teardown never reached the trace — a finding, not
+    // noise. It renders flagged, never suppressed.
+    const upAt = new Map();
+    for (const p of run.phones) {
+      if (p.order == null) continue;
+      let up = null;
+      for (const r of (p.radio || [])) { if (r.t <= t) up = r.up; else break; }
+      upAt.set(p.order, up !== false);
+    }
+    for (const e of seen.values()) {
+      e.conflict = !(upAt.get(e.a) ?? true) || !(upAt.get(e.b) ?? true);
+    }
     return [...seen.values()];
   }
 
@@ -737,9 +784,19 @@
     return run.phones.map(p => {
       const ws = windowsFor(p, run);
       const w = ws.find(x => t >= x.t && t < x.t1);
+      // The radio state is DATA: the last bt-on/bt-off stamp at or before
+      // t — the transport's own transitions, stamped at the event. The
+      // schedule's `joined` intent is only the fallback for a recording
+      // that carries no stamps at all.
+      const stamps = p.radio || [];
+      let stamped = null;
+      for (const r of stamps) { if (r.t <= t) stamped = r.up; else break; }
+      const held = w || [...ws].reverse().find(x => t >= x.t1) || null;
+      const up = stamped != null ? stamped
+               : held ? held.joined !== false : false;
       const last = ws.length ? ws[ws.length - 1].t1 : run.t0;
       const floored = p.batteryFloor != null && t >= p.batteryFloor;
-      return { phone: p, step: w || null, up: w ? w.joined !== false : false,
+      return { phone: p, step: w || null, up,
                dead: t > last || floored, floored, order: p.order };
     }).sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
   }
@@ -875,6 +932,39 @@
                                    "fill-opacity": ".13", stroke: "none" }));
       svg.appendChild(el("path", { d: a, fill: "none", stroke: "var(--accent)", "stroke-width": 2,
                                    "stroke-linejoin": "round" }));
+    }
+
+    // Trial strip: the run's structure at trial grain. One cell per step
+    // window along the plot floor — boundary tick at every trial, the
+    // workload named once per change (L= token of the label), the full
+    // label on hover. Workloads are time-bound segments, so they live on
+    // the axis, not as a series.
+    {
+      const stripT = H - B - 7, stripH = 6;
+      const armFill = new Map();
+      let prevArm = null;
+      for (const w of windowsFor(ref, run)) {
+        const arm = (/\bL=(\w+)/.exec(w.label) || [])[1] || null;
+        if (arm && !armFill.has(arm)) {
+          // deterministic distinct opacities in first-seen order
+          armFill.set(arm, [".10", ".22", ".38"][armFill.size % 3]);
+        }
+        const cell = el("rect", {
+          x: x(w.t), y: stripT, width: Math.max(0, x(w.t1) - x(w.t)),
+          height: stripH, fill: "var(--accent)",
+          "fill-opacity": arm ? armFill.get(arm) : ".08" });
+        const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        tip.textContent = w.label;
+        cell.appendChild(tip);
+        svg.appendChild(cell);
+        svg.appendChild(el("line", { x1: x(w.t), x2: x(w.t), y1: stripT,
+          y2: stripT + stripH, stroke: "var(--ink-3)", "stroke-width": 0.5 }));
+        if (arm && arm !== prevArm) {
+          svg.appendChild(el("text", { x: x(w.t) + 2, y: stripT - 2,
+            class: "axis-text", "font-style": "italic" }, arm));
+        }
+        prevArm = arm;
+      }
     }
 
     for (const p of run.phones) {
@@ -1081,10 +1171,11 @@
     return [cx + R * Math.cos(a), cy + R * Math.sin(a)];
   }
 
-  function renderGraph() {
-    const svg = $("graph"); svg.innerHTML = "";
-    const run = ST.run, t = ST.t;
-    const layout = $("layoutSelect").value;
+  // The one topology drawing: nodes as the radio record says they stood at
+  // t, edges as the link record says. The main panel and the packet-route
+  // playback both call this — one drawing, two clocks.
+  function drawTopoInto(svg, run, t, layout) {
+    svg.innerHTML = "";
     const states = phoneStateAt(run, t);
     const pos = new Map();
     states.forEach((s, i) => pos.set(s.order, nodePos(s.order ?? i + 1, states.length, layout)));
@@ -1095,12 +1186,24 @@
       if (!A || !B) continue;
       const mutual = e.legsA > 0 && e.legsB > 0;
       const legs = Math.max(e.legsA, e.legsB);
-      svg.appendChild(el("line", {
+      const edge = el("line", {
         x1: A[0], y1: A[1], x2: B[0], y2: B[1],
-        stroke: "var(--accent)", "stroke-width": legs >= 2 ? 4 : 2,
+        // A conflict edge — link evidence touching a phone whose own bt-off
+        // stamp says its radio is dark — renders in the critical colour:
+        // the trace contradicts itself, and that is a finding to show, not
+        // a state to secretly resolve.
+        stroke: e.conflict ? "var(--critical)" : "var(--accent)",
+        "stroke-width": legs >= 2 ? 4 : 2,
         "stroke-opacity": mutual ? .85 : .5,
         "stroke-dasharray": mutual ? "none" : "6 4", "stroke-linecap": "round"
-      }));
+      });
+      if (e.conflict) {
+        const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        tip.textContent = "link events say this leg is up, but an endpoint's " +
+            "radio stamp says off — the teardown never reached the trace";
+        edge.appendChild(tip);
+      }
+      svg.appendChild(edge);
     }
 
     for (const s of states) {
@@ -1121,6 +1224,13 @@
         x: P[0], y: P[1] + 36, "text-anchor": "middle", class: "axis-text"
       }, s.floored ? "battery floor" : s.dead ? "stopped" : s.up ? `deg ${deg}` : "radio off"));
     }
+    return { states, edges, pos };
+  }
+
+  function renderGraph() {
+    const svg = $("graph");
+    const layout = $("layoutSelect").value;
+    drawTopoInto(svg, ST.run, ST.t, layout);
 
     if (layout === "geo") {
       const m = metres();
@@ -1280,6 +1390,12 @@
   function selectRun(i) {
     ST.run = ST.runs[i];
     ST.route = null;
+    routeTopoStop();
+    // The packet list belongs to the run it was searched in. One experiment
+    // can hold several runs, and playing a row from the previous one against
+    // this run's phones renders a plausible, empty, wrong topology.
+    ST.pkts = [];
+    $("pktTable").innerHTML = "";
     $("routeView").classList.add("hidden");
     ST.series = realisedSeries(ST.run);
     loadPositions();
@@ -1463,6 +1579,7 @@
   $("layoutSelect").addEventListener("change", () => {
     layoutUserSet = true;
     renderGraph();
+    if (!$("routeView").classList.contains("hidden")) rtRender();
   });
 
   // The graph draws to scale the moment measured geometry EXISTS — entered
@@ -1552,7 +1669,7 @@
   //     the holder's `convey` and the receiver's later sighting, with nothing
   //     joining them. Those two are drawn as a carry, dashed.
   const EV_LABEL = {
-    mint: "minted here", aired: "put on the air", relay: "relayed on",
+    mint: "minted here", direct: "written straight to the recipient", relay: "relayed on",
     dup: "arrived again (already relayed)", packetDup: "arrived again (dropped)",
     store: "held for the recipient", convey: "handed over on a sync",
     end: "left the buffer", deliver: "DELIVERED to the recipient",
@@ -1627,10 +1744,27 @@
 
   async function loadPackets() {
     const qs = new URLSearchParams({ exp: ST.serverExp, limit: "300" });
-    for (const [k, id] of [["kind", "pktKind"], ["outcome", "pktOutcome"],
-                           ["minHops", "pktMinHops"], ["q", "pktQuery"]]) {
+    for (const [k, id] of [["kind", "pktKind"], ["q", "pktQuery"]]) {
       const v = $(id).value.trim();
       if (v) qs.set(k, v);
+    }
+    // The chips compose: each is off, must hold, or must NOT hold, and MATCH
+    // joins the active ones with AND or OR. "relayed and delivered and seen
+    // by >= 3" is three chips on must with MATCH all-of.
+    const conds = [];
+    for (const [id, term] of [["condRelayed", "relayed"],
+                              ["condDelivered", "delivered"],
+                              ["condCarried", "carried"]]) {
+      const st = $(id).dataset.state;
+      if (st !== "off") conds.push((st === "not" ? "!" : "") + term);
+    }
+    const seenSt = $("condSeen").dataset.state;
+    if (seenSt !== "off") {
+      conds.push((seenSt === "not" ? "!" : "") + "seen>=" + $("pktSeenN").value);
+    }
+    if (conds.length) {
+      qs.set("cond", conds.join(","));
+      qs.set("mode", $("pktMode").value);
     }
     $("pktTable").innerHTML = "<tr><td class='axis-text'>Searching…</td></tr>";
     try {
@@ -1677,6 +1811,7 @@
       ST.route.summary = ST.pkts.find(p => p.packetId === pid) || null;
       $("routeView").classList.remove("hidden");
       renderRoute();
+      routeTopoOpen(ST.route.events);
       $("routeView").scrollIntoView({ behavior: "smooth", block: "nearest" });
     } catch (err) {
       $("routeNote").textContent = err.message;
@@ -1814,7 +1949,10 @@
     $("routeHops").innerHTML =
       `<thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body.join("")}</tbody>`;
     for (const tr of $("routeHops").querySelectorAll("tbody tr")) {
-      tr.addEventListener("click", () => setT(+tr.dataset.t));   // scrub there
+      tr.addEventListener("click", () => {
+        setT(+tr.dataset.t);        // scrub the main topology panel
+        rtScrubTo(+tr.dataset.t);   // and the playback below the route
+      });
     }
 
     const s = r.summary;
@@ -1835,10 +1973,144 @@
       ` Click a row to scrub the topology view to that instant.`;
   }
 
+  for (const id of ["condRelayed", "condDelivered", "condCarried", "condSeen"]) {
+    const chip = $(id);
+    const cycle = () => {
+      chip.dataset.state =
+          { off: "must", must: "not", not: "off" }[chip.dataset.state];
+      loadPackets();
+    };
+    chip.addEventListener("click", e => {
+      if (e.target.tagName === "SELECT") return;  // picking N is not toggling
+      cycle();
+    });
+    chip.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); cycle(); }
+    });
+  }
+
+  // ------------------------------------------------- topology while it travelled
+  // The same drawing as the scrubbed topology panel, played across one
+  // packet's lifetime — minting to its last sighting (delivery, drop, or
+  // wherever the trace ends). Radio and link state come from the loaded
+  // phone files; the server copy alone has only the sightings.
+  const RT = { evs: [], t0: 0, t1: 1, t: 0, timer: null };
+
+  function routeTopoStop() {
+    if (RT.timer) { clearInterval(RT.timer); RT.timer = null; }
+    $("rtPlay").textContent = "\u25B8 play";
+  }
+
+  function routeTopoOpen(evs) {
+    routeTopoStop();
+    RT.evs = evs;
+    const usable = ST.run && evs.length;
+    $("routeTopoCtl").classList.toggle("hidden", !usable);
+    $("routeTopoSvg").classList.toggle("hidden", !usable);
+    if (!usable) {
+      $("routeTopoNote").textContent = evs.length
+        ? "Load every phone's file (top of the page) to draw the mesh around " +
+          "this packet — the server holds the sightings; the radio and link " +
+          "record the topology is drawn from lives in the files."
+        : "No sightings to play.";
+      return;
+    }
+    $("routeTopoNote").textContent =
+      "Plays from minting to the last sighting. A ring marks a node that has " +
+      "seen the packet by that moment; the dashed ring is the recipient; the " +
+      "halo is the sighting the clock just passed.";
+    RT.t0 = evs[0].t;
+    RT.t1 = evs[evs.length - 1].t;
+    RT.t = RT.t0;
+    rtRender();
+    rtPlayStart();
+  }
+
+  function rtRender() {
+    if (!ST.run || !RT.evs.length) return;
+    const svg = $("routeTopoSvg");
+    const { pos } = drawTopoInto(svg, ST.run, RT.t, $("layoutSelect").value);
+    const seen = new Set();
+    let cur = null, curIdx = -1;
+    RT.evs.forEach((e, i) => {
+      if (e.t > RT.t) return;
+      const o = orderOfPeer(e.device);
+      if (o != null) seen.add(o);
+      if (e.event === "convey") {
+        const d = orderOfBle(e.toDevice);
+        if (d != null) seen.add(d);
+      }
+      cur = e; curIdx = i;
+    });
+    for (const o of seen) {
+      const P = pos.get(o); if (!P) continue;
+      svg.appendChild(el("circle", { cx: P[0], cy: P[1], r: 26, fill: "none",
+        stroke: "var(--accent)", "stroke-width": 2.5 }));
+    }
+    const rec = orderOfPeer(ST.route?.summary?.recipient);
+    if (rec != null && pos.get(rec)) {
+      const P = pos.get(rec);
+      svg.appendChild(el("circle", { cx: P[0], cy: P[1], r: 30, fill: "none",
+        stroke: "var(--ink-2)", "stroke-width": 1.5, "stroke-dasharray": "3 3" }));
+    }
+    if (cur) {
+      const o = orderOfPeer(cur.device);
+      const P = o != null ? pos.get(o) : null;
+      if (P) svg.appendChild(el("circle", { cx: P[0], cy: P[1], r: 34,
+        fill: "none", stroke: "var(--accent)", "stroke-width": 1.5,
+        "stroke-opacity": .5 }));
+    }
+    $("rtScrub").value =
+        Math.round((RT.t - RT.t0) / Math.max(1, RT.t1 - RT.t0) * 1000);
+    $("rtReadout").textContent = cur
+      ? `+${((RT.t - RT.t0) / 1000).toFixed(2)}s \u00B7 sighting ` +
+        `${curIdx + 1}/${RT.evs.length}: ${nodeName(cur.device)} ` +
+        `${EV_LABEL[cur.event] || cur.event}`
+      : "+0.00s \u00B7 before the first sighting";
+  }
+
+  function rtPlayStart() {
+    routeTopoStop();
+    const span = RT.t1 - RT.t0;
+    if (span <= 0) return;                    // one sighting: nothing to play
+    if (RT.t >= RT.t1) RT.t = RT.t0;          // at the end, play = replay
+    const step = Math.max(span / 200, 1);     // the whole life in ~8 s
+    RT.timer = setInterval(() => {
+      RT.t = Math.min(RT.t + step, RT.t1);
+      rtRender();
+      if (RT.t >= RT.t1) routeTopoStop();
+    }, 40);
+    $("rtPlay").textContent = "\u23F8 pause";
+  }
+
+  function rtScrubTo(t) {
+    routeTopoStop();
+    RT.t = Math.min(Math.max(t, RT.t0), RT.t1);
+    rtRender();
+  }
+
+  $("rtPlay").addEventListener("click",
+      () => RT.timer ? routeTopoStop() : rtPlayStart());
+  $("rtScrub").addEventListener("input", e => {
+    routeTopoStop();
+    RT.t = RT.t0 + (RT.t1 - RT.t0) * (+e.target.value / 1000);
+    rtRender();
+  });
+  $("rtPrev").addEventListener("click", () => {
+    const prev = [...RT.evs].reverse().find(e => e.t < RT.t - 1);
+    rtScrubTo(prev ? prev.t : RT.t0);
+  });
+  $("rtNext").addEventListener("click", () => {
+    const next = RT.evs.find(e => e.t > RT.t + 1);
+    rtScrubTo(next ? next.t : RT.t1);
+  });
+
   $("pktBuild").addEventListener("click", buildPacketIndex);
   $("pktSearch").addEventListener("click", loadPackets);
   $("pktQuery").addEventListener("keydown", e => { if (e.key === "Enter") loadPackets(); });
-  for (const id of ["pktKind", "pktOutcome", "pktMinHops"]) {
+  // Changing any part of the filter re-runs the search: the selects on
+  // change, the chips on every click cycle (wired where the chips are).
+  for (const id of ["pktKind", "pktMode", "pktSeenN"]) {
     $(id).addEventListener("change", loadPackets);
   }
 

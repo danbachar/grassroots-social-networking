@@ -6,6 +6,7 @@ import 'package:redux/redux.dart';
 import 'package:sodium_libs/sodium_libs_sumo.dart';
 import 'package:uuid/uuid.dart';
 import 'package:grassroots_networking/src/mesh/dtn_store.dart';
+import 'package:grassroots_networking/src/mesh/gcs_filter.dart';
 import 'package:grassroots_networking/src/mesh/sync_codec.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
@@ -264,16 +265,129 @@ void main() {
       );
       router.storeInDtnBuffer(recipient, p);
 
-      final payload = router.buildSyncFilter(neighbourPubkey);
-      expect(payload, isNotNull,
+      final round = router.buildSyncRound(neighbourPubkey);
+      expect(round, hasLength(1),
           reason: 'a non-empty buffer advertises a filter');
-      final dec = decodeSyncFilter(payload!);
+      final dec = decodeSyncFilter(round.single);
       expect(dec.n, greaterThan(0),
           reason: 'the held packet contributes an element to the filter');
       expect(dec.fromMs, lessThanOrEqualTo(dec.toMs));
       expect(dec.toMs, greaterThan(0));
       expect(dec.toMs, 5000,
           reason: 'the window closes at the newest held creation stamp');
+    });
+
+    test('a round carries one frame per filter-full of newly seen ids', () {
+      // One frame names at most maxElements ids. A node that saw more than
+      // that since its last round cannot describe itself in one, so the round
+      // grows to cover the ground — otherwise the cursor falls behind the
+      // traffic and the node advertises a shrinking slice of itself.
+      expect(router.buildSyncRound(neighbourPubkey), hasLength(1),
+          reason: 'seen nothing: still one frame, or a quiet node that is '
+              'MISSING packets would never ask');
+
+      for (var i = 0; i < GcsFilter.maxElements * 2; i++) {
+        router.markSeen('p$i', 1000 + i);
+      }
+      expect(router.syncCursorState(neighbourPubkey).pending, GcsFilter.maxElements * 2);
+      final round = router.buildSyncRound(neighbourPubkey);
+      expect(round.length, inInclusiveRange(2, 3),
+          reason: 'two frame-fulls of ground, plus at most one boundary '
+              'remainder');
+      // Every window is distinct and strictly forward — the defect this
+      // shape exists to prevent is a round that wraps and re-sends a window
+      // it already sent.
+      final windows = [for (final f in round) decodeSyncFilter(f)];
+      for (var i = 1; i < windows.length; i++) {
+        expect(windows[i].fromMs, greaterThan(windows[i - 1].toMs),
+            reason: 'frame $i overlaps the one before it');
+      }
+      expect(router.syncCursorState(neighbourPubkey).pending,
+          lessThan(GcsFilter.maxElements),
+          reason: 'the round covered all but a boundary remainder, which '
+              'rides the next one');
+    });
+
+    test('a round whose slice is one millisecond deep cannot wrap mid-round',
+        () {
+      // The defect: a frame whose window lands inside ONE millisecond group
+      // consumes more ids than it names, so a loop could exhaust the ground
+      // mid-round, wrap to the oldest, and re-advertise a window it had
+      // already sent — while skipping the ids it jumped over.
+      for (var i = 0; i < 50; i++) {
+        router.markSeen('early$i', 1000 + i);
+      }
+      for (var i = 0; i < GcsFilter.maxElements * 3; i++) {
+        router.markSeen('same$i', 2000); // one millisecond, deeper than a frame
+      }
+      final round = router.buildSyncRound(neighbourPubkey);
+      final windows = [for (final f in round) decodeSyncFilter(f)];
+      final seen = <String>{};
+      for (final w in windows) {
+        expect(seen.add('${w.fromMs}-${w.toMs}'), isTrue,
+            reason: 'window ${w.fromMs}-${w.toMs} sent twice in one round');
+      }
+      for (var i = 1; i < windows.length; i++) {
+        expect(windows[i].fromMs, greaterThan(windows[i - 1].toMs));
+      }
+    });
+
+    test('every peer gets its own sweep, not whichever slice fell to it', () {
+      // The defect a shared cursor has: consecutive neighbours get
+      // consecutive slices, so a holder is only ever asked about the windows
+      // that happened to land on it — a node carrying packets named only in
+      // someone else's window is never asked and never conveys them.
+      final other = Uint8List.fromList(List.generate(32, (i) => i + 90));
+      for (var i = 0; i < GcsFilter.maxElements * 2; i++) {
+        router.markSeen('p$i', 1000 + i);
+      }
+      final toA = router.buildSyncRound(neighbourPubkey);
+      final toB = router.buildSyncRound(other);
+      final winA = [for (final f in toA) decodeSyncFilter(f)];
+      final winB = [for (final f in toB) decodeSyncFilter(f)];
+
+      expect(winB.first.fromMs, winA.first.fromMs,
+          reason: 'B starts its own sweep at the beginning, not where A '
+              'left off');
+      expect(winB.map((w) => '${w.fromMs}-${w.toMs}'),
+          winA.map((w) => '${w.fromMs}-${w.toMs}'),
+          reason: 'both peers are told about the same ground');
+
+      // And each peer's cursor advances independently.
+      expect(router.syncCursorState(neighbourPubkey).pending,
+          router.syncCursorState(other).pending);
+      router.buildSyncRound(neighbourPubkey);
+      expect(router.syncCursorState(neighbourPubkey).pending,
+          lessThanOrEqualTo(router.syncCursorState(other).pending),
+          reason: 'advancing A must not move B');
+    });
+
+    test('a cursor for a peer we stopped syncing with is not kept forever',
+        () {
+      // Per-peer state grows with every peer ever met unless something drops
+      // it, and a peer returning after the lifetime SHOULD be swept from the
+      // start — which is exactly what a missing cursor does.
+      final gone = Uint8List.fromList(List.generate(32, (i) => i + 70));
+      for (var i = 0; i < 40; i++) {
+        router.markSeen('r$i', 1000 + i);
+      }
+      router.buildSyncRound(gone);
+      expect(router.syncCursorState(gone).pending, 0,
+          reason: 'swept: its cursor is past the seen-set');
+      router.debugAgeSyncCursors(const Duration(minutes: 11));
+      expect(router.syncCursorState(gone).pending, 40,
+          reason: 'the stale cursor was dropped, so the sweep restarts');
+    });
+
+    test('a round is capped, so a huge gap does not become one burst', () {
+      for (var i = 0; i < GcsFilter.maxElements * 40; i++) {
+        router.markSeen('big$i', 1000 + i);
+      }
+      final round = router.buildSyncRound(neighbourPubkey);
+      expect(round.length, lessThanOrEqualTo(10),
+          reason: 'the per-round cap, not the full 40 frames');
+      expect(router.syncCursorState(neighbourPubkey).pending, greaterThan(0),
+          reason: 'the remainder is not lost — the cursor keeps its place');
     });
 
     test('a spent packet in TRANSIT is dropped on arrival', () async {

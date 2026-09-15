@@ -1602,8 +1602,8 @@ void main() {
             reason: 'the buffered copy is the sync-exchange backstop');
       });
 
-      test('writes directly and does NOT buffer when the recipient is '
-          'connected', () async {
+      test('writes directly AND buffers when the recipient is connected — '
+          'a local write success is not proof of delivery', () async {
         final before = router.dtnBufferedCount;
         Uint8List? sentTo;
         String? sentPacketId;
@@ -1617,9 +1617,23 @@ void main() {
         expect(via, PeerTransport.bleDirect);
         expect(sentTo, otherPubkey);
         expect(sentPacketId, packet.packetId);
-        expect(router.dtnBufferedCount, before,
-            reason: 'store-carry-forward is for the recipient that cannot be '
-                'reached now — a delivered packet does not enter the buffer');
+        expect(router.dtnBufferedCount, before + 1,
+            reason: 'a write succeeding at the transport level is proof the '
+                'bytes crossed the air, not proof the recipient processed '
+                'them — the buffered copy is the safety net a receiver-side '
+                'silent drop needs, and it only leaves on the end-to-end ACK');
+      });
+
+      test('the end-to-end ACK — not the write succeeding — retires a '
+          'directly-written packet from the buffer', () async {
+        router.directSend = (pubkey, sealed) async => PeerTransport.bleDirect;
+        final packet = sealedTo(otherPubkey);
+        await router.dispatchOutbound(otherPubkey, packet);
+        expect(router.dtnBufferFor(otherPubkey).map((p) => p.packetId),
+            contains(packet.packetId));
+        router.dropFromDtnBuffer([packet.packetId]);
+        expect(router.dtnBufferFor(otherPubkey).map((p) => p.packetId),
+            isNot(contains(packet.packetId)));
       });
 
       test('a refused direct write falls back to the buffer', () async {
@@ -1639,6 +1653,26 @@ void main() {
             otherPubkey, sealedTo(otherPubkey));
         expect(via, isNull);
         expect(router.dtnBufferedCount, before + 1);
+      });
+
+      test('a successful write traces BOTH direct and store — one event '
+          'for the radio transaction, one for the safety-net buffer entry '
+          'analysis depends on being able to tell apart', () async {
+        final trace = _CapturingRecorder();
+        final traced = MessageRouter(
+          identity: identity,
+          store: store,
+          protocolHandler: protocolHandler,
+          fragmentHandler: fragmentHandler,
+          trace: trace,
+        );
+        traced.directSend = (pubkey, sealed) async => PeerTransport.bleDirect;
+        await traced.dispatchOutbound(otherPubkey, sealedTo(otherPubkey));
+
+        final custody =
+            trace.records.where((r) => r['type'] == 'custody').toList();
+        expect(custody.map((r) => r['event']),
+            containsAll(['direct', 'store']));
       });
     });
   });

@@ -68,6 +68,11 @@ auto-advance gap at its tail, and nothing is sent in either — dividing by the
 span understates throughput by ~40% in a typical cycle-check. ``active_s``
 next to ``t0``/``t1`` makes the difference visible.
 
+``air_Bps`` is every sealed byte both devices put on the air, per second of
+the step -- the rate the RADIO carried, as opposed to ``goodput_Bps`` which
+counts only what arrived. A capacity model wants this one: its link rate has
+to carry retransmissions and acknowledgements as well as payload.
+
 ``airB_per_msg`` is every sealed byte both devices put on the air during the
 step (data + acks + custody sync) divided by the messages delivered, and
 ``air_overhead`` is that over the payload size. This is what the payload arm
@@ -98,6 +103,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.transforms as mtransforms  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
@@ -118,6 +124,10 @@ MARKER_LEG_RE = re.compile(r"\bleg\s*=\s*(\w+)", re.I)
 # Parsed into its own segment variable rather than re-matched at every call
 # site, which is the debt the clique's six copy-pasted `N=` matches became.
 MARKER_RADIUS_RE = re.compile(r"\br\s*=\s*(\d+)")
+# The connection-interval arm of the throughput run. Present or absent --
+# a label without it ran at whatever interval the platform defaults to,
+# which is the baseline the arm is compared against.
+MARKER_PRIO_RE = re.compile(r"\bprio\s*=\s*(\w+)", re.I)
 # What ONE occurrence of each link stage counts. The app emits four of them
 # per GATT leg and three per peer, so a converged dual-role pair produces TWO
 # `connected` events and ONE `session`. A ratio between stages of different
@@ -311,6 +321,13 @@ def sync_reach(df: pd.DataFrame) -> pd.DataFrame:
     d = df[df._type == "sync"]
     if d.empty:
         return pd.DataFrame()
+    # The asker's rounds only. The holder's answers ride the same record type
+    # under event 'answer' and are summarised separately by `sync_answers`;
+    # mixing them here would divide by a `pending` those rows do not carry.
+    if "event" in d.columns:
+        d = d[d.event.fillna("filter") == "filter"]
+    if d.empty:
+        return pd.DataFrame()
     d = d.copy()
     for c in ("frames", "pending", "seenTotal"):
         d[c] = pd.to_numeric(d.get(c), errors="coerce")
@@ -337,6 +354,130 @@ def sync_reach(df: pd.DataFrame) -> pd.DataFrame:
         behind_rounds=("covered", lambda c: int((c < 1).sum())),
         reach_median=("reach", "median"))
     return g.sort_values(["_device", "transport"])
+
+
+def ring_agreement(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Did every phone enforce the SAME ring?
+
+    A ring testbed is coherent only if all phones agree on the pubkey list,
+    because ring order is that list sorted and the gate is each node's local
+    slice of it. Disagree and the topology is not a ring at all: one side
+    thinks a pair adjacent and dials, the other thinks it two hops away and
+    refuses, and the run measures a shape nobody chose.
+
+    That used to be assumed. It is assumable when the list is a compiled
+    constant -- every phone runs the same build -- but not when each phone
+    derives it from its own Noise session table, which is what
+    `FieldPlan.ringRosterFromSessions` does. A phone that launched one session
+    short builds a smaller ring and disagrees about every distance, and nothing
+    in the trace would have said so. The runner therefore stamps the ring it is
+    actually enforcing on every marker, and this reads it back.
+
+    Returns (per-device table, list of loud problems). An empty list means the
+    fleet agreed -- or that this is not a ring run, which is the same absence.
+    """
+    if df.empty or "_type" not in df.columns or "ring" not in df.columns:
+        return pd.DataFrame(), []
+    d = df[(df._type == "marker") & df.ring.notna()]
+    if d.empty:
+        return pd.DataFrame(), []
+    rows, seen = [], {}
+    for dev, g in d.groupby("_device"):
+        # A phone must not change its ring mid-run either: it is frozen at
+        # launch precisely so a session lost under the gate cannot reshape the
+        # topology, and a second value here means that freeze did not hold.
+        variants = {tuple(r) for r in g.ring if isinstance(r, list)}
+        for v in variants:
+            seen.setdefault(v, set()).add(dev)
+        rows.append({
+            "_device": dev,
+            "markers": len(g),
+            "ring": " ".join(sorted(variants)[0]) if variants else "",
+            "n": len(sorted(variants)[0]) if variants else 0,
+            "changed_mid_run": len(variants) > 1,
+        })
+    table = pd.DataFrame(rows).sort_values("_device")
+    problems = []
+    if len(seen) > 1:
+        problems.append(
+            "PHONES DISAGREED ABOUT THE RING — the gate was incoherent and "
+            "this run is void. Rings stamped:")
+        for ring_, devs in sorted(seen.items()):
+            problems.append(f"    {' '.join(ring_)}  <- "
+                            f"{', '.join(sorted(x[:8] for x in devs))}")
+    for r in rows:
+        if r["changed_mid_run"]:
+            problems.append(
+                f"{r['_device'][:8]} changed its ring MID-RUN — the launch "
+                f"freeze did not hold")
+    # A ring member that never uploaded still occupies a position, so
+    # distances stay correct, but half of every pair it is in is missing.
+    if len(seen) == 1:
+        members = set(next(iter(seen)))
+        uploaded = {str(x)[:8] for x in df._device.unique()}
+        missing = sorted(m for m in members if m[:8] not in uploaded)
+        if missing:
+            problems.append(
+                f"IN THE RING BUT NEVER UPLOADED: {', '.join(missing)} — "
+                f"distances are unaffected, but that phone's side of every "
+                f"pair is absent, and 'aborted' cannot be told from 'absent'")
+    return table, problems
+
+
+def sync_answers(df: pd.DataFrame) -> pd.DataFrame:
+    """The HOLDER's side of each round: what the asker's window was worth.
+
+    `sync_reach` says how much of itself an asker managed to describe. It
+    cannot say whether the description was any use, and those are different
+    failures with opposite fixes. A buffer that sits full and motionless is
+    either "the window never covered what I hold" (the asker's cursor has
+    moved past those creation stamps and will not come back) or "the filter
+    said the peer already had it" — and from delivery outcomes alone the two
+    are indistinguishable.
+
+    So: `inWindow` is how much of what we hold the asker's window even
+    reached, `withheld` how much of that the filter then claimed. A run where
+    `inWindow` collapses toward zero while `held` stays high is the cursor
+    abandoning its backlog; one where `withheld` is high instead is genuine
+    convergence, or a filter false-positive rate worth measuring.
+    """
+    if df.empty or "_type" not in df.columns or "event" not in df.columns:
+        return pd.DataFrame()
+    d = df[(df._type == "sync") & (df.event == "answer")]
+    if d.empty:
+        return pd.DataFrame()
+    d = d.copy()
+    for c in ("held", "inWindow", "conveyed", "withheld",
+              "ownHeld", "ownInWindow", "ownConveyed", "ownWithheld"):
+        d[c] = pd.to_numeric(d.get(c), errors="coerce")
+    d = d.dropna(subset=["held", "inWindow"])
+    if d.empty:
+        return pd.DataFrame()
+    # Share of the buffer one round was even asked about. This is the number
+    # that went to ~0 while buffers stayed full in the ring smoke runs.
+    d["offered"] = (d.inWindow / d.held.where(d.held > 0)).round(3)
+    # The asker's OWN undelivered mail is the part that separates the two
+    # failures; the rest of the buffer is third-party transit and
+    # already-delivered copies awaiting an ACK, both correctly withheld.
+    # `unreached` is mail we hold for the asker that the window never even
+    # covered -- the cursor failing to come back around -- as against
+    # `ownWithheld`, which is the asker claiming mail it never delivered.
+    if "ownHeld" in d.columns:
+        d["unreached"] = (d.ownHeld - d.ownInWindow).clip(lower=0)
+    else:
+        d["unreached"] = float("nan")
+    g = d.groupby(["_device", "peer", "transport"], as_index=False).agg(
+        answers=("held", "size"), held_median=("held", "median"),
+        in_window_median=("inWindow", "median"),
+        offered_median=("offered", "median"),
+        conveyed_total=("conveyed", "sum"),
+        withheld_total=("withheld", "sum"),
+        own_held_median=("ownHeld", "median"),
+        own_conveyed_total=("ownConveyed", "sum"),
+        own_withheld_total=("ownWithheld", "sum"),
+        unreached_median=("unreached", "median"),
+        blind_rounds=("inWindow", lambda c: int((c == 0).sum())))
+    return g.sort_values(["_device", "peer", "transport"])
 
 
 #: Ids one GCS filter frame names — (maxPayloadBytes * 8) // (p + 2) in
@@ -712,6 +853,7 @@ def marker_segments(df: pd.DataFrame) -> list[dict]:
         lanes = MARKER_LANES_RE.search(label)
         leg = MARKER_LEG_RE.search(label)
         radius = MARKER_RADIUS_RE.search(label)
+        prio = MARKER_PRIO_RE.search(label)
         direction = (
             "approach"
             if "approach" in label.lower()
@@ -725,6 +867,7 @@ def marker_segments(df: pd.DataFrame) -> list[dict]:
                      # correctly -- the trap `d` fell into, where every
                      # non-line run keyed its buckets on NaN.
                      "r": int(radius.group(1)) if radius else None,
+                     "prio": prio.group(1).lower() if prio else None,
                      "direction": direction, "dev": str(m._device),
                      "label": label, "t0": m._t, "t1": None,
                      "t0_dwell": None, "t1_dwell": None,
@@ -753,6 +896,300 @@ def _distance_segments(df: pd.DataFrame) -> list[dict]:
     scatter across one bogus key PER SEGMENT in any dict grouped by `d`.
     """
     return [s for s in marker_segments(df) if not math.isnan(s["d"])]
+
+
+def link_events_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per link event, with the ACTIVE LINK COUNT AT BOTH ENDS.
+
+    Both ends, because a link is a property of a pair and the two devices
+    rarely hold the same number: an outage indexed by the busier end is a
+    different statistic from one indexed by whichever device logged the
+    event, and no complete-graph run can tell them apart, since every node
+    has the same degree there.
+
+    Concurrency is DISTINCT PEERS with an open leg, never paths or legs. A
+    path is keyed role+address and BLE addresses rotate, so one peer holds
+    several path entries; counting those reported 84 "links" on a ten-node
+    ring, which is not physically reachable. A converged pair holds two
+    legs, so legs double it. `pathsTracked` also counts dials in flight and
+    `legsReady` counts ready paths, both inflated by the same rotation.
+    """
+    link = df[df._type == "link"]
+    if link.empty:
+        return pd.DataFrame()
+    ev = list(_col(link, "event"))
+    peer = list(_col(link, "peer"))
+    role = list(_col(link, "role"))
+    path = list(_col(link, "path"))
+    order = link._t.argsort()
+    # A leg becomes usable at `gattConnected`, which carries NO peer: identity
+    # arrives later on the ANNOUNCE, so the connect cannot name who it is to.
+    # `connected` and `drop` do carry one. Keying concurrency on peer alone
+    # therefore counts every CLOSE and misses most OPENS, and the open set
+    # drains to empty -- which reported ~0 links held on a run that delivered
+    # 99.2% of its messages. So resolve path -> peer first, from the events
+    # that carry both, and key the tracking on the path.
+    path_peer: dict[str, str] = {}
+    for i in order:
+        pk, pt = peer[i], path[i]
+        if isinstance(pk, str) and isinstance(pt, str):
+            path_peer[pt] = pk[:8]
+    open_now = defaultdict(set)
+    # (device) -> {(peer, role): the ONE path currently holding that slot}.
+    # A device holds at most one leg per peer per role, so a new path for a
+    # pair that already has one SUPERSEDES it. Without that, a path whose
+    # close is never logged is held open forever and the count drifts up
+    # toward every peer ever linked to: 10-30% of paths on a long run never
+    # receive a `drop`, which read as 6-8 concurrent peers at ring radius 1
+    # where the gate permits exactly 2. Supersession bounds the set from the
+    # protocol rather than from a staleness timeout, so it needs no tunable.
+    slot = defaultdict(dict)
+    timeline = defaultdict(list)
+    rows = []
+    ts = list(link._t)
+    devs = list(link._device)
+    for i in order:
+        pk, rl, e, pt = peer[i], role[i], ev[i], path[i]
+        if not isinstance(pt, str):
+            continue
+        who = pk[:8] if isinstance(pk, str) else path_peer.get(pt)
+        d = str(devs[i])[:8]
+        held = open_now[d]
+        # Role from the path prefix, not the `role` field: the prefix is
+        # present on every path id, while the field is missing on some events.
+        rkey = pt.split(":", 1)[0]
+        key = (who, rkey)
+        if e in ("connected", "gattConnected"):
+            if who is not None:
+                prev = slot[d].get(key)
+                if prev is not None and prev != pt:
+                    held.discard(prev)
+                slot[d][key] = pt
+            held.add(pt)
+        elif e == "drop":
+            held.discard(pt)
+            if who is not None and slot[d].get(key) == pt:
+                del slot[d][key]
+        else:
+            continue
+        # Distinct PEERS, resolved through the path map: a converged pair
+        # holds two paths, and address rotation can give one peer several.
+        n = len({path_peer.get(x) for x in held if path_peer.get(x)})
+        t = int(ts[i])
+        timeline[d].append((t, n))
+        rows.append({"t": t, "device": d, "peer": who, "stage": e,
+                     "role": rl if isinstance(rl, str) else None,
+                     "links_self": n})
+    if not rows:
+        return pd.DataFrame()
+    keys = {d: [x[0] for x in tl] for d, tl in timeline.items()}
+    for r in rows:
+        tl = timeline.get(r["peer"]) if r["peer"] else None
+        if not tl:
+            r["links_peer"] = None
+            r["links_busier"] = None
+            continue
+        j = bisect.bisect_right(keys[r["peer"]], r["t"]) - 1
+        lp = tl[j][1] if j >= 0 else 0
+        r["links_peer"] = lp
+        r["links_busier"] = max(r["links_self"], lp)
+    return pd.DataFrame(rows)
+
+
+def _links_held_mean(links: pd.DataFrame, device: str,
+                     t0: int, t1: int) -> float | None:
+    """Time-weighted mean links held by [device] across [t0, t1).
+
+    Each link event sets a level that holds until the next one, so the mean
+    is the integral over the window divided by its length. The level at t0
+    is carried in from the last event BEFORE the window, which is what makes
+    a step with no events of its own report the links it actually held
+    rather than nothing.
+    """
+    if links.empty:
+        return None
+    d = links[links.device == device]
+    if d.empty:
+        return None
+    d = d.sort_values("t")
+    ts = d["t"].to_numpy()
+    lv = d["links_self"].to_numpy()
+    prior = ts <= t0
+    level = int(lv[prior][-1]) if prior.any() else 0
+    span = max(t1 - t0, 1)
+    area = 0.0
+    cur = t0
+    for t, n in zip(ts, lv):
+        if t <= t0 or t >= t1:
+            continue
+        area += level * (t - cur)
+        cur, level = int(t), int(n)
+    area += level * (t1 - cur)
+    return area / span
+
+
+def retirement_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Per device: what left the DTN buffer, and how much of it was RETIRED.
+
+    Retirement is the buffer's one deliberate deletion. A holder drops a
+    packet it carries for a peer when that peer's own seen-filter reports
+    having it twice under different salts --- the only retirement signal a
+    carried transit copy or a confirmation ever gets, since a carrier cannot
+    observe an end-to-end ACK and nothing acknowledges a confirmation.
+
+    It is also the one exit that can be WRONG. The filter is a GCS with a
+    1-in-128 false-positive rate, so "the peer has it" can be the hash
+    talking; two votes under different salts price that at 1/128 squared. A
+    run cannot be read without this column, because without it "the window
+    never reached the packet", "the peer said it already had it" and "we
+    deleted it" all present as a buffer that quietly empties.
+
+    `retired_frac` is retirements over all non-ACK exits. A run where it
+    dominates is a run whose custody numbers describe the retirement rule
+    rather than the mesh.
+    """
+    cust = df[df._type == "custody"]
+    if cust.empty or "event" not in cust.columns:
+        return pd.DataFrame()
+    ends = cust[_col(cust, "event") == "end"]
+    if ends.empty:
+        return pd.DataFrame()
+    reasons = _col(ends, "reason")
+    rows = []
+    for dev, d in ends.groupby("_device"):
+        r = _col(d, "reason")
+        counts = r.value_counts().to_dict()
+        total = int(len(d))
+        retired = int(counts.get("retiredSeen", 0))
+        # The aggregate the holder logs once per answered filter, which says
+        # WHO it retired for. The per-packet `end` records do not carry the
+        # peer, so this is the only place the recipient appears.
+        agg = cust[(cust._device == dev)
+                   & (_col(cust, "event") == "retiredSeen")]
+        rows.append({
+            "device": dev,
+            "exits": total,
+            "retiredSeen": retired,
+            "expired": int(counts.get("expired", 0)),
+            "evictedTotal": int(counts.get("evictedTotal", 0)),
+            "evictedRecipients": int(counts.get("evictedRecipients", 0)),
+            "retired_frac": round(retired / total, 4) if total else 0.0,
+            "retire_rounds": int(len(agg)),
+            "retire_peers": int(_col(agg, "toPeer").nunique()) if len(agg) else 0,
+        })
+    out = pd.DataFrame(rows).sort_values("retiredSeen", ascending=False)
+    _ = reasons  # the pooled series is kept for the summary line above
+    return out.reset_index(drop=True)
+
+
+def steps_by_device_table(df: pd.DataFrame, segs: list[dict],
+                          latency: pd.DataFrame,
+                          links: pd.DataFrame) -> pd.DataFrame:
+    """One row per (device, step): what THAT radio sent, carried and lost.
+
+    `steps.csv` sums link stages across devices, so churn and refused writes
+    cannot be split by device or class from it. On a mixed fleet that hides
+    the thing worth knowing: the diluting clique's loss at N=7 was two
+    populations, 0.57 arrival on the Nexus 5X against 0.89 on the modern
+    phones, and an average across them describes a fleet that does not exist.
+
+    `links_*` come from [link_events_table], so they are distinct peers.
+    `degree_*` come from the sender's own `degreeAtEvent`, which counts
+    REACHABLE PEERS off the Redux projection rather than open GATT links --
+    close on a BLE-only run, not identical. Both are reported rather than
+    merged.
+    """
+    msgs = df[df._type == "message"]
+    wire = df[df._type == "wire"]
+    drop = df[df._type == "drop"]
+    link_rec = df[df._type == "link"]
+    rows = []
+    for seg in segs:
+        t0, t1 = seg["t0"], seg["t1"]
+        dwell = max((t1 - t0) / 1000.0, 1e-9)
+        seg_m = msgs[(msgs._t >= t0) & (msgs._t < t1)]
+        seg_w = wire[(wire._t >= t0) & (wire._t < t1)]
+        seg_d = drop[(drop._t >= t0) & (drop._t < t1)]
+        seg_l = (links[(links.t >= t0) & (links.t < t1)]
+                 if not links.empty else links)
+        seg_link = link_rec[(link_rec._t >= t0) & (link_rec._t < t1)]
+        seg_lat = (latency[(latency.sentAt >= t0) & (latency.sentAt < t1)]
+                   if not latency.empty else latency)
+        md = seg_m._device.astype(str).str[:8] if len(seg_m) else pd.Series(dtype=str)
+        wd = seg_w._device.astype(str).str[:8] if len(seg_w) else pd.Series(dtype=str)
+        dvs = sorted(set(md) | set(wd))
+        for d in dvs:
+            dm = seg_m[md == d] if len(seg_m) else seg_m
+            dirs = _col(dm, "dir")
+            sent = dm[dirs == "sent"] if len(dm) else dm
+            recv = dm[dirs == "recv"] if len(dm) else dm
+            row = {"label": seg.get("label"), "t0": t0, "t1": t1,
+                   "device": d, "dwell_s": round(dwell, 1),
+                   "msg_sent": int(len(sent)), "msg_recv": int(len(recv))}
+            if not seg_lat.empty and "sender" in seg_lat.columns:
+                mine = seg_lat[seg_lat["sender"].astype(str).str[:8] == d]
+                row["msg_arrived"] = int(mine["deliveredAt"].notna().sum())
+                if "receivedAt" in mine.columns:
+                    row["msg_acked"] = int(mine["receivedAt"].notna().sum())
+            # Truncation guard: Android silently truncates an oversized write
+            # at the leg's usable MTU, and a short arrival is otherwise
+            # indistinguishable from a saturated link.
+            for lbl, frame in (("sent", sent), ("recv", recv)):
+                if "payloadSize" in frame.columns and len(frame):
+                    v = pd.to_numeric(frame["payloadSize"],
+                                      errors="coerce").dropna()
+                    if len(v):
+                        row[f"payload_{lbl}_median"] = float(v.median())
+                        row[f"payload_{lbl}_max"] = float(v.max())
+            dw = seg_w[wd == d] if len(seg_w) else seg_w
+            tx = sum(sum(int(v) for v in b.values())
+                     for b in _col(dw, "txBytes") if isinstance(b, dict))
+            rx = sum(sum(int(v) for v in b.values())
+                     for b in _col(dw, "rxBytes") if isinstance(b, dict))
+            row.update({"tx_bytes": tx, "rx_bytes": rx,
+                        "tx_Bps": round(tx / dwell, 1),
+                        "rx_Bps": round(rx / dwell, 1)})
+            dd = seg_d[seg_d._device.astype(str).str[:8] == d] if len(seg_d) else seg_d
+            reasons = _col(dd, "reason") if len(dd) else pd.Series(dtype=str)
+            for r in ("writeFailed", "writeTimeout", "noPath", "noSession"):
+                row[f"drop_{r}"] = int((reasons == r).sum()) if len(dd) else 0
+            # Stage counts come from the RAW link records, not from
+            # links.csv: `gattConnected` carries no peer -- identity arrives
+            # later on the ANNOUNCE, which is why identity follows the link
+            # rather than preceding it -- so it cannot be peer-keyed and
+            # never reaches that table. Counting it there silently reported
+            # zero against a pooled 18.
+            dlink = seg_link[seg_link._device.astype(str).str[:8] == d] \
+                if len(seg_link) else seg_link
+            levs = _col(dlink, "event") if len(dlink) else pd.Series(dtype=str)
+            for stage in ("gattConnected", "connected", "identified", "drop"):
+                row[f"link_{stage}"] = (int((levs == stage).sum())
+                                        if len(dlink) else 0)
+            dl = seg_l[seg_l.device == d] if len(seg_l) else seg_l
+            if len(dl):
+                row["links_max"] = int(dl.links_self.max())
+                if dl.links_busier.notna().any():
+                    row["links_busier_max"] = int(dl.links_busier.max())
+            # Links held is TIME-weighted across the step, not averaged over
+            # link events: events cluster at the step head, so an
+            # event-weighted mean describes the moments the topology changed
+            # rather than the state the traffic actually met.
+            held = _links_held_mean(links, d, t0, t1)
+            if held is not None:
+                row["links_mean"] = round(held, 2)
+                row["tx_Bps_per_link"] = (round(tx / dwell / held, 1)
+                                          if held > 0 else None)
+            deg = (pd.to_numeric(_col(sent, "degreeAtEvent"), errors="coerce")
+                   .dropna() if len(sent) else pd.Series(dtype=float))
+            if len(deg):
+                # Reported, never used as the per-link divisor. It counts
+                # peers the Redux projection calls reachable, which reads 0
+                # for half the sends on a ring where every node has two
+                # neighbours -- it lags link state and is not a link count.
+                row["degree_mean"] = round(float(deg.mean()), 2)
+                row["degree_max"] = int(deg.max())
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def steps_table(df: pd.DataFrame, segs: list[dict],
@@ -945,6 +1382,12 @@ def steps_table(df: pd.DataFrame, segs: list[dict],
                                    if len(lat) else None)
             row["air_overhead"] = (round(air_b / (len(lat) * payload_b), 2)
                                    if len(lat) and payload_b else None)
+            # Every sealed byte both devices put on the air, per second of the
+            # step. Unlike goodput_Bps this counts what the RADIO carried
+            # rather than what arrived, so it is the link's rate and not the
+            # protocol's yield -- the number a capacity model needs, since a
+            # model's link rate has to carry retransmissions and acks too.
+            row["air_Bps"] = round(air_b / active_sec, 1) if air_b else None
         else:
             row.update({"msg_sent": 0, "msg_recv": 0, "recv_rate": None,
                         "msg_delivered": 0, "msg_arrived": 0,
@@ -1444,6 +1887,16 @@ def mesh_summary(paths: pd.DataFrame, df: pd.DataFrame,
     if not cust.empty:
         ev = _col(cust, "event").value_counts().to_dict()
         lines.append(f"custody events: {ev}")
+        # WHY a packet left the buffer, not just that it did. The reasons are
+        # not interchangeable: `ack` is the journey completing, `expired` and
+        # the evictions are the buffer's bounds, and `retiredSeen` is a
+        # deliberate deletion on the recipient's own word that it already has
+        # the packet. Pooled into one `end` count, a run where custody was
+        # working and one where it was being thrown away read the same.
+        ends = cust[_col(cust, "event") == "end"]
+        if not ends.empty:
+            lines.append("custody exits by reason: "
+                         + str(_col(ends, "reason").value_counts().to_dict()))
     # Two distinct duplication questions — keep them apart:
     #   packetDup: redundant PACKETS on the air (dual-leg delivery, re-floods,
     #              custody conveyance), dropped by the packetId bloom;
@@ -3976,6 +4429,21 @@ def main() -> int:
         if not paths.empty:
             paths.to_csv(out / "mesh_paths.csv", index=False)
             summary += mesh_summary(paths, edf, clocks)
+        rings, ring_problems = ring_agreement(edf)
+        if not rings.empty:
+            rings.to_csv(out / "ring_agreement.csv", index=False)
+            head = ("\nRing agreement — every phone must enforce the SAME "
+                    "ring\n" + "-" * 60 + "\n")
+            body = rings.to_string(index=False) + "\n"
+            if ring_problems:
+                body += "\n" + "\n".join("  !! " + p for p in ring_problems)
+                body += "\n"
+                for p in ring_problems:
+                    print(f"  !! {p}", file=sys.stderr)
+            else:
+                body += ("  all phones stamped the same ring — the topology "
+                         "was the one the plan chose\n")
+            summary += head + body
         (out / "summary.txt").write_text(summary)
         if not latency.empty:
             latency.to_csv(out / "latency.csv", index=False)
@@ -3996,6 +4464,13 @@ def main() -> int:
                 fh.write("\nSync filter reach — share of its own seen-set a "
                          "node advertised per round\n" + "-" * 60 + "\n")
                 fh.write(reach.to_string(index=False) + "\n")
+        answers = sync_answers(edf)
+        if not answers.empty:
+            answers.to_csv(out / "sync_answers.csv", index=False)
+            with (out / "summary.txt").open("a") as fh:
+                fh.write("\nSync answers — share of the DTN buffer each "
+                         "round was asked about\n" + "-" * 60 + "\n")
+                fh.write(answers.to_string(index=False) + "\n")
         aborts = edf[(edf._type == "runner")]
         if not aborts.empty:
             with (out / "summary.txt").open("a") as fh:
@@ -4021,6 +4496,18 @@ def main() -> int:
         if segs:
             steps = steps_table(edf, segs, latency)
             steps.to_csv(out / "steps.csv", index=False)
+            # Per-device tables. `steps.csv` pools link stages across
+            # devices, so a mixed fleet's two populations average into one
+            # that does not exist; these keep them apart.
+            links = link_events_table(edf)
+            if not links.empty:
+                links.to_csv(out / "links.csv", index=False)
+            sbd = steps_by_device_table(edf, segs, latency, links)
+            if not sbd.empty:
+                sbd.to_csv(out / "steps_by_device.csv", index=False)
+            ret = retirement_table(edf)
+            if not ret.empty:
+                ret.to_csv(out / "retirement.csv", index=False)
             pairs = pair_matrix(latency, segs)
             if not pairs.empty:
                 pairs.to_csv(out / "pair_matrix.csv", index=False)
@@ -4054,6 +4541,8 @@ def main() -> int:
                                          Path(args.thesis_figs))
                 plot_thesis_clique_figures(edf, steps, pm,
                                            Path(args.thesis_figs))
+                with plt.rc_context(_TH):
+                    _th_adv_interval(edf, Path(args.thesis_figs))
             write_load_sweep(steps, out / "load_sweep_delivery.png", exp)
             # The lab companion to the line sweep. Self-gating on its own arms
             # (lanes / GATT leg / payload sizes) rather than on distance,
@@ -4136,6 +4625,34 @@ def _clique_active_pairs(msg: pd.DataFrame, seg: dict) -> int:
     w = msg[(msg._t >= a) & (msg._t < bd) & (msg.dir == "sent")]
     return len(set(zip(w._device.astype(str).str[:8],
                        w.peer.astype(str).str[:8])))
+
+
+def _clique_session_pair_times(df: pd.DataFrame) -> list:
+    """Sorted first-establishment time of every UNORDERED (dev, peer) pair
+    that reached a live Noise session, replayed from EXPERIMENT start.
+
+    A session is transport-independent and, once established, never goes
+    false for the life of the run (unfriending is the only thing that
+    clears one, and the clique never unfriends) -- so this is a monotonic
+    step function, safe to sample anywhere and safe to replay from t=0
+    the way `_th_delivery_vs_degree` replays connectivity. Both ends log
+    their own `session` event on completion; a handshake's initiator and
+    responder finish a few ms apart, so the pair's time is the EARLIER of
+    the two -- the first moment either direction could already send.
+
+    On the clique-final run this reaches exactly C(7,2) = 21 -- the whole
+    mesh eventually pairs -- which is the check that the event and the
+    peer-hex truncation are being read correctly.
+    """
+    lk = df[(df._type == "link") & (df.event == "session")].copy()
+    if lk.empty:
+        return []
+    lk["dev8"] = lk._device.astype(str).str[:8]
+    lk["peer8"] = lk["peer"].astype(str).str[:8]
+    lk["pair"] = list(map(tuple, np.sort(lk[["dev8", "peer8"]].to_numpy(),
+                                         axis=1)))
+    first = lk.groupby("pair")._t.min()
+    return sorted(float(v) for v in first.values)
 
 
 def _th_delivery_vs_degree(df: pd.DataFrame, out: Path) -> None:
@@ -4546,6 +5063,237 @@ def _th_delivery_mechanism_by_n(df: pd.DataFrame, out: Path) -> None:
     _th_save(fig, out / "clique_delivery_mechanism.pdf")
 
 
+def _th_delivery_outcome_by_n(df: pd.DataFrame, out: Path) -> None:
+    """Of every message SENT: failed, delivered direct, or delivered via
+    the DTN buffer's conveyance mechanism at least once -- one 100%
+    stacked bar per clique size N. The figure `clique_delivery.pdf` and
+    its per-trial companion answer "did it arrive"; `_th_delivery_method_
+    by_n` and `_th_delivery_mechanism_by_n` answer "of the ones that did,
+    how" -- both scoped to delivered messages only, so neither shows a
+    failed slice at all. This is the one figure that partitions the WHOLE
+    sent population three ways at once.
+
+    "Conveyed" reuses `_th_delivery_mechanism_by_n`'s definition exactly
+    (a `custody` `convey` event recorded for the packetId at any point in
+    its trace-wide history) -- the same mild upper-bound and the same
+    trace-capacity caveat about `custody` completeness apply here
+    unchanged (see that function's docstring).
+
+    Denominator is ALL sent, not aired-only: unlike the per-trial
+    arrived/ACK'd figure (where excluding aired:false isolates radio/
+    protocol reliability from the app's own queueing), a message that
+    never aired is itself a real failure this figure exists to count --
+    filtering it out would make N=7's failure share look smaller than it
+    is by removing exactly the failures that never left the device.
+    """
+    segs = [s for s in marker_segments(df)
+            if re.match(r"N=\d+", s.get("label") or "")]
+    if not segs:
+        return
+    msg = df[df._type == "message"]
+    cust = df[df._type == "custody"]
+    conv = cust[cust.event == "convey"] if "event" in cust.columns else cust
+    delivered_all = set(msg[msg.dir == "recv"].messageId.dropna())
+    conveyed_all = set(conv.packetId.dropna())
+    rows = []
+    for seg in segs:
+        n = int(re.match(r"N=(\d+)", seg["label"]).group(1))
+        sent = _clique_sent_ids(msg, seg)
+        if not sent:
+            continue
+        delivered = sent & delivered_all
+        conveyed = delivered & conveyed_all
+        rows.append(dict(n=n, sent=len(sent), failed=len(sent - delivered),
+                         direct=len(delivered - conveyed_all),
+                         conveyed=len(conveyed)))
+    if not rows:
+        return
+    t = pd.DataFrame(rows)
+    ns = sorted(t.n.unique())
+    grp = t.groupby("n")[["sent", "failed", "direct", "conveyed"]].sum()
+    grp = grp.reindex(ns)
+    failed_pct = 100 * grp.failed / grp.sent
+    direct_pct = 100 * grp.direct / grp.sent
+    conveyed_pct = 100 * grp.conveyed / grp.sent
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.4))
+    ax.bar(ns, direct_pct, .6, color=_TH_C1, label="delivered (direct)",
+           edgecolor="white", linewidth=0.6)
+    ax.bar(ns, conveyed_pct, .6, bottom=direct_pct, color=_TH_C3,
+           label="delivered (relayed)",
+           edgecolor="white", linewidth=0.6)
+    ax.bar(ns, failed_pct, .6, bottom=direct_pct + conveyed_pct,
+           color=_TH_C2, label="failed", edgecolor="white", linewidth=0.6)
+    for n in ns:
+        ax.annotate(f"{int(grp.sent[n]):,}", (n, 100.0),
+                    textcoords="offset points", xytext=(0, 4),
+                    ha="center", fontsize=6.5, color="#666666")
+    # Explicit axes-fraction rows for the title and the legend, with a
+    # deliberate gap between them, rather than a default labelpad
+    # sitting right against the legend's own anchor.
+    ax.set_xlabel("")
+    ax.text(0.5, -0.12, "clique size", transform=ax.transAxes,
+            ha="center", va="center", fontsize=plt.rcParams["axes.labelsize"])
+    ax.set_ylabel("share of sent messages (%)")
+    ax.set_xticks(ns)
+    ax.set_ylim(0, 110)
+    ax.grid(axis="y", alpha=.25)
+    ax.legend(frameon=False, fontsize=7.5, loc="upper center",
+              bbox_to_anchor=(0.5, -0.22), ncol=1)
+    _th_save(fig, out / "clique_delivery_outcome.pdf")
+
+
+def _th_delivery_outcome_by_sessions(df: pd.DataFrame, out: Path) -> None:
+    """The same failed/direct/conveyed partition as
+    `_th_delivery_outcome_by_n`, but grouped by the live-session count at
+    the moment each individual message was sent, instead of by clique
+    size N.
+
+    PER MESSAGE, not per trial. An earlier version sampled the session
+    count once per trial (at its first send) and assigned that ONE value
+    to the trial's whole few-hundred-message batch -- wrong, because
+    sessions keep forming mid-dwell: checked directly, messages exist at
+    every one of 1-21 sessions, including the values (2, 4, 5, 7-9,
+    11-13, 16, 17) the trial-level version never showed a bar for. Those
+    were never missing data, only a binning artifact: a trial that opens
+    at 3 sessions and closes at 6 has SOME of its own messages sent at 4
+    and 5, and grouping by the trial's first-send value threw that away.
+    This groups every sent message by its own live-session count, so all
+    21 values appear with real, independently-supported percentages.
+
+    Shown only for session counts with >= 1000 sent messages. Ten of the
+    21 (2, 4, 5, 7, 8, 9, 11, 12, 16, 17) have between 29 and 828 -- a
+    percentage from 29 messages carries enormous sampling noise next to
+    neighbours in the tens of thousands, and plotting it at the same
+    visual weight would misrepresent how much it can be trusted; cut
+    rather than shown thin.
+
+    Bars sit at equally-spaced categorical positions, one per surviving
+    session count -- a bar chart reads better with even column spacing
+    than with the true (uneven) numeric gaps reproduced literally; each
+    column's real value is exactly what its tick says. Clique size N is
+    drawn as vertical reference lines at each true N transition (a
+    handful of session counts mix messages from two adjacent N -- a
+    fresh device's sessions catching up mid-dwell -- so a line sits at
+    the point where the MAJORITY N changes, not at every bin edge).
+    """
+    segs = [s for s in marker_segments(df)
+            if re.match(r"N=\d+", s.get("label") or "")]
+    if not segs:
+        return
+    msg = df[df._type == "message"]
+    cust = df[df._type == "custody"]
+    conv = cust[cust.event == "convey"] if "event" in cust.columns else cust
+    delivered_all = set(msg[msg.dir == "recv"].messageId.dropna())
+    conveyed_all = set(conv.packetId.dropna())
+    pair_times = _clique_session_pair_times(df)
+    rows = []
+    for seg in segs:
+        n = int(re.match(r"N=(\d+)", seg["label"]).group(1))
+        a = seg["t0_dwell"] if seg["t0_dwell"] is not None else seg["t0"]
+        bd = seg["t1_drain"] if seg.get("t1_drain") is not None else seg["t1"]
+        sent = msg[(msg._t >= a) & (msg._t < bd) & (msg.dir == "sent")]
+        for mid, t in zip(sent.messageId, sent._t):
+            sessions = bisect.bisect_right(pair_times, float(t))
+            delivered = mid in delivered_all
+            conveyed = delivered and mid in conveyed_all
+            rows.append(dict(sessions=sessions, n=n,
+                             failed=0 if delivered else 1,
+                             direct=1 if delivered and not conveyed else 0,
+                             conveyed=1 if conveyed else 0))
+    if not rows:
+        return
+    t = pd.DataFrame(rows)
+    grp_all = t.groupby("sessions")[["failed", "direct", "conveyed"]].sum()
+    grp_all["sent"] = grp_all.failed + grp_all.direct + grp_all.conveyed
+    # A session count with a few dozen messages (2, 4, 5, 7-9, 11-13, 16,
+    # 17 all have under 1200) gives a percentage with enormous sampling
+    # noise next to bins in the tens of thousands -- drop rather than
+    # plot a rate no one should trust at face value.
+    xs = sorted(grp_all.index[grp_all.sent >= 1000])
+    grp = grp_all.reindex(xs)
+    majority_n = t.groupby("sessions").apply(
+        lambda g: g.n.value_counts().idxmax())
+    failed_pct = 100 * grp.failed / grp.sent
+    direct_pct = 100 * grp.direct / grp.sent
+    conveyed_pct = 100 * grp.conveyed / grp.sent
+
+    fig, ax = plt.subplots(figsize=(6.2, 3.7))
+    # Equal spacing between COLUMNS, not a true numeric axis: eleven
+    # observed session counts, unevenly spaced in reality (1, 3, 6 ...
+    # 18, 19, 20, 21), read worse as a sparse-then-cramped numeric axis
+    # than as a clean categorical bar chart -- each bar gets its own
+    # even slot, and its real value is what the tick underneath it says.
+    xpos = np.arange(len(xs), dtype=float)
+    bw = 0.6
+    # A thin white seam between the three segments reads as one shape cut
+    # into parts, not three bars glued together.
+    ax.bar(xpos, direct_pct, bw, color=_TH_C1, label="delivered (direct)",
+           edgecolor="white", linewidth=0.6)
+    ax.bar(xpos, conveyed_pct, bw, bottom=direct_pct, color=_TH_C3,
+           label="delivered (relayed)",
+           edgecolor="white", linewidth=0.6)
+    ax.bar(xpos, failed_pct, bw, bottom=direct_pct + conveyed_pct,
+           color=_TH_C2, label="failed", edgecolor="white", linewidth=0.6)
+    for x, s in zip(xpos, xs):
+        ax.annotate(f"{int(grp.sent[s]):,}", (x, 100.0),
+                    textcoords="offset points", xytext=(0, 4),
+                    ha="center", va="bottom", fontsize=6.5, color="#666666")
+    # N as vertical reference lines at each majority-N transition, on
+    # the same evenly-spaced positions -- labelled once per resulting
+    # segment rather than per bar.
+    ns_seq = [majority_n[s] for s in xs]
+    seg_bounds = [xpos[0] - bw]
+    for i in range(1, len(xs)):
+        if ns_seq[i] != ns_seq[i - 1]:
+            b = (xpos[i - 1] + xpos[i]) / 2
+            ax.axvline(b, color="#cccccc", lw=.8, ls="--", zorder=0)
+            seg_bounds.append(b)
+    seg_bounds.append(xpos[-1] + bw)
+    # Anchored to the segment's OWN left line (left-aligned, just right of
+    # it), not centred across the segment: a wide segment (N=6 spans three
+    # bars) previously put its label far from both lines, so which line
+    # "started" it was a guess. Every label but the first sits right next
+    # to the line it belongs to.
+    # Three added rows below the tick labels -- N, the axis title, the
+    # legend -- all placed in ONE coordinate system (axes fraction) at
+    # even steps, so the gaps between them are equal by construction
+    # rather than by eyeballing a mix of points-offsets and fractions.
+    row_n, row_label, row_legend = -0.10, -0.18, -0.26
+    # A short connector from the axis down to the label, in the same
+    # blended (data-x, axes-y) space as the label itself: without it the
+    # dashed line stops dead at the axis and the label floats below with
+    # nothing tying it back to the line it names.
+    blend = mtransforms.blended_transform_factory(ax.transData,
+                                                   ax.transAxes)
+    for i, (lo, n) in enumerate(zip(seg_bounds[:-1],
+                                    [ns_seq[0]] + [ns_seq[i] for i in
+                                                   range(1, len(xs))
+                                                   if ns_seq[i] != ns_seq[i - 1]])):
+        if i > 0:
+            ax.plot([lo, lo], [0, row_n + 0.03], transform=blend,
+                    color="#cccccc", lw=.8, ls="--", clip_on=False,
+                    zorder=0)
+        ax.annotate(f"N={n}", (lo, row_n), xycoords=("data", "axes fraction"),
+                    ha="left", va="center", fontsize=7.5, color="#444444")
+    ax.set_xlabel("")
+    ax.text(0.5, row_label, "live Noise sessions", transform=ax.transAxes,
+            ha="center", va="center", fontsize=plt.rcParams["axes.labelsize"])
+    ax.set_ylabel("share of sent messages (%)")
+    # One uniformly-spaced tick per column, labelled with that column's
+    # real session count -- uniform because the columns are, not because
+    # the underlying values are evenly spaced (they are not).
+    ax.set_xticks(xpos)
+    ax.set_xticklabels([str(s) for s in xs], fontsize=8)
+    ax.set_ylim(0, 112)
+    ax.set_xlim(xpos[0] - bw, xpos[-1] + bw)
+    ax.grid(axis="y", alpha=.25)
+    h1, l1 = ax.get_legend_handles_labels()
+    ax.legend(h1, l1, frameon=False, fontsize=7.5, ncol=3,
+              loc="upper center", bbox_to_anchor=(0.5, row_legend))
+    _th_save(fig, out / "clique_delivery_outcome_by_sessions.pdf")
+
+
 def _th_conveyance_touch_by_n(df: pd.DataFrame, out: Path) -> None:
     """Of ALL sent messages -- delivered or not -- share ever picked up by a
     bystander's custody (`relay`, non-dup events, `hop>=1`) vs never touched
@@ -4650,8 +5398,9 @@ def _th_write_fails_by_n(df: pd.DataFrame, out: Path) -> None:
 def plot_thesis_clique_figures(df: pd.DataFrame, steps: pd.DataFrame,
                                pairs: pd.DataFrame, out: Path) -> None:
     """The diluting clique's figures: delivery and acknowledgement against
-    clique size (aggregate offered load on a second axis), and the
-    direct-vs-conveyed delivery split.
+    clique size, with the REAL live-session count on a second axis (see
+    `_clique_session_pair_times`), and the direct-vs-conveyed delivery
+    split.
 
     Skipped unless the run carries `N=` steps at two or more clique sizes,
     so a line sweep never emits it.
@@ -4686,29 +5435,77 @@ def plot_thesis_clique_figures(df: pd.DataFrame, steps: pd.DataFrame,
         rates = (g["msg_arrived"] / g["msg_sent"].replace(0, np.nan)).dropna()
         err.append(100 * rates.std(ddof=1) / np.sqrt(len(rates))
                    if len(rates) > 1 else 0.0)
+    # "Of sent", not "of arrived": the return trip's own losses belong to
+    # the number a reader can actually act on -- the share of what was
+    # SENT that came all the way back round-trip -- not a rate conditioned
+    # on the first leg already having succeeded, which reads deceptively
+    # high (86-93%) next to arrival numbers half that.
     ack = ([pm[pm["N"] == n]["acked"].sum()
-            / max(pm[pm["N"] == n]["arrived"].sum(), 1) * 100 for n in ns]
+            / max(pm[pm["N"] == n]["sent"].sum(), 1) * 100 for n in ns]
            if pm is not None else None)
+    # Failed round trip, either half: the message never arrived, OR it
+    # arrived and its ack never made it back -- both leave the sender
+    # with nothing to show for that message, so both count. acked is a
+    # subset of sent regardless of which leg is missing, so this is
+    # exactly 100 - ack(of sent), not 100 - arrived.
+    failed = [100 - a for a in ack] if ack else None
+    # The real capacity for offered load: live Noise sessions, one point
+    # per TRIAL (not per N) at its true chronological position, spread
+    # symmetrically across [N-0.5, N+0.5) since the 60 trials run in
+    # strict N=2 t1..t10, N=3 t1..t10, ..., N=7 t1..t10 order. Sessions
+    # persist (the clique never resets links), so this is a measured
+    # ramp, not the nominal C(N,2) it converges to: a newly added
+    # device's sessions routinely take several trials to complete, worse
+    # at higher N -- t1 of a new N is still running on the PREVIOUS N's
+    # session count.
+    pair_times = _clique_session_pair_times(df)
+    segs = [s for s in marker_segments(df)
+            if re.match(r"N=\d+", s.get("label") or "")]
+    by_n: dict[int, list[dict]] = defaultdict(list)
+    for s in segs:
+        by_n[int(re.match(r"N=(\d+)", s["label"]).group(1))].append(s)
+    sx, sy = [], []
+    for n, group in sorted(by_n.items()):
+        for i, s in enumerate(group):
+            t = s["t0_dwell"] if s["t0_dwell"] is not None else s["t0"]
+            sx.append(n - 0.5 + (i + 0.5) / len(group))
+            sy.append(bisect.bisect_right(pair_times, t))
     with plt.rc_context(_TH):
         fig, ax = plt.subplots(figsize=(6.2, 3.4))
         ax.errorbar(ns, arr, yerr=err, fmt="-o", color=_TH_C1, ms=5, lw=1.8,
                     capsize=3, elinewidth=1.1, label="arrived")
         if ack:
             ax.plot(ns, ack, "-s", color=_TH_C3, ms=4.5, lw=1.6,
-                    label="acknowledged (of arrived)")
-        ax.set_xlabel("clique size $N$")
+                    label="acknowledged (of sent)")
+        if failed:
+            ax.plot(ns, failed, "-^", color=_TH_C2, ms=4.5, lw=1.6,
+                    label="failed round trip")
+        # The N=2 and N=7 aggregates hold over their WHOLE block, the same
+        # [N-0.5, N+0.5) span the sessions curve is sampled across, not
+        # just at the integer tick -- cap the two outer edges flat at the
+        # boundary aggregate so the line reaches where the sessions curve
+        # does, rather than stopping short of it at the tick. No new
+        # values: both segments repeat the already-plotted endpoint.
+        if sx:
+            lo, hi = min(sx), max(sx)
+            curves = ([(arr, _TH_C1)] + ([(ack, _TH_C3)] if ack else [])
+                     + ([(failed, _TH_C2)] if failed else []))
+            for ys, colr in curves:
+                lw = 1.8 if ys is arr else 1.6
+                ax.plot([lo, ns[0]], [ys[0], ys[0]], "-", color=colr,
+                        lw=lw, alpha=.55)
+                ax.plot([ns[-1], hi], [ys[-1], ys[-1]], "-", color=colr,
+                        lw=lw, alpha=.55)
+        ax.set_xlabel("clique size")
         ax.set_ylabel("share of messages (%)")
         ax.set_xticks([int(n) for n in ns])
         ax.set_ylim(0, 105)
         ax.grid(axis="y", alpha=.25)
-        # The offered load is the independent variable the sweep actually
-        # moves: per-pair load is held at the line sweep's, so aggregate
-        # grows as N(N-1).
         ax2 = ax.twinx()
-        load = [n * (n - 1) * 100 / 30.0 for n in ns]
-        ax2.plot(ns, load, ":", color="#999999", lw=1.4,
-                 label="offered load (right)")
-        ax2.set_ylabel("aggregate offered load (msg/s)", color="#777777")
+        ax2.plot(sx, sy, "-o", color="#999999", ms=2.6, lw=1.1, alpha=.8,
+                 label="live sessions, per trial (right)")
+        ax2.set_ylabel("Noise sessions", color="#777777")
+        ax2.set_ylim(0, max(ns) * (max(ns) - 1) / 2 * 1.1)
         ax2.tick_params(colors="#777777")
         ax2.spines["right"].set_visible(True)
         h1, l1 = ax.get_legend_handles_labels()
@@ -4720,8 +5517,185 @@ def plot_thesis_clique_figures(df: pd.DataFrame, steps: pd.DataFrame,
         _th_delivery_by_active_pairs(df, out)
         _th_delivery_vs_degree(df, out)
         _th_delivery_mechanism_by_n(df, out)
+        _th_delivery_outcome_by_n(df, out)
+        _th_delivery_outcome_by_sessions(df, out)
         _th_conveyance_touch_by_n(df, out)
         _th_write_fails_by_n(df, out)
+        _th_delivery_per_trial(df, out)
+
+
+def _th_delivery_per_trial(df: pd.DataFrame, out: Path) -> None:
+    """Arrived, ACK'd, and live Noise sessions, one point per TRIAL at its
+    true chronological position -- the complement to `clique_delivery.pdf`,
+    whose one point per N hides exactly the within-block behaviour this
+    resolves.
+
+    Motivated by the N=7 collapse: the aggregate point (70.3% arrived)
+    averages t1-t7 (~75%, reached full 21-pair mesh by t7 with no
+    problem) against t8-t10's collapse (68.2 / 62.7 / 46.4% arrived,
+    48.6 / 40.2 / 23.2% ACK'd) -- indistinguishable from a smooth
+    contention response with only six N-level points, and this figure is
+    what actually resolves it. N=6 ramps its sessions the same way
+    (10->15) with no such collapse, so this is NOT simply "more sessions,
+    less delivery" -- t8-t10 of N=7 are also the last three trials of a
+    60-trial, ~55-minute run whose links are never reset, so a
+    contention effect and a chronology/fatigue effect are confounded
+    here and this figure cannot tell them apart; it only proves the
+    aggregate was hiding something real.
+
+    Each N's block runs LEFT-ALIGNED from its own tick to the next --
+    trial t1 sits exactly at x=N, t10 approaches x=N+1 -- so every trial
+    belonging to N=7 is at or after the "7" tick, never before it. (The
+    sessions curve on `clique_delivery.pdf` centers its blocks on the
+    tick instead, to align with that figure's own N-aggregate markers;
+    this figure has no such marker to align to, so left-aligned is the
+    one that reads correctly on its own.) True N=2 t1..t10, ..., N=7 t10
+    chronological order throughout. No error bars -- each point IS one
+    trial, not an aggregate; the point of this figure is showing the
+    spread the aggregate throws away, not re-smoothing it.
+    """
+    segs = [s for s in marker_segments(df)
+            if re.match(r"N=\d+", s.get("label") or "")]
+    if not segs:
+        return
+    msg = df[df._type == "message"]
+    pair_times = _clique_session_pair_times(df)
+    delivered_all = set(msg[msg.dir == "recv"].messageId.dropna())
+    acked_all = set(msg[msg.dir == "ackRx"].messageId.dropna())
+    by_n: dict[int, list[dict]] = defaultdict(list)
+    for s in segs:
+        by_n[int(re.match(r"N=(\d+)", s["label"]).group(1))].append(s)
+    xs, arr, ack, sess = [], [], [], []
+    ns_sorted = sorted(by_n)
+    bounds = list(range(ns_sorted[0], ns_sorted[-1] + 2))
+    for n, group in sorted(by_n.items()):
+        for i, s in enumerate(group):
+            t = s["t0_dwell"] if s["t0_dwell"] is not None else s["t0"]
+            ids = _clique_sent_ids(msg, s)
+            if not ids:
+                continue
+            xs.append(n + i / len(group))
+            arr.append(100 * len(ids & delivered_all) / len(ids))
+            ack.append(100 * len(ids & acked_all) / len(ids))
+            sess.append(bisect.bisect_right(pair_times, t))
+    if not xs:
+        return
+    fig, ax = plt.subplots(figsize=(6.2, 3.4))
+    for b in bounds[1:-1]:
+        ax.axvline(b, color="#e5e5e5", lw=.8, zorder=0)
+    ax.plot(xs, arr, "-o", color=_TH_C1, ms=3.2, lw=1.1, label="arrived")
+    ax.plot(xs, ack, "-s", color=_TH_C3, ms=3, lw=1.0,
+            label="acknowledged (of sent)")
+    ax.set_xlabel("clique size")
+    ax.set_ylabel("share of messages (%)")
+    ax.set_xticks(sorted(by_n))
+    ax.set_ylim(0, 105)
+    ax.grid(axis="y", alpha=.25)
+    ax2 = ax.twinx()
+    ax2.plot(xs, sess, "-o", color="#999999", ms=2.6, lw=1.1, alpha=.8,
+             label="live Noise sessions")
+    ax2.set_ylabel("Noise sessions", color="#777777")
+    ax2.set_ylim(0, max(by_n) * (max(by_n) - 1) / 2 * 1.1)
+    ax2.tick_params(colors="#777777")
+    ax2.spines["right"].set_visible(True)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    # Every corner of the axes has real data passing through it at some N
+    # (the ACK'd curve's own N=3-4 dip sits exactly in "lower left"), so
+    # the legend goes OUTSIDE the axes instead of hunting for a gap that
+    # does not exist.
+    ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=7.5, ncol=3,
+              loc="upper center", bbox_to_anchor=(0.5, -0.16))
+    _th_save(fig, out / "clique_delivery_per_trial.pdf")
+
+
+def _th_adv_interval(df: pd.DataFrame, out: Path) -> None:
+    """Every inter-advertisement gap at the idle desk, with a rolling
+    median and IQR. Self-gates on the capture arm's `cap tN` markers, so
+    no other experiment emits it.
+
+    One scatter point per RECEPTION gap: the OS re-reports a single
+    reception up to 33 times a few ms apart with bit-identical RSSI, so
+    sightings under 20 ms apart are collapsed first -- real consecutive
+    beacons cannot be closer than the advertiser's own cadence (~135 ms),
+    an order of magnitude away from the duplicate spacing, so the
+    threshold cannot merge two genuine receptions. Both devices stamp
+    every step marker; runs are deduplicated by label or every gap counts
+    twice. Each run's x is anchored at the SCANNER's own `bt-on` -- the
+    ~9 s before it is the reset's radio-dark window, not measurement.
+
+    The reading: gaps quantize at 135 ms and its integer multiples (one,
+    two beacons missed), the median holds ~140 ms with no drift across
+    the dwell -- ~40% slower than the ~100 ms
+    ADVERTISE_MODE_LOW_LATENCY requests, which is why the advert cost
+    rung prices time at the measured 7.41 Hz rather than the nominal 10.
+    """
+    mk = df[df._type == "marker"]
+    if mk.empty:
+        return
+    steps = mk[mk.label.astype(str).str.startswith("cap ")]
+    if steps.empty:
+        return
+    rs = df[(df._type == "rssi") & (df.get("src") == "adv")].copy()
+    rs["dev8"] = rs._device.astype(str).str[:8]
+    scanner = rs.dev8.value_counts().idxmax()
+    rs = rs[rs.dev8 == scanner].sort_values("_t")
+    mk = mk.copy()
+    mk["dev8"] = mk._device.astype(str).str[:8]
+    # EVERY marker must be the scanner's own. A second phone running its own
+    # capture at the same time (a stale app left foreground) stamps a
+    # parallel cap/run-end schedule under the SAME expId; its run-ends
+    # interleave with the real pair's and truncate each window to that
+    # other phone's shorter dwell -- a 60 s run then plots as 35 s.
+    steps = steps.assign(dev8=steps._device.astype(str).str[:8])
+    steps = steps[steps.dev8 == scanner].sort_values("_t") \
+        .drop_duplicates("label")
+    btons = np.sort(mk[(mk.label == "bt-on")
+                       & (mk.dev8 == scanner)]._t.values.astype(float))
+    runends = np.sort(mk[(mk.label == "run-end")
+                         & (mk.dev8 == scanner)]._t.values.astype(float))
+    rows = []
+    for _, m in steps.iterrows():
+        a = float(m._t)
+        ends = runends[runends > a]
+        if not len(ends):
+            continue
+        b = float(ends[0])
+        bt = btons[(btons >= a) & (btons < b)]
+        anchor = float(bt[0]) if len(bt) else a
+        ts = np.sort(rs[(rs._t >= a) & (rs._t < b)]._t.values.astype(float))
+        if len(ts) < 20:
+            continue
+        ev = [ts[0]]
+        for t in ts[1:]:
+            if t - ev[-1] > 20:
+                ev.append(t)
+        ev = np.array(ev)
+        for g, tm in zip(np.diff(ev), (ev[1:] - anchor) / 1000):
+            rows.append((tm, g))
+    if len(rows) < 100:
+        return
+    t = pd.DataFrame(rows, columns=["t", "gap"])
+    cen = np.arange(0.5, float(t.t.max()) - 0.4, 0.25)
+    med = [float(t.gap[(t.t >= c - 1) & (t.t <= c + 1)].median())
+           for c in cen]
+    q1 = [float(t.gap[(t.t >= c - 1) & (t.t <= c + 1)].quantile(.25))
+          for c in cen]
+    q3 = [float(t.gap[(t.t >= c - 1) & (t.t <= c + 1)].quantile(.75))
+          for c in cen]
+    fig, ax = plt.subplots(figsize=(6.2, 3.2))
+    ax.scatter(t.t, t.gap, s=5, color=_TH_C1, alpha=.15, linewidths=0,
+               zorder=2)
+    ax.fill_between(cen, q1, q3, color=_TH_C1, alpha=.25, linewidth=0,
+                    zorder=3, label="IQR (2 s window)")
+    ax.plot(cen, med, "-", color="#1d4437", lw=1.8, zorder=4,
+            label="median (2 s window)")
+    ax.set_xlabel("time since radio up (s)")
+    ax.set_ylabel("advertisement interval (ms)")
+    ax.set_ylim(0, float(t.gap.quantile(.995)) * 1.1)
+    ax.grid(axis="y", alpha=.25)
+    ax.legend(frameon=False, fontsize=8, loc="upper right")
+    _th_save(fig, out / "adv_interval_idle.pdf")
 
 
 def plot_thesis_line_figures(df: pd.DataFrame, steps: pd.DataFrame,
@@ -4748,7 +5722,7 @@ def plot_thesis_line_figures(df: pd.DataFrame, steps: pd.DataFrame,
                           ylim=est_ylim, totals=est_totals)
         stages_ylim = _stages_shared_ylim(byd, df)
         _th_stages(byd, out / "line200_stages.pdf", ylim=stages_ylim,
-                   compact=True)
+                   compact=True, totals=est_totals)
         _th_stages_vs_rssi(df, out / "line200_stages_vs_rssi.pdf",
                            ylim=stages_ylim)
         _th_path_loss(df, out / "line200_path_loss.pdf")
@@ -4970,12 +5944,18 @@ _TH_STAGE_BANDS = ("advert", "usable")
 
 
 def _th_stages(byd: dict, out: Path, ylim: tuple | None = None,
-               compact: bool = False) -> None:
+               compact: bool = False, totals: dict | None = None) -> None:
     """The six-stage ladder, per-distance medians.
 
     `compact` sizes the panel to sit two-up beside [_th_stages_vs_rssi]
     (the establishment pair's geometry) and carries the pair's only
     legend, single-column so it fits the narrow panel's empty upper-left.
+
+    `totals` maps distance -> device-trial population: a position whose
+    trials include failed establishments is annotated with the session
+    rung's established/total at the panel top, so the failures thin no
+    packet rung silently (they still appear in the advertisement rung,
+    which is measured off the radio and needs no link).
     """
     if len(byd) < 2:
         return
@@ -4986,12 +5966,12 @@ def _th_stages(byd: dict, out: Path, ylim: tuple | None = None,
     # across the sweep. The advertisement keeps a hollow marker as well as a
     # dashed line: it is the only stage measured off the radio rather than
     # off a packet, and that distinction is the paragraph's whole point.
-    stages = [("advert", "advertisement", "--", _TH_C2, "o", "none"),
-             ("gattConnected", "GATT link", "-", _TH_C1, "s", None),
-             ("identified", "identified", "-", _TH_C3, "^", None),
-             ("session", "Noise session", "-", "#444444", "D", None),
-             ("settled", "settled", "-", "#7f8c8d", "v", None),
-             ("usable", "usable (first ACK)", "-", "#c0392b", "X", None)]
+    stages = [("advert", "Advertised", "--", _TH_C2, "o", "none"),
+             ("gattConnected", "Connected", "-", _TH_C1, "s", None),
+             ("identified", "Identified", "-", _TH_C3, "^", None),
+             ("session", "Authenticated", "-", "#444444", "D", None),
+             ("settled", "Settled", "-", "#7f8c8d", "v", None),
+             ("usable", "Usable", "-", "#c0392b", "X", None)]
     fig, ax = plt.subplots(figsize=(3.5, 3.0) if compact else (6.2, 3.8))
     for key, lab, ls, col, marker, mfc in stages:
         ys = [float(np.median(byd[d][key])) if byd[d].get(key) else np.nan
@@ -5021,6 +6001,15 @@ def _th_stages(byd: dict, out: Path, ylim: tuple | None = None,
                   if compact else ds)
     if ylim is not None:
         ax.set_ylim(*ylim)
+    if totals:
+        ytop = ax.get_ylim()[1]
+        for d in ds:
+            k = len(byd[d].get("session") or [])
+            n = int(totals.get(d, k))
+            if n > k:
+                ax.annotate(f"{k}/{n}", (d, ytop),
+                            textcoords="offset points", xytext=(0, -9),
+                            ha="center", fontsize=6.5, color="#666666")
     ax.grid(axis="y", alpha=.25)
     if compact:
         ax.legend(frameon=False, fontsize=6.5, ncol=1, handlelength=2.2,
@@ -5169,12 +6158,12 @@ def _th_stages_vs_rssi(df: pd.DataFrame, out: Path | None, width: int = 3,
         return None
     if out is None:
         return (ks, bins)
-    stages = [("advert", "advertisement", "--", _TH_C2, "o", "none"),
-              ("gattConnected", "GATT link", "-", _TH_C1, "s", None),
-              ("identified", "identified", "-", _TH_C3, "^", None),
-              ("session", "Noise session", "-", "#444444", "D", None),
-              ("settled", "settled", "-", "#7f8c8d", "v", None),
-              ("usable", "usable (first ACK)", "-", "#c0392b", "X", None)]
+    stages = [("advert", "Advertised", "--", _TH_C2, "o", "none"),
+              ("gattConnected", "Connected", "-", _TH_C1, "s", None),
+              ("identified", "Identified", "-", _TH_C3, "^", None),
+              ("session", "Authenticated", "-", "#444444", "D", None),
+              ("settled", "Settled", "-", "#7f8c8d", "v", None),
+              ("usable", "Usable", "-", "#c0392b", "X", None)]
     # The establishment pair's geometry: this is the pair's right panel.
     fig, ax = plt.subplots(figsize=(3.5, 3.0))
     for key, lab, ls, col, marker, mfc in stages:
@@ -5196,6 +6185,19 @@ def _th_stages_vs_rssi(df: pd.DataFrame, out: Path | None, width: int = 3,
     ax.set_xlabel("advertisement RSSI (dBm)")
     if ylim is not None:
         ax.set_ylim(*ylim)
+    # A bin whose trials include failed establishments is annotated with
+    # the session rung's established/total at the panel top -- the failed
+    # device-trials sit in these bins (their advertisement rung is real),
+    # they just never climb the packet rungs, and that must not read as a
+    # smaller bin.
+    ytop = ax.get_ylim()[1]
+    for k in ks:
+        n = len(bins[k])
+        got = sum(1 for s in bins[k] if "session" in s)
+        if got < n:
+            ax.annotate(f"{got}/{n}", (k, ytop),
+                        textcoords="offset points", xytext=(0, -9),
+                        ha="center", fontsize=6.5, color="#666666")
     # No y furniture and no legend: this panel sits to the RIGHT of the
     # distance stages figure on a shared scale, which carries both. The
     # tick positions stay so the gridlines align across the pair.
@@ -5381,12 +6383,14 @@ _ANNOUNCE_B = 182
 _SYNC_FRAME_B = 161
 
 
-_STAGE_RUNGS = ("adv", "ann", "hs", "settle", "ack")
-_STAGE_LAYERS = [("adv", "advertisements → GATT", _TH_C1),
-                 ("ann", "ANNOUNCE → identity", _TH_C2),
-                 ("hs", "handshake → session", _TH_C3),
-                 ("settle", "sync → settled", "#9aa0a6"),
-                 ("ack", "data → first e2e ACK", "#5b7fa6")]
+_STAGE_RUNGS = ("adv", "ann", "hs", "settle", "usable")
+# Rungs are named for the milestone they buy, in ladder order -- the same
+# five names, in the same order, in every legend and in the stages figure.
+_STAGE_LAYERS = [("adv", "Connected", _TH_C1),
+                 ("ann", "Identified", _TH_C2),
+                 ("hs", "Authenticated", _TH_C3),
+                 ("settle", "Settled", "#9aa0a6"),
+                 ("usable", "Usable", "#5b7fa6")]
 
 
 def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -5417,9 +6421,18 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
       hs      identified -> session: the ledger's handshake bytes over the
               whole trial, glare included (both sides initiate in 99/99
               trials -- 4 packets per pair for a 3-message handshake)
-      settle  session -> settled: sync frames x 161 B until `link-settled`
-      ack     settled -> first end-to-end ACK: sends + ACKs at the trial's
-              own average ledger sizes, plus sync frames
+      settle  GATT -> settled: the advertisements a single-leg pair keeps
+              airing until its second leg converges (`link-settled` is
+              session + both GATT legs), priced like the adv rung; a pair
+              that links and never settles is charged to the dwell's end
+      usable  session -> usable (the first end-to-end ACK): every sealed
+              byte -- sync frames x 161 B, sends and ACKs at the trial's
+              own average ledger sizes -- from the session until the ACK
+
+    The rungs partition the air by BYTE CLASS x TIME, so nothing is
+    charged twice: advertising before GATT is rung 1 and after it rung 4;
+    ANNOUNCE and handshake packets are rungs 2 and 3; every sealed packet
+    from the session on is rung 5.
     """
     segs = _distance_segments(df)
     lk = df[df._type == "link"].copy()
@@ -5435,7 +6448,8 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
         sy["dev8"] = sy._device.astype(str).str[:8]
     wire = df[df._type == "wire"].copy()
     wire["dev8"] = wire._device.astype(str).str[:8]
-    rs = df[(df._type == "rssi") & (df.get("src") == "adv")]
+    rs = df[(df._type == "rssi") & (df.get("src") == "adv")].copy()
+    rs["dev8"] = rs._device.astype(str).str[:8]
     adv_per_s = 1000.0 / _ADV_EVENT_MS
 
     rows: list[dict] = []
@@ -5445,21 +6459,30 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
         if a is None or b is None:
             continue
         bd = seg["t1_drain"] if seg.get("t1_drain") is not None else b
-        # Price RSSI only up to the earliest GATT connect in the trial: a
-        # link that forms keeps hearing advertisements (161/198 successful
-        # device-trials have post-GATT sightings, median 108 of them), and
-        # folding those into the median used to explain WHY establishment
-        # succeeded would be circular. A trial where neither device ever
-        # connects has no such boundary, so it keeps the whole [a, b) --
-        # already entirely pre-connection by definition.
-        gatt_times = []
+        # Each device-trial is binned by its OWN receiver's pre-GATT
+        # sightings -- RSSI is receiver-specific and the two ends' gains
+        # differ. Pre-GATT only: a link that forms keeps hearing
+        # advertisements (161/198 successful device-trials have post-GATT
+        # sightings, median 108 of them), and folding those into the median
+        # used to explain the outcome would be circular; a device that
+        # never connects keeps its whole [a, b). The 25 device-trials the
+        # peer dialled before their own scanner fired have NO own
+        # sightings; they take the partner's value as an IMPUTATION (own vs
+        # partner agree at r=0.982, 0.0 dB median difference) rather than
+        # being dropped -- they are the fast trials, and dropping them
+        # biased every bin slow.
+        own_rssi: dict[str, float] = {}
+        own_all: dict[str, float] = {}
         for dev in lk.dev8.unique():
             s = lk[(lk.dev8 == dev) & (lk._t >= a) & (lk._t < b)
                    & (lk.event == "gattConnected")]._t
-            if len(s):
-                gatt_times.append(float(s.min()))
-        rssi_end = min(gatt_times) if gatt_times else b
-        trial_rssi = float(rs[(rs._t >= a) & (rs._t < rssi_end)].rssi.median())
+            end = float(s.min()) if len(s) else b
+            mine = rs[(rs.dev8 == dev) & (rs._t >= a) & (rs._t < end)].rssi
+            if len(mine):
+                own_rssi[dev] = float(mine.median())
+            whole = rs[(rs.dev8 == dev) & (rs._t >= a) & (rs._t < b)].rssi
+            if len(whole):
+                own_all[dev] = float(whole.median())
         dp_b = 0
         for _, x in wire[(wire._t >= a) & (wire._t < bd)].iterrows():
             tb = _dict(x.get("txBytes"))
@@ -5489,8 +6512,20 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
             r = dict.fromkeys(
                 [f"{k}_num" for k in _STAGE_RUNGS]
                 + [f"{k}_ok" for k in _STAGE_RUNGS], 0.0)
+            # Own pre-GATT median first; the partner's stands in for a
+            # device with no own sightings. When the WHOLE PAIR linked
+            # before either heard a beacon (a warm dial at 0 s), pre-GATT
+            # signal does not exist and the whole-window median is the
+            # only measurement there is -- post-link contamination is moot
+            # for a link that was never slow.
+            fallbacks = ([own_rssi.get(dev)]
+                         + [v for k, v in own_rssi.items() if k != dev]
+                         + [own_all.get(dev)]
+                         + [v for k, v in own_all.items() if k != dev])
+            rssi_val = next((v for v in fallbacks if v is not None),
+                            float("nan"))
             r.update(d=float(seg["d"]), trial=seg["label"],
-                     rssi=trial_rssi,
+                     rssi=rssi_val,
                      dp_bytes=dp_b if first_row else 0,
                      dp_acked=dp_a if first_row else 0,
                      dp_sent=dp_s if first_row else 0)
@@ -5513,15 +6548,14 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
             r["hs_num"] = hsb
             r["hs_ok"] = 0 if math.isnan(t_ses) else 1
 
-            if not math.isnan(t_ses) and not sy.empty:
+            if not math.isnan(t_gatt):
                 hi = t_set if not math.isnan(t_set) else b
-                fr = sy[(sy.dev8 == dev) & (sy._t >= t_ses)
-                        & (sy._t < hi)].frames.sum()
-                r["settle_num"] = float(fr) * _SYNC_FRAME_B
+                r["settle_num"] = ((hi - t_gatt) / 1000 * adv_per_s
+                                   * _ADV_ON_AIR_B)
             r["settle_ok"] = 0 if math.isnan(t_set) else 1
 
-            if not math.isnan(t_set):
-                lo, hi = t_set, (t_ack if not math.isnan(t_ack) else bd)
+            if not math.isnan(t_ses):
+                lo, hi = t_ses, (t_ack if not math.isnan(t_ack) else bd)
                 mm = msg[(msg.dev8 == dev) & (msg._t >= lo) & (msg._t < hi)]
                 n_sent = int((mm.dir == "sent").sum())
                 n_ack_tx = int((mm.dir == "ackTx").sum())
@@ -5540,9 +6574,9 @@ def _stage_cost_rows(df: pd.DataFrame) -> pd.DataFrame:
                     ap += int(tp.get("secure:ack", 0))
                 sec_b = sb / sp if sp else 0.0
                 ack_b = ab_ / ap if ap else 0.0
-                r["ack_num"] = (n_sent * sec_b + n_ack_tx * ack_b
-                                + fr * _SYNC_FRAME_B)
-            r["ack_ok"] = 0 if math.isnan(t_ack) else 1
+                r["usable_num"] = (n_sent * sec_b + n_ack_tx * ack_b
+                                   + fr * _SYNC_FRAME_B)
+            r["usable_ok"] = 0 if math.isnan(t_ack) else 1
             rows.append(r)
     return pd.DataFrame(rows)
 
@@ -5677,25 +6711,78 @@ def _draw_stage_bytes_perack(st: dict, labels: list[str], xlabel: str,
     _th_save(fig, out, tight=False)
 
 
+def _draw_stage_bytes_rungs(st: dict, labels: list[str], xlabel: str,
+                            out: Path, ylim: tuple,
+                            right: bool = False) -> None:
+    """The stacked pair's companion: the same per-rung costs as GROUPED
+    bars on a LOG y, one bar per rung per group.
+
+    The stacked figures answer "what does the whole stack cost and what
+    dominates it"; the answer (advertising, by 1-2 orders of magnitude)
+    flattens the other four rungs into hairlines there. A log axis cannot
+    rescue a stacked bar -- a segment's drawn height then depends on where
+    it sits in the pile, and a bottom at zero is undefined -- so the
+    resolved view UNstacks: each rung its own bar, readable in its own
+    decade. No whiskers: the bootstrap prices the TOTAL, and per-rung
+    intervals would need their own resampling for bars whose message is
+    the trend, not the pairwise ordering.
+    """
+    x = np.arange(len(st["groups"]))
+    fig, ax = plt.subplots(figsize=(3.5, 3.0))
+    w = 0.16
+    for i, (kk, lab, col) in enumerate(_STAGE_LAYERS):
+        v = np.array([b[i] for b in st["bars"]])
+        ax.bar(x + (i - 2) * w, v, w, color=col, label=lab)
+    ax.set_yscale("log")
+    ax.set_ylim(*ylim)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=7)
+    ax.set_xlabel(xlabel)
+    if right:
+        ax.tick_params(left=False, labelleft=False, which="both")
+        ax.invert_xaxis()
+    else:
+        ax.set_ylabel("bytes on air per success")
+        ax.legend(frameon=False, fontsize=6.2, ncol=1, loc="upper left")
+    ax.grid(axis="y", alpha=.25, which="both")
+    fig.subplots_adjust(**_TH_PAIR_MARGINS)
+    _th_save(fig, out, tight=False)
+
+
 def _th_stage_bytes_pair(df: pd.DataFrame, out: Path) -> None:
     """The bytes-on-air figures: distance and RSSI variants of the stacked
     control-plane bars and of the data-plane cost line, each pair on one
     shared y-scale with the distance panel carrying the y furniture.
 
+    The unit is the PAIR: each row sums BOTH sides' aired bytes for a
+    trial, and a rung succeeds only when both sides completed it -- a
+    session is a pair achievement, and per-side rows halved the handshake
+    into a number (262 B) that was neither side's cost nor the exchange's
+    (524 B). The pair's RSSI is the mean of the two receivers' OWN
+    pre-GATT medians: receiver-specific at each end, averaged only
+    because one row needs one x.
+
     Distance is the experiment's procedure axis but a noisy proxy for the
     link budget that actually drives cost (180 m measured 2 dB stronger
     than 140/160 on the day and its bar dips accordingly), and at n=10
     trials per distance the per-bar CI spans +/-15-35%, so adjacent bars
-    are not individually ordered. Binning by the trial's own median
-    advertisement RSSI (3 dB) pools the ~99 independent trials across the
-    whole sweep, and site effects that stutter the distance version land
-    in their correct bin. RSSI bars are labelled by the bin's lower edge;
-    the caption states the width. Dial attempts (5 -> 13 across the
-    sweep) have no byte record at all -- link-layer, below the envelope.
+    are not individually ordered. Binning by pair RSSI (3 dB) pools the
+    ~100 independent trials across the whole sweep, and site effects that
+    stutter the distance version land in their correct bin. RSSI bars are
+    labelled by the bin's lower edge; the caption states the width. Dial
+    attempts (5 -> 13 across the sweep) have no byte record at all --
+    link-layer, below the envelope.
     """
-    t = _stage_cost_rows(df)
-    if t.empty:
+    td = _stage_cost_rows(df)
+    if td.empty:
         return
+    num_cols = ([f"{k}_num" for k in _STAGE_RUNGS]
+                + ["dp_bytes", "dp_acked", "dp_sent"])
+    ok_cols = [f"{k}_ok" for k in _STAGE_RUNGS]
+    t = td.groupby("trial", as_index=False).agg(
+        {**{c: "sum" for c in num_cols},
+         **{c: "min" for c in ok_cols},
+         "d": "first", "rssi": "mean"})
     ds = sorted(t.d.unique())
     st_d = _stage_bytes_stats(t, "d")
     tr = t[t.rssi.notna()].copy()
@@ -5739,6 +6826,16 @@ def _th_stage_bytes_pair(df: pd.DataFrame, out: Path) -> None:
     _draw_stage_bytes_perack(st_r, lab_r, "advertisement RSSI (dBm)",
                              out / "line200_stage_bytes_rssi_perack.pdf",
                              pa_ylim, right=True)
+    # Shared log scale for the rung pair, with top headroom for the left
+    # panel's in-axes legend.
+    allv = [v for stx in (st_d, st_r) for b in stx["bars"] for v in b if v > 0]
+    rung_ylim = (min(allv) * 0.7, max(allv) * 6.0)
+    _draw_stage_bytes_rungs(st_d, lab_d, "distance (m)",
+                            out / "line200_stage_bytes_rungs.pdf",
+                            rung_ylim)
+    _draw_stage_bytes_rungs(st_r, lab_r, "advertisement RSSI (dBm)",
+                            out / "line200_stage_bytes_rungs_rssi.pdf",
+                            rung_ylim, right=True)
 
 
 def _th_trial_rssi(df: pd.DataFrame) -> list[tuple[float, float, float]]:
@@ -5822,20 +6919,27 @@ def _th_trial_rssi(df: pd.DataFrame) -> list[tuple[float, float, float]]:
                   and (runend is None or t <= runend)):
                 advs.append(float(v))
         flush()
-    # Pool by trial: both devices walk the same schedule, so a trial is the
-    # k-th step on each -- keyed with the label so a skipped marker on one
-    # device degrades to that device pooling alone rather than pairing two
-    # different marks.
-    pooled: dict[tuple, list[float]] = defaultdict(list)
+    # Each device-trial keeps its OWN receiver's median -- RSSI is
+    # receiver-specific and the two ends' gains differ. The partner's
+    # median (paired by step ordinal + label: both devices walk the same
+    # schedule) stands in ONLY for a device the peer dialled before its
+    # own scanner fired, which has no sightings of its own -- an
+    # imputation (own vs partner: r=0.982, 0.0 dB median difference), not
+    # a definition, because dropping those fast trials biased every bin
+    # slow.
+    by_key: dict[tuple, list[dict]] = defaultdict(list)
     for rec in recs:
-        pooled[(rec["ordn"], rec["lab"])].extend(rec["advs"])
+        by_key[(rec["ordn"], rec["lab"])].append(rec)
     out_rows: list[tuple[float, float, float]] = []
     for rec in recs:
-        pool = pooled[(rec["ordn"], rec["lab"])]
-        if not pool:
+        advs = rec["advs"]
+        if not advs:
+            advs = [v for mate in by_key[(rec["ordn"], rec["lab"])]
+                    if mate is not rec for v in mate["advs"]]
+        if not advs:
             continue
         d = float(re.match(r"d=(\d+)", rec["lab"]).group(1))
-        out_rows.append((rec["est"], float(np.median(pool)), d))
+        out_rows.append((rec["est"], float(np.median(advs)), d))
     return out_rows
 
 
@@ -6035,62 +7139,103 @@ def _th_latency_vs_rssi(line: pd.DataFrame, out: Path) -> None:
     _th_save(fig, out)
 
 
+def _wilson(k: float, n: float) -> tuple[float, float, float]:
+    """Rate in percent with its 95% Wilson interval's lower/upper offsets.
+
+    The ratio is capped at 1: arrivals are counted in the window they LAND
+    in, so a delivery that straddles a drain can be credited to a
+    neighbouring bin and push its arrived past its sent -- window
+    bookkeeping, not >100% delivery, and a p above 1 would put a negative
+    upper error on the interval.
+    """
+    if n <= 0:
+        return float("nan"), 0.0, 0.0
+    p, z = min(1.0, k / n), 1.96
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return (p * 100, max(0.0, p - max(0.0, c - h)) * 100,
+            max(0.0, min(1.0, c + h) - p) * 100)
+
+
+_DELIVERY_CURVES = [("msg_arrived", "arrived", _TH_C1, "o"),
+                    ("msg_delivered", "ACK'd", _TH_C3, "s")]
+
+
 def _th_delivery_vs_rssi(line: pd.DataFrame, out: Path) -> None:
-    """Top: connection RSSI per distance. Bottom: arrival per 3 dB bin with
-    Wilson intervals --- the threshold, not a gradient."""
+    """The delivery pair: arrived and ACK'd, as a share of sent, against
+    distance (`line200_delivery_vs_distance`, carries the legend and y
+    furniture) and against 3 dB bins of connection RSSI (`out`, stripped
+    for the side-by-side). Pooled: every message at a point at once,
+    with a Wilson 95% interval; messages sent per point in a row along
+    the top. Both panels share one y-range.
+
+    `msg_delivered` IS the ACK'd count: its ids are exactly the `ackRx`
+    ids (checked, 17,551 of each on the line sweep).
+
+    Against RSSI the arrived curve is flat at 98-100% down to -84 dBm and
+    off a cliff below -85: delivery is a THRESHOLD, not a gradient. The
+    ACK'd curve sits below it by the return trip's own losses and falls
+    off the same cliff harder -- an ACK has to cross the failing link
+    twice.
+    """
     if "rssi_conn_mean" not in line.columns:
         return
-    fig, (a1, a2) = plt.subplots(2, 1, figsize=(6.2, 4.4),
-                                 gridspec_kw={"height_ratios": [1, 1.25]})
-    g = line.groupby("d")["rssi_conn_mean"]
-    a1.fill_between(g.median().index, g.quantile(.25), g.quantile(.75),
-                    color=_TH_C1, alpha=.15)
-    a1.plot(g.median().index, g.median().values, "-o", color=_TH_C1,
-            ms=4, lw=1.5)
-    a1.set_ylabel("conn. RSSI (dBm)")
-    a1.set_xlabel("distance (m)")
-    a1.set_xticks(sorted(line["d"].unique()))
-    a1.grid(alpha=.25)
-    bins: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
-    for _, r in line.iterrows():
-        v = r.get("rssi_conn_mean")
-        if pd.isna(v) or pd.isna(r.get("msg_sent")):
-            continue
-        k = int(v // 3) * 3
-        bins[k][0] += float(r["msg_sent"])
-        bins[k][1] += float(r.get("msg_arrived") or 0)
-    ks = sorted(bins)
-    if not ks:
-        plt.close(fig)
+    sent = pd.to_numeric(line["msg_sent"], errors="coerce")
+    ok = sent.notna() & (sent > 0)
+    if not ok.any():
         return
-    cen = [k + 1.5 for k in ks]
-    # Arrivals are counted in the window they LAND in, so a delivery that
-    # straddles a drain can be credited to a neighbouring bin and push a
-    # bin's arrived past its sent. Cap the ratio at 1: the excess is window
-    # bookkeeping, not >100% delivery, and a p above 1 puts a negative upper
-    # error on the Wilson interval below.
-    rate = [min(1.0, bins[k][1] / bins[k][0]) * 100 for k in ks]
-    lo, hi = [], []
-    for k in ks:
-        n, z = bins[k][0], 1.96
-        p = min(1.0, bins[k][1] / bins[k][0])
-        den = 1 + z * z / n
-        c = (p + z * z / (2 * n)) / den
-        h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
-        lo.append(max(0.0, p - max(0.0, c - h)) * 100)
-        hi.append(max(0.0, min(1.0, c + h) - p) * 100)
-    a2.errorbar(cen, rate, yerr=[lo, hi], fmt="o-", color=_TH_C1, ms=5,
-                lw=1.5, capsize=3)
-    for x, y, k in zip(cen, rate, ks):
-        a2.annotate(f"{int(bins[k][0])}", (x, y), textcoords="offset points",
-                    xytext=(0, 9), ha="center", fontsize=6.5, color="#666666")
-    a2.set_xlabel("connection RSSI (dBm)")
-    a2.set_ylabel("arrived (%)")
-    a2.grid(alpha=.25)
-    a2.invert_xaxis()  # strong signal left, weak right -- a1's axis is
-                       # distance, not RSSI, and is untouched
-    fig.tight_layout()
-    _th_save(fig, out)
+    ln = line[ok].copy()
+    ln["bin"] = (pd.to_numeric(ln["rssi_conn_mean"], errors="coerce")
+                 // 3) * 3
+    panels = [("d", sorted(ln.d.unique()), "distance (m)",
+               out.with_name("line200_delivery_vs_distance.pdf"), False),
+              ("bin", sorted(ln.bin.dropna().unique()),
+               "connection RSSI (dBm)", out, True)]
+    # One y-range for both: the lowest lower-whisker across every curve
+    # and both panels, floored to a 5 % step with room for the count row.
+    series = {}
+    ymin = 100.0
+    for key, xs, _, _, _ in panels:
+        g = ln.dropna(subset=[key]).groupby(key)
+        n = g["msg_sent"].sum()
+        for col, _, _, _ in _DELIVERY_CURVES:
+            k = g[col].sum()
+            pts = [_wilson(float(k[x]), float(n[x])) for x in xs]
+            series[(key, col)] = (n, pts)
+            ymin = min(ymin, min(r - lo for r, lo, _ in pts))
+    ylim = (math.floor(ymin / 5) * 5 - 1, 100 + (100 - ymin) * 0.18)
+    for key, xs, xlabel, path, right in panels:
+        fig, ax = plt.subplots(figsize=(3.5, 3.0))
+        for col, lab, colr, mk in _DELIVERY_CURVES:
+            n, pts = series[(key, col)]
+            ax.errorbar(xs, [r for r, _, _ in pts],
+                        yerr=[[lo for _, lo, _ in pts],
+                              [hi for _, _, hi in pts]],
+                        fmt=f"{mk}-", color=colr, ms=4, lw=1.4, capsize=2.5,
+                        label=lab)
+        n, _ = series[(key, _DELIVERY_CURVES[0][0])]
+        for x in xs:
+            ax.annotate(f"{int(n[x])}", (x, 1.0),
+                        xycoords=("data", "axes fraction"),
+                        textcoords="offset points", xytext=(0, -7),
+                        ha="center", va="top", fontsize=6, color="#666666")
+        ax.set_ylim(*ylim)
+        ax.set_yticks([t for t in range(0, 101, 10) if t >= ylim[0]])
+        ax.set_xlabel(xlabel)
+        ax.grid(alpha=.25)
+        if right:
+            ax.set_xticks(xs)
+            ax.set_xticklabels([f"\u2212{abs(int(x))}" for x in xs],
+                               fontsize=7)
+            ax.tick_params(left=False, labelleft=False)
+            ax.invert_xaxis()  # strong signal left, weak right
+        else:
+            ax.set_xticks(xs[1::2] if len(xs) % 2 == 0 else xs[::2])
+            ax.set_ylabel("share of sent (%)")
+            ax.legend(frameon=False, fontsize=7, loc="lower left")
+        fig.subplots_adjust(**_TH_PAIR_MARGINS)
+        _th_save(fig, path, tight=False)
 
 if __name__ == "__main__":
     sys.exit(main())

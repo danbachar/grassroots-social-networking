@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
 import 'package:grassroots_networking/src/models/packet.dart';
@@ -276,6 +277,30 @@ void main() {
 
     expect(finished.sessionEstablished, isFalse);
     expect(bobSessions.hasSession(alice.publicKey), isFalse);
+  });
+
+  test('refuses a handshake from a peer the coordinator says to ignore',
+      () async {
+    // The testbed ignore list is enforced where identity is first known: a
+    // msg1 from an ignored phone gets no reply and opens no session, so the
+    // phone cannot re-pair its way back into the room while ignored.
+    final alice = await identity('Alice');
+    final bob = await identity('Bob');
+    final aliceSessions = NoiseSessionManager(identity: alice, sodium: sodium);
+    final bobSessions = NoiseSessionManager(identity: bob, sodium: sodium);
+    bobSessions.refuseSessionWith =
+        (pubkey) => listEquals(pubkey, alice.publicKey);
+
+    final msg1 = await aliceSessions.startHandshake(bob.publicKey);
+    final msg2 = await bobSessions.handleHandshakePacket(
+      handshakePacket(msg1!),
+      remotePubkey: alice.publicKey,
+    );
+
+    expect(msg2.responsePayload, isNull);
+    expect(msg2.sessionEstablished, isFalse);
+    expect(bobSessions.hasSession(alice.publicKey), isFalse);
+    expect(bobSessions.sessionPeerHexes, isEmpty);
   });
 
   test(

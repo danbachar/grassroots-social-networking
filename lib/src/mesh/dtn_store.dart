@@ -30,14 +30,23 @@ class DtnStore {
   /// This counts sealed PAYLOAD bytes, which is what [totalBytes] reports and
   /// what the `buf` trace record carries — not the Dart object overhead
   /// around each entry, so real process memory sits above this figure.
-  final int maxBytes;
+  /// Adjustable, because the testbed needs the store to be FULL. The default
+  /// is three orders of magnitude above anything the fleet has ever held ---
+  /// the highest occupancy on record is 482 KiB, 0.09% of it --- so eviction
+  /// has never once run in a recorded experiment, and an outage measured
+  /// under an empty buffer is measured under a condition the field will not
+  /// meet. Lowering it is how a run exercises the loss path that a deployed
+  /// mesh actually lives on.
+  int maxBytes;
 
   /// Packets older than this are dropped.
   final Duration maxAge;
 
   /// Fired for every packet that leaves the buffer WITHOUT an ACK — age
-  /// expiry ('expired'), store-wide cap eviction ('evictedTotal'), or
-  /// recipient-cap eviction ('evictedRecipients'). ACK-driven removal goes
+  /// expiry ('expired'), store-wide cap eviction ('evictedTotal'),
+  /// recipient-cap eviction ('evictedRecipients'), or retirement on the
+  /// recipient's own seen-filter ('retiredSeen', see [retireSeenFor]).
+  /// ACK-driven removal goes
   /// through [removeById] and is reported by the caller, not here. Without
   /// this, a `custody store` record with no `end` is ambiguous between
   /// "still held" and "silently expired" — which is exactly the packet-loss
@@ -50,6 +59,18 @@ class DtnStore {
     this.maxBytes = 512 * 1024 * 1024, // 512 MiB
     this.maxAge = const Duration(hours: 6),
   });
+
+  /// Set the byte cap and apply it NOW.
+  ///
+  /// Applied immediately rather than at the next store: a cap lowered below
+  /// current occupancy would otherwise sit un-enforced until the next packet
+  /// arrives, so the store would be over its own bound for as long as the
+  /// node stayed quiet — which on a testbed is exactly the interval being
+  /// measured.
+  void setMaxBytes(int bytes) {
+    maxBytes = bytes;
+    _evictToFit();
+  }
 
   final Map<String, List<_Entry>> _byRecipient = {};
 
@@ -69,7 +90,8 @@ class DtnStore {
 
   /// Cache [packet] for later delivery to [recipientHex]. Idempotent per
   /// packetId. [now] defaults to wall-clock; injectable for tests.
-  void store(String recipientHex, GrassrootsPacket packet, {DateTime? now}) {
+  void store(String recipientHex, GrassrootsPacket packet,
+      {DateTime? now, bool retirableOnSeen = false}) {
     final at = now ?? DateTime.now();
     _prune(at);
 
@@ -77,30 +99,10 @@ class DtnStore {
     if (list.any((e) => e.packet.packetId == packet.packetId)) {
       return; // already carrying this exact packet
     }
-    list.add(_Entry(packet, at));
+    list.add(_Entry(packet, at, retirableOnSeen: retirableOnSeen));
     _totalBytes += packet.payload.length;
 
-    // Bound the store as a whole: evict the globally-oldest packet until the
-    // buffer is inside its byte ceiling. Each per-recipient list is
-    // append-ordered, so the oldest entry overall is the oldest list head.
-    while (_totalBytes > maxBytes) {
-      String? evictKey;
-      DateTime? oldestHead;
-      for (final entry in _byRecipient.entries) {
-        if (entry.value.isEmpty) continue;
-        final head = entry.value.first.storedAt;
-        if (oldestHead == null || head.isBefore(oldestHead)) {
-          oldestHead = head;
-          evictKey = entry.key;
-        }
-      }
-      if (evictKey == null) break;
-      final evictList = _byRecipient[evictKey]!;
-      final evicted = evictList.removeAt(0);
-      _totalBytes -= _entryBytes(evicted);
-      onDrop?.call('evictedTotal', evictKey, evicted.packet);
-      if (evictList.isEmpty) _byRecipient.remove(evictKey);
-    }
+    _evictToFit();
 
     // Bound number of recipients (evict the one whose oldest packet is oldest).
     if (_byRecipient.length > maxRecipients) {
@@ -224,6 +226,122 @@ class DtnStore {
     });
   }
 
+  /// Drop packets held FOR [recipientHex] that [seen] reports it already has.
+  ///
+  /// The sync exchange has the peer advertise what it has SEEN, and a holder
+  /// currently answers by withholding those and conveying the rest --- so the
+  /// packet stays in custody forever even though its journey is over. That is
+  /// the buffer's largest resting population on a relaying node: transit
+  /// packets have no end-to-end acknowledgement a carrier can observe, and a
+  /// confirmation is never itself acknowledged, so neither has any retirement
+  /// signal at all besides age.
+  ///
+  /// Two votes are required, under DIFFERENT SALTS --- see
+  /// [_Entry.seenVoteSalt]. Only entries marked [_Entry.retirableOnSeen] go,
+  /// only from the asking peer's OWN bucket --- this is the peer telling us about its own traffic,
+  /// not an inference about a third party --- and only within the window the
+  /// filter declared. Our own undelivered data is never retired this way; see
+  /// [_Entry.retirableOnSeen].
+  int retireSeenFor(String recipientHex, bool Function(String packetId) seen,
+      {required int fromMs, required int toMs, required int voteSalt}) {
+    // Every other entry point prunes first; without it an age-expired entry
+    // is deleted here and reported as `retiredSeen`, mislabelling a loss in
+    // the records a run is read from.
+    _prune(DateTime.now());
+    final list = _byRecipient[recipientHex];
+    if (list == null || list.isEmpty) return 0;
+    final retired = <_Entry>[];
+    list.removeWhere((e) {
+      // ONLY inside the window the filter declared. A GCS filter asserts
+      // membership for the ids it was built from, which is the asker's
+      // seen-set over [fromMs, toMs] and nothing else; outside that range a
+      // hit is a hash collision, not evidence. The asker sweeps a cursor
+      // across its history, so a packet the filter does not cover this round
+      // is covered on a later one and retirement is delayed, never skipped.
+      final created = e.packet.createdAtMs;
+      // Says nothing about this packet: leave any standing vote alone.
+      if (created < fromMs || created > toMs) return false;
+      if (!e.retirableOnSeen) return false;
+      if (!seen(e.packet.packetId)) {
+        // A filter that COVERS this packet and does not name it contradicts
+        // the standing vote, so the vote is spent. This is what makes the
+        // rule "two CONSECUTIVE confirmations" rather than "two ever": a
+        // vote that never expires accumulates independent rolls across the
+        // entry's whole six-hour life, and over a ten-minute step the chance
+        // that some two of them land is ~24%, against ~0.7% for two in a
+        // row.
+        e.seenVoteSalt = null;
+        return false;
+      }
+      final prior = e.seenVoteSalt;
+      if (prior == null || prior == voteSalt) {
+        // First vote, or another frame hashed under the salt that already
+        // voted — the same draw, so it carries no new information. Record and
+        // wait for one under a different salt.
+        e.seenVoteSalt = voteSalt;
+        return false;
+      }
+      _totalBytes -= _entryBytes(e);
+      retired.add(e);
+      return true;
+    });
+    if (list.isEmpty) _byRecipient.remove(recipientHex);
+    // Reported only once the store is settled. `removeWhere` does not shrink
+    // the list as it runs, so a callback fired from inside it reads a count
+    // that still includes every entry the pass is about to delete — including
+    // the one being reported — against a byte total that has already been
+    // charged for them.
+    for (final e in retired) {
+      onDrop?.call('retiredSeen', recipientHex, e.packet);
+    }
+    return retired.length;
+  }
+
+  /// Fraction of [maxBytes] at which eviction starts, and the fraction it
+  /// stops at.
+  ///
+  /// Hysteresis rather than a single line, because a store pinned AT its cap
+  /// evicts on every subsequent packet: one arrival, one eviction, forever.
+  /// That makes the loss path a property of the arrival rate instead of of
+  /// the buffer, and it leaves no headroom, so a burst is shed the instant it
+  /// lands. Draining to a low-water mark instead sheds a batch and then runs
+  /// free until the next high-water crossing, which is how a bounded cache is
+  /// normally worked and what lets occupancy sit in a band rather than on a
+  /// line.
+  static const double evictHighWater = 0.99;
+  static const double evictLowWater = 0.80;
+
+  /// Evict the globally-oldest packets when occupancy crosses
+  /// [evictHighWater], down to [evictLowWater].
+  ///
+  /// Each per-recipient list is append-ordered, so the oldest entry overall is
+  /// the oldest list head. Shared by [store] and [setMaxBytes]: a cap lowered
+  /// below current occupancy has to shed the excess with the same policy a
+  /// full store sheds it, or the two paths would disagree about which packet
+  /// dies first.
+  void _evictToFit() {
+    if (_totalBytes <= maxBytes * evictHighWater) return;
+    final target = maxBytes * evictLowWater;
+    while (_totalBytes > target) {
+      String? evictKey;
+      DateTime? oldestHead;
+      for (final entry in _byRecipient.entries) {
+        if (entry.value.isEmpty) continue;
+        final head = entry.value.first.storedAt;
+        if (oldestHead == null || head.isBefore(oldestHead)) {
+          oldestHead = head;
+          evictKey = entry.key;
+        }
+      }
+      if (evictKey == null) break;
+      final evictList = _byRecipient[evictKey]!;
+      final evicted = evictList.removeAt(0);
+      _totalBytes -= _entryBytes(evicted);
+      onDrop?.call('evictedTotal', evictKey, evicted.packet);
+      if (evictList.isEmpty) _byRecipient.remove(evictKey);
+    }
+  }
+
   void _prune(DateTime now) {
     _byRecipient.removeWhere((recipientHex, list) {
       list.removeWhere((e) {
@@ -245,5 +363,42 @@ class DtnStore {
 class _Entry {
   final GrassrootsPacket packet;
   final DateTime storedAt;
-  _Entry(this.packet, this.storedAt);
+
+  /// May this entry be retired when its RECIPIENT says it has seen it?
+  ///
+  /// True for packets we carry for somebody else, and for our own
+  /// confirmations. False for our own undelivered data, which is the one
+  /// case where we may be the last holder: a false positive from the sync
+  /// filter would lose the message outright, whereas a wrongly-retired
+  /// transit copy is still held by its originator and a wrongly-retired
+  /// confirmation costs only a receipt for data that already arrived.
+  final bool retirableOnSeen;
+
+  /// Salt of the filter that last voted to retire this entry, or null.
+  ///
+  /// Retirement needs TWO CONSECUTIVE votes under DIFFERENT SALTS --- any
+  /// covering filter that does not name the packet clears the standing vote.
+  /// That is what turns 1-in-128 into 1-in-16384, and the salt is the only
+  /// part of a filter that guarantees the second roll is a fresh one: under
+  /// one salt a packet's hash target is fixed, so two filters that share it
+  /// put the same value against whatever slots they happen to occupy and
+  /// agree with each other far more often than two draws would.
+  ///
+  /// A changed id set is NOT enough on its own, and neither is a changed
+  /// window. The prefix frame's set stands still on a node that has seen
+  /// nothing new; a sweep frame's window is historical, so its set does not
+  /// change between one pass of the cursor and the next; and the prefix's
+  /// `toMs` advances every round regardless, so keying on the window would
+  /// score an unchanged draw as a fresh one.
+  ///
+  /// A salt recurring against a standing vote is refused rather than counted,
+  /// so the failure is a packet that ages out instead of retiring --- the
+  /// direction this rule is allowed to fail in.
+  ///
+  /// It matters because the rolls compound: a packet starved behind the
+  /// convey cap, or whose write keeps being refused, is re-rolled every
+  /// round, and over a ten-minute step a single-vote rule is more likely
+  /// than not to retire it by mistake.
+  int? seenVoteSalt;
+  _Entry(this.packet, this.storedAt, {this.retirableOnSeen = false});
 }

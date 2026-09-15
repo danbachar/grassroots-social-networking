@@ -1,8 +1,5 @@
 import 'package:flutter/foundation.dart';
 
-import '../testbed/ring_topology.dart';
-
-
 /// Available transport protocols
 enum TransportProtocol {
   bluetooth,
@@ -100,9 +97,8 @@ class SettingsState {
   /// The sort IS the ring (see `testbed/ring_topology.dart`): ordering by
   /// pubkey is what lets every phone derive the same ring from the same roster
   /// with no coordination and no assigned positions. Normalisation is applied
-  /// by the reducer and by [fromJson] — the only two write paths — so ring
-  /// order is an invariant of the state rather than a property of whoever
-  /// supplied the list.
+  /// by the reducer — the only write path — so ring order is an invariant of
+  /// the state rather than a property of whoever supplied the list.
   ///
   /// Empty in production, which leaves [ringRadius] nothing to constrain.
   final List<String> ringRoster;
@@ -111,14 +107,30 @@ class SettingsState {
   ///
   /// **Null means the gate is not armed** — the production value, and also the
   /// state the operator warms the mesh up in, where every pair has to be able
-  /// to handshake. Persisted like every other settings field: a stale radius is
-  /// visible in the testbed UI and inert without a roster, which is a smaller
-  /// cost than carving out a separate unpersisted slice.
+  /// to handshake.
+  ///
+  /// NOT persisted, and neither is [ringRoster]: a radius that survives a
+  /// restart arms the gate before warm-up, so non-neighbours never handshake,
+  /// the session table comes up short and [FieldPlan.ringSize] refuses to
+  /// launch. The gate is armed by a running step and disarmed when the run
+  /// ends; a process restart lands in the same disarmed state.
   ///
   /// It lives here beside [coldCallTrustLevel], not in `TransportsState`,
   /// because it is POLICY: Redux transport state is a strict projection of
   /// facts the transports report, never an input to them.
   final int? ringRadius;
+
+  /// Testbed ignore list: pubkeys (lowercase hex) of phones in the room that
+  /// are not part of the experiment.
+  ///
+  /// The ring roster is derived from the session table, so a phone that is
+  /// merely in range joins the ring by pairing. An ignored phone is refused
+  /// at every point identity is known — its ANNOUNCE, its handshake and its
+  /// links — and is left out of the session table the roster is read from.
+  ///
+  /// NOT persisted, like [ringRadius]: a list that came back from disk would
+  /// silently shrink the next full-fleet run.
+  final Set<String> ignoredPeerHexes;
 
   const SettingsState({
     this.bluetoothEnabled = true,
@@ -133,6 +145,7 @@ class SettingsState {
     this.showLinkDiagnostics = false,
     this.ringRoster = const [],
     this.ringRadius,
+    this.ignoredPeerHexes = const {},
   });
 
   static const SettingsState initial = SettingsState();
@@ -171,6 +184,7 @@ class SettingsState {
     List<String>? ringRoster,
     // Use Object? + sentinel so callers can pass null to clear.
     Object? ringRadius = _unset,
+    Set<String>? ignoredPeerHexes,
   }) {
     return SettingsState(
       bluetoothEnabled: bluetoothEnabled ?? this.bluetoothEnabled,
@@ -185,6 +199,7 @@ class SettingsState {
       // the sentinel: "not passed" and "passed null" mean opposite things.
       ringRadius:
           identical(ringRadius, _unset) ? this.ringRadius : ringRadius as int?,
+      ignoredPeerHexes: ignoredPeerHexes ?? this.ignoredPeerHexes,
     );
   }
 
@@ -196,8 +211,6 @@ class SettingsState {
         'coldCallTrustLevel': coldCallTrustLevel.name,
         'facilitateInvites': facilitateInvites,
         'showLinkDiagnostics': showLinkDiagnostics,
-        'ringRoster': ringRoster,
-        'ringRadius': ringRadius,
       };
 
   factory SettingsState.fromJson(Map<String, dynamic> json) {
@@ -226,13 +239,7 @@ class SettingsState {
       coldCallTrustLevel: coldCallTrustLevel,
       facilitateInvites: json['facilitateInvites'] as bool? ?? false,
       showLinkDiagnostics: json['showLinkDiagnostics'] as bool? ?? false,
-      // Re-normalised on the way in: hydration is a write path, and a roster
-      // that came back in a different order would give this phone different
-      // ring neighbours than the one that wrote it.
-      ringRoster:
-          ringOrder((json['ringRoster'] as List<dynamic>?)?.cast<String>() ??
-              const <String>[]),
-      ringRadius: json['ringRadius'] as int?,
+      // The ring gate is deliberately absent: hydration always disarms it.
     );
   }
 
@@ -249,7 +256,8 @@ class SettingsState {
           facilitateInvites == other.facilitateInvites &&
           showLinkDiagnostics == other.showLinkDiagnostics &&
           listEquals(ringRoster, other.ringRoster) &&
-          ringRadius == other.ringRadius;
+          ringRadius == other.ringRadius &&
+          setEquals(ignoredPeerHexes, other.ignoredPeerHexes);
 
   @override
   int get hashCode => Object.hash(
@@ -262,6 +270,7 @@ class SettingsState {
         showLinkDiagnostics,
         Object.hashAll(ringRoster),
         ringRadius,
+        Object.hashAllUnordered(ignoredPeerHexes),
       );
 
   @override

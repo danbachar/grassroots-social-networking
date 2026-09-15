@@ -6,6 +6,7 @@ import 'package:uuid/uuid.dart';
 
 import '../trace/experiment_recorder.dart';
 import '../models/block.dart';
+import 'ring_topology.dart';
 import 'testbed_config.dart';
 
 /// The runner's user-visible phase.
@@ -114,6 +115,17 @@ class FieldRunner extends ChangeNotifier {
   /// until the files come back, and by then the run is spent.
   final bool Function()? bleUndiscoverable;
 
+  /// How many BLE legs this phone currently holds ready, or null where the
+  /// host cannot say.
+  ///
+  /// Surfaced on the runner screen because it is the one number that says
+  /// whether a trial is measuring the topology it asked for. A radius permits
+  /// a leg count; the radio delivers whatever it can hold under the traffic,
+  /// and the two have been measured a factor of three apart. Reading it off
+  /// the phone is what lets a sweep be abandoned in its first trial rather
+  /// than its last.
+  final int Function()? legsReady;
+
   /// BLE-usability TRANSITIONS, emitted at the transport-state change
   /// itself. The `bt-on`/`bt-off` markers are stamped exclusively from this
   /// stream: a marker timestamp is the instant the BLE service became
@@ -178,6 +190,39 @@ class FieldRunner extends ChangeNotifier {
   /// change between runs and become a variable nobody declared.
   final void Function(bool every)? onSetTraceEveryAdvertisement;
 
+  /// Ask the radio for the fast connection interval, or hand it back.
+  ///
+  /// Raised for a SETTLE step and lowered for every other one. A settle is
+  /// the window where newly permitted links have to form, and establishment
+  /// — MTU, discovery, subscribe, ANNOUNCE, the Noise flights — is a chain of
+  /// round trips costing one connection interval each, so the fast interval
+  /// is what makes it quick. It is not worth its price for the traffic
+  /// afterwards: the cost is the controller's, paid on every leg holding it
+  /// for as long as it holds it, and a fleet that held it on every leg for a
+  /// whole run had dials refused with status 133 against live advertised
+  /// addresses for tens of minutes at a time.
+  final void Function(bool high)? onSetConnectionPriority;
+
+  /// Set the fragment spacing for a step, or restore the production default
+  /// when the step does not ask for one. See [FieldStep.fragmentDelayMs].
+  final void Function(int? ms)? onSetFragmentDelay;
+
+  /// Deliver without acknowledging, for a one-directional run. Applied once
+  /// at launch from [FieldPlan.suppressAcks].
+  final void Function(bool on)? onSetSuppressAcks;
+
+  /// Silence everything that is not payload for the run. See
+  /// [FieldPlan.quietLink].
+  final Future<void> Function(bool on)? onSetQuietLink;
+
+  /// Suspend eviction of quiet peers for the whole run. See
+  /// [FieldPlan.quietLink].
+  final void Function(bool on)? onSetStaleSweepSuspended;
+
+  /// Message ids whose end-to-end acknowledgement came home. Feeds [onAck],
+  /// which is how a saturating step reports carried load against offered.
+  final Stream<String>? ackEvents;
+
   /// Dial grid: central legs that reached GATT-usable since
   /// [onResetEstablishmentCount]. Read at the step's end so the per-step
   /// establishment count is a recorded fact.
@@ -200,6 +245,24 @@ class FieldRunner extends ChangeNotifier {
   /// on the marker instead of an inference from link records.
   final int Function()? sessionPeerCount;
 
+  /// Apply [FieldPlan.dtnMaxBytes] to the DTN store when a plan starts.
+  ///
+  /// A run that never purges its buffer needs a bound, and the bound has to
+  /// be the one the plan declares rather than whatever the build shipped, or
+  /// the recording cannot say what the buffer was held to.
+  final void Function(int bytes)? onSetDtnMaxBytes;
+
+  /// Peers this phone holds a ready LINK to, stamped into every step marker
+  /// as `links`.
+  ///
+  /// Distinct from [sessionPeerCount]: a session outlives the link that
+  /// formed it, so the two diverge exactly when a run is interesting, and a
+  /// link count reconstructed afterwards from link records is wrong in both
+  /// directions -- an open that carries no peer is missed, a close that is
+  /// never logged is never applied. The transport knows its own answer, so
+  /// the marker carries it.
+  final int Function()? linkPeerCount;
+
   /// Sessions held in the Noise table itself, stamped as `sessionTable`.
   ///
   /// [sessionPeerCount] counts only sessions whose peer is still listed in
@@ -209,6 +272,50 @@ class FieldRunner extends ChangeNotifier {
   /// pair of numbers separates a lost session from a delisted peer; one of
   /// them alone cannot.
   final int Function()? sessionTableCount;
+
+  /// The identities this device holds a Noise session with, lowercase hex —
+  /// the ring roster's source when [FieldPlan.ringRosterFromSessions] is set.
+  final Iterable<String> Function()? sessionPeerHexes;
+
+  /// The ring the gate is being driven with: either the plan's compiled
+  /// roster, or the one frozen from the session table at launch.
+  ///
+  /// Read on every reset slot rather than recomputed, so a session dropped
+  /// mid-run cannot reshape the topology under the gate.
+  List<String> _ringRoster = const [];
+
+  String _ringFp = '';
+
+  /// The frozen ring's fingerprint: 8 hex characters over the FULL pubkeys,
+  /// empty when no ring is in force.
+  ///
+  /// Whether the fleet derived the same ring is not decidable on one phone
+  /// (see [FieldPlan.ringRosterFromSessions]), so this is the cross-check that
+  /// IS available — every phone shows one short token at launch and the
+  /// operator compares them while the fleet is still in their hands. Comparing
+  /// the ring lists themselves works too, and is what the trace does; a person
+  /// holding four phones will not reliably diff four lists of eight-hex
+  /// prefixes, and will spot two tokens that differ.
+  String get ringFingerprint => _ringFp;
+
+  /// The ring fields every marker carries: the ring as 8-hex labels and the
+  /// fingerprint over the full pubkeys.
+  ///
+  /// On EVERY marker rather than only the launch one, because a run that dies
+  /// before its first step still has to say what ring it froze, and because a
+  /// per-marker field makes the fleet-agreement check one query over whatever
+  /// records survived.
+  Map<String, Object?> _ringMarkerFields() => _ringRoster.isEmpty
+      ? const {}
+      : {
+          // Truncated defensively rather than with a bare substring: an entry
+          // is normally a 64-hex pubkey, but nothing here enforces that and a
+          // short one must not take the whole marker — and so the step — down.
+          'ring': [
+            for (final h in _ringRoster) h.length <= 8 ? h : h.substring(0, 8),
+          ],
+          'ringFp': _ringFp,
+        };
 
   /// THIS phone's join order, read from its own nickname.
   ///
@@ -239,7 +346,10 @@ class FieldRunner extends ChangeNotifier {
     required this.recorder,
     this.nowMs = _realNowMs,
     this.sessionPeerCount,
+    this.onSetDtnMaxBytes,
+    this.linkPeerCount,
     this.sessionTableCount,
+    this.sessionPeerHexes,
     this.myPubkeyHex,
     this.myNickname,
     this.send,
@@ -253,6 +363,7 @@ class FieldRunner extends ChangeNotifier {
     this.refreshSystemBt,
     this.bleUsable,
     this.bleUndiscoverable,
+    this.legsReady,
     this.bleUsableChanges,
     this.knownPeers,
     this.linkSettled,
@@ -261,6 +372,12 @@ class FieldRunner extends ChangeNotifier {
     this.linkSettledEvents,
     this.onSetDialParallelism,
     this.onSetTraceEveryAdvertisement,
+    this.onSetConnectionPriority,
+    this.onSetFragmentDelay,
+    this.onSetSuppressAcks,
+    this.onSetQuietLink,
+    this.onSetStaleSweepSuspended,
+    this.ackEvents,
     this.establishmentCount,
     this.onResetEstablishmentCount,
     this.upload,
@@ -320,6 +437,15 @@ class FieldRunner extends ChangeNotifier {
   final List<StreamSubscription<Uint8List>> _sessionWaits = [];
   int _sentCount = 0;
 
+  /// Saturating mode only: messages fired, acknowledged, and still in flight.
+  ///
+  /// `_outstanding` is what makes `sent` against `acked` meaningful — offered
+  /// load against carried load — and the gap between them is the overrun that
+  /// finds the ceiling.
+  int _satSeq = 0;
+  int _ackedCount = 0;
+  final Set<String> _outstanding = {};
+
   /// Sends not attempted because the target pair was not settled yet. Reported
   /// so a step that fired few messages is distinguishable from one whose
   /// messages failed.
@@ -346,6 +472,7 @@ class FieldRunner extends ChangeNotifier {
 
   StreamSubscription<Uint8List>? _suspectClear;
   StreamSubscription<bool>? _btSub;
+  StreamSubscription<String>? _ackSub;
   bool _btOnSeen = false;
   bool _radioUp = false;
   // Operator stack-reset verification for the open placement/walk window:
@@ -604,6 +731,76 @@ class FieldRunner extends ChangeNotifier {
         return;
       }
     }
+    // Freeze the ring HERE — before any step runs, so a session lost mid-run
+    // cannot reshape the topology under the gate.
+    _ringRoster = [for (final r in plan.roster) r.pubkeyHex.toLowerCase()];
+    if (plan.ringRosterFromSessions) {
+      final me = myPubkeyHex?.toLowerCase();
+      if (me == null) {
+        _abortReason = 'this plan builds its ring from the session table, but '
+            'this device does not know its own pubkey';
+        _notify();
+        return;
+      }
+      // The size the plan was built for is DECLARED, never inferred from
+      // another field. Without it there is nothing to compare the derived ring
+      // against, and refusing is the only honest response — a guard that
+      // silently does not run is worse than no guard, because the launch it
+      // waves through looks checked.
+      final want = plan.ringSize;
+      if (want == null) {
+        _abortReason = 'this plan builds its ring from the session table but '
+            'declares no ringSize, so nothing can tell the derived ring from '
+            'the wrong one';
+        _notify();
+        return;
+      }
+      // A ring needs four to be a ring. At three every pair sits at ring
+      // distance 1, so r=1 is already the complete graph and no message can
+      // require conveyance — the run would produce nothing, which is exactly
+      // what happened on 2026-09-01 when a phone was missing. This is a claim
+      // about the PLAN's shape, so it is checked against the declared size;
+      // a room that turns up three phones short of a four-plan is caught by
+      // the size comparison below, with a message that says so.
+      if (want < 4) {
+        _abortReason = 'this plan declares a ring of $want — a ring needs at '
+            'least 4, or every pair is adjacent and there is nothing to convey';
+        _notify();
+        return;
+      }
+      _ringRoster = ringOrder([me, ...?sessionPeerHexes?.call()]);
+      // THE ONLY THING A PHONE CAN DECIDE ALONE IS THE COUNT, and this claims
+      // no more than that. It catches a table that is short (a half-warmed
+      // fleet, missing a node) and one that is long (a stray phone warmed by
+      // accident, which turns an N=4 run into N=5 while the radii and per-pair
+      // send counts were both chosen for four).
+      //
+      // It cannot see MEMBERSHIP: this device knows its own session table and
+      // nothing about anyone else's, so two phones can hold four-entry tables
+      // naming different sets — {self,B,C,D} against {self,A,C,E} — pass this,
+      // and enforce rings that disagree about every distance. No local check
+      // can separate those, so that failure is made detectable rather than
+      // prevented: the ring and its fingerprint are stamped on every marker,
+      // for the operator to compare across the phones in their hands and for
+      // the analysis to check afterwards. Nothing here catches it.
+      //
+      // The refusal is also per-device, with no channel to coordinate it — a
+      // stray phone that handshakes with ONE fleet member leaves only that
+      // member refusing while the rest launch a node short. Hence "relaunch
+      // the fleet" rather than "relaunch this phone".
+      if (_ringRoster.length != want) {
+        _abortReason = 'this plan is built for $want phones but this device\'s '
+            'session table describes ${_ringRoster.length} '
+            '(${_ringRoster.map((h) => h.length <= 8 ? h : h.substring(0, 8)).join(", ")}) — '
+            'a ring the fleet does not agree on is worse than no run. Warm up '
+            'or power down until every phone shows ${want - 1} sessions, then '
+            'relaunch the WHOLE fleet: the phones that did launch are running '
+            'a ring with a hole in it';
+        _notify();
+        return;
+      }
+    }
+    _ringFp = _ringRoster.isEmpty ? '' : _ringFingerprintOf(_ringRoster);
     if (plan.steps.any((s) => s.cliqueN != null)) {
       final order = joinOrder;
       if (order == null) {
@@ -640,7 +837,21 @@ class FieldRunner extends ChangeNotifier {
     _runId = nowMs();
     _btOnSeen = false;
     _radioUp = false;
+    final dtnCap = plan.dtnMaxBytes;
+    if (dtnCap != null) onSetDtnMaxBytes?.call(dtnCap);
+    // Off unless the plan asks: a state-of-charge flush writes to disk inside
+    // a measurement window, which only a discharge run should pay for.
+    recorder.flushEverySocDrop = plan.flushEverySocDrop ?? 0;
     await recorder.startExperiment(plan.expId);
+    // Acknowledgement suppression is a whole-run property: it changes what
+    // the receiver does, and flipping it per step would leave half a step's
+    // messages waiting for an acknowledgement that the next step suppresses.
+    //
+    // Going QUIET is not. It is scoped to the dwell — see [_beginDwellQuiet].
+    onSetSuppressAcks?.call(plan.suppressAcks);
+    // Whole-run, unlike the silencing itself: the sweep must not evict on a
+    // silence the run is causing on purpose, and its window spans dwells.
+    if (plan.quietLink) onSetStaleSweepSuspended?.call(true);
     if (plan.manualJoin) {
       // Anchor on the wall clock, not the tap: every phone rounds up to the
       // same alignment boundary, so the start skew collapses to clock-sync
@@ -659,6 +870,7 @@ class FieldRunner extends ChangeNotifier {
       // query shows whether all phones computed the same instant.
       await recorder.logMarker('placement', extra: {
         'targetMs': anchor,
+        ..._ringMarkerFields(),
         if (joinOrder != null) 'order': joinOrder,
         if (myNickname != null && myNickname!.isNotEmpty) 'nick': myNickname,
       });
@@ -846,10 +1058,7 @@ class FieldRunner extends ChangeNotifier {
     // armed, so severing second cannot leave a window in which surviving links
     // re-dial under the outgoing radius.
     if (onSetRingGate != null) {
-      await onSetRingGate!.call(
-        [for (final r in _plan!.roster) r.pubkeyHex],
-        step.ringRadius,
-      );
+      await onSetRingGate!.call(_ringRoster, step.ringRadius);
       if (step.ringRadius != null) {
         await recorder.logMarker('ring-gate', extra: {'r': step.ringRadius});
       }
@@ -864,6 +1073,20 @@ class FieldRunner extends ChangeNotifier {
     // running under the previous step's.
     onSetDialParallelism?.call(
         maxParallel: step.maxParallelDials, popN: step.cliqueN);
+    // Set on EVERY step, not only on settles, so a step never inherits the
+    // previous one's interval — the step after a settle is exactly the one
+    // that has to hand it back.
+    //
+    // A plan may hold it high for the whole run instead. That is an ARM, not
+    // a phase: the throughput experiment measures the interval's effect by
+    // running one launch with it and one without, and a per-step flip would
+    // blur the two together.
+    onSetConnectionPriority?.call(
+        _plan?.connectionPriorityHigh ?? step.settle);
+    // Null restores the production spacing, so a step never inherits the
+    // previous one's — the pacing-off arm and its control sit next to each
+    // other in the same run.
+    onSetFragmentDelay?.call(step.fragmentDelayMs);
     onResetEstablishmentCount?.call();
     // Only when the bounce did not already carry the purge — a plan that does
     // not reset links has no dark window to put it in.
@@ -914,6 +1137,13 @@ class FieldRunner extends ChangeNotifier {
     await recorder.logMarker(step.label, extra: {
       if (joinOrder != null) 'order': joinOrder,
       if (step.bleOn != null) 'joined': step.bleOn,
+      // The ring this phone is actually enforcing. Every phone must have
+      // derived the SAME list or the gate is incoherent, and when the list
+      // comes from each device's own session table that is a claim to be
+      // CHECKED rather than assumed — the launch guard can only count, so this
+      // is the only place a membership disagreement ever surfaces. Cheap
+      // enough to carry per marker (a handful of short strings).
+      ..._ringMarkerFields(),
       if (sessionPeerCount != null) 'sessions': sessionPeerCount!(),
       if (sessionTableCount != null)
         'sessionTable': sessionTableCount!(),
@@ -955,6 +1185,16 @@ class FieldRunner extends ChangeNotifier {
         if (!_running || currentStep != step) return;
       }
     }
+    _ackSub ??= ackEvents?.listen(onAck);
+    // Silence the radio for the MEASUREMENT, never before it.
+    //
+    // ANNOUNCE is what holds a leg up between steps: it is the inbound
+    // traffic the liveness veto reads, and its timer carries the stale sweep
+    // that would otherwise evict the peer. Silencing it from launch spends
+    // the whole placement and alignment lattice with nothing keeping the link
+    // alive — a run that did exactly that opened its first step already down
+    // a leg and had none by the fourth minute.
+    if (_plan?.quietLink ?? false) await onSetQuietLink?.call(true);
     _phase = FieldPhase.dwelling;
     _dwellEndsAtMs = _stepStartMs![_stepIndex] + step.dwellSec * 1000;
     _armRadioSuspectCheck(step);
@@ -1071,11 +1311,8 @@ class FieldRunner extends ChangeNotifier {
   }
 
 
-  /// Send targets for the current instant. With a roster: this device must
-  /// be a member (else receive-only) and targets are every other row, roster
-  /// labels naming the id set. Without a roster: every currently identified
-  /// peer, labeled by 8-hex pubkey prefix — the two-device case with no
-  /// manual pubkey entry.
+  /// Send targets for the current instant, narrowed to [FieldStep.sendTo].
+  /// The three sources are described on [_allSendTargets].
   List<(String, Uint8List)> _sendTargets() {
     final targets = _allSendTargets();
     final want = currentStep?.sendTo.toLowerCase() ?? 'all';
@@ -1088,9 +1325,37 @@ class FieldRunner extends ChangeNotifier {
         .toList();
   }
 
+  /// Every peer this device addresses, in priority order of three sources:
+  ///
+  /// - **The derived ring**, whenever the plan builds one from the session
+  ///   table. Targets are every ring member but this device, labeled by 8-hex
+  ///   prefix. It outranks the compiled roster deliberately — see below.
+  /// - **The compiled roster**: this device must be a member (else it is
+  ///   receive-only) and targets are every other row, with the roster's own
+  ///   labels naming the id set.
+  /// - **Neither**: every peer currently holding a session, labeled by 8-hex
+  ///   prefix — the two-device case, with no pubkey to enter by hand.
   List<(String, Uint8List)> _allSendTargets() {
     final me = myPubkeyHex?.toLowerCase();
     final plan = _plan!;
+    // A derived ring is the target list too, not just the topology.
+    //
+    // Leaving targets on the compiled roster while the gate ran on the derived
+    // ring would only half-fix the failure this exists for: on 2026-09-01 the
+    // roster named an absent phone and omitted a present one, and the present
+    // one falls through `mine == null` below to receive-only — it would take a
+    // ring position, relay for everyone else, and send nothing at all, all
+    // run, without a word. Meanwhile the others would address a third of their
+    // traffic to a phone that is not there. Six of twelve ordered pairs would
+    // produce no records and nothing would say why.
+    if (plan.ringRosterFromSessions && _ringRoster.isNotEmpty) {
+      if (me == null) return const [];
+      return [
+        for (final hex in _ringRoster)
+          if (hex != me)
+            if (_hexToBytes(hex) case final pk?) (hex.substring(0, 8), pk),
+      ];
+    }
     if (plan.roster.isNotEmpty) {
       if (me == null) return const [];
       final mine =
@@ -1130,6 +1395,11 @@ class FieldRunner extends ChangeNotifier {
     if (step.bleOn == false) return;
     final doSend = send;
     if (doSend == null) return;
+    if (step.saturate) {
+      _watchConvergence();
+      _scheduleSaturating(step); // saturating mode ignores sendCount
+      return;
+    }
     if (step.sendCount <= 0) return;
     _watchConvergence();
     final ready0 = sessionUp;
@@ -1194,6 +1464,125 @@ class FieldRunner extends ChangeNotifier {
       round();
       if (fired >= step.sendCount) t.cancel();
     });
+  }
+
+  /// Saturating throughput mode: once a session exists, push for the rest of
+  /// the dwell on [FieldStep.sendLanes] concurrent lanes, each looping "fire
+  /// one, await it, fire the next".
+  ///
+  /// Nothing is ACK-gated. An acknowledgement only counts ([onAck]); it never
+  /// clocks a send, because clocking on acknowledgements caps the rate at
+  /// lanes/RTT and measures the window rather than the link. Offered load is
+  /// therefore set purely by the lane count and by how fast the send path
+  /// drains, so `sent` against `acked` is offered load against carried load.
+  void _scheduleSaturating(FieldStep step) {
+    _outstanding.clear();
+    _satSeq = 0;
+    _ackedCount = 0;
+    void begin() {
+      unawaited(recorder.logMarker('saturate-start'));
+      // The window the analyzer measures the rate over. The step marker is
+      // the wrong start: it includes the wait for a session, which is dead
+      // time that would be charged to the link as a lower rate.
+      unawaited(recorder.log({
+        'type': 'flow',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'start',
+        'flow': 'saturate',
+        'payloadBytes': step.sendBytes,
+        'sendLanes': step.sendLanes,
+      }));
+      final lanes = step.sendLanes < 1 ? 1 : step.sendLanes;
+      for (var i = 0; i < lanes; i++) {
+        unawaited(_pushLane(step));
+      }
+      _notify();
+    }
+
+    final ready = sessionUp;
+    if (ready == null) {
+      begin();
+      return;
+    }
+    _whenReady(ready, sessionEvents, () {
+      unawaited(recorder.logMarker('session-up'));
+      begin();
+    });
+  }
+
+  /// One push lane: keep sending until the dwell ends, awaiting each send so
+  /// the lane runs at exactly the rate the send path drains it.
+  /// How long a lane waits before trying again once the link is gone.
+  ///
+  /// Yielding to the event loop keeps the loop INTERRUPTIBLE; it does not
+  /// bound its RATE, and with no leg to carry anything the two are not the
+  /// same problem. Each turn still mints a message id, allocates a payload —
+  /// up to 55 kB for the largest step — fills it byte by byte, fails the
+  /// send, and appends a drop record to a recorder that buffers in memory
+  /// for the whole run. Thousands of times a second, that pegs the isolate
+  /// and grows the heap without bound: measured as a sender whose frame
+  /// intervals decayed 60 s, 90 s, 205 s, 600 s, 940 s and then stopped,
+  /// with the run's own timers still firing. The UI was dead, so the step
+  /// looked frozen at "00:01 left" while the loop underneath spun on.
+  ///
+  /// A link that is up makes this dead code: [_fireSaturating] then awaits
+  /// real I/O and returns on the radio's schedule, which is the clock the
+  /// measurement wants.
+  static const Duration _noLinkBackoff = Duration(milliseconds: 100);
+
+  Future<void> _pushLane(FieldStep step) async {
+    while (_running && _phase == FieldPhase.dwelling && currentStep == step) {
+      await _fireSaturating(step);
+      // Yield to the EVENT LOOP, not just the microtask queue. A send that
+      // never touches real I/O resolves as a microtask, and microtasks run
+      // ahead of timers — an unbroken chain of them would starve the dwell
+      // countdown and the UI, hanging the app for the rest of the step. A
+      // zero-duration delay is a timer, so the loop can always be
+      // interrupted. It costs one event-loop turn per message, far above
+      // anything BLE carries, so it does not cap the measurement.
+      //
+      // With no leg ready the yield is not enough on its own — see
+      // [_noLinkBackoff].
+      final legs = legsReady?.call();
+      await Future<void>.delayed(
+          legs == 0 ? _noLinkBackoff : Duration.zero);
+    }
+  }
+
+  /// Fire one message per target and await it. The await IS the clock.
+  Future<void> _fireSaturating(FieldStep step) async {
+    final doSend = send;
+    if (doSend == null) return;
+    if (!_running || _phase != FieldPhase.dwelling) return;
+    final hasSession = sessionUp;
+    final seq = _satSeq++;
+    for (final (_, pubkey) in _sendTargets()) {
+      if (hasSession != null && !hasSession(pubkey)) {
+        _skippedSends++;
+        continue;
+      }
+      final messageId = _uuid.v4();
+      final payload = Uint8List(step.sendBytes);
+      for (var i = 0; i < payload.length; i++) {
+        payload[i] = (seq + i) & 0xff;
+      }
+      // Reserved first byte: testbed traffic must never look like a real
+      // block class in the wire-byte breakdown.
+      if (payload.isNotEmpty) payload[0] = testbedPayloadMarker;
+      _outstanding.add(messageId);
+      _sentCount++;
+      await doSend(pubkey, payload, messageId: messageId);
+    }
+  }
+
+  /// End-to-end acknowledgement feed from the coordinator.
+  ///
+  /// An acknowledgement only COUNTS here. It never triggers a send — see
+  /// [_scheduleSaturating].
+  void onAck(String messageId) {
+    if (!_outstanding.remove(messageId)) return;
+    _ackedCount++;
+    _notify();
   }
 
   /// One paced round: one message to EVERY target that can receive it. The
@@ -1506,6 +1895,26 @@ class FieldRunner extends ChangeNotifier {
 
   Future<void> _endDwell() async {
     _cancelSends();
+    // The drain gets the radio back: a leg lost during the dwell can re-form
+    // before the next one, instead of the run degrading step by step.
+    if (_plan?.quietLink ?? false) await onSetQuietLink?.call(false);
+    final saturating = currentStep;
+    if (saturating != null && saturating.saturate) {
+      // Closes the window the analyzer measures the rate over. `sent` is
+      // offered load and `acked` is carried load; their gap is the overrun.
+      await recorder.log({
+        'type': 'flow',
+        't': DateTime.now().millisecondsSinceEpoch,
+        'event': 'stop',
+        'flow': 'saturate',
+        'payloadBytes': saturating.sendBytes,
+        'sendLanes': saturating.sendLanes,
+        'sent': _satSeq,
+        'acked': _ackedCount,
+        'ackedBytes': _ackedCount * saturating.sendBytes,
+      });
+      _outstanding.clear();
+    }
     // The run's own end, stamped before anything is torn down. A step's
     // segment runs to the NEXT step marker and so carries the reset that
     // follows, which makes the span the wrong place to read the dwell from;
@@ -1517,6 +1926,14 @@ class FieldRunner extends ChangeNotifier {
     await recorder.logMarker('run-end', extra: {
       'sent': _sentCount - _sentAtSegStart,
       if (_skippedSends > 0) 'skippedSends': _skippedSends,
+      // Links held as the window CLOSES, which is the count the traffic
+      // actually met. It cannot ride the step marker: that is stamped before
+      // `_runResets` bounces the transport, so on a step that resets links it
+      // would report the count carried out of the PREVIOUS run. One sample
+      // per run also says nothing about how a count moved inside a long
+      // dwell -- adequate for a 60 s window, and the reason a ten-minute hold
+      // is read from link records rather than from this field.
+      if (linkPeerCount != null) 'links': linkPeerCount!(),
     });
     _sentAtSegStart = _sentCount;
     _skippedSends = 0;
@@ -1607,10 +2024,32 @@ class FieldRunner extends ChangeNotifier {
     // force-finish) runs through here, so the trace rate never outlives the
     // test that asked for it.
     onSetTraceEveryAdvertisement?.call(false);
+    onSetConnectionPriority?.call(false);
+    // The ring gate too. Left armed at the last step's radius it would refuse
+    // the non-neighbour handshakes the next warm-up needs, and the next launch
+    // would fail its session-count check. Disarming prunes nothing — it only
+    // grants permission — so the standing links are untouched.
+    onSetRingGate?.call(const [], null);
+  }
+
+  /// Undo everything a run silenced. Called from EVERY exit — the natural
+  /// end, an early finish and an abort alike.
+  ///
+  /// A phone left quiet cannot find anyone again and cannot be recovered
+  /// except by restarting the app, which is not something an operator away
+  /// from the bench can be asked to do. There is no exit worth leaving it in
+  /// that state for.
+  Future<void> _restoreAfterQuietRun() async {
+    if (_plan?.quietLink ?? false) {
+      await onSetQuietLink?.call(false);
+      onSetStaleSweepSuspended?.call(false);
+    }
+    if (_plan?.suppressAcks ?? false) onSetSuppressAcks?.call(false);
   }
 
   Future<void> _finish() async {
     recorder.onBatteryFloor = null;
+    await _restoreAfterQuietRun();
     _finishing = true;
     _finishingWhat = 'writing the recording to disk';
     _notify();
@@ -1661,6 +2100,7 @@ class FieldRunner extends ChangeNotifier {
   /// find out which.
   Future<void> forceFinish() async {
     if (!_running) return;
+    await _restoreAfterQuietRun();
     _cancelSends();
     _tick?.cancel();
     _tick = null;
@@ -1701,6 +2141,7 @@ class FieldRunner extends ChangeNotifier {
   /// Abandon the run: marker the abort, stop recording. Files stay.
   Future<void> abort() async {
     if (!_running) return;
+    await _restoreAfterQuietRun();
     _cancelSends();
     _tick?.cancel();
     _tick = null;
@@ -1752,6 +2193,8 @@ class FieldRunner extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _ackSub?.cancel();
+    _ackSub = null;
     _cancelSends();
     _tick?.cancel();
     _tick = null;
@@ -1766,6 +2209,24 @@ class FieldRunner extends ChangeNotifier {
     _restoreDialCap();
     super.dispose();
   }
+}
+
+/// 8 hex characters over the whole ring, for comparing two phones' rings at a
+/// glance.
+///
+/// FNV-1a written out rather than a hash from a package: every phone has to
+/// compute the same token from the same ring, and the value lands in traces
+/// that outlive this code, so it cannot be a function whose output is free to
+/// change between versions. Masked to 32 bits at every step so the arithmetic
+/// is exact on any Dart runtime. Collisions are irrelevant here — the token
+/// compares a handful of phones standing on one desk, and the full ring rides
+/// beside it on the same marker.
+String _ringFingerprintOf(List<String> ring) {
+  var h = 0x811c9dc5;
+  for (final c in ring.join(',').codeUnits) {
+    h = ((h ^ c) * 0x01000193) & 0xffffffff;
+  }
+  return h.toRadixString(16).padLeft(8, '0');
 }
 
 Uint8List? _hexToBytes(String hex) {

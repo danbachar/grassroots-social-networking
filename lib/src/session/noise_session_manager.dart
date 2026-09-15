@@ -90,6 +90,11 @@ class NoiseSessionManager {
   /// and when recording is off).
   final ExperimentRecorder? trace;
 
+  /// Asked before an inbound handshake is answered. True refuses the peer: no
+  /// reply, no session — the testbed ignore list, enforced where identity is
+  /// first known. Null accepts everyone.
+  bool Function(Uint8List remotePubkey)? refuseSessionWith;
+
   /// Active sessions / in-flight handshakes, keyed by the peer's Ed25519 public
   /// key (hex). A mesh session is end-to-end and path-independent, so it is NOT
   /// keyed by transport — the same session serves direct and relayed paths.
@@ -112,6 +117,18 @@ class NoiseSessionManager {
   /// per-packet receive cost, and deliberately unbounded (see the class doc).
   int get sessionCount =>
       _entries.values.where((e) => e.session != null).length;
+
+  /// The identities we hold a live session with, lowercase hex.
+  ///
+  /// Sessions live in memory and are never persisted, so this can only name
+  /// peers THIS process completed a handshake with — which makes it a
+  /// statement about the room rather than about a config file, and is what
+  /// lets the ring testbed derive its roster from it (see
+  /// [FieldPlan.ringRosterFromSessions]).
+  Iterable<String> get sessionPeerHexes => [
+        for (final e in _entries.entries)
+          if (e.value.session != null) e.key.toLowerCase(),
+      ];
 
   bool hasSession(Uint8List remotePubkey) {
     return _entries[_hex(remotePubkey)]?.session != null;
@@ -187,6 +204,10 @@ class NoiseSessionManager {
   }) async {
     final (message, body) = _decodeHandshakePayload(packet.payload);
     final hex = _hex(remotePubkey);
+    if (refuseSessionWith?.call(remotePubkey) ?? false) {
+      _traceHandshakeDrop('ignored', hex);
+      return const NoiseHandshakeResult();
+    }
     final entry = _entries.putIfAbsent(hex, _SessionEntry.new);
     entry.remotePubkey = Uint8List.fromList(remotePubkey);
 
@@ -344,7 +365,8 @@ class NoiseSessionManager {
   /// security-relevant or availability-relevant event that would otherwise be
   /// silent. `why`: 'verifyFailed' (delivered static key does not match the
   /// claimed identity — tampering or impersonation), 'timeout' (peer never
-  /// answered within [handshakeTimeout]), 'reaped' (stalled handshake swept).
+  /// answered within [handshakeTimeout]), 'reaped' (stalled handshake swept),
+  /// 'ignored' (refused by [refuseSessionWith]).
   void _traceHandshakeDrop(String why, String remoteHex) {
     if (!(trace?.active ?? false)) return;
     unawaited(trace!.log({

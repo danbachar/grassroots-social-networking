@@ -73,16 +73,27 @@ class ExperimentRecorder {
   final Future<void> Function()? preStopFlush;
 
   /// Flush the buffer to disk each time the battery drops this many
-  /// percentage points since the last flush.
+  /// percentage points since the last flush. **Zero disables it, and zero is
+  /// the default.**
   ///
-  /// A discharge run has no clean stop — the phone hits its floor (or dies)
-  /// while recording — and the buffer is memory-only, so without this the
-  /// run that matters most loses everything. Pacing on STATE OF CHARGE
-  /// rather than on a timer is what keeps this out of the measurement: the
-  /// write rate follows the experiment's own progress (~20 small writes
-  /// across a full discharge) instead of scaling with traffic, which is what
-  /// made periodic flushing a confound in the first place.
-  final int flushEverySocDrop;
+  /// Only a DISCHARGE run wants this. Such a run has no clean stop — the
+  /// phone hits its floor, or dies, while recording — and the buffer is
+  /// memory-only, so without a periodic write the run that matters most
+  /// loses everything. Pacing on state of charge rather than on a timer
+  /// keeps the write rate following the run's own progress (~20 small writes
+  /// across a full discharge) instead of scaling with traffic.
+  ///
+  /// Everywhere else it is a confound, which is why it is off unless asked
+  /// for. It lands a write INSIDE a measurement window — on a phone drawing
+  /// ~27%/h that is roughly every eleven minutes — and this class exists on
+  /// the premise that no disk I/O happens inside one. A run measuring link
+  /// churn or throughput should be paying for its radio, not for the
+  /// recorder.
+  ///
+  /// Settable, because it is a property of the RUN rather than of the build:
+  /// the field runner applies [FieldPlan.flushEverySocDrop] when a plan
+  /// starts.
+  int flushEverySocDrop;
 
   /// Fired once when a power sample reads at or below this state of charge.
   /// The field runner ends the run here.
@@ -131,7 +142,7 @@ class ExperimentRecorder {
     this.powerProbe,
     this.bufferProbe,
     this.preStopFlush,
-    this.flushEverySocDrop = 5,
+    this.flushEverySocDrop = 0,
     this.batteryFloorPct = 5,
     this.linkSnapshot,
     this.httpClient,
@@ -285,7 +296,7 @@ class ExperimentRecorder {
     final charging = reading['charging'] == true;
 
     _lastFlushLevel ??= level;
-    if (_lastFlushLevel! - level >= flushEverySocDrop) {
+    if (flushEverySocDrop > 0 && _lastFlushLevel! - level >= flushEverySocDrop) {
       _lastFlushLevel = level;
       await _writeBufferToDisk();
     }

@@ -83,3 +83,19 @@ class SetRingGateAction extends SettingsAction {
 
   SetRingGateAction({required this.rosterHex, this.radius});
 }
+
+/// Testbed: refuse every ANNOUNCE, handshake and link from this phone and
+/// leave it out of the session table (see [SettingsState.ignoredPeerHexes]).
+class IgnorePeerAction extends SettingsAction {
+  final String pubkeyHex;
+
+  IgnorePeerAction(this.pubkeyHex);
+}
+
+/// Testbed: lift an [IgnorePeerAction]. The phone pairs again on its next
+/// ANNOUNCE.
+class UnignorePeerAction extends SettingsAction {
+  final String pubkeyHex;
+
+  UnignorePeerAction(this.pubkeyHex);
+}

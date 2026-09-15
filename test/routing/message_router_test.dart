@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:redux/redux.dart';
@@ -296,6 +297,52 @@ void main() {
         expect(peer!.nickname, equals('OtherPeer'));
         expect(peer.rssi, equals(-55));
         expect(peer.transport, equals(PeerTransport.bleDirect));
+      });
+
+      test('an ignored phone\'s ANNOUNCE is refused and its link dropped',
+          () async {
+        // The testbed ignore list: a phone in the room that is not part of
+        // the experiment must neither get a peer record nor keep the link its
+        // ANNOUNCE arrived on, even with cold calls open.
+        final trace = _CapturingRecorder();
+        final traced = MessageRouter(
+          identity: identity,
+          store: store,
+          protocolHandler: protocolHandler,
+          fragmentHandler: fragmentHandler,
+          trace: trace,
+        );
+        addTearDown(traced.dispose);
+        final otherHex = otherPubkey
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join();
+        store.dispatch(IgnorePeerAction(otherHex));
+        String? rejectedDeviceId;
+        var announced = false;
+        traced.onBleAnnounceRejected = (_, bleDeviceId) {
+          rejectedDeviceId = bleDeviceId;
+        };
+        traced.onPeerAnnounced = (_, __,
+            {bool isNew = false, String? udpPeerId, String? bleDeviceId}) {
+          announced = true;
+        };
+
+        await traced.processPacket(
+          announcePacket(otherProtocolHandler),
+          transport: PeerTransport.bleDirect,
+          bleDeviceId: 'peripheral:stray',
+          rssi: -55,
+        );
+
+        expect(store.state.peers.getPeerByPubkey(otherPubkey), isNull);
+        expect(announced, isFalse);
+        expect(rejectedDeviceId, 'peripheral:stray');
+        final drops = trace.records
+            .where((r) => r['type'] == 'drop' && r['where'] == 'announce')
+            .toList();
+        expect(drops, hasLength(1));
+        expect(drops.single['reason'], 'ignored');
+        expect(drops.single['peer'], otherHex);
       });
 
       test('includes bleDeviceId in dispatch', () async {
@@ -755,6 +802,38 @@ void main() {
         expect(held.single.ttl, 4,
             reason: 'ONE decrement per arrival, paid on the way in');
         expect(conveyed, 0, reason: 'nothing is pushed; a peer must ask');
+      });
+
+      test('closed trust: a transit packet is never taken into custody',
+          () async {
+        // A closed-trust device narrows which peers it links with to
+        // friends, but that is not the same as declining to relay for
+        // strangers it does link with — it declines to relay for ANYONE.
+        // Taking custody would expose the packet to every peer the carrier
+        // relays to in turn, which a closed-trust device cannot vouch for.
+        store.dispatch(
+            SetColdCallTrustLevelAction(ColdCallTrustLevel.closed));
+        router.onMessageReceived = (_, __, ___, ____) =>
+            fail('a packet not addressed to us must not be delivered');
+        var conveyed = 0;
+        router.onSyncSend = (_, __) => conveyed++;
+
+        final thirdParty = Uint8List.fromList(List.generate(32, (i) => i + 1));
+        final p = GrassrootsPacket(
+          type: PacketType.secure,
+          ttl: 5,
+          recipientPubkey: thirdParty,
+          payload: Uint8List.fromList([9]),
+        );
+        await router.processPacket(p,
+            transport: PeerTransport.bleDirect,
+            bleDeviceId: 'inbound-leg',
+            rssi: -60);
+
+        expect(router.dtnBufferFor(thirdParty), isEmpty,
+            reason: 'closed trust takes no third-party packet into custody');
+        expect(router.dtnBufferedCount, 0);
+        expect(conveyed, 0);
       });
 
       test('it is buffered even when the recipient is reachable right now',
@@ -1349,6 +1428,54 @@ void main() {
         expect(peer!.lastUdpSeen, isNotNull);
       });
 
+
+      test('a one-sided testbed run delivers but never acknowledges',
+          () async {
+        // A throughput run wants the link carrying traffic in ONE direction.
+        // Every acknowledgement is a packet back down the same radio, so
+        // leaving them on measures a duplex link and calls it simplex.
+        // Delivery itself must be untouched — the receiver still gets the
+        // message, it just says nothing about it.
+        await establishSession();
+
+        var acks = 0;
+        var delivered = 0;
+        router.onMessageReceived = (_, __, ___, ____) => delivered++;
+        router.onAckRequested = (_, __, ___) => acks++;
+        router.suppressAcks = true;
+
+        await router.processPacket(
+          await sealedFromOther(
+            contentType: ContentType.message,
+            frameMessageId: '88888888-8888-4888-8888-888888888888',
+            chunk: Uint8List.fromList([1, 2, 3]),
+          ),
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-oneway',
+        );
+
+        expect(delivered, 1, reason: 'the message still arrives');
+        expect(acks, 0, reason: 'and nothing goes back');
+      });
+
+      test('acknowledging is the default; only a run turns it off', () async {
+        expect(MessageRouter.new, isNotNull);
+        await establishSession();
+        var acks = 0;
+        router.onMessageReceived = (_, __, ___, ____) {};
+        router.onAckRequested = (_, __, ___) => acks++;
+        await router.processPacket(
+          await sealedFromOther(
+            contentType: ContentType.message,
+            frameMessageId: '99999999-9999-4999-8999-999999999999',
+            chunk: Uint8List.fromList([4, 5, 6]),
+          ),
+          transport: PeerTransport.udp,
+          udpPeerId: 'peer-default',
+        );
+        expect(acks, 1);
+      });
+
       test('triggers onAckRequested with the recovered sender over UDP',
           () async {
         await establishSession();
@@ -1634,6 +1761,40 @@ void main() {
         router.dropFromDtnBuffer([packet.packetId]);
         expect(router.dtnBufferFor(otherPubkey).map((p) => p.packetId),
             isNot(contains(packet.packetId)));
+      });
+
+      test('a write that never completes still leaves the packet buffered',
+          () async {
+        // The ordering rule, and it is load-bearing. `directSend` awaits an
+        // acknowledged GATT write, and the plugin serialises ops per path — so
+        // ONE write the stack never answers suspends this call forever and
+        // takes every later message to that peer down with it. If the store
+        // ran after the await, the packet would exist nowhere: not on the air,
+        // not in the buffer, not in a drop record.
+        //
+        // Measured on 2026-09-01: one leg went quiet mid-run and 20 messages
+        // to that single peer were sealed and then simply vanished, over two
+        // trials, while the same device's other two peers were served
+        // normally throughout.
+        final before = router.dtnBufferedCount;
+        final wedged = Completer<PeerTransport?>();
+        router.directSend = (pubkey, sealed) => wedged.future;
+        final packet = sealedTo(otherPubkey);
+        final pending = router.dispatchOutbound(otherPubkey, packet);
+
+        // Nothing has completed and nothing ever will, but the packet is
+        // already conveyable.
+        await pumpEventQueue();
+        expect(router.dtnBufferedCount, before + 1,
+            reason: 'buffered BEFORE the write is awaited, so a wedged leg '
+                'costs a delay and not the message');
+        expect(router.dtnBufferFor(otherPubkey).map((p) => p.packetId),
+            contains(packet.packetId));
+
+        wedged.complete(null);
+        expect(await pending, isNull);
+        expect(router.dtnBufferedCount, before + 1,
+            reason: 'and it is stored exactly once');
       });
 
       test('a refused direct write falls back to the buffer', () async {

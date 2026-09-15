@@ -1,7 +1,10 @@
 @TestOn('vm')
 library;
 
+import 'dart:async';
 import 'dart:typed_data';
+
+import 'package:flutter/services.dart' show PlatformException;
 
 import 'package:grassroots_bluetooth_layer/grassroots_bluetooth_layer_testing.dart';
 import 'package:grassroots_networking/src/models/identity.dart';
@@ -66,8 +69,8 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   }
 
   @override
-  Future<void> stopAdvertising() async {
-    calls.add('stopAdvertising');
+  Future<void> stopAdvertising(bool keepServer) async {
+    calls.add(keepServer ? 'stopAdvertising:keepServer' : 'stopAdvertising');
   }
 
   @override
@@ -81,9 +84,14 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
     calls.add('stopScan');
   }
 
+  /// When set, `connect` records the call and never returns — the
+  /// platform-channel round trip still in progress.
+  bool holdConnect = false;
+
   @override
   Future<BlePath> connect(BleConnectRequest request) async {
     calls.add('connect:${request.remoteId}');
+    if (holdConnect) return Completer<BlePath>().future;
     return BlePath(
       pathId: 'central:${request.remoteId}',
       role: BleRole.central,
@@ -104,12 +112,49 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   /// buffer — always BEFORE any byte reaches the controller.
   final Set<String> refuse = {};
 
+  /// Paths whose writes are ACCEPTED and then never answered — the dead leg
+  /// that neither throws nor completes. Distinct from [refuse] on purpose:
+  /// a refusal is reported and retried, whereas an unanswered write is a
+  /// Future that hangs, and the two need opposite defences.
+  final Set<String> swallow = {};
+
+  /// Paths whose single GATT op slot is taken: the plugin refuses the write
+  /// at once with code `write-busy`, and the bytes never reach the stack.
+  final Set<String> busy = {};
+
+  /// Paths whose writes fail with a PlatformException the plugin did not
+  /// raise itself — what Pigeon's wrapError produces when a framework call
+  /// throws through it, carrying the cause and stack in `details`.
+  final Set<String> throughPigeon = {};
+
   @override
   Future<void> send(BleSendRequest request) async {
     calls.add('send:${request.pathId}:${request.value.length}');
     if (refuse.contains(request.pathId)) {
       throw StateError('refused write on ${request.pathId}');
     }
+    if (busy.contains(request.pathId)) {
+      throw PlatformException(
+          code: 'write-busy',
+          message: 'A WriteCharacteristic is in flight on ${request.pathId}');
+    }
+    if (throughPigeon.contains(request.pathId)) {
+      throw PlatformException(
+          code: 'channel-error',
+          message: 'Unable to establish connection on channel.',
+          details: 'Cause: java.lang.NullPointerException: Attempt to invoke '
+              'virtual method on a null object reference, Stacktrace: at '
+              'android.bluetooth.BluetoothGattServer.notifyCharacteristic');
+    }
+    if (swallow.contains(request.pathId)) return Completer<void>().future;
+  }
+
+  /// Connection-priority requests, in order, as 'priority:high'/'priority:low'.
+  final List<String> priorityCalls = [];
+
+  @override
+  Future<void> setConnectionPriority(bool high) async {
+    priorityCalls.add('priority:${high ? 'high' : 'low'}');
   }
 
   @override
@@ -119,8 +164,8 @@ class _RecordingHostApi implements GrassrootsBluetoothLayerHostApi {
   Future<List<BleLinkInfo?>> linkSnapshot() async => [];
 
   @override
-  Future<void> dispose() async {
-    calls.add('dispose');
+  Future<void> dispose(bool keepAdvertiser) async {
+    calls.add('dispose:keep=$keepAdvertiser');
   }
 
   @override
@@ -436,6 +481,41 @@ void main() {
 
       expect(
           hostApi.calls.where((c) => c == 'connect:$remoteId'), hasLength(1));
+    });
+
+    test('a dial that ends before ready clears the entry\'s connecting flag',
+        () async {
+      // The flag is what the advertised-MAC retry and the discovery reducer
+      // read to leave an address alone; a dial that died must not keep
+      // holding it, or the address is never retried and never pruned.
+      const pathId = 'central:GONE';
+      callbacks.pushAdvertisement(BleAdvertisement(
+        remoteId: 'GONE',
+        serviceUuids: ['84c40316-0871-e5ad-8888-000000000000'],
+        rssi: -55,
+        connectable: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.connecting,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers[pathId]!.isConnecting, true);
+      callbacks.pushPath(BlePath(
+        pathId: pathId,
+        role: BleRole.central,
+        state: BlePathState.disconnected,
+        rssi: null,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      expect(store.state.peers.discoveredBlePeers[pathId]!.isConnecting, false);
     });
 
     test('a failed central dial keeps the address but cools down the redial',
@@ -1524,9 +1604,9 @@ void main() {
     }
 
     void sight(FakeGrassrootsBluetoothCallbacks callbacks, String uuid,
-        {int rssi = -55}) {
+        {int rssi = -55, String remoteId = 'PEER'}) {
       callbacks.pushAdvertisement(BleAdvertisement(
-        remoteId: 'PEER',
+        remoteId: remoteId,
         serviceUuids: [uuid],
         rssi: rssi,
         connectable: true,
@@ -1539,6 +1619,52 @@ void main() {
       sight(callbacks, highPeerUuid);
       await Future<void>.delayed(Duration.zero);
       expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1));
+    });
+
+    test('a second sighting while the dial is still being placed does not '
+        'dial again', () async {
+      // The plugin reports every scan result of an undialled address as a
+      // `discovered` path event, and the next advertisement follows it. A
+      // dial takes a platform-channel round trip to place, so a sighting can
+      // land in that gap: measured in the ring runs as two dialIssued
+      // records for the same address 12-14 ms apart, both counting zero
+      // dials in flight.
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeLowIdentity('Initiator'));
+      hostApi.holdConnect = true;
+      sight(callbacks, highPeerUuid);
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: 'central:PEER',
+        role: BleRole.central,
+        state: BlePathState.discovered,
+        rssi: -55,
+        mtu: 23,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      sight(callbacks, highPeerUuid, rssi: -54);
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c == 'connect:PEER'), hasLength(1),
+          reason: 'the first dial is still being placed; a second connectGatt '
+              'to the same address is the 133 that follows');
+    });
+
+    test('a rotated address seen while the dial is still being placed is not '
+        'dialled alongside it', () async {
+      // Same peer, fresh random address, same gap: the first dial is in the
+      // channel and has no path to show for it yet. Two connectGatts to one
+      // peer over two addresses are the status-133 storm the one-central-leg
+      // rule exists to prevent.
+      final (hostApi, callbacks, _, _) =
+          await build(await _makeLowIdentity('Initiator'));
+      hostApi.holdConnect = true;
+      sight(callbacks, highPeerUuid, remoteId: 'OLD');
+      await Future<void>.delayed(Duration.zero);
+      sight(callbacks, highPeerUuid, remoteId: 'NEW');
+      await Future<void>.delayed(Duration.zero);
+      expect(hostApi.calls.where((c) => c.startsWith('connect:')),
+          ['connect:OLD']);
     });
 
     test('the higher peer holds its dial, so the pair is never both-dialing',
@@ -1673,7 +1799,32 @@ void main() {
     test('the cap defaults to the production value', () {
       expect(transport.maxInFlightCentralDials,
           BleTransportService.defaultMaxInFlightCentralDials);
-      expect(BleTransportService.defaultMaxInFlightCentralDials, 7);
+      expect(BleTransportService.defaultMaxInFlightCentralDials, 1,
+          reason: 'The Android stack runs one LE connection attempt at a '
+              'time and queues the rest. Our per-dial deadline cancelling a '
+              'QUEUED dial is refused by the stack and leaves that address '
+              'failing instantly until a link to it comes and goes; with one '
+              'dial in flight every cancel hits a dial the stack started.');
+    });
+
+    test('at the production cap a second sighting waits for the first dial',
+        () async {
+      await adv(1);
+      expect(dials(1), 1);
+      await pushState(1, BlePathState.connecting);
+
+      await adv(2);
+      expect(dials(2), 0,
+          reason: 'A second dial would sit in the stack\'s queue, where the '
+              'deadline cannot cancel it cleanly.');
+      final skip = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'dialSkip');
+      expect(skip['path'], 'central:MAC2');
+      expect(skip['reason'], 'dialCap');
+
+      await pushState(1, BlePathState.ready);
+      await adv(2);
+      expect(dials(2), 1, reason: 'The next sighting takes the freed slot.');
     });
 
     test('setDialParallelism sets the cap and restores it on null', () {
@@ -1683,7 +1834,7 @@ void main() {
       expect(transport.dialProbePopN, 5);
 
       transport.setDialParallelism();
-      expect(transport.maxInFlightCentralDials, 7,
+      expect(transport.maxInFlightCentralDials, 1,
           reason: 'A null M is how the runner puts production behaviour back '
               'when a run ends; nothing else ever writes this field.');
       expect(transport.dialProbeMaxParallel, isNull);
@@ -1728,6 +1879,31 @@ void main() {
       await adv(3);
       expect(dials(3), 0,
           reason: 'The freed slot was taken by peer 2; the cap still holds.');
+    });
+
+    test('a sighting reported as a `discovered` path is not tracked', () async {
+      // An advertisement is a sighting of an address, not a connection. A
+      // rotating peer mints a fresh address every slot, so a table keeping
+      // one entry per address seen grows for the life of the run while the
+      // number of links stays under the controller's ceiling. Only a path
+      // the plugin holds a connection object for belongs in the table.
+      for (var i = 0; i < 50; i++) {
+        callbacks.pushPath(BlePath(
+          pathId: 'central:RPA$i',
+          role: BleRole.central,
+          state: BlePathState.discovered,
+          rssi: -55,
+          mtu: 23,
+          canSend: false,
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+      await adv(1);
+
+      final rec = trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'dialIssued');
+      expect(rec['pathsTracked'], 0);
+      expect(rec['pathsTrackedCentral'], 0);
     });
 
     test('the establishment is the LINK coming up, not `ready`', () async {
@@ -2051,6 +2227,71 @@ void main() {
           reason: 'a deliberate stop is not a boot regression, and a marker '
               'flicker here would poison every establishment anchor');
     });
+
+    test('a kept advertiser is not trusted: the next boot waits for a fresh '
+        'answer', () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushScanState(BleScanState(active: true));
+      callbacks.pushAdvertisingState(BleAdvertisingState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active);
+
+      await transport.stop(keepAdvertiser: true);
+      expect(st(), TransportState.ready);
+      expect(hostApi.calls, isNot(contains('stopAdvertising')),
+          reason: 'the set stays on the air at its address — that is what '
+              'the keep is for');
+
+      hostApi.calls.clear();
+      await transport.start();
+      callbacks.pushScanState(BleScanState(active: true));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.ready,
+          reason: 'legacy advertising ends at the controller on every '
+              'accepted connection; what the last transport heard says '
+              'nothing about now, and assuming it did left a fleet '
+              'undiscoverable');
+      expect(hostApi.calls, contains(startsWith('startAdvertising:')),
+          reason: 'the plugin is asked again — it is the one that can '
+              'verify the set with the controller');
+
+      callbacks.pushAdvertisingState(BleAdvertisingState(
+          active: true, reason: 'enabled by this plugin'));
+      await Future<void>.delayed(Duration.zero);
+      expect(st(), TransportState.active,
+          reason: 'the controller answered — now it is a fact');
+    });
+
+    test('dispose with keepAdvertiser drops every link and keeps the set',
+        () async {
+      await build(BleRoleMode.auto);
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:KEPT',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+
+      await transport.dispose(keepAdvertiser: true);
+
+      expect(hostApi.calls, contains('disconnect:peripheral:KEPT'),
+          reason: 'links are what a bounce resets');
+      expect(hostApi.calls, isNot(contains('stopAdvertising')));
+      expect(hostApi.calls, contains('dispose:keep=true'),
+          reason: 'the plugin owns the set and is told to keep it');
+    });
+
+    test('a plain dispose still takes the advertiser down', () async {
+      await build(BleRoleMode.auto);
+      hostApi.calls.clear();
+      await transport.dispose();
+      expect(hostApi.calls, contains('stopAdvertising'));
+      expect(hostApi.calls, contains('dispose:keep=false'));
+    });
   });
 
   group('BleTransportService — scan-liveness watchdog', () {
@@ -2189,6 +2430,7 @@ void main() {
     late FakeGrassrootsBluetoothCallbacks callbacks;
     late Store<AppState> store;
     late BleTransportService transport;
+    late _CapturingTrace trace;
 
     setUp(() async {
       hostApi = _RecordingHostApi();
@@ -2197,10 +2439,14 @@ void main() {
           GrassrootsBluetooth.test(hostApi: hostApi, callbacks: callbacks);
       store = Store<AppState>(appReducer, initialState: AppState.initial);
       store.dispatch(SetColdCallTrustLevelAction(ColdCallTrustLevel.open));
+      trace = _CapturingTrace();
+      await trace.startExperiment('other-leg');
       transport = BleTransportService(
         identity: await _makeIdentity('Sender'),
         store: store,
         grassrootsBluetooth: ble,
+        trace: trace,
+        writeAckTimeout: const Duration(milliseconds: 100),
       );
       await transport.initialize();
       addTearDown(transport.dispose);
@@ -2239,6 +2485,13 @@ void main() {
         bleCentralDeviceId: centralPathId,
         blePeripheralDeviceId: peripheralPathId,
       ));
+      // An ANNOUNCE attaches its leg in Redux and identifies the same leg on
+      // the transport in one step (MessageRouter dispatches the action, then
+      // calls onBlePeerIdentified). A leg Redux knows and the transport does
+      // not cannot occur, so a pair attributed on both legs was identified on
+      // both.
+      transport.onPeerIdentified(centralPathId, peer.publicKey);
+      transport.onPeerIdentified(peripheralPathId, peer.publicKey);
       await Future<void>.delayed(Duration.zero);
       hostApi.calls.clear();
       return peer;
@@ -2264,6 +2517,99 @@ void main() {
 
 
 
+    /// Rotate the pair's peripheral leg: a fresh address arrives, is
+    /// identified, and the address it replaced then drops. Redux holds ONE
+    /// peripheral device id per peer, so the rotation overwrites the slot and
+    /// the drop clears it — while the ORIGINAL leg is still ready and still
+    /// known to the transport by path. A peer presented up to 21 addresses to
+    /// one device in thirty minutes, so this is the steady state, not an edge.
+    Future<void> rotatePeripheralOnto(
+        GrassrootsIdentity peer, String freshPathId) async {
+      callbacks.pushPath(BlePath(
+        pathId: freshPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peer.publicKey,
+        nickname: 'PairPeer',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: freshPathId,
+      ));
+      transport.onPeerIdentified(freshPathId, peer.publicKey);
+      await Future<void>.delayed(Duration.zero);
+      callbacks.pushPath(BlePath(
+        pathId: freshPathId,
+        role: BleRole.peripheral,
+        state: BlePathState.disconnected,
+        rssi: null,
+        mtu: 247,
+        canSend: false,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      hostApi.calls.clear();
+    }
+
+    test('a live peripheral leg the rotation orphaned is still the data leg',
+        () async {
+      final peer = await convergedPair();
+      await rotatePeripheralOnto(peer, 'peripheral:PAIR2');
+
+      expect(transport.isDeviceConnected('peripheral:PAIR'), isTrue,
+          reason: 'The original leg never dropped — only the address that '
+              'briefly superseded it did.');
+      expect(transport.getPeerIdForPubkey(peer.publicKey), 'peripheral:PAIR',
+          reason: 'Identity is a fact about the PATH, and the transport holds '
+              'it per path. Redux keeps one device id per role per peer and '
+              'cannot represent a rotation in flight, so asking it sends data '
+              'to the acknowledged leg — one ATT op slot, and every write '
+              'that arrives meanwhile refused as write-busy.');
+    });
+
+    test('a busy central write is rescued onto the orphaned peripheral leg',
+        () async {
+      final peer = await convergedPair();
+      await rotatePeripheralOnto(peer, 'peripheral:PAIR2');
+
+      hostApi.busy.add('central:PAIR');
+      expect(
+          await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue,
+          reason: 'A busy op slot is a collision with our own traffic, and '
+              'the pair still holds a live notify leg to carry the frame.');
+      expect(hostApi.calls, [
+        'send:central:PAIR:40',
+        'send:peripheral:PAIR:40',
+      ], reason: 'otherLegFor must find the live peripheral leg. Resolving it '
+          'through Redux instead returns null and the conveyance is lost.');
+    });
+
+    test('a link record says whether the peer projection still names the path',
+        () async {
+      final peer = await convergedPair();
+      Map<String, dynamic> lastIdentified() => trace.records.lastWhere(
+          (r) => r['type'] == 'link' && r['event'] == 'identified');
+
+      transport.onPeerIdentified('peripheral:PAIR', peer.publicKey);
+      expect(lastIdentified()['reduxAttached'], isTrue,
+          reason: 'Both authorities agree while the pair is settled.');
+
+      await rotatePeripheralOnto(peer, 'peripheral:PAIR2');
+      transport.onPeerIdentified('peripheral:PAIR', peer.publicKey);
+
+      final record = lastIdentified();
+      expect(record['peer'], isNotNull,
+          reason: 'The transport still knows whose leg this is.');
+      expect(record['reduxAttached'], isFalse,
+          reason: 'The rotation took PeerState\'s one peripheral slot with '
+              'it. Sends no longer care — identity comes from the per-path '
+              'record — and this field is how a run counts the legs that '
+              'would once have been unsendable.');
+    });
+
     test('a write that succeeds never touches the second leg', () async {
       await convergedPair();
       final aired = await transport.broadcast(Uint8List(40));
@@ -2287,6 +2633,365 @@ void main() {
       hostApi.refuse.add('central:PAIR');
       expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
       expect(hostApi.calls.last, 'send:peripheral:PAIR:40');
+    });
+
+    test('a write the stack never answers does not wedge the leg forever',
+        () async {
+      // The failure this bound exists for. An acknowledged central write waits
+      // for its ATT response, and the plugin serialises GATT ops per path — so
+      // a write that is accepted and then never answered stops that path dead:
+      // every later message to the peer queues behind it and no caller is ever
+      // replied to. Measured on 2026-09-01, one leg went quiet mid-run and
+      // that ordered pair carried nothing for the remaining five minutes,
+      // while the same device's other paths were untouched.
+      //
+      // A timeout turns the hang into a refusal, which the existing machinery
+      // already knows how to survive: retry the pair's other leg, and leave
+      // the packet in the DTN buffer either way.
+      await convergedPair();
+      hostApi.swallow.add('central:PAIR');
+      expect(
+        await transport
+            .sendToPeer('central:PAIR', Uint8List(40))
+            .timeout(const Duration(seconds: 30)),
+        isFalse,
+        reason: 'the unanswered write times out and is reported failed — the '
+            'DTN buffer and the sync exchange are what redeliver it',
+      );
+      // And NOT on the other leg. The fallback exists for a refusal, where the
+      // bytes provably never reached the controller; here they were accepted
+      // and may already be on the air, so a retry would be the double-send the
+      // one-leg-per-flood rule forbids.
+      expect(hostApi.calls, ['send:central:PAIR:40'],
+          reason: 'exactly one write attempt, on the leg that was asked');
+
+      // And the path is usable again straight away — the wedge does not
+      // outlive the write that caused it.
+      hostApi.calls.clear();
+      hostApi.swallow.clear();
+      expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
+      expect(hostApi.calls, ['send:central:PAIR:40']);
+    }, timeout: const Timeout(Duration(seconds: 60)));
+
+    test('unanswered writes never drop the leg', () async {
+      // A write the stack does not answer says nothing about the link: on a
+      // loaded desk most such writes were received by the peer regardless,
+      // the response was merely late. Liveness is the ANNOUNCE the peer
+      // sends over every leg each interval, and only its absence condemns a
+      // leg.
+      await convergedPair();
+      hostApi.swallow.add('central:PAIR');
+      for (var i = 0; i < 5; i++) {
+        await transport.sendToPeer('central:PAIR', Uint8List(40));
+      }
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty);
+    });
+
+
+    test('a leg whose writes keep failing is dropped', () async {
+      // Nothing about what the peer sends us enters this: a quiet leg may
+      // simply have a peer with nothing to say. A leg that will not carry
+      // our bytes is the whole verdict.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      hostApi.refuse.add('central:PAIR');
+      // The send itself still succeeds: a refusal falls back to the other leg.
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      transport.dropFailingLegsNow();
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'one refused write is a collision, not a verdict');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      transport.dropFailingLegsNow(
+          now: DateTime.now().add(const Duration(seconds: 11)));
+      expect(hostApi.calls, contains('disconnect:central:PAIR'));
+      expect(hostApi.calls, isNot(contains('disconnect:peripheral:PAIR')),
+          reason: 'the verdict is per leg; the other leg carries traffic');
+    });
+
+    test('a burst of refusals inside one announce interval is not a verdict',
+        () async {
+      // The measured failure mode this guards: under send load a leg refuses
+      // several writes in a row within milliseconds, which condemned it and
+      // took the pair down with it. A run lost 470 central legs this way —
+      // against 174 that died of an actual radio fault — and with one dial in
+      // flight the rebuild never caught up, so connectivity fell from 11.6
+      // legs per device to 5 and kept falling.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      hostApi.refuse.add('central:PAIR');
+      for (var i = 0; i < 8; i++) {
+        await transport.sendToPeer('central:PAIR', Uint8List(40));
+      }
+      transport.dropFailingLegsNow();
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'Eight refusals arriving inside one announce interval are '
+              'one congested moment, not eight verdicts. Contention refuses '
+              'in bursts; a dead leg refuses across cycles.');
+    });
+
+    test('a refused write records WHAT refused it', () async {
+      // Two runs went on guessing why writes fail under load because the
+      // record named only that one had. The reason is what separates a
+      // congested queue from a link the stack has given up on, and neither
+      // the drop table nor the leg's own history could tell them apart.
+      await convergedPair();
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+
+      final drop = trace.records.lastWhere(
+          (r) => r['type'] == 'drop' && r['reason'] == 'writeFailed');
+      expect(drop['error'], isNotNull,
+          reason: 'A writeFailed with no cause is a dead end for analysis.');
+      expect(drop['error'].toString(), contains('refused write'),
+          reason: 'Carry what the stack actually said.');
+    });
+
+    test('a foreign exception keeps the cause Pigeon put in details',
+        () async {
+      // Pigeon's wrapError puts "Cause: ..., Stacktrace: ..." in `details` for
+      // any throwable that is not one of the plugin's own FlutterErrors. That
+      // is where a framework NPE thrown inside the Android BLE stack arrives,
+      // and dropping it cost an hour of reading bytecode to reconstruct what
+      // had already been delivered.
+      await convergedPair();
+      hostApi.throughPigeon.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+
+      final drop = trace.records.lastWhere(
+          (r) => r['type'] == 'drop' && r['reason'] == 'writeFailed');
+      expect(drop['error'].toString(), contains('NullPointerException'),
+          reason: 'The cause is the whole value of the record.');
+    });
+
+    test('a refusal the plugin raised itself carries no stack', () async {
+      // The plugin's own codes are self-describing, and their details are
+      // empty or noise. Appending them would push the useful half of every
+      // record past the eye.
+      await convergedPair();
+      hostApi.busy.add('central:PAIR');
+      await transport.sendToPeerIdempotent('central:PAIR', Uint8List(40));
+
+      final drop = trace.records.lastWhere((r) => r['type'] == 'drop');
+      expect(drop['reason'], 'writeBusy');
+    });
+
+    test('coming out of quiet actually starts scanning again', () async {
+      // The drains between dwells exist to let a lost leg re-form, which is
+      // impossible if discovery never comes back. A run was observed holding
+      // the NOT ADVERTISING banner through every drain: quiet went on and
+      // never came off, so the phone was undiscoverable from the first dwell
+      // to the end of the run.
+      await convergedPair();
+      await transport.setDiscoveryQuiet(true);
+      hostApi.calls.clear();
+
+      await transport.setDiscoveryQuiet(false);
+
+      expect(transport.discoveryQuiet, isFalse);
+      expect(hostApi.calls.any((c) => c.startsWith('startScan')), isTrue,
+          reason: 'the drain must be able to find a lost leg again');
+      expect(hostApi.calls.any((c) => c.startsWith('startAdvertising')), isTrue,
+          reason: 'and the peer must be able to find us');
+    });
+
+    test('a quiet run never condemns a leg', () async {
+      // The failing-leg sweep exists to free a slot for a better leg. With
+      // discovery off no better leg can form, so condemning one only ends the
+      // run — and a quiet run is exactly where the inbound-liveness veto
+      // cannot protect it, because ANNOUNCE is off and acknowledgements are
+      // suppressed, so the leg hears nothing and looks dead to the sweep.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      await transport.setDiscoveryQuiet(true);
+      hostApi.calls.clear();
+
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      transport.dropFailingLegsNow(
+          now: DateTime.now().add(const Duration(seconds: 60)));
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'nothing may tear down the only link the run has');
+    });
+
+    test('the drain does not condemn the leg the quiet step was measuring',
+        () async {
+      // The sweep stands aside while quiet, but the streaks kept counting
+      // behind that guard and the drain is where they came due: a run lost a
+      // leg within seconds of every dwell end, eight times over, and delivered
+      // 4 of 378 messages. Leaving quiet must discard what was counted under
+      // it — a refused write there says the peer is silent, which is what a
+      // one-way step with acknowledgements suppressed asked it to be.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      await transport.setDiscoveryQuiet(true);
+
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+
+      hostApi.refuse.remove('central:PAIR');
+      await transport.setDiscoveryQuiet(false);
+      hostApi.calls.clear();
+      transport.dropFailingLegsNow(
+          now: DateTime.now().add(const Duration(seconds: 60)));
+
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'failures counted while quiet must not come due at the drain');
+    });
+
+    test('going quiet stops discovery but keeps the links up', () async {
+      // A throughput ceiling wants the radio carrying payload and nothing
+      // else. Advertising and scanning cost airtime and controller time on
+      // the same chip, so they are what a ceiling run has to silence — but
+      // severing the link it is measuring would end the run, so the legs stay.
+      await convergedPair();
+      hostApi.calls.clear();
+
+      await transport.setDiscoveryQuiet(true);
+
+      expect(hostApi.calls, contains('stopScan'));
+      // The GATT server must be KEPT. A plain stop takes it down with the
+      // advertiser, and the peer's central leg — holding the characteristic
+      // handle it discovered — then gets GATT status 1 on every write for the
+      // rest of the run. Measured: 17,284 such failures, zero delivered.
+      expect(hostApi.calls, contains('stopAdvertising:keepServer'));
+      expect(hostApi.calls, isNot(contains('stopAdvertising')),
+          reason: 'a plain stop here deletes the link under measurement');
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'the link under measurement must survive going quiet');
+      expect(transport.isDeviceConnected('peripheral:PAIR'), isTrue);
+      expect(transport.isDeviceConnected('central:PAIR'), isTrue);
+    });
+
+    test('a leg still hearing from its peer is never condemned', () async {
+      // Refused writes are evidence about our queue, not about the link. A
+      // leg the peer is still notifying us over is carrying traffic in the
+      // direction only the peer controls, which no amount of local
+      // congestion can fake. Under send load this is the difference between
+      // shedding a live leg and keeping the mesh: a run condemned 27 legs in
+      // one 15 s bucket against 7 lost to actual radio faults, and
+      // connectivity fell from twelve legs per device to four.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+
+      callbacks.pushPayload(BlePayload(
+        pathId: 'central:PAIR',
+        role: BleRole.central,
+        value: Uint8List.fromList([1, 2, 3]),
+        rssi: -50,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      transport.dropFailingLegsNow(
+          now: DateTime.now().add(const Duration(seconds: 11)));
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'The peer is still talking on this leg. Silence is not '
+              'evidence of death — we notify over our own peripheral leg, so '
+              'quiet there is the design working — but inbound traffic IS '
+              'evidence of life, and that is not the same claim.');
+    });
+
+    test('a leg refusing across announce intervals is still condemned',
+        () async {
+      // The rule the window must not weaken: every leg carries an ANNOUNCE
+      // each interval, so a leg that has genuinely died goes on refusing
+      // without anything having to probe it.
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      transport.dropFailingLegsNow(
+          now: DateTime.now().add(const Duration(seconds: 11)));
+      expect(hostApi.calls, contains('disconnect:central:PAIR'),
+          reason: 'Still refusing an announce interval later is a leg that '
+              'will not carry bytes.');
+    });
+
+    test('a write that lands clears the leg\'s failure count', () async {
+      final peer = await convergedPair();
+      transport.onPeerIdentified('central:PAIR', peer.publicKey);
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      hostApi.refuse.remove('central:PAIR');
+      expect(await transport.sendToPeer('central:PAIR', Uint8List(40)), isTrue);
+      hostApi.refuse.add('central:PAIR');
+      await transport.sendToPeer('central:PAIR', Uint8List(40));
+      transport.dropFailingLegsNow();
+      expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
+          reason: 'the run of failures restarted at the write that landed');
+    });
+
+    test('data leaves a peripheral leg whose writes are failing', () async {
+      // Demotion without a teardown, and on FAILURE alone: silence on our
+      // peripheral leg says nothing — it is the leg we notify over, so the
+      // peer has no reason to send anything back on it. A write that will
+      // not go out is the only evidence the leg cannot carry volume.
+      final peer = await convergedPair();
+      expect(transport.getPeerIdForPubkey(peer.publicKey), 'peripheral:PAIR');
+      hostApi.refuse.add('peripheral:PAIR');
+      await transport.sendToPeer('peripheral:PAIR', Uint8List(40));
+      expect(transport.getPeerIdForPubkey(peer.publicKey), 'central:PAIR',
+          reason: 'a leg that will not carry a write is not where data goes');
+      expect(transport.isDeviceConnected('peripheral:PAIR'), isTrue,
+          reason: 'demoted, not dropped');
+      hostApi.refuse.remove('peripheral:PAIR');
+      await transport.sendToPeer('peripheral:PAIR', Uint8List(40));
+      expect(transport.getPeerIdForPubkey(peer.publicKey), 'peripheral:PAIR',
+          reason: 'a write that lands restores the leg to the data role');
+    });
+
+
+
+    test('the write budget for a peer is its narrowest ready leg', () async {
+      // The legs negotiate separately and a frame may go out on either, so
+      // what one write can carry is the smaller of the two — not the leg the
+      // sender happens to prefer.
+      final peer = await convergedPair(centralMtu: 517, peripheralMtu: 185);
+      expect(transport.usableWriteBytesForPubkey(peer.publicKey), 185 - 3);
+    });
+
+    test('an unknown or legless peer has no budget', () async {
+      final stranger = await _makeIdentity('Stranger');
+      expect(transport.usableWriteBytesForPubkey(stranger.publicKey), isNull);
+    });
+
+    test('a busy op slot is a refusal of its own kind', () async {
+      // The plugin holds one GATT op per path and refuses a write that finds
+      // the slot taken. That is a collision, not the stack saying no, and the
+      // write-up needs to count the two apart.
+      await convergedPair();
+      hostApi.busy.add('central:PAIR');
+      expect(
+          await transport.sendToPeerIdempotent('central:PAIR', Uint8List(40)),
+          isTrue);
+      expect(hostApi.calls, [
+        'send:central:PAIR:40',
+        'send:peripheral:PAIR:40',
+      ]);
+      final drops = trace.records.where((r) => r['type'] == 'drop').toList();
+      expect(drops.map((r) => r['reason']), ['writeBusy']);
+    });
+
+    test('an idempotent send retries the other leg after a timeout', () async {
+      // Sync frames are safe to deliver twice — the receiver answers a filter
+      // it has already seen with the same conveyance, and a duplicate frame
+      // costs one round, not a double delivery. For those the double-send
+      // rule gives way: a timed-out write is retried on the pair's other leg.
+      await convergedPair();
+      hostApi.swallow.add('central:PAIR');
+      expect(
+          await transport.sendToPeerIdempotent('central:PAIR', Uint8List(40)),
+          isTrue);
+      expect(hostApi.calls, [
+        'send:central:PAIR:40',
+        'send:peripheral:PAIR:40',
+      ]);
     });
 
     test('no fallback onto a leg that would truncate the packet', () async {
@@ -2329,6 +3034,65 @@ void main() {
       expect(hostApi.calls, hasLength(2),
           reason: 'Both unidentified legs are flood targets in their own '
               'right, but neither is the other one\'s fallback.');
+    });
+
+    test('data takes the peripheral leg, control takes the central one',
+        () async {
+      final peer = await convergedPair();
+
+      expect(transport.getPeerIdForPubkey(peer.publicKey), 'peripheral:PAIR',
+          reason: 'A notification costs no round trip and several pack into '
+              'one connection interval, so everything with volume rides it.');
+      expect(
+          transport.getControlPeerIdForPubkey(peer.publicKey), 'central:PAIR',
+          reason: 'A handshake flight is neither buffered nor re-offered, so '
+              'it pays a round trip to be refused rather than to vanish.');
+    });
+
+    test('both preferences fall back to the only leg a pair holds', () async {
+      final centralOnly = await _makeIdentity('CentralOnly');
+      callbacks.pushPath(BlePath(
+        pathId: 'central:SOLO',
+        role: BleRole.central,
+        state: BlePathState.ready,
+        rssi: -50,
+        mtu: 247,
+        canSend: true,
+      ));
+      final peripheralOnly = await _makeIdentity('PeripheralOnly');
+      callbacks.pushPath(BlePath(
+        pathId: 'peripheral:SOLO',
+        role: BleRole.peripheral,
+        state: BlePathState.ready,
+        rssi: null,
+        mtu: 247,
+        canSend: true,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: centralOnly.publicKey,
+        nickname: 'CentralOnly',
+        transport: PeerTransport.bleDirect,
+        bleCentralDeviceId: 'central:SOLO',
+      ));
+      store.dispatch(PeerAnnounceReceivedAction(
+        publicKey: peripheralOnly.publicKey,
+        nickname: 'PeripheralOnly',
+        transport: PeerTransport.bleDirect,
+        blePeripheralDeviceId: 'peripheral:SOLO',
+      ));
+      transport.onPeerIdentified('central:SOLO', centralOnly.publicKey);
+      transport.onPeerIdentified('peripheral:SOLO', peripheralOnly.publicKey);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(transport.getPeerIdForPubkey(centralOnly.publicKey),
+          'central:SOLO',
+          reason: 'A pair is single-legged for the whole of first contact, '
+              'so a preference may never refuse to send.');
+      expect(transport.getControlPeerIdForPubkey(peripheralOnly.publicKey),
+          'peripheral:SOLO',
+          reason: 'The handshake that converges a pair runs before the pair '
+              'has a central leg to prefer.');
     });
 
   });
@@ -2375,6 +3139,7 @@ void main() {
         transport: PeerTransport.bleDirect,
         blePeripheralDeviceId: 'peripheral:PAIR',
       ));
+      transport.onPeerIdentified('peripheral:PAIR', peer.publicKey);
       await Future<void>.delayed(Duration.zero);
       hostApi.calls.clear();
     }
@@ -2447,6 +3212,8 @@ void main() {
         blePeripheralDeviceId: 'peripheral:WIDE',
         bleCentralDeviceId: 'central:WIDE',
       ));
+      transport.onPeerIdentified('peripheral:WIDE', peer.publicKey);
+      transport.onPeerIdentified('central:WIDE', peer.publicKey);
       await Future<void>.delayed(Duration.zero);
       hostApi.calls.clear();
 
@@ -2555,9 +3322,15 @@ void main() {
       trace = _CapturingTrace();
       await trace.startExperiment('ring-gate');
 
-      final members = [
-        for (var i = 0; i < 4; i++) await _makeIdentity('Ring$i'),
-      ]..sort((a, b) => hexOf(a).compareTo(hexOf(b)));
+      // `self` is the NON-initiator toward the opposite peer (its service
+      // UUID sorts higher), so the initiator grace applies to that pair.
+      late List<GrassrootsIdentity> members;
+      do {
+        members = [
+          for (var i = 0; i < 4; i++) await _makeIdentity('Ring$i'),
+        ]..sort((a, b) => hexOf(a).compareTo(hexOf(b)));
+      } while (
+          members[2].bleServiceUuid.compareTo(members[0].bleServiceUuid) > 0);
       ring = members;
       self = members.first; // ring position 0
 
@@ -2729,6 +3502,59 @@ void main() {
       });
     });
 
+    group('ignored phone', () {
+      // A phone that is in range but not part of the experiment: the ring
+      // gate cannot exclude it (its roster is derived from the session
+      // table, which the stray is in), so the testbed ignores it by pubkey.
+      test('refuses a dial to an ignored phone with the gate disarmed',
+          () async {
+        store.dispatch(IgnorePeerAction(hexOf(opposite())));
+        hostApi.calls.clear();
+
+        expect(await dial(opposite()), isFalse);
+
+        expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty);
+        expect(skipsWithReason('ignored'), hasLength(1));
+      });
+
+      test('still dials everyone else', () async {
+        store.dispatch(IgnorePeerAction(hexOf(opposite())));
+        hostApi.calls.clear();
+
+        expect(await dial(neighbour()), isTrue);
+        expect(skipsWithReason('ignored'), isEmpty);
+      });
+
+      test('dials the phone again once it is no longer ignored', () async {
+        store.dispatch(IgnorePeerAction(hexOf(opposite())));
+        store.dispatch(UnignorePeerAction(hexOf(opposite())));
+        hostApi.calls.clear();
+
+        expect(await dial(opposite()), isTrue);
+      });
+
+      test('drops an inbound leg from an ignored phone', () async {
+        store.dispatch(IgnorePeerAction(hexOf(opposite())));
+        callbacks.pushPath(BlePath(
+          pathId: 'peripheral:IGN',
+          role: BleRole.peripheral,
+          state: BlePathState.ready,
+          rssi: -55,
+          mtu: 247,
+          canSend: true,
+        ));
+        await Future<void>.delayed(Duration.zero);
+        hostApi.calls.clear();
+
+        transport.onPeerIdentified('peripheral:IGN', opposite().publicKey);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(hostApi.calls, contains('disconnect:peripheral:IGN'));
+        expect(trace.records.where((r) => r['event'] == 'ignoreDrop'),
+            hasLength(1));
+      });
+    });
+
     group('prune on shrink', () {
       /// Bring up BOTH legs of the pair with `peer`, identified, so
       /// `_pairViewFor` resolves the identity and the prune can find them.
@@ -2790,6 +3616,57 @@ void main() {
 
         expect(hostApi.calls.where((c) => c.startsWith('disconnect:')), isEmpty,
             reason: 'the dual-role mandate: an allowed pair keeps both legs');
+      });
+
+      test('severLinksWith drops BOTH legs of a pair that is now ignored',
+          () async {
+        await dualRoleWith(opposite(), 'IGN');
+        hostApi.calls.clear();
+
+        store.dispatch(IgnorePeerAction(hexOf(opposite())));
+        await transport.severLinksWith(hexOf(opposite()));
+
+        expect(hostApi.calls, contains('disconnect:central:IGN'));
+        expect(hostApi.calls, contains('disconnect:peripheral:IGN'));
+        expect(trace.records.where((r) => r['event'] == 'ignorePrune'),
+            hasLength(2));
+      });
+    });
+
+    group('widening', () {
+      test('re-arms the initiator grace for a pair the gate just allowed',
+          () async {
+        // A refused peer keeps being sighted the whole time it is refused, so
+        // by the time the gate widens its first sighting is minutes old and
+        // the grace has long elapsed. Without re-arming it, both sides of
+        // every newly-allowed pair dial on the first sighting after the
+        // change — measured at settle 1 of the ring sweep as all four phones
+        // dialling at once and two of the dials failing.
+        //
+        void sightOpposite() => callbacks.pushAdvertisement(BleAdvertisement(
+              remoteId: 'OPP',
+              serviceUuids: [opposite().bleServiceUuid],
+              rssi: -55,
+              connectable: true,
+            ));
+
+        armRing(radius: 1);
+        sightOpposite();
+        await Future<void>.delayed(const Duration(milliseconds: 1600));
+        sightOpposite();
+        await Future<void>.delayed(Duration.zero);
+        expect(skipsWithReason('ringRadius'), isNotEmpty,
+            reason: 'refused, with the grace already elapsed');
+        hostApi.calls.clear();
+
+        armRing(radius: 2);
+        await transport.applyRingGateChange();
+        sightOpposite();
+        await Future<void>.delayed(Duration.zero);
+
+        expect(hostApi.calls.where((c) => c.startsWith('connect:')), isEmpty,
+            reason: 'the initiator gets its uncontested window again');
+        expect(skipsWithReason('awaitingInitiator'), isNotEmpty);
       });
     });
 

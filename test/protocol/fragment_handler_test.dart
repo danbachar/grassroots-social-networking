@@ -65,15 +65,42 @@ void main() {
         await handler.send([1, 2, 3], (_) async => true);
         sw.stop();
         // Two gaps for three parts: nothing is waited on after the last.
-        expect(sw.elapsed, greaterThanOrEqualTo(FragmentHandler.fragmentDelay * 2));
-        expect(sw.elapsed, lessThan(FragmentHandler.fragmentDelay * 3));
+        expect(sw.elapsed,
+            greaterThanOrEqualTo(FragmentHandler.defaultFragmentDelay * 2));
+        expect(sw.elapsed, lessThan(FragmentHandler.defaultFragmentDelay * 3));
+      });
+
+      test('the pacing can be turned off for a throughput measurement',
+          () async {
+        // The spacing exists because a fire-and-forget write could outrun the
+        // radio's buffer. The write path now AWAITS its acknowledgement and
+        // the plugin holds one GATT op per path, so the loop already cannot
+        // outrun anything — an hour of saturating traffic produced one
+        // write-busy refusal. Left in, the delay is the ceiling a throughput
+        // run measures instead of the link.
+        //
+        // Off by plan, never by default: production keeps the spacing until a
+        // run says otherwise.
+        handler.fragmentDelay = Duration.zero;
+        final sw = Stopwatch()..start();
+        await handler.send([1, 2, 3, 4, 5], (_) async => true);
+        sw.stop();
+        expect(sw.elapsed, lessThan(FragmentHandler.defaultFragmentDelay),
+            reason: 'five parts must not cost four spacings');
+      });
+
+      test('the default spacing is what production ships', () {
+        expect(FragmentHandler().fragmentDelay,
+            FragmentHandler.defaultFragmentDelay);
+        expect(FragmentHandler.defaultFragmentDelay,
+            const Duration(milliseconds: 20));
       });
 
       test('does not wait on a part that reached no radio', () async {
         final sw = Stopwatch()..start();
         await handler.send(List.filled(20, 0), (_) async => false);
         sw.stop();
-        expect(sw.elapsed, lessThan(FragmentHandler.fragmentDelay));
+        expect(sw.elapsed, lessThan(FragmentHandler.defaultFragmentDelay));
       });
 
       test('an empty part list writes nothing and waits on nothing', () async {

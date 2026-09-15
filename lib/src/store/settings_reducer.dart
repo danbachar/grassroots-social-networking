@@ -60,6 +60,20 @@ SettingsState settingsReducer(SettingsState state, SettingsAction action) {
     );
   }
 
+  if (action is IgnorePeerAction) {
+    return state.copyWith(ignoredPeerHexes: {
+      ...state.ignoredPeerHexes,
+      action.pubkeyHex.toLowerCase(),
+    });
+  }
+
+  if (action is UnignorePeerAction) {
+    return state.copyWith(
+      ignoredPeerHexes: state.ignoredPeerHexes
+          .where((h) => h != action.pubkeyHex.toLowerCase())
+          .toSet(),
+    );
+  }
 
   return state;
 }

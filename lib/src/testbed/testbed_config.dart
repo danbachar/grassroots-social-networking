@@ -184,6 +184,40 @@ class FieldStep {
   /// exist keep their cadence instead of pacing around a gap.
   final bool perPairPacing;
 
+  /// Saturating send mode: instead of [sendCount] messages paced across the
+  /// dwell, push continuously for the whole of it. [sendCount] is ignored.
+  ///
+  /// This is the throughput instrument. Paced sending measures whatever rate
+  /// the plan asked for; saturating measures the rate the send path can
+  /// actually drain, which is the only way to find a ceiling rather than
+  /// confirm an offered load.
+  final bool saturate;
+
+  /// How many sends are pushed CONCURRENTLY while [saturate] is on: that many
+  /// independent lanes, each looping "fire one, await it, fire the next".
+  ///
+  /// Nothing is ACK-gated — an ACK never clocks a send — so offered load is
+  /// set purely by lane count and by how fast the send path drains. Clocking
+  /// on acknowledgements would cap the rate at lanes/RTT and measure the
+  /// window instead of the link.
+  ///
+  /// One lane keeps exactly one message in the send path at a time, so its
+  /// rate is what the pipe carries. The plugin holds ONE GATT op per path, so
+  /// a second lane's write meets a taken slot and is retried on the pair's
+  /// other leg — which is what makes two lanes a test of whether a converged
+  /// pair is two usable pipes. Beyond two there is nothing left to find: more
+  /// lanes only manufacture write-busy refusals.
+  final int sendLanes;
+
+  /// Milliseconds between consecutive fragment writes for this step, or null
+  /// to leave the production spacing alone.
+  ///
+  /// Only a fragmented payload feels it. Zero measures the link; the default
+  /// 20 ms measures the spacing, which at ten fragments is 180 ms of a
+  /// message's life. Per STEP rather than per plan so one run can carry both
+  /// and the difference is measured under the same conditions.
+  final int? fragmentDelayMs;
+
   const FieldStep({
     required this.label,
     required this.dwellSec,
@@ -201,13 +235,16 @@ class FieldStep {
     this.severLinks,
     this.perPairPacing = false,
     this.settle = false,
+    this.saturate = false,
+    this.sendLanes = 1,
+    this.fragmentDelayMs,
   });
 
   Map<String, dynamic> toJson() => {
         'label': label,
         'dwellSec': dwellSec,
         if (sendCount > 0) 'sendCount': sendCount,
-        if (sendCount > 0) 'sendBytes': sendBytes,
+        if (sendCount > 0 || saturate) 'sendBytes': sendBytes,
         if (autoAdvance) 'autoAdvance': autoAdvance,
         if (sendTo != 'all') 'sendTo': sendTo,
         if (bleOn != null) 'bleOn': bleOn,
@@ -220,6 +257,9 @@ class FieldStep {
         if (severLinks != null) 'severLinks': severLinks,
         if (perPairPacing) 'perPairPacing': perPairPacing,
         if (settle) 'settle': settle,
+        if (saturate) 'saturate': saturate,
+        if (saturate) 'sendLanes': sendLanes,
+        if (fragmentDelayMs != null) 'fragmentDelayMs': fragmentDelayMs,
       };
 
   factory FieldStep.fromJson(Map<String, dynamic> json) {
@@ -229,7 +269,8 @@ class FieldStep {
           'label', 'dwellSec', 'sendCount', 'sendBytes', 'autoAdvance',
           'sendTo', 'bleOn', 'cliqueN', 'maxParallelDials', 'resetSessions',
           'resetLinks', 'resetDtnBuffer', 'ringRadius', 'severLinks',
-          'perPairPacing', 'settle',
+          'perPairPacing', 'settle', 'saturate', 'sendLanes',
+          'fragmentDelayMs',
         },
         "step '${json['label'] ?? '?'}'");
     return FieldStep(
@@ -249,6 +290,9 @@ class FieldStep {
         severLinks: json['severLinks'] as bool?,
         perPairPacing: json['perPairPacing'] as bool? ?? false,
         settle: json['settle'] as bool? ?? false,
+        saturate: json['saturate'] as bool? ?? false,
+        sendLanes: json['sendLanes'] as int? ?? 1,
+        fragmentDelayMs: json['fragmentDelayMs'] as int?,
       );
   }
 
@@ -270,14 +314,18 @@ class FieldStep {
       other.ringRadius == ringRadius &&
       other.severLinks == severLinks &&
       other.perPairPacing == perPairPacing &&
-      other.settle == settle;
+      other.settle == settle &&
+      other.saturate == saturate &&
+      other.sendLanes == sendLanes &&
+      other.fragmentDelayMs == fragmentDelayMs;
 
   @override
   int get hashCode =>
       Object.hash(label, dwellSec, sendCount, sendBytes, autoAdvance,
           sendTo, bleOn, cliqueN,
           maxParallelDials, resetSessions, resetLinks, resetDtnBuffer,
-          ringRadius, severLinks, perPairPacing, settle);
+          ringRadius, severLinks, perPairPacing, settle, saturate,
+          sendLanes, fragmentDelayMs);
 }
 
 /// A scripted field experiment: the same plan is loaded on every device and
@@ -409,6 +457,42 @@ class FieldPlan {
   /// Minimum seconds between the start tap and the shared wall-clock anchor:
   /// the time to carry phones to their marks. The actual wait is this plus
   /// however long until the next 10-minute boundary.
+  /// DEBUG/TESTBED. Silence everything that is not payload for the whole run:
+  /// advertising, scanning, the periodic ANNOUNCE and its stale sweep, and the
+  /// DTN buffer, which retires a message as soon as it is aired instead of
+  /// holding it for an acknowledgement.
+  ///
+  /// This is what turns a throughput run into a measurement of the RADIO
+  /// rather than of the protocol around it. A one-way run without it came out
+  /// slower than the duplex run it was meant to beat, because with nothing
+  /// acknowledged the buffer grew to 8,700 packets and the sender spent more
+  /// managing it than the acknowledgements had cost.
+  ///
+  /// Links already up are untouched, but nothing can re-form one: a run that
+  /// loses its link is over.
+  final bool quietLink;
+
+  /// DEBUG/TESTBED. Deliver without acknowledging, for a one-directional
+  /// throughput measurement.
+  ///
+  /// Every acknowledgement is a packet back down the same radio, so a duplex
+  /// run reports duplex capacity. With this set the receiver takes delivery
+  /// and says nothing, and the only honest measure becomes the RECEIVER's own
+  /// arrival records — the sender's flow record will report zero acked, by
+  /// construction rather than by failure.
+  final bool suppressAcks;
+
+  /// Ask the radio for CONNECTION_PRIORITY_HIGH on every central leg for the
+  /// whole run, or leave the interval where it is (null).
+  ///
+  /// Applied at launch on every phone that loads the plan, not per step:
+  /// Android lets only the CENTRAL request an interval, and in a converged
+  /// pair each phone is central on one leg, so both must ask or only one
+  /// direction speeds up. Moving it mid-plan would blur the boundary between
+  /// the arm that has it and the arm that does not, which is why the
+  /// throughput experiment runs it as a separate launch.
+  final bool? connectionPriorityHigh;
+
   final int placementSec;
 
   /// Wall-clock alignment granularity for the manual-join anchor, seconds.
@@ -476,6 +560,20 @@ class FieldPlan {
   /// it.
   final int? drainSec;
 
+  /// Testbed override for the DTN buffer's byte cap.
+  ///
+  /// Carried in the PLAN so the trace records the bound the run was made
+  /// under: a buffer's behaviour is meaningless without knowing what it was
+  /// bounded by, and a value set out of band is invisible to anyone reading
+  /// the recording afterwards. Null leaves the store's own default.
+  final int? dtnMaxBytes;
+
+  /// Flush the trace buffer every this many percentage points of battery
+  /// drop. Null or zero leaves it OFF, which is what every run except a
+  /// discharge measurement wants: the flush lands a disk write inside a
+  /// measurement window, and the recorder is built so that never happens.
+  final int? flushEverySocDrop;
+
   /// DEBUG/TESTBED. Refuse to start unless this device already holds at least
   /// this many Noise sessions.
   ///
@@ -490,7 +588,73 @@ class FieldPlan {
   /// This is the guard that stops a half-warmed fleet silently starting a
   /// five-hour run whose non-neighbour messages could never be created at all.
   /// Zero (the default) disables it.
+  ///
+  /// A FLOOR and nothing else. How many phones a ring plan is built for is
+  /// [ringSize], which is a separate field precisely so this one keeps a
+  /// single meaning: a fleet size read off `this + 1` would ride on whatever a
+  /// preset happened to set here — absent entirely at zero, and wrong for any
+  /// plan using this as the floor it says it is.
   final int minSessionsToLaunch;
+
+  /// DEBUG/TESTBED. How many phones the ring plan was built for.
+  ///
+  /// [ringRosterFromSessions] lets the room decide WHICH phones are in the
+  /// ring; this declares HOW MANY the radii and the per-pair send counts were
+  /// chosen for. Declared rather than inferred because the two facts have
+  /// different sources: the fleet is whoever warmed up, the size is a number
+  /// the preset author chose and knows (`n`, where the preset is built).
+  ///
+  /// It is what lets the runner refuse a launch whose ring is not the one the
+  /// plan means — a table one short and the run is missing a node, one too long
+  /// and a stray warmed phone silently turns an N=4 run into N=5. That is a
+  /// cardinality test, which is all a phone can decide for itself; see
+  /// [ringRosterFromSessions] for the half it cannot.
+  ///
+  /// Required whenever [ringRosterFromSessions] is set, meaningless otherwise.
+  final int? ringSize;
+
+  /// Build the ring roster at launch from this device's Noise session table
+  /// (plus itself) instead of from [roster].
+  ///
+  /// The ring is defined by a list of pubkeys — sorted order IS ring order —
+  /// and every phone must derive the SAME list or the gate is incoherent: one
+  /// side thinks a pair is adjacent and dials, the other thinks it is two
+  /// hops away and refuses. That is why the list cannot be each node's local
+  /// view of who is nearby, and at r=1 it would also be circular, since the
+  /// gate's whole job is to stop a node seeing most of the fleet.
+  ///
+  /// A hand-maintained list satisfies "identical" but not "correct": on
+  /// 2026-09-01 the compiled roster named a phone that was not on the desk
+  /// and omitted the one that was, which cost the run — three usable phones,
+  /// and at N=3 every pair sits at ring distance 1, so r=1 is already the
+  /// complete graph and there is nothing to convey.
+  ///
+  /// The session table fixes exactly that, because it cannot name an absent
+  /// phone. Sessions are held in memory and never persisted, so the table can
+  /// only contain peers this process actually handshaked with; a Noise
+  /// session is pairwise, so if A holds one with B then B holds one with A;
+  /// and the operator warm-up precondition already requires every phone to
+  /// reach a full table before launch. Those three together make
+  /// `self + sessions` the same set on every phone, and that set is the
+  /// phones in the room.
+  ///
+  /// Frozen ONCE at launch, never re-derived: a session lost mid-run must not
+  /// reshape the ring under the gate.
+  ///
+  /// **A phone cannot check that the fleet agreed, and the runner does not
+  /// pretend to.** It knows its own session table and nothing about anyone
+  /// else's, so identical MEMBERSHIP is not locally decidable: with five phones
+  /// warmed, one holding {B,C,D} and another {A,C,E} derive different four-node
+  /// rings, and neither table shows the difference. What is locally decidable
+  /// is the SIZE, against [ringSize], and that is exactly as much as the launch
+  /// guard claims.
+  ///
+  /// Membership is made DETECTABLE instead: the derived ring and an 8-hex
+  /// fingerprint over the full pubkeys ride on EVERY marker, so the operator
+  /// compares one short token across the phones still in their hands at launch,
+  /// and the analysis proves agreement afterwards (one distinct `ringFp` per
+  /// run) rather than assuming it.
+  final bool ringRosterFromSessions;
 
   const FieldPlan({
     required this.expId,
@@ -504,6 +668,9 @@ class FieldPlan {
     this.joinGapSec = 0,
     this.walkBudgetSec = 0,
     this.manualJoin = false,
+    this.connectionPriorityHigh,
+    this.suppressAcks = false,
+    this.quietLink = false,
     this.placementSec = 300,
     this.alignSec = 600,
     this.scriptedRadio = false,
@@ -511,7 +678,11 @@ class FieldPlan {
     this.stackResetPerPosition = false,
     this.severLinks = false,
     this.drainSec,
+    this.dtnMaxBytes,
+    this.flushEverySocDrop,
     this.minSessionsToLaunch = 0,
+    this.ringRosterFromSessions = false,
+    this.ringSize,
   });
 
   /// Resolve a role-free diluting plan for THIS device: every step carrying
@@ -558,6 +729,9 @@ class FieldPlan {
                   severLinks: s.severLinks,
                   perPairPacing: s.perPairPacing,
                   settle: s.settle,
+                  saturate: s.saturate,
+                  sendLanes: s.sendLanes,
+                  fragmentDelayMs: s.fragmentDelayMs,
                 ),
       ],
       roster: roster,
@@ -576,7 +750,14 @@ class FieldPlan {
       stackResetPerPosition: stackResetPerPosition,
       severLinks: severLinks,
       drainSec: drainSec,
+      dtnMaxBytes: dtnMaxBytes,
+      flushEverySocDrop: flushEverySocDrop,
       minSessionsToLaunch: minSessionsToLaunch,
+      ringRosterFromSessions: ringRosterFromSessions,
+      ringSize: ringSize,
+      connectionPriorityHigh: connectionPriorityHigh,
+      suppressAcks: suppressAcks,
+      quietLink: quietLink,
     );
   }
 
@@ -600,8 +781,17 @@ class FieldPlan {
         if (stackResetPerPosition) 'stackResetPerPosition': true,
         if (severLinks) 'severLinks': severLinks,
         if (drainSec != null) 'drainSec': drainSec,
+        if (dtnMaxBytes != null) 'dtnMaxBytes': dtnMaxBytes,
+        if (flushEverySocDrop != null)
+          'flushEverySocDrop': flushEverySocDrop,
         if (minSessionsToLaunch > 0)
           'minSessionsToLaunch': minSessionsToLaunch,
+        if (ringRosterFromSessions) 'ringRosterFromSessions': true,
+        if (ringSize != null) 'ringSize': ringSize,
+        if (connectionPriorityHigh != null)
+          'connectionPriorityHigh': connectionPriorityHigh,
+        if (suppressAcks) 'suppressAcks': true,
+        if (quietLink) 'quietLink': true,
       };
 
   factory FieldPlan.fromJson(Map<String, dynamic> json) {
@@ -613,9 +803,22 @@ class FieldPlan {
           'resetBudgetSec', 'joinGapSec', 'walkBudgetSec',
           'manualJoin', 'placementSec', 'alignSec', 'scriptedRadio',
           'traceEveryAdvertisement', 'stackResetPerPosition', 'severLinks',
-          'minSessionsToLaunch', 'drainSec',
+          'minSessionsToLaunch', 'ringRosterFromSessions', 'ringSize',
+          'connectionPriorityHigh', 'suppressAcks', 'quietLink',
+          'drainSec',
+          'dtnMaxBytes',
+          'flushEverySocDrop',
         },
         'plan');
+    // A plan that derives its ring but declares no size is not a smaller
+    // check, it is no check: nothing then compares the derived ring against
+    // the fleet the plan was built for. Refuse it at the parse, which is where
+    // a hand-pasted plan enters.
+    if ((json['ringRosterFromSessions'] as bool? ?? false) &&
+        json['ringSize'] == null) {
+      throw const FormatException(
+          "a plan with 'ringRosterFromSessions' must declare 'ringSize'");
+    }
     return FieldPlan(
         expId: json['expId'] as String,
         steps: (json['steps'] as List<dynamic>)
@@ -643,7 +846,15 @@ class FieldPlan {
             json['stackResetPerPosition'] as bool? ?? false,
         severLinks: json['severLinks'] as bool? ?? false,
         drainSec: json['drainSec'] as int?,
+        dtnMaxBytes: json['dtnMaxBytes'] as int?,
+        flushEverySocDrop: json['flushEverySocDrop'] as int?,
         minSessionsToLaunch: json['minSessionsToLaunch'] as int? ?? 0,
+        ringRosterFromSessions:
+            json['ringRosterFromSessions'] as bool? ?? false,
+        ringSize: json['ringSize'] as int?,
+        connectionPriorityHigh: json['connectionPriorityHigh'] as bool?,
+        suppressAcks: json['suppressAcks'] as bool? ?? false,
+        quietLink: json['quietLink'] as bool? ?? false,
       );
   }
 
@@ -668,13 +879,23 @@ class FieldPlan {
       other.stackResetPerPosition == stackResetPerPosition &&
       other.severLinks == severLinks &&
       other.drainSec == drainSec &&
-      other.minSessionsToLaunch == minSessionsToLaunch;
+      other.dtnMaxBytes == dtnMaxBytes &&
+      other.flushEverySocDrop == flushEverySocDrop &&
+      other.minSessionsToLaunch == minSessionsToLaunch &&
+      other.ringRosterFromSessions == ringRosterFromSessions &&
+      other.ringSize == ringSize;
 
+  // hashAll rather than hash: the plan has more fields than Object.hash takes
+  // positionally, and a field left out of the digest is one that two unequal
+  // plans can collide on.
   @override
-  int get hashCode => Object.hash(expId, Object.hashAll(steps),
-      Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
-      resetDtnBuffer, resetBudgetSec, joinGapSec, walkBudgetSec,
-      manualJoin, placementSec, alignSec, scriptedRadio,
-      traceEveryAdvertisement, stackResetPerPosition, severLinks,
-      minSessionsToLaunch, drainSec);
+  int get hashCode => Object.hashAll([
+        expId, Object.hashAll(steps),
+        Object.hashAll(roster), resetSessions, resetLinks, linkResetDarkSec,
+        resetDtnBuffer, resetBudgetSec, joinGapSec, walkBudgetSec,
+        manualJoin, placementSec, alignSec, scriptedRadio,
+        traceEveryAdvertisement, stackResetPerPosition, severLinks,
+        minSessionsToLaunch, ringRosterFromSessions, ringSize, drainSec,
+        dtnMaxBytes, flushEverySocDrop,
+      ]);
 }

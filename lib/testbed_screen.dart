@@ -15,6 +15,25 @@ import 'src/testbed/testbed_config.dart';
 import 'src/trace/experiment_recorder.dart';
 import 'src/trace/trace_config.dart';
 
+/// One half of the ring sweep, as its own run.
+///
+/// The five sweeps do not fit in one sitting: the four Nexus 5X drain
+/// 18-25%/h and reach 48 C inside half an hour, so a single 3h36 run empties
+/// them and leaves the late trials measuring a throttled radio. Splitting on
+/// WHOLE sweeps is what keeps the design intact — every sweep still visits
+/// every radius, so neither half is a blocked design, and the units get a
+/// charge and a cool in between.
+///
+/// The halves carry different seeds, which gives them different experiment
+/// ids as well as independent radius orders. Sharing an id would pool them in
+/// one database and force a split on a timestamp afterwards.
+FieldPlan ringSweepSession({required int session, required int n}) =>
+    FieldPlanPresets.ringSweep(
+      n: n,
+      sweeps: session == 1 ? 3 : 2,
+      seed: session == 1 ? 20260901 : 20260902,
+    );
+
 /// DEBUG/TESTBED ONLY screen for the evaluation in
 /// `docs/testbed_experiments.md`: experiment recording and the scripted
 /// field runner. Inert in production.
@@ -64,6 +83,9 @@ class TestbedScreen extends StatefulWidget {
   final bool Function()? bleUsable;
   final bool Function()? bleUndiscoverable;
 
+  /// BLE legs held ready now, for the runner screen's readout.
+  final int Function()? legsReady;
+
   /// BLE-usability transitions, delivered at the state change itself — the
   /// runner's bt-on/bt-off stamps come from this, never from a poll.
   final Stream<bool>? bleUsableChanges;
@@ -77,12 +99,31 @@ class TestbedScreen extends StatefulWidget {
   final Stream<Uint8List>? sessionEvents;
   final Stream<Uint8List>? linkSettledEvents;
 
+  /// Message ids whose end-to-end ACK came home — the throughput runner's
+  /// carried-load counter.
+  final Stream<String>? ackEvents;
+
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
 
   /// Record every advertisement sighting (see
   /// FieldPlan.traceEveryAdvertisement).
   final void Function(bool every)? onSetTraceEveryAdvertisement;
+
+  /// Raise or drop the BLE connection interval (see FieldRunner).
+  final void Function(bool high)? onSetConnectionPriority;
+
+  /// Set the fragment spacing for a step (null restores production).
+  final void Function(int? ms)? onSetFragmentDelay;
+
+  /// Deliver without acknowledging, for a one-directional run.
+  final void Function(bool on)? onSetSuppressAcks;
+
+  /// Silence everything that is not payload for the run.
+  final Future<void> Function(bool on)? onSetQuietLink;
+
+  /// Suspend eviction of quiet peers for the whole run.
+  final void Function(bool on)? onSetStaleSweepSuspended;
   final int Function()? establishmentCount;
   final VoidCallback? onResetEstablishmentCount;
 
@@ -90,8 +131,18 @@ class TestbedScreen extends StatefulWidget {
   /// DEBUG/TESTBED. Peers this phone holds a session with.
   final int Function()? sessionPeerCount;
 
+  /// Distinct peers holding a ready link, stamped on every step marker
+  /// as `links` beside `sessions`.
+  final int Function()? linkPeerCount;
+
+  /// Applies [FieldPlan.dtnMaxBytes] when a plan starts.
+  final void Function(int bytes)? onSetDtnMaxBytes;
+
   /// Sessions in the Noise table (see FieldRunner.sessionTableCount).
   final int Function()? sessionTableCount;
+
+  /// Who those sessions are with (see FieldRunner.sessionPeerHexes).
+  final Iterable<String> Function()? sessionPeerHexes;
 
   const TestbedScreen({
     super.key,
@@ -108,6 +159,7 @@ class TestbedScreen extends StatefulWidget {
     this.onCryptoBench,
     this.bleUsable,
     this.bleUndiscoverable,
+    this.legsReady,
     this.bleUsableChanges,
     this.onSetBle,
     this.linkSettled,
@@ -116,12 +168,21 @@ class TestbedScreen extends StatefulWidget {
     this.refreshSystemBt,
     this.sessionEvents,
     this.linkSettledEvents,
+    this.ackEvents,
     this.onSetDialParallelism,
     this.onSetTraceEveryAdvertisement,
+    this.onSetConnectionPriority,
+    this.onSetFragmentDelay,
+    this.onSetSuppressAcks,
+    this.onSetQuietLink,
+    this.onSetStaleSweepSuspended,
     this.establishmentCount,
     this.onResetEstablishmentCount,
     this.sessionPeerCount,
+    this.linkPeerCount,
+    this.onSetDtnMaxBytes,
     this.sessionTableCount,
+    this.sessionPeerHexes,
   });
 
   @override
@@ -254,6 +315,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
     _markerController.dispose();
     _planController.dispose();
     _sweepStepController.dispose();
+    _ringPhonesController.dispose();
     _sweepDwellController.dispose();
     _sweepSendsController.dispose();
     _sweepReceiverController.dispose();
@@ -353,7 +415,10 @@ class _TestbedScreenState extends State<TestbedScreen> {
       // the marker. The hook existed but was never handed to the runner —
       // the home preflight's markers all read sessions:null.
       sessionPeerCount: widget.sessionPeerCount,
+      linkPeerCount: widget.linkPeerCount,
+      onSetDtnMaxBytes: widget.onSetDtnMaxBytes,
       sessionTableCount: widget.sessionTableCount,
+      sessionPeerHexes: widget.sessionPeerHexes,
       myPubkeyHex: widget.myPubkeyHex,
       myNickname: widget.myNickname,
       send: widget.sendMessage,
@@ -365,6 +430,7 @@ class _TestbedScreenState extends State<TestbedScreen> {
       onSetBle: widget.onSetBle,
       bleUsable: widget.bleUsable,
       bleUndiscoverable: widget.bleUndiscoverable,
+      legsReady: widget.legsReady,
       bleUsableChanges: widget.bleUsableChanges,
       linkSettled: widget.linkSettled,
       sessionUp: widget.sessionUp,
@@ -372,8 +438,14 @@ class _TestbedScreenState extends State<TestbedScreen> {
       refreshSystemBt: widget.refreshSystemBt,
       sessionEvents: widget.sessionEvents,
       linkSettledEvents: widget.linkSettledEvents,
+      ackEvents: widget.ackEvents,
       onSetDialParallelism: widget.onSetDialParallelism,
       onSetTraceEveryAdvertisement: widget.onSetTraceEveryAdvertisement,
+      onSetConnectionPriority: widget.onSetConnectionPriority,
+      onSetFragmentDelay: widget.onSetFragmentDelay,
+      onSetSuppressAcks: widget.onSetSuppressAcks,
+      onSetQuietLink: widget.onSetQuietLink,
+      onSetStaleSweepSuspended: widget.onSetStaleSweepSuspended,
       establishmentCount: widget.establishmentCount,
       onResetEstablishmentCount: widget.onResetEstablishmentCount,
       // Rosterless plans target every peer a message can be addressed to —
@@ -697,6 +769,16 @@ class _TestbedScreenState extends State<TestbedScreen> {
                 _applySweep();
               } else if (name == FieldPlanPresets.dilutingSmokePresetName) {
                 _applyDilute();
+              } else if (_isRingPreset(name)) {
+                // Each ring preset opens at the size of the ROOM, and falls
+                // back to the size it was designed for only when the room
+                // cannot say. The field then overrides either by hand.
+                final designed = name == FieldPlanPresets.ringSweepPresetName
+                    ? FieldPlanPresets.ringSweep().ringSize!
+                    : FieldPlanPresets.ringSmokeDesk().ringSize!;
+                _ringPhones = _phonesInTheRoom() ?? designed;
+                _ringPhonesController.text = '$_ringPhones';
+                _applyRing();
               } else {
                 _setPlan(FieldPlanPresets.presets[name]!);
               }
@@ -704,6 +786,54 @@ class _TestbedScreenState extends State<TestbedScreen> {
           ),
         ),
       ]),
+      if (_isRingPreset(_selectedPreset)) ...[
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: TextField(
+              controller: _ringPhonesController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                border: OutlineInputBorder(),
+                isDense: true,
+                labelText: 'Phones',
+              ),
+              onChanged: (text) {
+                // The ring is whoever is in the room, and this is the one
+                // thing the room cannot say. Below four there is no ring —
+                // every pair is adjacent — so a half-typed or too-small
+                // number keeps the last plan rather than building one the
+                // launch guard would refuse.
+                final n = int.tryParse(text.trim());
+                if (n == null || n < 4) return;
+                setState(() => _ringPhones = n);
+                _applyRing();
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '${_ringPlan.steps.where((s) => s.sendCount > 0).length} trials '
+              '· ${_planDuration(_ringPlan)}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ]),
+        if (_selectedPreset == FieldPlanPresets.ringSweepPresetName) ...[
+          const SizedBox(height: 8),
+          _sweepPicker(
+            label: 'Sweep session',
+            value: _ringSession,
+            options: const [1, 2],
+            suffix: ' of 2',
+            onPick: (v) {
+              setState(() => _ringSession = v);
+              _applyRing();
+            },
+          ),
+        ],
+      ],
       if (_selectedPreset == FieldPlanPresets.dilutingSmokePresetName) ...[
         const SizedBox(height: 8),
         Row(children: [
@@ -904,6 +1034,48 @@ class _TestbedScreenState extends State<TestbedScreen> {
   FieldPlan get _dilutePlan => FieldPlanPresets.dilutingSmoke(reps: _diluteReps);
 
   void _applyDilute() => _setPlan(_dilutePlan);
+
+  /// How many phones the ring presets are built for. The plan declares this
+  /// and nothing else about the fleet: the launch guard compares it with the
+  /// session table, and the radii and per-pair counts are derived from it.
+  int _ringPhones = 4;
+
+  /// Which half of the split sweep this run is. See [ringSweepSession].
+  int _ringSession = 1;
+  late final TextEditingController _ringPhonesController =
+      TextEditingController(text: '$_ringPhones');
+
+  /// How many phones are warmed up with this one, itself included — the ring
+  /// the room would actually form.
+  ///
+  /// A Noise session is pairwise and is never persisted, so this device's
+  /// table can only name phones it really handshaked with, and the warm-up
+  /// precondition is that every phone reaches a full table before launch.
+  /// `self + sessions` is therefore the fleet, and it is what a ring plan
+  /// should be built for — a size compiled into the preset is how a ten-phone
+  /// room got a plan built for eleven.
+  ///
+  /// Null when the room cannot say: no session callback, or a table too small
+  /// to be a ring at all (below four every pair is adjacent, and the launch
+  /// guard would refuse such a plan anyway). The caller then falls back to the
+  /// preset's own size, which the operator can still override by hand.
+  int? _phonesInTheRoom() {
+    final peers = widget.sessionPeerHexes?.call();
+    if (peers == null) return null;
+    final n = peers.toSet().length + 1;
+    return n < 4 ? null : n;
+  }
+
+  static bool _isRingPreset(String? name) =>
+      name == FieldPlanPresets.ringSmokePresetName ||
+      name == FieldPlanPresets.ringSweepPresetName;
+
+  FieldPlan get _ringPlan =>
+      _selectedPreset == FieldPlanPresets.ringSweepPresetName
+          ? ringSweepSession(session: _ringSession, n: _ringPhones)
+          : FieldPlanPresets.ringSmokeDesk(n: _ringPhones);
+
+  void _applyRing() => _setPlan(_ringPlan);
 
   FieldPlan get _sweepPlan => FieldPlanPresets.lineSweepUpTo(
         startDistance: _sweepStartDistance,

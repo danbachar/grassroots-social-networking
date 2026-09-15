@@ -56,6 +56,8 @@ void main() {
     Store<AppState> store, {
     void Function(Uint8List peer)? onResetSessionWith,
     VoidCallback? onResetSessions,
+    void Function(Uint8List peer)? onIgnorePeer,
+    void Function(String pubkeyHex)? onUnignorePeer,
   }) async {
     // A tall surface so the whole ListView is laid out and no assertion
     // depends on scroll position.
@@ -69,6 +71,8 @@ void main() {
         store: store,
         onResetSessionWith: onResetSessionWith,
         onResetSessions: onResetSessions,
+        onIgnorePeer: onIgnorePeer,
+        onUnignorePeer: onUnignorePeer,
       ),
     ));
     await tester.pump();
@@ -153,6 +157,36 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(cleared, 1);
+  });
+
+  testWidgets('a session row can ignore its phone, no confirmation',
+      (tester) async {
+    // Ignoring is in memory only and is undone from the ignored-phones panel,
+    // so unlike a session drop it does not need a confirmation.
+    final ignored = <Uint8List>[];
+    await pumpSettings(tester, storeWithSweptPeer(), onIgnorePeer: ignored.add);
+
+    await tester.tap(find.byTooltip('Ignore this phone').first);
+    await tester.pumpAndSettle();
+
+    expect(ignored, hasLength(1));
+    expect(ignored.single, equals(swept));
+  });
+
+  testWidgets('ignored phones are listed and can be un-ignored',
+      (tester) async {
+    final store = storeWithSweptPeer();
+    store.dispatch(IgnorePeerAction(hexOf(known)));
+    final lifted = <String>[];
+    await pumpSettings(tester, store, onUnignorePeer: lifted.add);
+
+    expect(find.text('Ignored phones (debug)'), findsOneWidget);
+    expect(find.textContaining(hexOf(known).substring(0, 8)), findsWidgets);
+
+    await tester.tap(find.text('Stop ignoring'));
+    await tester.pumpAndSettle();
+
+    expect(lifted, [hexOf(known)]);
   });
 
   testWidgets('an empty session table says nothing can be messaged',

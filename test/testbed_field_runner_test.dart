@@ -155,6 +155,10 @@ void main() {
     });
   });
 
+  String hexOf(int base) =>
+      List.generate(32, (i) => ((base + i) & 0xff).toRadixString(16).padLeft(2, '0'))
+          .join();
+
   group('operator stack-reset verification', () {
     FieldPlan resetPlan() => FieldPlan(
           expId: 'reset-ui-1',
@@ -246,6 +250,46 @@ void main() {
   });
 
   group('the walk window names the place being walked to', () {
+    test('the connection interval is raised for a settle and handed back',
+        () {
+      // A settle exists to let newly permitted links FORM, and establishment
+      // is a chain of round trips priced one connection interval each. The
+      // fast interval is worth its controller cost there and not for the
+      // traffic afterwards, so the run asks for it and gives it back.
+      fakeAsync((async) {
+        final priority = <bool>[];
+        var clock = 1700000000000;
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          myNickname: '1',
+          nowMs: () => clock,
+          onSetConnectionPriority: priority.add,
+        );
+        runner.start(const FieldPlan(
+          expId: 'settle-priority',
+          manualJoin: true,
+          placementSec: 60,
+          alignSec: 60,
+          steps: [
+            FieldStep(label: 'settle 1', dwellSec: 10, settle: true),
+            FieldStep(label: 'r=2 t1', dwellSec: 10, autoAdvance: true),
+          ],
+        ));
+        async.flushMicrotasks();
+        for (var i = 0; i < 400 && runner.isRunning; i++) {
+          clock += 1000;
+          async.elapse(const Duration(seconds: 1));
+          async.flushMicrotasks();
+        }
+        expect(priority.first, isTrue, reason: 'the settle step raises it');
+        expect(priority.skip(1), contains(false),
+            reason: 'the step after the settle hands it back');
+        expect(priority.last, isFalse,
+            reason: 'a run must not leave the fleet at the fast interval');
+        runner.dispose();
+      });
+    });
+
     FieldPlan sweep() => FieldPlan(
           expId: 'walk-1',
           manualJoin: true,
@@ -403,13 +447,26 @@ void main() {
         final runner = FieldRunner(
           recorder: recorder,
           myNickname: '1',
-          // A warmed mesh. The ring presets set minSessionsToLaunch: under the
-          // ring gate a non-neighbour can never handshake, so every pair must
-          // already hold a session before the topology is constrained, and the
-          // operator brings the fleet there before launching. Reporting a full
-          // session table is what "warmed up" looks like to the runner —
-          // without it the ring presets correctly refuse to start.
-          sessionTableCount: () => 64,
+          // A warmed mesh. Under the ring gate a non-neighbour can never
+          // handshake, so every pair must already hold a session before the
+          // topology is constrained, and the operator brings the fleet there
+          // before launching. Reporting a full session table is what "warmed
+          // up" looks like to the runner — without it the ring presets
+          // correctly refuse to start.
+          sessionTableCount: () =>
+              entry.value.minSessionsToLaunch > 0
+                  ? entry.value.minSessionsToLaunch
+                  : 64,
+          // ...and WHO those sessions are with. The ring presets derive their
+          // ring from this (FieldPlan.ringRosterFromSessions) and require it to
+          // describe EXACTLY the fleet the plan declares in ringSize — a table
+          // one short means the phones would build different rings, and one too
+          // long silently changes N. So the warmed mesh has to be sized to the
+          // preset rather than to a convenient constant.
+          myPubkeyHex: hexOf(0),
+          sessionPeerHexes: () => [
+                for (var i = 1; i < (entry.value.ringSize ?? 1); i++) hexOf(i),
+              ],
         );
         runner.start(entry.value);
         async.flushMicrotasks();
@@ -418,6 +475,78 @@ void main() {
         runner.dispose();
       });
     }
+  });
+
+  group('the connection interval follows the ring plans', () {
+    /// Drive [plan] to the end and return the priority calls it made, in
+    /// order. Wall-clock anchored, so the injected clock moves with the
+    /// virtual one.
+    List<bool> priorityCallsFor(FakeAsync async, FieldPlan plan) {
+      final calls = <bool>[];
+      var clock = 1700000000000;
+      final runner = FieldRunner(
+        recorder: _FakeRecorder(),
+        myNickname: '1',
+        nowMs: () => clock,
+        myPubkeyHex: hexOf(0),
+        sessionPeerHexes: () => [
+              for (var i = 1; i < (plan.ringSize ?? 1); i++) hexOf(i),
+            ],
+        onSetConnectionPriority: calls.add,
+      );
+      runner.start(plan);
+      async.flushMicrotasks();
+      expect(runner.isRunning, isTrue, reason: runner.abortReason ?? '');
+      for (var i = 0; i < 40000 && runner.isRunning; i++) {
+        clock += 1000;
+        async.elapse(const Duration(seconds: 1));
+        async.flushMicrotasks();
+      }
+      runner.dispose();
+      return calls;
+    }
+
+    /// The first call per step matches that step's settle flag, in order, and
+    /// nothing after the last step ever raises the interval again.
+    void expectFollowsSteps(List<bool> calls, FieldPlan plan) {
+      expect(calls.length, greaterThanOrEqualTo(plan.steps.length));
+      expect(calls.take(plan.steps.length),
+          [for (final s in plan.steps) s.settle],
+          reason: 'each step must ask for the interval its own settle flag '
+              'implies, in order');
+      // The tail is the trailing reset and the end-of-run hand-back. They may
+      // repeat — asking twice for the interval already held costs nothing —
+      // but not one of them may raise it.
+      expect(calls.skip(plan.steps.length), everyElement(isFalse),
+          reason: 'nothing after the last step may raise the interval');
+      expect(calls.last, isFalse,
+          reason: 'a run must not leave the fleet at the fast interval');
+      expect(calls.where((c) => c).length,
+          plan.steps.where((s) => s.settle).length,
+          reason: 'the interval is raised once per settle and never else');
+    }
+
+    test('the desk smoke raises it only for its settle', () {
+      fakeAsync((async) {
+        final plan = FieldPlanPresets.ringSmokeDesk();
+        expect(plan.steps.where((s) => s.settle), isNotEmpty,
+            reason: 'a widening ring plan must carry a settle to test');
+        expectFollowsSteps(priorityCallsFor(async, plan), plan);
+      });
+    });
+
+    test('the radius sweep raises it for every settle it inserts', () {
+      fakeAsync((async) {
+        // The real builder and the real settle-placement rule — a settle is
+        // inserted wherever the radius WIDENS — at one sweep rather than ten,
+        // so the whole plan fits a test. The repeat count is the only thing
+        // reduced; the step shapes are the field plan's.
+        final plan = FieldPlanPresets.ringSweep(n: 10, sweeps: 1);
+        final settles = plan.steps.where((s) => s.settle).length;
+        expect(settles, greaterThan(0));
+        expectFollowsSteps(priorityCallsFor(async, plan), plan);
+      });
+    });
   });
 
   test('start is a no-op on an empty plan', () {
@@ -439,10 +568,6 @@ void main() {
 
   // ===== Per-step sends + session reset =====
 
-  String hexOf(int base) =>
-      List.generate(32, (i) => ((base + i) & 0xff).toRadixString(16).padLeft(2, '0'))
-          .join();
-
   FieldPlan sendPlan({bool resetSessions = true}) => FieldPlan(
         expId: 'cp',
         resetSessions: resetSessions,
@@ -455,6 +580,315 @@ void main() {
         ],
       );
 
+
+  FieldPlan saturatePlan({int lanes = 1, int dwellSec = 10}) => FieldPlan(
+        expId: 'tp',
+        resetSessions: false,
+        // Wall-clock lattice: start() refuses anything else.
+        manualJoin: true,
+        placementSec: 5,
+        alignSec: 5,
+        roster: [
+          WorkloadRosterEntry(label: 'A', pubkeyHex: hexOf(0)),
+          WorkloadRosterEntry(label: 'B', pubkeyHex: hexOf(100)),
+        ],
+        steps: [
+          FieldStep(
+              label: 'p=138B lanes=$lanes t1',
+              dwellSec: dwellSec,
+              sendBytes: 138,
+              saturate: true,
+              sendLanes: lanes),
+        ],
+      );
+
+  group('a quiet run always gives the radio back', () {
+    // A phone left quiet cannot find anyone again — advertising and scanning
+    // are off, so nothing rediscovers it — and the only recovery is
+    // restarting the app. An operator away from the bench cannot do that, so
+    // no exit path may leave a phone in that state.
+    FieldPlan quietPlan() => FieldPlan(
+          expId: 'q',
+          resetSessions: false,
+          manualJoin: true,
+          // A lattice long enough that "before the dwell" is unambiguous.
+          placementSec: 30,
+          alignSec: 30,
+          quietLink: true,
+          suppressAcks: true,
+          roster: [
+            WorkloadRosterEntry(label: 'A', pubkeyHex: hexOf(0)),
+            WorkloadRosterEntry(label: 'B', pubkeyHex: hexOf(100)),
+          ],
+          steps: const [FieldStep(label: 'p=1380B lanes=1 pace=0 oneway t1',
+              dwellSec: 3, sendBytes: 1380, saturate: true, fragmentDelayMs: 0)],
+        );
+
+    test('the stale sweep is suspended for the WHOLE run, not per dwell', () {
+      // The sweep evicts a peer unheard for ten announce intervals (~100 s),
+      // and a quiet cycle is a 60 s silent dwell plus a 30 s drain — ten
+      // seconds of margin. On the sender nothing refreshes the clock at all
+      // during a dwell, since ANNOUNCE is off and acknowledgements are
+      // suppressed. Suspending it only while quiet leaves the eviction to
+      // land in the drain, which is exactly what killed a run: both phones
+      // opened at two legs and were at zero by the fourth step.
+      fakeAsync((async) {
+        final sweep = <bool>[];
+        final quiet = <bool>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+            return messageId;
+          },
+          onSetQuietLink: (on) async => quiet.add(on),
+          onSetStaleSweepSuspended: sweep.add,
+        );
+        runner.start(quietPlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+
+        // Suspended from launch, before anything is silenced.
+        async.elapse(const Duration(seconds: 20));
+        expect(sweep, [true]);
+        expect(quiet, isEmpty, reason: 'the radio is still talking');
+
+        // It stays suspended through the dwell AND the drain that follows.
+        async.elapse(const Duration(seconds: 120));
+        expect(quiet, containsAllInOrder([true, false]),
+            reason: 'silencing is per dwell');
+        expect(sweep.last, isFalse, reason: 'and released when the run ends');
+        expect(sweep.where((s) => s).length, 1,
+            reason: 'suspended once for the run, not once per dwell');
+        runner.dispose();
+      });
+    });
+
+    test('quiet covers the measurement only, not the lattice before it', () {
+      // ANNOUNCE is what keeps a leg alive between steps: it is the inbound
+      // traffic the liveness veto reads, and its timer carries the stale
+      // sweep. Silencing it from launch means two minutes of placement and
+      // alignment with nothing holding the link up — which is how the first
+      // quiet run arrived at its opening frame already down to one leg.
+      fakeAsync((async) {
+        final quiet = <bool>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+            return messageId;
+          },
+          onSetQuietLink: (on) async => quiet.add(on),
+        );
+        runner.start(quietPlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+
+        // Through placement and alignment the radio is still talking.
+        async.elapse(const Duration(seconds: 20));
+        expect(quiet, isEmpty,
+            reason: 'nothing is silenced before the dwell opens');
+
+        // The dwell silences it, and the dwell ending gives it back.
+        async.elapse(const Duration(seconds: 120));
+        expect(quiet.first, isTrue);
+        expect(quiet.last, isFalse);
+        runner.dispose();
+      });
+    });
+
+    for (final exit in ['natural end', 'end now', 'abort']) {
+      test('$exit restores discovery', () {
+        fakeAsync((async) {
+          final quiet = <bool>[];
+          final runner = FieldRunner(
+            recorder: _FakeRecorder(),
+            myPubkeyHex: hexOf(0),
+            send: (r, p, {String? messageId}) async {
+              await Future<void>.delayed(const Duration(milliseconds: 100));
+              return messageId;
+            },
+            onSetQuietLink: (on) async => quiet.add(on),
+          );
+          runner.start(quietPlan());
+          async.flushMicrotasks();
+          runner.inPosition();
+          async.elapse(const Duration(seconds: 70));
+          expect(quiet, isNotEmpty, reason: 'the run went quiet');
+
+          switch (exit) {
+            case 'end now':
+              unawaited(runner.forceFinish());
+            case 'abort':
+              unawaited(runner.abort());
+            default:
+              break; // let it run out
+          }
+          async.elapse(const Duration(seconds: 60));
+
+          expect(quiet.last, isFalse,
+              reason: 'the radio must be handed back on $exit');
+          runner.dispose();
+        });
+      });
+    }
+  });
+
+  group('saturating throughput mode', () {
+    test('a plan asking for the high interval holds it for every step', () {
+      // The interval is an ARM of the throughput experiment, not a phase of
+      // it: one launch runs with it, one without. Flipping per step would
+      // blur the comparison the run exists to make.
+      fakeAsync((async) {
+        final priorities = <bool>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+            return messageId;
+          },
+          onSetConnectionPriority: priorities.add,
+        );
+        final base = saturatePlan(dwellSec: 3);
+        runner.start(FieldPlan(
+          expId: base.expId,
+          steps: base.steps,
+          roster: base.roster,
+          resetSessions: false,
+          manualJoin: true,
+          placementSec: 5,
+          alignSec: 5,
+          connectionPriorityHigh: true,
+        ));
+        async.flushMicrotasks();
+        runner.inPosition();
+        // Generously past the whole run (5 s placement + 5 s align + 3 s
+        // dwell). The assertion below counts the end-of-run restore, so the
+        // run MUST have finished — at 20 s it occasionally had not, and the
+        // test failed on its own timing rather than on the behaviour.
+        async.elapse(const Duration(seconds: 60));
+
+        expect(priorities, isNotEmpty);
+        // Exactly one hand-back, and it is the run's own end. A false
+        // anywhere else would be a step inheriting the ring sweep's
+        // settle-based rule and splitting the arm in two.
+        expect(priorities.where((p) => !p), hasLength(1),
+            reason: 'no step may hand the interval back mid-arm');
+        expect(priorities.last, isFalse,
+            reason: 'the run restores the production interval when it ends');
+        runner.dispose();
+      });
+    });
+
+    test('one lane fires again only when the awaited send resolves', () {
+      // The whole instrument rests on this. If the loop did not await, it
+      // would spin at the event loop's rate and measure the runner; awaiting
+      // makes it run at exactly the rate the send path drains, which is the
+      // link.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var started = 0;
+        final gates = <Completer<void>>[];
+        final runner = FieldRunner(
+          recorder: recorder,
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async {
+            started++;
+            final gate = Completer<void>();
+            gates.add(gate);
+            await gate.future;
+            return messageId;
+          },
+        );
+        runner.start(saturatePlan());
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 12)); // past placement + align
+
+        expect(started, 1, reason: 'one lane, one send in flight');
+        async.elapse(const Duration(seconds: 2));
+        expect(started, 1, reason: 'the lane is blocked on its own send');
+
+        gates.first.complete();
+        async.elapse(const Duration(milliseconds: 10));
+        expect(started, 2, reason: 'the pipe drained, so the lane fires again');
+        runner.dispose();
+      });
+    });
+
+    test('two lanes hold two sends outstanding', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var started = 0;
+        final runner = FieldRunner(
+          recorder: recorder,
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async {
+            started++;
+            await Completer<void>().future; // never resolves
+            return messageId;
+          },
+        );
+        runner.start(saturatePlan(lanes: 2));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 12)); // past placement + align
+
+        expect(started, 2,
+            reason: 'two lanes put two messages in the send path at once');
+        runner.dispose();
+      });
+    });
+
+    test('the flow record brackets the push with start and stop', () {
+      // The analyzer measures the throughput window from `start` to `stop`.
+      // Without the start it can only fall back to the step marker, which
+      // includes the wait for the link to settle and understates the rate.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          myPubkeyHex: hexOf(0),
+          // A send that costs virtual time. An instantly-resolving one turns
+          // the lane into a loop that re-arms at the same virtual instant,
+          // which fakeAsync runs forever.
+          send: (r, p, {String? messageId}) async {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+            return messageId;
+          },
+        );
+        runner.start(saturatePlan(dwellSec: 5));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 30));
+
+        expect(recorder.events, contains('log:flow:start'));
+        expect(recorder.events, contains('log:flow:stop'));
+        runner.dispose();
+      });
+    });
+
+    test('a step that does not saturate logs no flow record', () {
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          myPubkeyHex: hexOf(0),
+          send: (r, p, {String? messageId}) async => messageId,
+        );
+        runner.start(sendPlan(resetSessions: false));
+        async.flushMicrotasks();
+        runner.inPosition();
+        async.elapse(const Duration(seconds: 30));
+        expect(recorder.events.where((e) => e.startsWith('log:flow:')),
+            isEmpty);
+        runner.dispose();
+      });
+    });
+  });
 
   test('resetSessions=false skips the reset and its marker', () {
     fakeAsync((async) {
@@ -693,6 +1127,325 @@ void main() {
         final severIdx = recorder.events.indexOf('marker:links-severed');
         expect(markerIdx, isNonNegative);
         expect(severIdx, greaterThan(markerIdx));
+        runner.dispose();
+      });
+    });
+
+    test('every way out of a run disarms the gate', () {
+      // A gate left armed at the last step's radius refuses the non-neighbour
+      // handshakes the NEXT warm-up needs, and that launch then fails its
+      // session-count check. The radius is not persisted either, so a restart
+      // and a finished run land in the same disarmed state.
+      for (final exit in ['forceFinish', 'abort']) {
+        fakeAsync((async) {
+          final gates = <String>[];
+          final runner = FieldRunner(
+            recorder: _FakeRecorder(),
+            nowMs: () => lb + async.elapsed.inMilliseconds,
+            sessionTableCount: () => 3,
+            onSetRingGate: (roster, radius) async =>
+                gates.add('$radius:${roster.length}'),
+          );
+          runner.start(FieldPlan(
+            expId: 'ring-exit',
+            manualJoin: true,
+            placementSec: 0,
+            alignSec: 1,
+            resetSessions: false,
+            resetDtnBuffer: false,
+            roster: const [
+              WorkloadRosterEntry(label: 'a', pubkeyHex: 'aa'),
+              WorkloadRosterEntry(label: 'b', pubkeyHex: 'bb'),
+            ],
+            steps: const [
+              FieldStep(label: 'r=1 t1', dwellSec: 30, ringRadius: 1),
+            ],
+          ));
+          pump(async);
+          expect(gates, ['1:2'], reason: exit);
+          if (exit == 'abort') {
+            runner.abort();
+          } else {
+            runner.forceFinish();
+          }
+          pump(async);
+          expect(gates.last, 'null:0', reason: exit);
+          runner.dispose();
+        });
+      }
+    });
+
+    test('the ring is built from the session table, not the compiled roster',
+        () {
+      // Why this exists: the roster used to be a hardcoded list of pubkeys,
+      // and on 2026-09-01 it named a phone that was not on the desk while
+      // omitting the one that was. Three usable phones is not a ring — at N=3
+      // every pair sits at ring distance 1, so r=1 is already the complete
+      // graph — and the run produced nothing.
+      //
+      // The session table cannot make that mistake: sessions are never
+      // persisted, so it can only name peers this process actually handshaked
+      // with, and a Noise session is pairwise, so every phone derives the same
+      // set. Here the compiled roster is deliberately WRONG (it names 'ff…',
+      // which is absent) and the gate must still be driven with the four
+      // identities that hold sessions.
+      fakeAsync((async) {
+        final seen = <List<String>>[];
+        final runner = FieldRunner(
+          recorder: _FakeRecorder(),
+          nowMs: () => lb + async.elapsed.inMilliseconds,
+          myPubkeyHex: hexOf(0),
+          sessionTableCount: () => 3,
+          sessionPeerHexes: () => [hexOf(9), hexOf(3), hexOf(6)],
+          onSetRingGate: (roster, _) async => seen.add(roster),
+        );
+        runner.start(FieldPlan(
+          expId: 'ring-sess',
+          manualJoin: true,
+          placementSec: 0,
+          alignSec: 1,
+          resetSessions: false,
+          resetDtnBuffer: false,
+          ringRosterFromSessions: true,
+          ringSize: 4,
+          roster: [
+            WorkloadRosterEntry(label: 'ghost', pubkeyHex: 'f' * 64),
+          ],
+          steps: const [
+            FieldStep(label: 'r=1 t1', dwellSec: 1, ringRadius: 1),
+          ],
+        ));
+        pump(async);
+        expect(seen, isNotEmpty, reason: runner.abortReason ?? 'never armed');
+        expect(seen.single, [hexOf(0), hexOf(3), hexOf(6), hexOf(9)],
+            reason: 'self plus every session, in sorted order — sorting IS '
+                'the ring, so all four phones compute the same one');
+        expect(seen.single, isNot(contains('f' * 64)),
+            reason: 'the compiled roster does not decide the topology');
+        runner.dispose();
+      });
+    });
+
+    // The ring launch guard. EVERY case here runs with no session floor —
+    // `minSessionsToLaunch` is left at its default zero — because that is the
+    // configuration the shipped ring presets use and the one an earlier
+    // version of this guard silently switched itself off in.
+    group('ring launch guard (no session floor)', () {
+      FieldPlan ringPlan({required int? ringSize, String expId = 'ring-g'}) =>
+          FieldPlan(
+            expId: expId,
+            manualJoin: true,
+            placementSec: 0,
+            alignSec: 1,
+            resetSessions: false,
+            resetDtnBuffer: false,
+            ringRosterFromSessions: true,
+            ringSize: ringSize,
+            steps: const [
+              FieldStep(label: 'r=1 t1', dwellSec: 1, ringRadius: 1),
+            ],
+          );
+
+      FieldRunner ringRunner(FakeAsync async, List<int> peers,
+              {_FakeRecorder? recorder}) =>
+          FieldRunner(
+            recorder: recorder ?? _FakeRecorder(),
+            nowMs: () => lb + async.elapsed.inMilliseconds,
+            myPubkeyHex: hexOf(0),
+            sessionPeerHexes: () => [for (final b in peers) hexOf(b)],
+            onSetRingGate: (_, __) async {},
+          );
+
+      test('the declared size is checked with no floor set at all', () {
+        // A guard keyed off `minSessionsToLaunch + 1` is inert whenever that
+        // floor is zero — inert, that is, in the one configuration that also
+        // has no cardinality check of its own, where a plan built for five
+        // phones launches on four without a word.
+        fakeAsync((async) {
+          final plan = ringPlan(ringSize: 5);
+          expect(plan.minSessionsToLaunch, 0, reason: 'no floor, deliberately');
+          final runner = ringRunner(async, [3, 6, 9]);
+          runner.start(plan);
+          async.flushMicrotasks();
+          expect(runner.isRunning, isFalse);
+          expect(runner.abortReason, contains('built for 5'));
+          expect(runner.abortReason, contains('describes 4'));
+          runner.dispose();
+        });
+      });
+
+      test('a table one too LONG refuses: a stray warmed phone changes N', () {
+        // The failure the size check exists for at the top end. One phone
+        // warmed by accident gives this device a fifth session, and an N=4 run
+        // would quietly become an N=5 one — where the radii and the per-pair
+        // send counts were both chosen for four.
+        fakeAsync((async) {
+          final runner = ringRunner(async, [3, 6, 9, 12]);
+          runner.start(ringPlan(ringSize: 4));
+          async.flushMicrotasks();
+          expect(runner.isRunning, isFalse);
+          expect(runner.abortReason, contains('built for 4'));
+          expect(runner.abortReason, contains('describes 5'));
+          // The abort is per-device and there is no channel to coordinate it:
+          // only the phone that met the stray refuses, so the message has to
+          // send the operator back to the whole fleet.
+          expect(runner.abortReason, contains('WHOLE fleet'));
+          runner.dispose();
+        });
+      });
+
+      test('deriving a ring without declaring its size refuses to launch', () {
+        // A plan that derives its ring but names no size leaves nothing to
+        // compare the derived ring against. Refusing is the only honest
+        // response: the alternative is a guard that reports success without
+        // having checked anything.
+        fakeAsync((async) {
+          final runner = ringRunner(async, [3, 6, 9]);
+          runner.start(ringPlan(ringSize: null));
+          async.flushMicrotasks();
+          expect(runner.isRunning, isFalse);
+          expect(runner.abortReason, contains('declares no ringSize'));
+          runner.dispose();
+        });
+      });
+
+      test('a plan declaring a ring of three refuses to launch', () {
+        // N=3 is not a degraded ring, it is a different experiment: every pair
+        // is at ring distance 1, so r=1 is the complete graph and no message
+        // can require conveyance. This is the PLAN being wrong, not the room,
+        // so it is checked against the declared size and says so.
+        fakeAsync((async) {
+          final runner = ringRunner(async, [3, 6]);
+          runner.start(ringPlan(ringSize: 3));
+          async.flushMicrotasks();
+          expect(runner.isRunning, isFalse);
+          expect(runner.abortReason, contains('at least 4'));
+          runner.dispose();
+        });
+      });
+
+      test('a table of exactly the declared size launches', () {
+        fakeAsync((async) {
+          final runner = ringRunner(async, [3, 6, 9]);
+          runner.start(ringPlan(ringSize: 4));
+          async.flushMicrotasks();
+          expect(runner.isRunning, isTrue, reason: runner.abortReason);
+          runner.dispose();
+        });
+      });
+
+      test('two rings of the SAME size both launch — membership is not '
+          'locally decidable, only detectable', () {
+        // The failure this guard cannot prevent, pinned so nobody believes it
+        // can. Five phones half-warmed: this device holds {B,C,D} and another
+        // holds {A,C,E}. Both derive a four-node ring, both satisfy every
+        // local check there is, and the two rings disagree about every
+        // distance — one side dials a pair the other refuses.
+        //
+        // A phone knows its own session table and nothing about anyone else's,
+        // so no check at launch can separate these. What CAN is the
+        // fingerprint: the two runs carry different tokens, on screen while
+        // the phones are still in the operator's hands and on every marker
+        // afterwards.
+        fakeAsync((async) {
+          final a = ringRunner(async, [3, 6, 9]);
+          final b = ringRunner(async, [3, 6, 12]);
+          a.start(ringPlan(ringSize: 4, expId: 'ring-fp-a'));
+          b.start(ringPlan(ringSize: 4, expId: 'ring-fp-b'));
+          async.flushMicrotasks();
+          expect(a.isRunning, isTrue, reason: a.abortReason);
+          expect(b.isRunning, isTrue, reason: b.abortReason);
+          expect(a.ringFingerprint, isNot(b.ringFingerprint),
+              reason: 'the token is what makes the disagreement visible');
+          expect(a.ringFingerprint, hasLength(8));
+          a.dispose();
+          b.dispose();
+        });
+      });
+
+      test('the same ring fingerprints identically wherever it is derived',
+          () {
+        // Every phone in the ring derives the same SET in a different order —
+        // each one names itself plus its own peers — so the token has to be a
+        // property of the ring and not of who computed it. Otherwise the
+        // comparison the operator is asked to make would always fail.
+        fakeAsync((async) {
+          final fromZero = ringRunner(async, [3, 6, 9]);
+          final fromSix = FieldRunner(
+            recorder: _FakeRecorder(),
+            nowMs: () => lb + async.elapsed.inMilliseconds,
+            myPubkeyHex: hexOf(6),
+            sessionPeerHexes: () => [hexOf(9), hexOf(0), hexOf(3)],
+            onSetRingGate: (_, __) async {},
+          );
+          fromZero.start(ringPlan(ringSize: 4, expId: 'ring-fp-0'));
+          fromSix.start(ringPlan(ringSize: 4, expId: 'ring-fp-6'));
+          async.flushMicrotasks();
+          expect(fromSix.isRunning, isTrue, reason: fromSix.abortReason);
+          expect(fromZero.ringFingerprint, fromSix.ringFingerprint);
+          fromZero.dispose();
+          fromSix.dispose();
+        });
+      });
+
+      test('the ring and its fingerprint are on the placement marker', () {
+        // The earliest marker a run has. A run that dies before its first step
+        // still has to say which ring it froze — otherwise the fleet-agreement
+        // check has nothing to read for exactly the phone that went wrong.
+        fakeAsync((async) {
+          final recorder = _FakeRecorder();
+          final runner = ringRunner(async, [3, 6, 9], recorder: recorder);
+          runner.start(ringPlan(ringSize: 4));
+          async.flushMicrotasks();
+          final extra =
+              recorder.markerExtras.firstWhere((e) => e.$1 == 'placement').$2;
+          expect(extra['ring'],
+              [for (final b in [0, 3, 6, 9]) hexOf(b).substring(0, 8)]);
+          expect(extra['ringFp'], runner.ringFingerprint);
+          runner.dispose();
+        });
+      });
+    });
+
+    test('the derived ring is stamped on every marker, so agreement is '
+        'checkable rather than assumed', () {
+      // Each phone derives its own ring from its own session table. They agree
+      // only if every table was complete at launch — a phone that launched one
+      // session short builds a smaller ring and disagrees about every
+      // distance. Stamping it means the analysis can prove they matched.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => lb + async.elapsed.inMilliseconds,
+          myPubkeyHex: hexOf(0),
+          sessionTableCount: () => 3,
+          sessionPeerHexes: () => [hexOf(9), hexOf(3), hexOf(6)],
+          onSetRingGate: (_, __) async {},
+        );
+        runner.start(FieldPlan(
+          expId: 'ring-stamp',
+          manualJoin: true,
+          placementSec: 0,
+          alignSec: 1,
+          resetSessions: false,
+          resetDtnBuffer: false,
+          ringRosterFromSessions: true,
+          ringSize: 4,
+          steps: const [
+            FieldStep(label: 'r=1 t1', dwellSec: 1, ringRadius: 1),
+          ],
+        ));
+        pump(async);
+        final extra = recorder.markerExtras
+            .firstWhere((e) => e.$1 == 'r=1 t1')
+            .$2;
+        expect(extra['ring'],
+            [for (final b in [0, 3, 6, 9]) hexOf(b).substring(0, 8)]);
+        // And the one-token form beside it, so the agreement check over a
+        // fleet's traces is a count of distinct values rather than a diff of
+        // lists.
+        expect(extra['ringFp'], runner.ringFingerprint);
         runner.dispose();
       });
     });
@@ -1999,4 +2752,73 @@ void main() {
     });
   });
 
+  group('saturating sends with no link', () {
+    FieldPlan satPlan() => FieldPlan(
+          expId: 'sat-backoff-1',
+          manualJoin: true,
+          placementSec: 60,
+          alignSec: 60,
+          steps: const [
+            FieldStep(
+              label: 'p=55200B lanes=1 pace=0 oneway t1',
+              dwellSec: 60,
+              sendBytes: 55200,
+              saturate: true,
+              sendLanes: 1,
+            ),
+          ],
+        );
+
+    test('a lane with no leg ready backs off instead of spinning', () {
+      // The zero-duration yield keeps the loop interruptible but does not
+      // bound its rate. With no leg, every turn still allocates a 55 kB
+      // payload, fills it, fails the send and appends a drop record to a
+      // recorder that buffers in memory for the whole run — which pegged the
+      // isolate until the UI stopped painting entirely and the step looked
+      // frozen at "00:01 left" while the loop underneath spun on.
+      fakeAsync((async) {
+        final recorder = _FakeRecorder();
+        var sends = 0;
+        // The lattice must run on FAKE time like every other fakeAsync test
+        // here. Without this the runner aligns against the real wall clock
+        // while the test drives fake time, so the step opens or does not
+        // depending on where the real clock sits relative to an alignment
+        // boundary — it failed six times running, then passed twice.
+        final lb = DateTime(2026, 1, 1).millisecondsSinceEpoch;
+        final runner = FieldRunner(
+          recorder: recorder,
+          nowMs: () => lb + async.elapsed.inMilliseconds,
+          myNickname: '1',
+          legsReady: () => 0,
+          sessionUp: (_) => true,
+          knownPeers: () => [Uint8List.fromList(List.filled(32, 7))],
+          send: (pubkey, payload, {messageId}) async {
+            sends++;
+            return null;
+          },
+        );
+        runner.start(satPlan());
+        async.flushMicrotasks();
+        // Walk into the dwell, then measure only what the lane does there.
+        for (var i = 0; i < 200 && runner.phase != FieldPhase.dwelling; i++) {
+          async.elapse(const Duration(seconds: 1));
+          async.flushMicrotasks();
+        }
+        expect(runner.phase, FieldPhase.dwelling);
+        sends = 0;
+        async.elapse(const Duration(seconds: 10));
+        async.flushMicrotasks();
+
+        // Ten seconds at the 100 ms backoff is about a hundred attempts. The
+        // unbounded loop managed one per event-loop turn, which is orders of
+        // magnitude more; anything near that is the spin, not a measurement.
+        expect(sends, lessThan(200),
+            reason: 'a lane with nothing to send to must not spin the isolate');
+        expect(sends, greaterThan(0),
+            reason: 'it must keep trying — the leg can come back');
+
+        runner.dispose();
+      });
+    });
+  });
 }

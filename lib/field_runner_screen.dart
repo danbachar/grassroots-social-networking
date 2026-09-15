@@ -43,6 +43,96 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
     if (mounted) setState(() {});
   }
 
+  /// The step whose radius the leg count is judged against: the running one,
+  /// else the one about to run. A settle measures nothing itself, but its
+  /// whole purpose is to reach the NEXT step's topology, so during one the
+  /// bar to read against is the step ahead.
+  FieldStep? _radiusStep(FieldRunner runner) {
+    if (runner.currentStep != null) return runner.currentStep;
+    final i = runner.stepIndex;
+    final steps = widget.plan.steps;
+    return i >= 0 && i < steps.length ? steps[i] : null;
+  }
+
+  /// Peers the step's radius permits, or null when nothing has set a radius.
+  ///
+  /// On an n-ring at radius r a node may hold 2r neighbours, capped at the
+  /// whole room. This is the number the leg count is judged against: a count
+  /// means nothing on its own, since two legs is the entire ring at r=1 and a
+  /// collapsed mesh at r=5.
+  int? _permittedPeers(FieldStep? step) {
+    final r = step?.ringRadius;
+    final n = widget.plan.ringSize;
+    if (r == null || n == null || n < 2) return null;
+    final cap = n - 1;
+    final permitted = 2 * r;
+    return permitted < cap ? permitted : cap;
+  }
+
+  /// The live ready-leg count, when the host can supply one, against what the
+  /// radius permits.
+  ///
+  /// A radius says how many legs a node MAY hold; this says how many it does.
+  /// The two have been measured a factor of three apart under load, and the
+  /// gap is invisible on every other part of this screen — the countdown, the
+  /// step and the phase look identical whether the mesh is holding twelve legs
+  /// or four. It sits above the phases rather than inside one because it is
+  /// true of the whole run.
+  Widget _legsStrip(FieldRunner runner) {
+    final legs = runner.legsReady?.call();
+    if (legs == null) return const SizedBox.shrink();
+    // One leg per permitted peer is the bar. A converged pair holds two, so
+    // this is deliberately the floor and not the target — it asks whether the
+    // topology exists at all, not whether it is fully dual-legged.
+    final want = _permittedPeers(_radiusStep(runner));
+    final colour = switch (want) {
+      null => Colors.white,
+      _ when legs >= want => Colors.white,
+      _ when legs * 2 >= want => Colors.amber,
+      _ => Colors.red,
+    };
+    // At ten metres nothing on a phone is READ — a logical pixel is 1/160
+    // inch, so even this screen's largest text is a 13 mm digit against the
+    // 25 mm signage wants at that range. What carries is a saturated area of
+    // colour, so an alarm fills the band and a healthy mesh leaves it dark.
+    // The number is for whoever walks over, and it is sized to be the first
+    // thing they can read on the way.
+    final alarm = colour != Colors.white;
+    return Container(
+      key: const ValueKey('legsStrip'),
+      width: double.infinity,
+      color: alarm ? colour : Colors.white10,
+      padding: EdgeInsets.symmetric(vertical: alarm ? 20 : 8, horizontal: 16),
+      child: Row(children: [
+        Icon(Icons.hub_outlined,
+            color: alarm ? Colors.black87 : Colors.white54,
+            size: alarm ? 56 : 22),
+        const SizedBox(width: 14),
+        Text(
+          '$legs',
+          style: TextStyle(
+              color: alarm ? Colors.black : Colors.white,
+              fontSize: alarm ? 110 : 26,
+              height: 1.0,
+              fontWeight: FontWeight.w900,
+              fontFeatures: const [FontFeature.tabularFigures()]),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            want == null
+                ? 'legs ready'
+                : 'legs ready\nof $want the radius permits',
+            style: TextStyle(
+                color: alarm ? Colors.black87 : Colors.white70,
+                fontSize: alarm ? 22 : 16,
+                fontWeight: alarm ? FontWeight.w700 : FontWeight.normal),
+          ),
+        ),
+      ]),
+    );
+  }
+
   String _mmss(int sec) => '${(sec ~/ 60).toString().padLeft(2, '0')}:'
       '${(sec % 60).toString().padLeft(2, '0')}';
 
@@ -150,6 +240,7 @@ class _FieldRunnerScreenState extends State<FieldRunnerScreen> {
                   ),
                 ]),
               ),
+            _legsStrip(runner),
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) => SingleChildScrollView(

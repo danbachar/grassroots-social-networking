@@ -72,16 +72,38 @@ class SettingsScreen extends StatefulWidget {
   final Future<void> Function(List<String> rosterHex, int? radius)?
       onSetRingGate;
 
+  /// DEBUG/TESTBED. Ignore a phone in the room that is not part of the
+  /// experiment (see [SettingsState.ignoredPeerHexes]).
+  final void Function(Uint8List peer)? onIgnorePeer;
+
+  /// DEBUG/TESTBED. Lift [onIgnorePeer] for the phone with this pubkey hex.
+  final void Function(String pubkeyHex)? onUnignorePeer;
+
   /// DEBUG/TESTBED. Sever every GATT link, keeping sessions and DTN state.
   final Future<void> Function()? onSeverLinks;
   final Future<Map<String, dynamic>> Function()? onCryptoBench;
   final bool Function()? bleUsable;
   final bool Function()? bleUndiscoverable;
+
+  /// BLE legs held ready now, for the runner screen's readout.
+  final int Function()? legsReady;
   final Stream<bool>? bleUsableChanges;
   final int Function()? sessionPeerCount;
 
+  /// Distinct peers holding a ready link, stamped on every step marker
+  /// as `links` beside `sessions`.
+  final int Function()? linkPeerCount;
+
+  /// Applies [FieldPlan.dtnMaxBytes] when a plan starts.
+  final void Function(int bytes)? onSetDtnMaxBytes;
+
   /// Sessions in the Noise table, forwarded to the testbed.
   final int Function()? sessionTableCount;
+
+  /// Who those sessions are with — the ring plan's roster source when
+  /// [FieldPlan.ringRosterFromSessions] is set. Passed straight through to
+  /// the testbed screen; the settings UI itself does not read it.
+  final Iterable<String> Function()? sessionPeerHexes;
   final Future<void> Function(bool on)? onSetBle;
   final Future<void> Function(int? darkSec,
       {Future<void> Function()? whileDark, int? untilMs})?
@@ -96,12 +118,30 @@ class SettingsScreen extends StatefulWidget {
   final Stream<Uint8List>? sessionEvents;
   final Stream<Uint8List>? linkSettledEvents;
 
+  /// Message ids whose end-to-end ACK came home, for the throughput runner.
+  final Stream<String>? ackEvents;
+
   /// Dial-grid hooks (see FieldRunner.onSetDialParallelism).
   final void Function({int? maxParallel, int? popN})? onSetDialParallelism;
 
   /// Record every advertisement sighting (see
   /// FieldPlan.traceEveryAdvertisement).
   final void Function(bool every)? onSetTraceEveryAdvertisement;
+
+  /// Raise or drop the BLE connection interval (see FieldRunner).
+  final void Function(bool high)? onSetConnectionPriority;
+
+  /// Set the fragment spacing for a step (null restores production).
+  final void Function(int? ms)? onSetFragmentDelay;
+
+  /// Deliver without acknowledging, for a one-directional run.
+  final void Function(bool on)? onSetSuppressAcks;
+
+  /// Silence everything that is not payload for the run.
+  final Future<void> Function(bool on)? onSetQuietLink;
+
+  /// Suspend eviction of quiet peers for the whole run.
+  final void Function(bool on)? onSetStaleSweepSuspended;
   final int Function()? establishmentCount;
   final VoidCallback? onResetEstablishmentCount;
 
@@ -121,13 +161,19 @@ class SettingsScreen extends StatefulWidget {
     this.onResetSessionWith,
     this.onResetDtnBuffer,
     this.onSetRingGate,
+    this.onIgnorePeer,
+    this.onUnignorePeer,
     this.onSeverLinks,
     this.onCryptoBench,
     this.bleUsable,
     this.bleUndiscoverable,
+    this.legsReady,
     this.bleUsableChanges,
     this.sessionPeerCount,
+    this.linkPeerCount,
+    this.onSetDtnMaxBytes,
     this.sessionTableCount,
+    this.sessionPeerHexes,
     this.onSetBle,
     this.onResetLinks,
     this.linkSettled,
@@ -136,8 +182,14 @@ class SettingsScreen extends StatefulWidget {
     this.refreshSystemBt,
     this.sessionEvents,
     this.linkSettledEvents,
+    this.ackEvents,
     this.onSetDialParallelism,
     this.onSetTraceEveryAdvertisement,
+    this.onSetConnectionPriority,
+    this.onSetFragmentDelay,
+    this.onSetSuppressAcks,
+    this.onSetQuietLink,
+    this.onSetStaleSweepSuspended,
     this.establishmentCount,
     this.onResetEstablishmentCount,
   });
@@ -309,6 +361,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // Noise session table (debug)
           _buildSessionTableSection(),
 
+          if (widget.onUnignorePeer != null) ...[
+            const Divider(height: 32),
+            _buildIgnoredPhonesSection(),
+          ],
+
           const Divider(height: 32),
 
           // Debug Logs
@@ -386,9 +443,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       onCryptoBench: widget.onCryptoBench,
                       bleUsable: widget.bleUsable,
       bleUndiscoverable: widget.bleUndiscoverable,
+      legsReady: widget.legsReady,
                       bleUsableChanges: widget.bleUsableChanges,
                       sessionPeerCount: widget.sessionPeerCount,
+                      linkPeerCount: widget.linkPeerCount,
+                      onSetDtnMaxBytes: widget.onSetDtnMaxBytes,
                       sessionTableCount: widget.sessionTableCount,
+                      sessionPeerHexes: widget.sessionPeerHexes,
                       onSetBle: widget.onSetBle,
                       onResetLinks: widget.onResetLinks,
                       linkSettled: widget.linkSettled,
@@ -397,9 +458,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       refreshSystemBt: widget.refreshSystemBt,
                       sessionEvents: widget.sessionEvents,
                       linkSettledEvents: widget.linkSettledEvents,
+      ackEvents: widget.ackEvents,
                       onSetDialParallelism: widget.onSetDialParallelism,
                       onSetTraceEveryAdvertisement:
                           widget.onSetTraceEveryAdvertisement,
+                      onSetConnectionPriority: widget.onSetConnectionPriority,
+      onSetFragmentDelay: widget.onSetFragmentDelay,
+      onSetSuppressAcks: widget.onSetSuppressAcks,
+      onSetQuietLink: widget.onSetQuietLink,
+      onSetStaleSweepSuspended: widget.onSetStaleSweepSuspended,
                       establishmentCount: widget.establishmentCount,
                       onResetEstablishmentCount:
                           widget.onResetEstablishmentCount,
@@ -840,6 +907,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
+          // No confirmation: ignoring lives in memory only and is undone from
+          // the ignored-phones panel below.
+          IconButton(
+            onPressed: widget.onIgnorePeer == null
+                ? null
+                : () => widget.onIgnorePeer!(_pubkeyBytes(hex)),
+            icon: const Icon(Icons.visibility_off_outlined, size: 18),
+            color: GlColors.warning,
+            tooltip: 'Ignore this phone',
+            visualDensity: VisualDensity.compact,
+          ),
           IconButton(
             onPressed: widget.onResetSessionWith == null
                 ? null
@@ -848,6 +926,99 @@ class _SettingsScreenState extends State<SettingsScreen> {
             color: GlColors.danger,
             tooltip: 'Drop this session',
             visualDensity: VisualDensity.compact,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Phones the testbed is ignoring, each with the control that lifts it.
+  /// Nothing here survives a restart, which the copy says so nobody looks for
+  /// a stale entry after one.
+  Widget _buildIgnoredPhonesSection() {
+    final hexes = widget.store.state.settings.ignoredPeerHexes.toList()..sort();
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.visibility_off_outlined,
+                  size: 16, color: GlColors.warning),
+              SizedBox(width: 6),
+              Text(
+                'Ignored phones (debug)',
+                style: TextStyle(
+                  fontSize: GlType.textSm,
+                  fontWeight: FontWeight.w600,
+                  color: GlColors.warning,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: GlSpace.s1),
+          const Text(
+            'Phones in range that are not part of the experiment. An ignored '
+            'phone gets no session and no link, and is left out of the ring. '
+            'The list is forgotten when the app restarts.',
+            style: TextStyle(
+                fontSize: GlType.textXs, color: GlColors.textMuted),
+          ),
+          const SizedBox(height: GlSpace.s2),
+          if (hexes.isEmpty)
+            const Text(
+              'Nobody is ignored.',
+              style: TextStyle(
+                fontSize: GlType.textXs,
+                color: GlColors.textStrong,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          for (final hex in hexes) _buildIgnoredPhoneRow(hex),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildIgnoredPhoneRow(String hex) {
+    final nickname =
+        widget.store.state.peers.getPeerByPubkeyHex(hex)?.nickname ?? '';
+    final prefix = hex.length >= 16 ? hex.substring(0, 16) : hex;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (nickname.isNotEmpty)
+                  Text(
+                    nickname,
+                    style: const TextStyle(
+                      fontSize: GlType.textSm,
+                      fontWeight: FontWeight.w600,
+                      color: GlColors.textStrong,
+                    ),
+                  ),
+                Text(
+                  prefix,
+                  style: GlType.monoStyle(GlType.text2xs,
+                      color: GlColors.textSubtle),
+                ),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: () => widget.onUnignorePeer!(hex),
+            style: TextButton.styleFrom(
+              foregroundColor: GlColors.warning,
+              textStyle: const TextStyle(fontSize: GlType.textSm),
+            ),
+            child: const Text('Stop ignoring'),
           ),
         ],
       ),
@@ -1007,7 +1178,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'but never your address or any friend-only details.\n'
             '• Closed — introductions from non-friends are refused. Nearby '
             'devices still see your advertisement, but strangers cannot '
-            'learn your nickname over Bluetooth.',
+            'learn your nickname over Bluetooth. Your device also stops '
+            'relaying mesh traffic for anyone but yourself, even friends\' '
+            'messages passing through to someone else.',
             style: TextStyle(
                 fontSize: GlType.textXs, color: GlColors.textMuted),
           ),

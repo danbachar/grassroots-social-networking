@@ -14,50 +14,100 @@ them either. Hence this file — serials are stable, join orders are not.
 }
 ```
 
-## The fleet as of 2026-08-14 — RENUMBERED 1-6, a six-phone clique
+## The fleet as of 2026-09-02 — ten phones, numbered 1-10
 
-The clique is six phones, numbered 1-6 contiguously. Each nickname below was
-read off that phone's own You screen on 2026-08-14, with the pubkey verified
-first; the Pixel 10 confirmed "5 peers in reach" (the full clique) on the same
-screen. Three earlier handsets are detached and out of the fleet (listed after
-the table); their serial↔pubkey bindings stay in `fleet_map.json` so they
-recover their identity the moment they re-attach.
+Ten handsets, contiguous 1-10. Nicknames are as read back from the phones
+after the 2026-09-02 renumber; pubkeys are the ones the `mtu-check2` upload
+was keyed by, so this table and `fleet_map.json` agree with the traces.
 
-| join | serial | phone | Android | pubkey | was |
-|---|---|---|---|---|---|
-| 1 | `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` | 2 |
-| 2 | `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` | 3 |
-| 3 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `f5aee069…` | 1 |
-| 4 | `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` | 4 |
-| 5 | `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` | 6 |
-| 6 | `00d98aa1795bc454` | Nexus 5X | 8.1 | `d5aedd63…` | 7 |
-
-Detached, not in the clique:
-
-| serial | phone | Android | pubkey | note |
+| join | serial | phone | Android | pubkey |
 |---|---|---|---|---|
-| `00de4b24f89021e4` | Nexus 5X | 8.1 | `b7d04acb…` | was 5, dropped off adb |
-| `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` | was 3, OFF ADB (pairing lost) |
-| `31311JEHN12328` | Pixel 7a | 15 | `6b819f64…` | wireless adb only, USB port damaged |
-| `RF8NB0TYWJM` | Galaxy Note20 | — | `4fecd00f…` | wireless adb only |
-| `R58RB4ED7GM` | Galaxy A72 | — | `dbac04ef…` | wireless adb only |
+| 1 | `00d98aa1795bc454` | Nexus 5X | 8.1 | `72440e8a…` |
+| 2 | `00de4b24f89021e4` | Nexus 5X | 8.1 | `07e47335…` |
+| 3 | `0253914a45ebaeb0` | Nexus 5X | 8.1 | `44a266c4…` |
+| 4 | `00f8380a3668adb1` | Nexus 5X | 8.1 | `18130c0f…` |
+| 5 | `55281FDCH002QK` | Pixel 10 Pro | 16 | `366dca50…` |
+| 6 | `56261FDCH00B50` | Pixel 10 Pro | 16 | `a2b11ef1…` |
+| 7 | `RF8M337Q3FE` | Galaxy S10e | 12 | `929a022c…` |
+| 8 | `8DM0218B02000956` | Huawei HMA-L09 | 9 | `be3a5ef5…` |
+| 9 | `HT7AG1A00486` | Pixel 2 | 11 | `c3cba742…` |
+| 10 | `31311JEHN12328` | Pixel 7a | — | `6b819f64…` |
 
-**The traveller is the Pixel 10 Pro, now node 3** (`f5aee069…`) — the phone that
-goes dark in a store-carry-forward run. It carries the role because it is the
-only handset with no GATT exhaustion and no Bluetooth stack crashes (the Pixel 2
-that once held it crashed its stack seven times in one day). The join number no
-longer marks the traveller — the pubkey does; a run's traveller is set by the
+`31311JEHN12328` is wireless only and its USB port is damaged, so it cannot be
+driven or rebooted over a cable. Two further handsets hold bindings in
+`fleet_map.json` but are not in the fleet: `RF8NB0TYWJM` (Galaxy Note20,
+wireless-adb only) and `R58RB4ED7GM` (Galaxy A72, wireless only).
+
+**Node 10 was the Galaxy Note20 `RF8NB0TYWJM` until 2026-09-05.** It is the
+only handset that has ever stamped a `bt-off` — its BLE transport goes
+unusable mid-run while the app itself stays healthy, four times across the two
+`ring-smoke6` runs, each one punching a hole in whatever stage it landed in.
+Nine other phones pass through the same stage transitions and none does it.
+The cause was never established: the trace carries no error record at the
+edge, and logcat is in-memory, so powering the unit off destroyed the only
+evidence. Swapped rather than diagnosed.
+
+## The N=8 roster — `churn-n8-1`
+
+Eight of the ten, joins 1-8. Nodes 9 (Pixel 2) and 10 (Pixel 7a) sit this one
+out, and that is the point rather than an absence: a node's link count is
+N-1, so eight phones is the k=7 row the run exists for, and a ninth would
+take every node past the seven-link cap the Nexus 5X holds.
+
+| join | serial | phone | pubkey |
+|---|---|---|---|
+| 1 | `00d98aa1795bc454` | Nexus 5X | `72440e8a…` |
+| 2 | `00de4b24f89021e4` | Nexus 5X | `07e47335…` |
+| 3 | `0253914a45ebaeb0` | Nexus 5X | `44a266c4…` |
+| 4 | `00f8380a3668adb1` | Nexus 5X | `18130c0f…` |
+| 5 | `55281FDCH002QK` | Pixel 10 Pro | `366dca50…` |
+| 6 | `56261FDCH00B50` | Pixel 10 Pro | `a2b11ef1…` |
+| 7 | `RF8M337Q3FE` | Galaxy S10e | `929a022c…` |
+| 8 | `8DM0218B02000956` | Huawei HMA-L09 | `be3a5ef5…` |
+
+Four Nexus 5X against four newer handsets, and every per-device reduction has
+to keep the two apart: the Nexus refuses about a third of its conveyance
+attempts and airs half the bytes a modern phone does, so a mixed-fleet mean
+describes a population that does not exist.
+
+**Node 6 attaches over WIRELESS adb**, so `adb devices` prints it as
+`adb-56261FDCH00B50-…._adb-tls-connect._tcp` and every per-serial tool has to
+strip the wrapper before its lookup — see "The mDNS name is not a serial". It
+is not the only wireless handset in the fleet (node 10's USB port is damaged),
+but it is the only one in this roster, so a tool that silently skips the
+unmatched key loses a phone that is present and running.
+
+**Three serials carry a different pubkey than they did on 2026-08-14** —
+`56261FDCH00B50`, `00d98aa1795bc454` and `00de4b24f89021e4`. An identity is
+regenerated by a reinstall or by the You screen's regenerate action, and it
+takes the phone's whole history with it. The serial is the only thing that
+survives that, which is what this file is for.
+
+**The traveller is the Pixel 10 Pro `56261FDCH00B50`, now node 6** — the phone
+that goes dark in a store-carry-forward run. It carries the role because it is
+the only handset with no GATT exhaustion and no Bluetooth stack crashes (the
+Pixel 2 that once held it crashed its stack seven times in one day, and a
+Nexus 5X crashed its stack during the ten-phone `mtu-check2`). The join number
+does not mark the traveller — the pubkey does; a run's traveller is set by the
 plan, not by whoever happens to be node 1.
+
+**A duplicate nickname is silent and costly.** The 2026-09-02 fleet numbered
+itself 1, 2, 3, 4, 5, 6, 6, 7, 7, 10 — two collisions and two gaps — and
+nothing on any phone said so. It is only visible by reading the `nick` on the
+placement markers of a run that has already happened, or one You screen at a
+time. Two phones sharing a number are indistinguishable to every analysis
+that labels by join order, and under a plan whose steps gate on
+`role <= cliqueN` they turn one phone's schedule into two.
 
 A peer's Nearby list LAGS a rename — during a renumber several phones show two
 peers claiming one number. The authoritative value is the phone's own You
 screen, never a neighbour's list of it.
 
-**Every trace recorded before 2026-08-14 uses an OLD numbering** (the fleet was
-renumbered on 2026-08-13 and again here), and scf-rearm-1..5 additionally ran
-with eight phones. Join order is only meaningful alongside the numbering that was
-live when the run was recorded; the pubkey is the only identifier that never
-moves.
+**A trace's join numbers are only readable against the numbering that was live
+when it was recorded.** The fleet was renumbered on 2026-08-13, again on
+2026-08-14, and again on 2026-09-02 when it grew to ten; scf-rearm-1..5
+additionally ran with eight phones. The pubkey is the only identifier that
+never moves.
 
 ### A nickname must be a number
 
@@ -87,16 +137,24 @@ the UI can still show location as on. Check this key on all four before every
 run; it is one adb read per phone and it is the difference between a mesh and
 a phone that only ever answers.
 
-### Clocks: reboot the Nexus 5X
+### Clocks: the Nexus 5X take the NTP path, not the direct write
 
-Android 8.1 denies `SET_TIME` to the shell uid, so the four Nexus 5X cannot be
-written by `sync_phone_clocks.sh` — it reports `No shell command
-implementation.` and leaves them wherever they are. That is not the same as
-being stuck: after a power cycle on 2026-08-12 all four came back inside
-±0.03 s of NTP on their own, against the +0.36…+0.83 s they had been sitting
-at. **Reboot the 5X units, then sync the writable four**; on 2026-08-12 that
-put the whole fleet inside ±0.065 s. Manual time does not survive a power
-cycle, so sync after every reboot, not before.
+Android 8.1 denies `SET_TIME` to the shell uid, so the four Nexus 5X refuse
+the direct write and `sync_phone_clocks.sh` reports `No shell command
+implementation.` for them. **They are still writable** — the script falls back
+to arming NTP on those units (`ntp_server` plus `auto_time`), and the phone
+corrects itself within about a minute given a network. Re-run the script after
+that minute to verify rather than assuming it took; a unit with no network
+silently stays where it was.
+
+The direct write does not survive a power cycle, so sync AFTER any reboot,
+never before. A power cycle is also its own repair: on 2026-08-12 all four 5X
+came back inside ±0.03 s of NTP on their own, against the +0.36…+0.83 s they
+had been sitting at, and syncing the writable four after that put the whole
+fleet inside ±0.065 s.
+
+Never reboot a phone whose `auto_time` is 0 — it comes back with a clock
+nothing is correcting.
 
 ## Pairing a phone by hand
 

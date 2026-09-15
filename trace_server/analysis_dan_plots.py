@@ -35,9 +35,10 @@ def plot_one(exp: str, d: dict, out: Path) -> None:
         stages_ylim = analyze._stages_shared_ylim(byd, edf)
         analyze._th_stages_vs_rssi(edf, out / "line200_stages_vs_rssi.pdf",
                                    ylim=stages_ylim)
+        #est_totals = __import__('collections').Counter(d for _e, _r, d in analyze._th_trial_rssi(edf))
         #analyze._th_establishment(byd, out / "line200_establishment.pdf",
-        #                          ylim=est_ylim)
-        #analyze._th_stages(byd, out / "line200_stages.pdf", ylim=stages_ylim, compact=True)
+        #                          ylim=est_ylim, totals=est_totals)
+        #analyze._th_stages(byd, out / "line200_stages.pdf", ylim=stages_ylim, compact=True, totals=est_totals)
         #analyze._th_path_loss(edf, out / "line200_path_loss.pdf")
         #analyze._th_control_bytes(edf, out / "line200_control_bytes.pdf")
         #analyze._th_stage_bytes_pair(edf, out)

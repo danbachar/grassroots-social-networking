@@ -1,7 +1,4 @@
-import 'dart:typed_data';
-
 import 'package:flutter_test/flutter_test.dart';
-import 'package:grassroots_networking/src/protocol/fragment_handler.dart';
 import 'package:grassroots_networking/src/testbed/field_plan_presets.dart';
 import 'package:grassroots_networking/src/testbed/field_runner.dart';
 import 'package:grassroots_networking/src/testbed/testbed_config.dart';
@@ -566,6 +563,47 @@ void main() {
     });
   });
 
+  group('mtuCheck (both legs of a pair know their link\'s MTU)', () {
+    test('every step is an independent convergence', () {
+      final plan = FieldPlanPresets.mtuCheck();
+      expect(plan.resetLinks, isTrue);
+      expect(plan.steps.every((s) => s.resetLinks == null), isTrue,
+          reason: 'No step opts out — the bounce is the point, and the MTU '
+              'exchange only happens while a link is coming up.');
+      expect(plan.linkResetDarkSec, 10);
+      expect(plan.resetBudgetSec, greaterThan(15),
+          reason: 'A budget that cuts a bounce short opens the step late '
+              'into the dwell that is measuring the bounce.');
+    });
+
+    test('the load is bigger than an ANNOUNCE, which is the whole test', () {
+      final plan = FieldPlanPresets.mtuCheck();
+      expect(plan.steps.every((s) => s.sendBytes > 182), isTrue,
+          reason: 'An ANNOUNCE is the largest thing a peripheral leg '
+              'receives once control traffic is all that is written to it, '
+              'so a leg that believes what it receives caps there. Only a '
+              'bigger payload separates that leg from a correct one.');
+      expect(plan.steps.every((s) => s.sendCount > 0), isTrue);
+    });
+
+    test('desk-sized lattice windows, and one operator tap', () {
+      final plan = FieldPlanPresets.mtuCheck();
+      expect(plan.manualJoin, isTrue);
+      expect(plan.placementSec, 20);
+      expect(plan.alignSec, 60);
+      expect(plan.steps.first.autoAdvance, isFalse);
+      expect(plan.steps.skip(1).every((s) => s.autoAdvance), isTrue);
+    });
+
+    test('the dropdown entry is the real builder, and survives the JSON', () {
+      final entry = FieldPlanPresets.presets[FieldPlanPresets.mtuCheckPresetName];
+      expect(entry, isNotNull);
+      expect(entry!.expId, 'mtu-check${FieldPlanPresets.mtuCheckRun}');
+      expect(entry.steps, hasLength(8));
+      expect(FieldPlan.fromJson(entry.toJson()), entry);
+    });
+  });
+
   group('strict plan parsing', () {
     test('a typo\'d plan field is refused, not defaulted', () {
       final json = FieldPlanPresets.dilutingLineLoads().toJson();
@@ -613,6 +651,16 @@ void main() {
       }
     });
 
+    test('radii default to 1..diameter of the declared ring', () {
+      // Past the diameter every radius is the complete graph again, so a
+      // sweep that kept r=1..5 at n=7 would spend two fifths of its trials
+      // measuring the same topology.
+      expect(FieldPlanPresets.ringSweep(n: 7).steps.map((s) => s.ringRadius).toSet(),
+          {1, 2, 3});
+      expect(FieldPlanPresets.ringSweep().steps.map((s) => s.ringRadius).toSet(),
+          {1, 2, 3, 4, 5});
+    });
+
     test('the label and the ringRadius field can never disagree', () {
       final p = FieldPlanPresets.ringSweep();
       for (final s in p.steps.where((s) => s.sendCount > 0)) {
@@ -646,7 +694,10 @@ void main() {
       // counted.
       final gaps = trials.map((s) => p.gapAfterSec(s)).toSet();
       expect(gaps, hasLength(1));
-      expect(gaps.single, 180, reason: 'drain is decoupled from the dwell');
+      // 300 s: the sync sweep moves one 106-id frame per 10 s round per
+      // peer, and at N=11 and r=1 a trial's backlog needs most of that just
+      // to be offered once at each hop.
+      expect(gaps.single, 300, reason: 'drain is decoupled from the dwell');
       expect(trials.map((s) => s.dwellSec).toSet(), {100});
     });
 
@@ -655,17 +706,27 @@ void main() {
       // One purge and every later message to a non-neighbour fails at
       // creation — no session, no packet — and the run is dead from there.
       expect(p.resetSessions, isFalse);
+      // Links bounce, but ONLY inside a settle. The plan-level flag fires at
+      // the top of every step, which would tear the mesh down at the start of
+      // each trial as well as before it.
       expect(p.resetLinks, isFalse);
       // The DTN buffer IS cleared every stage, so each trial's delivery is
       // decided inside its own window rather than by how much of its
       // successors' time it happened to borrow.
       expect(p.resetDtnBuffer, isTrue);
       expect(p.steps.every((s) => s.resetSessions != true), isTrue);
-      expect(p.steps.every((s) => s.resetLinks != true), isTrue);
+      // A trial never bounces; the settle before it does, so the rebuild
+      // finishes before the dwell that measures the data plane begins.
+      expect(
+          p.steps
+              .where((s) => s.sendCount > 0)
+              .every((s) => s.resetLinks != true),
+          isTrue);
+      expect(p.steps.where((s) => s.settle).every((s) => s.resetLinks == true),
+          isTrue);
       expect(p.steps.every((s) => s.resetDtnBuffer != false), isTrue);
-      // Nothing severs at all: the gate's prune is the only teardown, and it
-      // removes exactly what a narrowing disallows while a widening destroys
-      // nothing. Severing would tear down a working mesh twice a trial.
+      // Severing is still never used: a settle's bounce is a reconnecting
+      // teardown the mesh comes back from, which is not the same act.
       expect(p.severLinks, isFalse);
       expect(p.steps.every((s) => s.severLinks != true), isTrue);
     });
@@ -682,30 +743,29 @@ void main() {
       }
     });
 
-    test('a settle precedes a WIDENING only, and carries no drain', () {
+    test('EVERY trial is preceded by a settle, and it carries no drain', () {
       final p = FieldPlanPresets.ringSweep(
           radii: const [1, 2, 3, 4, 5], sweeps: 6);
-      int? prev;
       var checked = 0;
       for (var i = 0; i < p.steps.length; i++) {
         final st = p.steps[i];
         if (st.sendCount == 0) continue; // a settle
-        final settledBefore = i > 0 && p.steps[i - 1].sendCount == 0;
-        if (prev != null) {
-          final widened = st.ringRadius! > prev;
-          expect(settledBefore, widened,
-              reason: 'r=$prev -> r=${st.ringRadius} should '
-                  '${widened ? "" : "NOT "}be preceded by a settle');
-          checked++;
-        }
-        prev = st.ringRadius;
+        // Independence is the point: a trial that inherited the previous
+        // one's mesh is a second sample of one trajectory, not a second draw.
+        expect(i > 0 && p.steps[i - 1].settle, isTrue,
+            reason: 'r=${st.ringRadius} must open on a mesh it built itself');
+        expect(p.steps[i - 1].ringRadius, st.ringRadius,
+            reason: 'the settle builds the topology its trial will measure');
+        checked++;
       }
-      expect(checked, greaterThan(20), reason: 'exercised many transitions');
+      expect(checked, greaterThan(20), reason: 'exercised many trials');
       // A settle is exactly settleSec long: it measures nothing, so it has no
       // tail in flight and carries no drain.
       for (final st in p.steps.where((s) => s.sendCount == 0)) {
         expect(st.settle, isTrue);
-        expect(st.dwellSec, 60);
+        // Long enough to contain the dark window, the reset budget and ~20 s
+        // of convergence, with margin — not merely their sum.
+        expect(st.dwellSec, 90);
         expect(p.gapAfterSec(st), 0);
       }
     });
@@ -743,8 +803,35 @@ void main() {
       expect(t.dwellSec / t.sendCount, 10.0);
     });
 
-    test('refuses to launch below a full session table', () {
-      expect(FieldPlanPresets.ringSweep(n: 11).minSessionsToLaunch, 10);
+    test('declares its fleet size and carries no session floor', () {
+      final p = FieldPlanPresets.ringSweep(n: 11);
+      // The ring's size is declared once, as itself. It used to be read off
+      // minSessionsToLaunch + 1, which put two meanings in one number: that
+      // field is a floor ("at least this many"), so a plan using it as one was
+      // refused for it and a plan leaving it at zero switched the ring check
+      // off entirely.
+      expect(p.ringSize, 11);
+      expect(p.minSessionsToLaunch, 0,
+          reason: 'a floor cannot say anything ringSize does not say better');
+    });
+
+    test('every preset that derives a ring declares a workable size', () {
+      // The runner refuses a derive-without-size plan at launch, which is the
+      // right place for a pasted one — but a preset author should find out
+      // here rather than on a desk with the fleet warmed up.
+      for (final entry in FieldPlanPresets.presets.entries) {
+        if (!entry.value.ringRosterFromSessions) continue;
+        expect(entry.value.ringSize, isNotNull, reason: entry.key);
+        expect(entry.value.ringSize, greaterThanOrEqualTo(4),
+            reason: '${entry.key}: below four every pair is adjacent');
+      }
+    });
+
+    test('a derived ring without a size is refused at the parse', () {
+      final json = FieldPlanPresets.ringSweep(radii: const [1], sweeps: 1)
+          .toJson();
+      json.remove('ringSize');
+      expect(() => FieldPlan.fromJson(json), throwsFormatException);
     });
 
     test('the seed is reproducible and rides in the expId', () {
@@ -797,31 +884,46 @@ void main() {
   });
 
   group('ringSmoke', () {
-    test('is a 4-ring over two radii — three phones could not show a relay',
-        () {
+    test('is a 10-ring over its two extreme radii', () {
       final p = FieldPlanPresets.ringSmoke();
-      // On a 3-ring every pair is at distance 1, so r=1 is already complete
-      // and no message can require a relay. Four is the smallest ring with a
-      // pair two hops apart.
-      expect(p.minSessionsToLaunch, 3);
-      expect(p.steps.map((s) => s.ringRadius).toSet(), {1, 2});
+      // The whole fleet, and the two topologies the contrast is between: the
+      // bare ring at r=1, where a message four hops away must be conveyed,
+      // and the complete graph at the diameter, where nothing needs a relay.
+      expect(p.ringSize, 10);
+      expect(p.steps.map((s) => s.ringRadius).toSet(), {1, 5});
       final trials = p.steps.where((s) => s.sendCount > 0).toList();
       expect(trials, hasLength(4));
-      expect(trials.every((s) => s.sendCount == 10), isTrue);
+      // Ten times the sweep's cadence: one message per pair per second, so the
+      // ask window is measured while the seen-set outruns one filter.
+      expect(trials.every((s) => s.sendCount == 100), isTrue);
     });
 
-    test('the desk variant carries a 4-entry roster of distinct pubkeys', () {
-      // With minSessionsToLaunch a single wrong roster entry means a phone
-      // never launches at all, so the roster is asserted rather than assumed.
+    test('sized for the room: radii are ring and full mesh for any n', () {
+      // The contrast the smoke proves is ring against complete graph, and
+      // the radius that completes an n-ring is its diameter n ~/ 2.
+      final p = FieldPlanPresets.ringSmoke(n: 6);
+      expect(p.ringSize, 6);
+      expect(p.steps.map((s) => s.ringRadius).toSet(), {1, 3});
+      expect(FieldPlanPresets.ringSmokeDesk(n: 6).ringSize, 6);
+      // Four is the smallest ring the contrast means anything on: on a
+      // 3-ring every pair is already at distance 1, so r=1 is complete and
+      // no message can require a relay.
+      final four = FieldPlanPresets.ringSmoke(n: 4);
+      expect(four.ringSize, 4);
+      expect(four.steps.map((s) => s.ringRadius).toSet(), {1, 2});
+    });
+
+    test('the desk variant carries no roster at all', () {
+      // It used to carry the desk fleet's four pubkeys. They were dead twice
+      // over — the derived ring decides both the topology and the send targets
+      // — so all they did was ride into the plan JSON and every trace naming a
+      // fleet that was not the one running, and one entry had already gone
+      // stale. The room says who is in the ring; the plan says only how many.
       final p = FieldPlanPresets.ringSmokeDesk();
-      expect(p.roster, hasLength(4));
-      expect(p.roster.map((r) => r.pubkeyHex).toSet(), hasLength(4));
-      for (final r in p.roster) {
-        expect(r.pubkeyHex, hasLength(64), reason: r.label);
-        expect(RegExp(r'^[0-9a-f]{64}$').hasMatch(r.pubkeyHex), isTrue,
-            reason: '${r.label} must be lowercase hex');
-      }
-      expect(p.minSessionsToLaunch, 3);
+      expect(p.roster, isEmpty);
+      expect(p.ringRosterFromSessions, isTrue);
+      expect(p.ringSize, 10);
+      expect(p.expId, contains('ring-smoke'));
     });
 
     test('uses desk-sized lattice windows, not the field-day defaults', () {
@@ -830,7 +932,11 @@ void main() {
       // around to a twelve-minute desk run.
       final p = FieldPlanPresets.ringSmoke();
       expect(p.placementSec, 60);
-      expect(p.alignSec, 60);
+      // Wider than placement, and that gap is the point: a tap spread may be
+      // at most `alignSec - placementSec` and still land on one anchor, so
+      // equal values leave no guarantee at all.
+      expect(p.alignSec, 180);
+      expect(p.alignSec - p.placementSec, greaterThanOrEqualTo(120));
     });
 
     test('drains far longer than it sends, because conveyance is slow', () {
@@ -839,12 +945,195 @@ void main() {
       // stages are excluded because they send nothing and so carry no drain —
       // they are not windows the analysis reads.
       //
-      // The drain is three times the dwell. At diameter two the smoke measured
-      // relayed deliveries at p50 42 s / p90 68 s, and a 60 s drain left 103
-      // of 400 far-pair messages still in flight when the window shut.
+      // The drain is three times the dwell. At the sweep's cadence relayed
+      // mail drained inside 120 s; at ten times that load the tail is the
+      // measurement, and a drain that cuts it off reports slow mail as lost.
       final trials = p.steps.where((s) => s.sendCount > 0);
-      expect(trials.map((s) => p.gapAfterSec(s)).toSet(), {120});
+      expect(trials.map((s) => p.gapAfterSec(s)).toSet(), {300});
       expect(trials.map((s) => s.dwellSec).toSet(), {100});
+    });
+  });
+
+  group('BLE throughput presets', () {
+    List<String> labels(FieldPlan p) => [for (final s in p.steps) s.label];
+
+    test('the sender saturates and the receiver sends nothing', () {
+      // A step's sends otherwise target every known peer, so a receiver
+      // running the sender's plan would push back down the link under test
+      // and the measurement would be of two directions at once.
+      final tx = FieldPlanPresets.bleThroughput();
+      final rx = FieldPlanPresets.bleThroughput(saturating: false);
+      expect(tx.steps.every((s) => s.saturate), isTrue);
+      expect(rx.steps.every((s) => !s.saturate), isTrue);
+      expect(rx.steps.every((s) => s.sendCount == 0), isTrue);
+      expect(labels(rx), labels(tx),
+          reason: 'The two phones must segment identically on the server.');
+    });
+
+    test('three arms, ten trials each, interleaved not blocked', () {
+      final p = FieldPlanPresets.bleThroughput();
+      expect(p.steps, hasLength(30));
+      for (final arm in ['p=138B lanes=1', 'p=138B lanes=2', 'p=1380B lanes=1']) {
+        expect(labels(p).where((l) => l.startsWith('$arm t')), hasLength(10),
+            reason: '$arm must run ten times');
+      }
+      // Blocked would run all five of one arm before the next; interleaved
+      // visits every arm once per sweep, so no arm owns a contiguous third of
+      // the run and thermal drift is spread across all three.
+      final firstThree = labels(p).take(3).map((l) => l.split(' t').first);
+      expect(firstThree.toSet(), hasLength(3));
+    });
+
+    test('links and sessions stay warm; the DTN buffer does not', () {
+      // This measures the data plane, not establishment. But a write refused
+      // in one step is buffered and conveyed by a sync round inside the next,
+      // where it would be counted.
+      final p = FieldPlanPresets.bleThroughput();
+      expect(p.resetSessions, isFalse);
+      expect(p.resetLinks, isFalse);
+      expect(p.steps.every((s) => s.resetDtnBuffer == true), isTrue);
+    });
+
+    test('the interval arm runs arm A alone and says so in the label', () {
+      final p = FieldPlanPresets.bleThroughput(
+          expId: 'ble-tp-hi-1', arms: const [0], connectionPriorityHigh: true);
+      expect(p.connectionPriorityHigh, isTrue);
+      expect(p.steps, hasLength(10));
+      expect(labels(p).every((l) => l.contains('prio=high')), isTrue);
+      expect(labels(p).every((l) => l.startsWith('p=138B lanes=1')), isTrue);
+    });
+
+    test('the priority field round-trips through JSON', () {
+      final p = FieldPlanPresets.bleThroughput(connectionPriorityHigh: true);
+      expect(FieldPlan.fromJson(p.toJson()).connectionPriorityHigh, isTrue);
+      // Absent means "leave the interval alone", which is not the same as
+      // false — a plan that asked for BALANCED would fight the other launch.
+      final plain = FieldPlanPresets.bleThroughput();
+      expect(plain.toJson().containsKey('connectionPriorityHigh'), isFalse);
+      expect(FieldPlan.fromJson(plain.toJson()).connectionPriorityHigh, isNull);
+    });
+
+    test('saturate and sendLanes survive a JSON round-trip', () {
+      final p = FieldPlanPresets.bleThroughput();
+      final back = FieldPlan.fromJson(p.toJson());
+      expect(back.steps, p.steps);
+      expect(back.steps.where((s) => s.sendLanes == 2), hasLength(10));
+    });
+  });
+
+  group('BLE goodput ceiling preset', () {
+    List<String> labels(FieldPlan p) => [for (final s in p.steps) s.label];
+
+    test('every payload runs paced and unpaced, in the same run', () {
+      // The control has to sit beside its own arm. Comparing an unpaced run
+      // against a previous paced one would fold a day of drift into the
+      // difference the run exists to measure.
+      final p = FieldPlanPresets.bleGoodputCeiling();
+      for (final bytes in const [138, 1380, 4140, 13800]) {
+        expect(labels(p).where((l) => l.startsWith('p=${bytes}B lanes=1 pace=0 ')),
+            hasLength(5), reason: '$bytes B unpaced must run five times');
+        expect(labels(p).where((l) => l.startsWith('p=${bytes}B lanes=1 pace=20 ')),
+            hasLength(5), reason: '$bytes B paced must run five times');
+      }
+      expect(p.steps, hasLength(40));
+    });
+
+    test('only the unpaced arm zeroes the spacing; the control leaves it', () {
+      // Null is not zero: null restores production, which is what makes the
+      // control a control.
+      final p = FieldPlanPresets.bleGoodputCeiling();
+      for (final s in p.steps) {
+        expect(s.fragmentDelayMs, s.label.contains('pace=0') ? 0 : isNull);
+      }
+    });
+
+    test('one lane throughout — the lane question is closed', () {
+      // Two lanes carried no more than one and produced a single write-busy
+      // refusal in an hour. Sweeping lanes again would spend a run to
+      // reproduce that.
+      final p = FieldPlanPresets.bleGoodputCeiling();
+      expect(p.steps.every((s) => s.sendLanes == 1), isTrue);
+    });
+
+    test('the advertised duration matches the plan it builds', () {
+      // A preset's name is what an operator budgets battery and an evening
+      // against. This one shipped saying ~50m and ran 83 — eight arms times
+      // five sweeps is forty steps, not twenty.
+      final p = FieldPlanPresets.bleGoodputCeiling();
+      final secs = p.steps.fold<int>(0, (a, s) => a + s.dwellSec) +
+          (p.drainSec ?? 0) * p.steps.length +
+          p.placementSec +
+          p.alignSec;
+      expect((secs / 60).round(), 83);
+      expect(FieldPlanPresets.bleCeilingSenderPresetName, contains('~83m'));
+    });
+
+    test('the tap tolerance is two minutes, not one', () {
+      // alignSec is the anchor granularity: an anchor rounds up to the next
+      // multiple of it. At 60 s two phones must tap inside one wall-clock
+      // minute, and a smoke run was lost to taps either side of a boundary.
+      expect(FieldPlanPresets.bleGoodputCeiling().alignSec, 120);
+    });
+
+    test('the receiver sends nothing but segments identically', () {
+      final tx = FieldPlanPresets.bleGoodputCeiling();
+      final rx = FieldPlanPresets.bleGoodputCeiling(saturating: false);
+      expect(rx.steps.every((s) => !s.saturate && s.sendCount == 0), isTrue);
+      expect(labels(rx), labels(tx));
+    });
+
+    test('the step fields survive a JSON round-trip', () {
+      final p = FieldPlanPresets.bleGoodputCeiling();
+      expect(FieldPlan.fromJson(p.toJson()).steps, p.steps);
+    });
+  });
+
+  group('BLE one-way ceiling preset', () {
+    test('the receiver never acknowledges, so the link carries one direction',
+        () {
+      // Every acknowledgement is a packet back down the same radio. A duplex
+      // run reports duplex capacity as if it were simplex.
+      final p = FieldPlanPresets.bleOneWayCeiling();
+      expect(p.suppressAcks, isTrue);
+      expect(FieldPlan.fromJson(p.toJson()).suppressAcks, isTrue);
+    });
+
+    test('the run silences everything that is not payload', () {
+      // Advertising, scanning, ANNOUNCE and the DTN buffer all spend the same
+      // radio and the same controller. A ceiling measured with them running
+      // is a ceiling on the protocol, not on the link.
+      final p = FieldPlanPresets.bleOneWayCeiling();
+      expect(p.quietLink, isTrue);
+      expect(FieldPlan.fromJson(p.toJson()).quietLink, isTrue);
+    });
+
+    test('quiet is never the default — it disables discovery', () {
+      // A phone left quiet cannot find anyone again, so only a run may ask.
+      expect(FieldPlanPresets.bleGoodputCeiling().quietLink, isFalse);
+      expect(FieldPlanPresets.bleThroughput().quietLink, isFalse);
+      expect(FieldPlanPresets.ringSweep().quietLink, isFalse);
+    });
+
+    test('acknowledging stays the default everywhere else', () {
+      expect(FieldPlanPresets.bleGoodputCeiling().suppressAcks, isFalse);
+      expect(FieldPlanPresets.bleThroughput().suppressAcks, isFalse);
+    });
+
+    test('spacing off throughout, and payloads start where the last run '
+        'stopped climbing', () {
+      final p = FieldPlanPresets.bleOneWayCeiling();
+      expect(p.steps.every((s) => s.fragmentDelayMs == 0), isTrue);
+      final sizes = p.steps.map((s) => s.sendBytes).toSet();
+      expect(sizes, {1380, 4140, 13800, 27600, 55200});
+      expect(p.steps, hasLength(20));
+    });
+
+    test('the advertised duration matches the plan', () {
+      final p = FieldPlanPresets.bleOneWayCeiling();
+      final secs = p.steps.fold<int>(0, (a, s) => a + s.dwellSec) +
+          (p.drainSec ?? 0) * p.steps.length + p.placementSec + p.alignSec;
+      expect((secs / 60).round(), 33);
+      expect(FieldPlanPresets.bleOneWaySenderPresetName, contains('~33m'));
     });
   });
 }

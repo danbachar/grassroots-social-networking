@@ -2542,6 +2542,12 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               ? null
               : (rosterHex, radius) => _grassroots!.setRingGateForTestbed(
                   rosterHex: rosterHex, radius: radius),
+          onIgnorePeer: _grassroots == null
+              ? null
+              : (peer) => unawaited(_grassroots!.ignorePeerForTestbed(peer)),
+          onUnignorePeer: _grassroots == null
+              ? null
+              : (hex) => _grassroots!.unignorePeerForTestbed(hex),
           onSeverLinks:
               _grassroots == null ? null : () => _grassroots!.severAllBleLinks(),
           onCryptoBench:
@@ -2551,6 +2557,8 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
           bleUndiscoverable: _grassroots == null
               ? null
               : () => _grassroots!.bleUndiscoverable,
+          legsReady:
+              _grassroots == null ? null : () => _grassroots!.bleLegsReady,
           bleUsableChanges: _grassroots?.bleUsableChanges,
           onSetBle: _grassroots == null
               ? null
@@ -2566,6 +2574,7 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
             await _grassroots?.refreshSystemBt();
           },
           sessionEvents: _grassroots?.noiseSessionEstablished,
+          ackEvents: _grassroots?.messageAcknowledged,
           linkSettledEvents: _grassroots?.peerLinkSettled,
           onSetDialParallelism: _grassroots == null
               ? null
@@ -2576,6 +2585,22 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               ? null
               : (every) =>
                   _grassroots!.setTraceEveryAdvertisementForTestbed(every),
+          onSetConnectionPriority: _grassroots == null
+              ? null
+              : (high) => _grassroots!.setConnectionPriorityForTestbed(high),
+          onSetFragmentDelay: _grassroots == null
+              ? null
+              : (ms) => _grassroots!.setFragmentDelayForTestbed(ms),
+          onSetSuppressAcks: _grassroots == null
+              ? null
+              : (on) => _grassroots!.setSuppressAcksForTestbed(on),
+          onSetQuietLink: _grassroots == null
+              ? null
+              : (on) => _grassroots!.setQuietLinkForTestbed(on),
+          onSetStaleSweepSuspended: _grassroots == null
+              ? null
+              : (on) =>
+                  _grassroots!.staleSweepSuspendedForTestbed = on,
           establishmentCount: _grassroots == null
               ? null
               : () => _grassroots!.bleEstablishmentCount,
@@ -2584,8 +2609,16 @@ class _GrassrootsHomeState extends State<GrassrootsHome>
               : () => _grassroots!.resetBleEstablishmentCount(),
           sessionPeerCount:
               _grassroots == null ? null : () => _grassroots!.sessionPeerCount,
+          linkPeerCount:
+              _grassroots == null ? null : () => _grassroots!.linkPeerCount,
+          onSetDtnMaxBytes: _grassroots == null
+              ? null
+              : (bytes) => _grassroots!.setDtnMaxBytes(bytes),
           sessionTableCount:
               _grassroots == null ? null : () => _grassroots!.noiseSessionCount,
+          sessionPeerHexes: _grassroots == null
+              ? null
+              : () => _grassroots!.noiseSessionPeerHexes,
         ),
       ),
     );

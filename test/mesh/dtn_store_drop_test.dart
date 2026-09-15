@@ -32,8 +32,11 @@ void main() {
   });
 
   test('store-wide cap eviction reports evictedTotal, oldest first', () {
-    // The bound is BYTES: 10 + 20 fits, the 30-byte packet does not, so the
-    // globally-oldest goes and the ledger lands exactly on the ceiling.
+    // The bound is BYTES, and eviction has hysteresis: crossing
+    // [DtnStore.evictHighWater] drains to [DtnStore.evictLowWater] rather
+    // than shedding one packet to land on the ceiling. So 10 + 20 + 30
+    // against a 50-byte cap shed BOTH older packets to reach the 40-byte
+    // low-water mark, oldest first.
     final store = DtnStore(maxBytes: 50);
     final drops = <(String, String)>[];
     store.onDrop =
@@ -41,13 +44,18 @@ void main() {
 
     final t0 = DateTime(2026, 1, 1);
     final first = _packet(10);
+    final second = _packet(20);
     store.store('aa', first, now: t0);
-    store.store('bb', _packet(20), now: t0.add(const Duration(seconds: 1)));
+    store.store('bb', second, now: t0.add(const Duration(seconds: 1)));
     store.store('cc', _packet(30), now: t0.add(const Duration(seconds: 2)));
 
-    expect(drops, [('evictedTotal', first.packetId)]);
-    expect(store.totalCount, 2);
-    expect(store.totalBytes, 50);
+    expect(drops, [
+      ('evictedTotal', first.packetId),
+      ('evictedTotal', second.packetId),
+    ]);
+    expect(store.totalCount, 1);
+    expect(store.totalBytes, 30,
+        reason: 'drained to at or below the low-water mark');
   });
 
   test('recipient-cap eviction reports every packet of the evicted recipient',

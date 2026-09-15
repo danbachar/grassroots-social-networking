@@ -49,17 +49,36 @@ class FieldPlanPresets {
     int sendCount = 100,
     int placementSec = 120,
     int alignSec = 300,
+    // Offer as much as the radio will take instead of a fixed count, so a
+    // cell reports the link's CEILING rather than the load the plan chose.
+    // At moderate load every clique size below five is an offered-load
+    // floor: the mesh delivered what it was given and was never asked for
+    // more, so nothing in that data says what a radio can carry at k links.
+    // [FieldStep.sendCount] is ignored while this is on, so every other
+    // parameter here keeps its meaning and the two arms differ in exactly
+    // the three fields the label names.
+    bool saturating = false,
+    // A saturating dwell ends with acknowledgements still in flight, and
+    // one lane in flight is not a queue tail — but the confirmations still
+    // outlive the window, so the drain is longer than the dwell rather
+    // than equal to it, as on the throughput arms.
+    int saturatingDrainSec = 60,
   }) {
     final steps = <FieldStep>[];
     for (final n in const [2, 3, 4, 5, 6, 7]) {
       for (var t = 1; t <= reps; t++) {
         steps.add(FieldStep(
-          label: 'N=$n L=moderate t$t',
+          label: 'N=$n L=${saturating ? 'sat' : 'moderate'} t$t',
           dwellSec: sendSec,
           cliqueN: n,
           sendTo: 'all',
           sendBytes: sendBytes,
           sendCount: sendCount,
+          saturate: saturating,
+          // One write in flight per lane: `_fireSaturating` awaits each
+          // send, so a single lane cannot leave a backlog that spills into
+          // the next step and charges its dwell for this one's traffic.
+          sendLanes: 1,
           autoAdvance: steps.isNotEmpty,
           // The test's FIRST run resets links and sessions, once, on
           // every device: both form at the desk during staging and
@@ -109,6 +128,7 @@ class FieldPlanPresets {
       // a send to it can land. Measured at seven phones: linked 0.6 s and
       // receiving 2.2 s after its instant.
       joinGapSec: 5,
+      drainSec: saturating ? saturatingDrainSec : null,
       manualJoin: true,
       alignSec: alignSec,
       placementSec: placementSec,
@@ -323,6 +343,163 @@ class FieldPlanPresets {
   /// while checking that a fresh build joins, paces, resets and uploads at
   /// all needs one. Both are the same plan at a different repeat count, so
   /// the count is picked at launch instead of edited into the source.
+  static const String linkChurnPresetName =
+      'Link churn + throughput at N=8 (~2h40m — the k=7 row)';
+
+  /// The one clique size the simulator cannot get from `clique-final`.
+  ///
+  /// Every simulated node holds the seven-link cap, and the surviving clique
+  /// reductions already carry k=1..6, so the only missing row is k=7 --- which
+  /// is N=8, since a node's link count is N-1. The clique's RAW records are
+  /// gone, so nothing per-device can be recovered from it below k=7; that is
+  /// a limit of the archive, not something more phones fix.
+  ///
+  /// Three arms in one plan, run in this order because each leaves the mesh
+  /// in the state the next one wants:
+  ///
+  ///  1. **fixed load** --- 60 s of [sendCount] messages to every session,
+  ///     then a 60 s drain, then links broken and the DTN buffer purged.
+  ///     Sessions are KEPT, so each run measures link establishment against
+  ///     warm sessions and the handshake never sits on the latency path. The
+  ///     operator establishes sessions by hand before the first run; a
+  ///     `session` stage inside a run is therefore a session LOSS, except on
+  ///     the joining phone at a clique-size boundary, of which this plan has
+  ///     none.
+  ///  2. **saturating** --- the same, offering as much as the radio takes
+  ///     rather than a fixed count, which is the only way to read a CEILING.
+  ///     A fixed-load arm reports what it was given, never what it could
+  ///     carry, so the two arms answer different questions and both are
+  ///     needed.
+  ///  3. **long hold** --- ten [holdReps] ten-minute runs with NO in-run
+  ///     resets, so a
+  ///     dropped link is watched until it comes back. Outage durations
+  ///     elsewhere are censored by the run length: on 120 s runs against
+  ///     outage means of one to five minutes, most durations are cut off and
+  ///     the mean is a lower bound of unknown tightness.
+  ///
+  /// There is no N=10 cap arm. The seven-link cap is settled by direct
+  /// observation --- nine devices in range for over an hour at ZERO load,
+  /// with no Nexus 5X above seven --- and zero load is what makes that
+  /// decisive, since it removes the one confound a loaded run cannot
+  /// exclude: that the phones were too busy dialling to reach more peers.
+  /// A loaded N=10 arm could only weaken it.
+  static FieldPlan linkChurn({
+    String expId = 'churn-n8-1',
+    int reps = 10,
+    int holdReps = 10,
+    int sendSec = 60,
+    int holdSec = 600,
+    int sendBytes = 138,
+    int sendCount = 100,
+  }) {
+    final steps = <FieldStep>[];
+    void arm(String load, int n, int count, int dwell,
+        {required bool saturating, required bool breakLinks}) {
+      for (var t = 1; t <= count; t++) {
+        // Purged on the FIRST run of each arm and never again inside it.
+        //
+        // Not per run: that is what truncated latency, since a message still
+        // in flight when a run ends was deleted and the distribution cut off
+        // at about dwell-plus-drain. Not never, either: the arms offer
+        // DIFFERENT loads, so each has its own steady state, and an arm that
+        // inherits the previous arm's backlog starts outside its own. The
+        // saturating arm is the case that matters --- inherited transit goes
+        // straight into the ceiling it exists to measure, so it has to
+        // generate the buffer it works against rather than borrow one.
+        //
+        // Arms independent of each other, runs independent inside an arm by
+        // reaching a common steady state under one constant offered rate.
+        final firstOfArm = t == 1;
+        steps.add(FieldStep(
+          label: 'N=$n L=$load t$t',
+          dwellSec: dwell,
+          cliqueN: n,
+          sendTo: 'all',
+          sendBytes: sendBytes,
+          // Scaled to the dwell so every arm offers the SAME RATE. Sends are
+          // paced evenly across the window, so a fixed count over a ten-minute
+          // dwell would offer a tenth of what the one-minute arms do, and the
+          // long hold would measure outages under a load the rest of the run
+          // never sees.
+          sendCount: (sendCount * dwell / sendSec).round(),
+          saturate: saturating,
+          sendLanes: 1,
+          resetDtnBuffer: firstOfArm,
+          // Links go down between runs so establishment is measured each
+          // time --- except in the long hold, whose whole point is to let an
+          // outage run its course rather than be ended by the harness.
+          resetLinks: breakLinks,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    arm('moderate', 8, reps, sendSec, saturating: false, breakLinks: true);
+    arm('sat', 8, reps, sendSec, saturating: true, breakLinks: true);
+    arm('hold', 8, holdReps, holdSec, saturating: false, breakLinks: false);
+    return FieldPlan(
+      expId: expId,
+      // Sessions are NEVER reset, on any step including the first: the
+      // testbed starts warm with the operator having established them by
+      // hand, and this plan has no clique-size growth to form new ones.
+      resetSessions: false,
+      // Seven, because a node's session count is N-1 and this plan never
+      // forms one. A phone launching short cannot create a packet for the
+      // peers it is missing --- the send path gates on `hasSession` --- so
+      // those ordered pairs would contribute nothing for the whole run and
+      // the shortfall would surface only in the reduction. Refusing to launch
+      // costs a relaunch; launching short costs the row.
+      minSessionsToLaunch: 7,
+      // FALSE at plan level, with the real value carried per step. This is
+      // not a preference: `FieldPlan.gapAfterSec` reads the PLAN flag and
+      // short-circuits the drain to zero when it is true, so a plan-level
+      // `true` silently discards every drain in the run --- and a saturating
+      // dwell ends with acknowledgements still in flight, which is exactly
+      // the tail that would be lost. The steps set it explicitly, and every
+      // reset site (`_runResets`, `resetSlotMs`, `stepStarts`) reads the
+      // per-step override, so behaviour is unchanged where it matters.
+      resetLinks: false,
+      resetDtnBuffer: false,
+      // NO cap override: the store's default is left in place, so eviction
+      // never fires. A cap plus a uniform offered rate would make the SLOWER
+      // phones fill and evict more, and eviction is oldest-first, so the loss
+      // would land on exactly the devices whose write capability this run is
+      // measuring --- the Nexus refuses about a third of its conveyance
+      // attempts and airs half the bytes of a modern phone. Buffer occupancy
+      // is left free to differ by device, where it is an OBSERVATION of that
+      // difference rather than a mechanism distorting it.
+      linkResetDarkSec: 10,
+      resetBudgetSec: 15,
+      // Acknowledgements outlive a 60 s send window, so the drain is longer
+      // than the dwell rather than derived from it.
+      drainSec: 60,
+      joinGapSec: 5,
+      manualJoin: true,
+      alignSec: 300,
+      placementSec: 120,
+      scriptedRadio: true,
+      traceEveryAdvertisement: true,
+      steps: steps,
+    );
+  }
+
+  /// The dropdown entry for the saturating arm of the diluting clique.
+  static const String dilutingSaturatingPresetName =
+      'Diluting clique SATURATING N=2..7 (~1.5h — per-link ceilings)';
+
+  /// The diluting clique offering as much as each radio will take, so every
+  /// clique size reports a carrying ceiling rather than the load the plan
+  /// chose. Identical to [dilutingLineLoads] in every other respect --- same
+  /// sizes, repeats, dwell, join order and warm mesh --- because it IS that
+  /// preset with its saturating flag set, not a second copy of it.
+  ///
+  /// Its own expId: the label distinguishes the arms inside a run, and the
+  /// id keeps them in separate files so neither can overwrite the other.
+  static FieldPlan dilutingSaturating({
+    String expId = 'clique-sat-1',
+    int reps = 10,
+  }) =>
+      dilutingLineLoads(expId: expId, reps: reps, saturating: true);
+
   static const String dilutingSmokePresetName =
       'Diluting clique smoke test (N=2..7, field dwell — pick runs)';
 
@@ -532,12 +709,12 @@ class FieldPlanPresets {
     );
   }
 
-  /// Name of the ring sweep in the dropdown. The roster is empty in the preset
-  /// (this file holds no pubkeys), so the operator pastes the plan JSON with
-  /// the fleet's roster filled in — the ring needs identities, and hardcoding
-  /// them here would break the rosterless rule the rest of this file keeps.
-  static const ringSweepPresetName = 'Ring-radius sweep r=1..5 (~4.5h)';
-  static const ringSmokePresetName = 'Ring-radius desk smoke (4 phones, ~18m)';
+  /// Name of the ring sweep in the dropdown. It carries no roster and needs
+  /// none: the ring is derived on each phone from its own session table
+  /// ([FieldPlan.ringRosterFromSessions]), so the identities come from the
+  /// room and only the SIZE ([FieldPlan.ringSize]) is declared here.
+  static const ringSweepPresetName = 'Ring-radius sweep r=1..diameter';
+  static const ringSmokePresetName = 'Ring-radius desk smoke (~30m)';
 
   /// A deterministic shuffle, so every phone materialises a byte-identical
   /// schedule from the same seed.
@@ -589,8 +766,9 @@ class FieldPlanPresets {
   /// **Sessions are never cleaned.** Not by the plan, not by any step. Under
   /// the gate a non-neighbour can never handshake, so one purge would make
   /// every later message to a non-neighbour fail at creation and the run would
-  /// be dead from that point. [FieldPlan.minSessionsToLaunch] refuses to start
-  /// a phone that has not been warmed up.
+  /// be dead from that point. [FieldPlan.ringSize] refuses to start a phone
+  /// whose session table is not the size of the fleet, which is what a phone
+  /// that has not been warmed up looks like.
   ///
   /// [perPair] is messages per ordered pair per trial; the device's total is
   /// `perPair * (n - 1)`, sent one at a time on rotation so each pair's share
@@ -598,7 +776,10 @@ class FieldPlanPresets {
   static FieldPlan ringSweep({
     String expId = 'ring',
     int n = 11,
-    List<int> radii = const [1, 2, 3, 4, 5],
+    // Null means every radius from 1 to the ring's diameter, n ~/ 2. Past the
+    // diameter every radius is the complete graph again, so a longer list
+    // would spend trials measuring one topology under several names.
+    List<int>? radii,
     int sweeps = 10,
     // 100 s against perPair 10 puts one message per ordered pair per 10 s —
     // exactly one ANNOUNCE/sync round, which is the mesh's own conveyance
@@ -609,18 +790,19 @@ class FieldPlanPresets {
     // Time allowed for delivery after sending stops.
     //
     // Conveyance advances at most ONE HOP per 10 s sync round, so diameter
-    // five has an irreducible floor near 50 s before any queueing. The 4-phone
-    // smoke measured the rest of the tail at diameter two — p90 113 s — but
-    // did so at ten times this load, where queueing dominated; most of that
-    // should fall away here. 180 s is roughly 3.5x the hop floor and is a
-    // standing estimate, not a measurement: the fleet run's own latency
-    // distribution is what should confirm or move it, and cutting it further
-    // on speculation would re-introduce exactly the censoring this replaced.
-    int drainSec = 180,
+    // five has an irreducible floor near 50 s before any queueing. On top of
+    // that the sync sweep offers a peer one 106-id frame per round, so at
+    // N=11 and r=1 the hundred packets a trial leaves on a ring edge need ten
+    // rounds just to be offered once per hop, before any queueing behind
+    // earlier trials. 300 s is a standing estimate, not a measurement: the
+    // fleet run's own latency distribution is what should confirm or move it,
+    // and cutting it on speculation would re-introduce exactly the censoring
+    // the drain exists to prevent.
+    int drainSec = 300,
     // Seconds of quiet before a widened trial, for the newly permitted links
     // to form in. It is exactly this long: a settle stage measures nothing and
     // so carries no drain.
-    int settleSec = 60,
+    int settleSec = 90,
     int sendBytes = defaultSendBytes,
     int perPair = 10,
     int seed = 20260901,
@@ -630,40 +812,46 @@ class FieldPlanPresets {
     // around to a twelve-minute run.
     int placementSec = 120,
     int alignSec = 300,
-    List<WorkloadRosterEntry> roster = const [],
   }) {
+    radii ??= [for (var r = 1; r <= n ~/ 2; r++) r];
     final steps = <FieldStep>[];
     final trialOf = <int, int>{for (final r in radii) r: 0};
     var settleNo = 0;
-    // The radius the previous step left in force. Null means unconstrained,
-    // which is what warm-up leaves behind: every pair linked. Arming any
-    // radius against that is a TIGHTENING, so the first trial needs no settle.
-    int? prevRadius;
     for (var sweep = 0; sweep < sweeps; sweep++) {
       // A fresh draw per sweep, derived from the one seed so the whole fleet
       // agrees. The emitted step list IS the schedule, and it rides in the plan
       // JSON every phone loads, so the run is reconstructible from the trace.
       for (final r in _seededShuffle(radii, seed + sweep)) {
         final trial = (trialOf[r] = trialOf[r]! + 1);
-        // A quiet stage inserted ONLY where the radius WIDENS, because that is
-        // the only direction that has to build anything.
+        // Every trial opens on a mesh it built itself, inside a quiet stage
+        // that precedes it.
         //
-        // Nothing severs links here. Narrowing is already handled the moment
-        // the radius lands: the gate's prune tears down exactly the links the
-        // new radius disallows and leaves the rest of the topology standing,
-        // warm and already converged. Widening tears down nothing — it only
-        // grants permission — so the newly allowed pairs must find each other,
-        // and that is what this window pays for.
+        // The stage BOUNCES THE LINKS and then waits, and both halves are
+        // load bearing. Without the bounce a trial inherits whatever the
+        // previous one left — its leg count, its stale addresses, its wear —
+        // so two trials at one radius are a single trajectory sampled twice
+        // rather than two draws, and a decay measured across them cannot be
+        // told from the mesh simply ageing. Without the wait the rebuild
+        // happens INSIDE the dwell, and the trial measures convergence
+        // instead of the data plane it exists to measure.
         //
-        // An earlier revision severed every link at every stage, to make each
-        // trial start from an identical cold state so link age could not
-        // co-vary with the direction the radius moved. That uniformity is real
-        // but it is bought by destroying a working mesh twice a trial and
-        // rebuilding it under time pressure, and the first desk smoke showed
-        // what that costs: one permitted edge (366dca50<->44a266c4) never came
-        // back inside the window, so two of four nodes held one neighbour
-        // instead of two and the trial measured a path rather than a ring.
-        // Disturbing less is worth more here than starting identically.
+        // [settleSec] must cover three things in series: the dark window, the
+        // reset budget, and convergence. Convergence from cold is about 20 s
+        // to roughly ten legs at N=10, so the default leaves margin over that
+        // sum rather than matching it — a reset that runs long otherwise
+        // opens the dwell mid-rebuild, which is the failure the wait exists
+        // to prevent.
+        //
+        // THE RISK THIS CARRIES: a bounced mesh has to find every permitted
+        // pair again, and a pair that does not come back inside the window
+        // silently shrinks the topology. At r=1 one missing edge turns the
+        // ring into a path and the trial measures a shape nobody chose — a
+        // 4-phone desk smoke lost exactly one permitted edge that way. The
+        // settle-end leg count is what says whether it happened, and it has
+        // to be read before any trial is trusted.
+        //
+        // Sessions are NOT touched: they are why a non-neighbour is
+        // addressable at all, and one purge ends the run.
         //
         // The label carries NO `r=` token, so it opens its own segment for
         // inspection without being read as a ring trial, and it is numbered so
@@ -671,17 +859,16 @@ class FieldPlanPresets {
         //
         // [FieldStep.settle] is what makes it exactly settleSec long: a stage
         // that aired nothing has no tail in flight, so it carries no drain.
-        if (prevRadius != null && r > prevRadius) {
-          settleNo++;
-          steps.add(FieldStep(
-            label: 'settle $settleNo',
-            dwellSec: settleSec,
-            sendCount: 0,
-            ringRadius: r,
-            settle: true,
-            autoAdvance: steps.isNotEmpty,
-          ));
-        }
+        settleNo++;
+        steps.add(FieldStep(
+          label: 'settle $settleNo',
+          dwellSec: settleSec,
+          sendCount: 0,
+          ringRadius: r,
+          settle: true,
+          resetLinks: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
         steps.add(FieldStep(
           // `r=<radius> t<trial>` exactly, with no token before the `r`:
           // analyze.py splits labels on " r" for the power ladder's legacy
@@ -699,7 +886,6 @@ class FieldPlanPresets {
           ringRadius: r,
           autoAdvance: steps.isNotEmpty,
         ));
-        prevRadius = r;
       }
     }
     return FieldPlan(
@@ -707,12 +893,18 @@ class FieldPlanPresets {
       // from the trace alone.
       expId: '$expId-$n-s$seed',
       steps: steps,
-      roster: roster,
       manualJoin: true,
       // Sessions are never cleaned: they are the reason a non-neighbour is
       // addressable at all, and one purge ends the run.
       resetSessions: false,
+      // Bouncing is a per-settle act, never a plan-wide one: the plan-level
+      // flag fires at the start of EVERY step, which would tear the links
+      // down at the top of each trial as well.
       resetLinks: false,
+      // The bounce gets a reserved slot inside the settle rather than eating
+      // into it. Both sides drop at the same lattice instant, so neither
+      // holds a stale path the other has to wait out.
+      linkResetDarkSec: 10,
       // The DTN buffer IS cleared, at the start of every stage, and that is a
       // deliberate reversal of what a store-carry-forward run wants.
       //
@@ -729,8 +921,10 @@ class FieldPlanPresets {
       // its own dwell plus drain. It is affordable precisely because the drain
       // is now sized for the conveyance tail rather than derived from the
       // dwell; what it discards is the residue that failed to arrive in a
-      // window every trial gets equally. Sessions, links and the seen-set are
-      // untouched, so a stage still starts warm and dedup still holds.
+      // window every trial gets equally. The seen-set goes with it, so the
+      // sync sweep offers a fresh trial's packets without first re-walking
+      // every id the previous trials left behind; sessions and links are
+      // untouched, so a stage still starts warm.
       //
       // The cost, stated: originators buffer their confirmations too, so a
       // pending ACK is discarded with everything else and the acked column
@@ -741,7 +935,19 @@ class FieldPlanPresets {
       // a widening destroys nothing. severAllLinks remains available as an
       // operator primitive; this sweep simply has no use for it.
       severLinks: false,
-      minSessionsToLaunch: n - 1,
+      // The ring is whoever is in the room, not whoever a constant in this
+      // file remembers: the session table cannot name an absent phone, and it
+      // decides the topology AND the send targets, so no compiled roster is
+      // carried at all.
+      //
+      // The plan still declares how many phones it was built for, because
+      // that is the one thing the room cannot say and it is the launch guard's
+      // only local assertion — the radii and the per-pair counts were chosen
+      // for exactly n. No [FieldPlan.minSessionsToLaunch] sits beside it: a
+      // session floor says strictly less than the size check does, and two
+      // numbers for one fleet are two numbers that can disagree.
+      ringRosterFromSessions: true,
+      ringSize: n,
       resetBudgetSec: 30,
       drainSec: drainSec,
       traceEveryAdvertisement: true,
@@ -750,104 +956,449 @@ class FieldPlanPresets {
     );
   }
 
-  /// The desk-sized ring smoke: four phones, two radii, ~12 minutes.
+  /// The desk-sized ring smoke: [n] phones, two radii, ~30 minutes.
   ///
-  /// Four and not three, which is a geometric requirement rather than a
-  /// preference: on a 3-ring every pair sits at ring distance 1, so r=1 is
-  /// already the complete graph and no message can ever require a relay. On the
-  /// 4-ring at r=1 the two opposite pairs are two hops apart, so their messages
-  /// MUST be conveyed — and r=2 makes the same graph complete, which is the
-  /// contrast that proves the gate.
+  /// The two radii are the ring (r=1) and the complete graph (the diameter,
+  /// n ~/ 2), which is the contrast that proves the gate. Four is the floor,
+  /// and a geometric one rather than a preference: on a 3-ring every pair sits
+  /// at ring distance 1, so r=1 is already the complete graph and no message
+  /// can ever require a relay. On the 4-ring at r=1 the two opposite pairs are
+  /// two hops apart, so their messages MUST be conveyed.
   ///
-  /// Both the dwell and the drain shorten together (they are the same number),
-  /// per the rule that a tuned window is tuned at every stage or not at all.
-  static FieldPlan ringSmoke({
-    String expId = 'ring-smoke',
-    List<WorkloadRosterEntry> roster = const [],
-  }) =>
+  /// The drain is longer than the sweep's, not shorter, because the load is
+  /// ten times higher: the tail is what this run measures, and a drain that
+  /// cuts it off would report slow mail as lost mail.
+  static FieldPlan ringSmoke({String expId = 'ring-smoke', int n = 10}) =>
       ringSweep(
         expId: expId,
-        n: 4,
-        radii: const [1, 2],
+        n: n,
+        // The ring and the complete graph: r=1 and the diameter.
+        radii: [1, n ~/ 2],
         sweeps: 2,
         // Same one-message-per-pair-per-sync-round cadence as the sweep, so
         // the smoke measures the tail at the load the sweep will actually run.
         dwellSec: 100,
-        // Diameter two needs less than the sweep's five.
-        drainSec: 120,
-        perPair: 10,
-        settleSec: 60,
-        // Desk-sized: everyone is standing at the same table, so the windows
-        // only have to cover launching four phones by hand.
+        // Ten times the sweep's cadence: one message per ordered pair per
+        // SECOND rather than per sync round. The sweep's rate offers the mesh
+        // one packet per opportunity to move it, which measures the mechanism
+        // at rest; this measures it under queueing, where the ask window has to
+        // keep up with a seen-set growing ten times faster. That is the regime
+        // the prefix frame's floor is shallowest in — a filter holds one
+        // filter's worth of ids however fast they arrive, so at this rate the
+        // floor is seconds deep instead of a minute, and whatever the forward
+        // sweep is worth shows up here or nowhere.
+        drainSec: 300,
+        perPair: 100,
+        settleSec: 90,
+        // Desk-sized: everyone is standing at the same table, so placement
+        // only has to cover reaching the handsets.
         placementSec: 60,
-        alignSec: 60,
-        roster: roster,
+        // What a tap spread may be and still land on one anchor is
+        // `alignSec - placementSec`, so these two were equal and the
+        // guarantee was zero — every launch relied on the taps happening to
+        // fall inside one bucket. Ten handsets take appreciably longer to
+        // work through than four, and a phone that lands on the next anchor
+        // starts a whole alignment period late, which at these radii is a
+        // trial it spends outside the ring the others formed.
+        alignSec: 180,
       );
 
-  /// The desk fleet's ring roster, for [ringSmokeDesk].
+  /// [ringSmoke] under a numbered experiment id, so the run is one dropdown
+  /// tap on each phone and nothing has to be typed at a handset.
   ///
-  /// This file otherwise holds NO pubkeys, and that rule is worth keeping: a
-  /// plan is portable and a roster is hardware. The ring is the one shape that
-  /// cannot be rosterless — a node derives its own ring position by finding
-  /// itself among sorted pubkeys, so without identities there is no topology at
-  /// all — and the alternative is pasting plan JSON into the runner's text
-  /// field over adb, which has wedged a phone before (braces and quotes need
-  /// escaping and a half-entered plan is unrecoverable).
-  ///
-  /// Verified against each handset's Settings > You > FINGERPRINT on
-  /// 2026-09-01; `tools/fleet_map.json` agreed on all four. (`fleet_map.md` did
-  /// NOT — it carries a stale identity for 00de4b24, which is what an
-  /// uninstall does to a key. Trust the json.)
-  ///
-  /// Ring order is the sort, so at r=1 the conveyance pairs — the ones two hops
-  /// apart, whose messages MUST be relayed — are 07e47335<->366dca50 and
-  /// 18130c0f<->44a266c4.
-  static const deskRingRoster = [
-    // 00de4b24f89021e4, Nexus 5X, nickname 2
-    WorkloadRosterEntry(
-        label: 'n5x-00de4b',
-        pubkeyHex:
-            '07e473354009ebe81b22b1c6a79606c8d653558a865c4941c98e4befbfda546c'),
-    // 00f8380a3668adb1, Nexus 5X, nickname 4
-    WorkloadRosterEntry(
-        label: 'n5x-00f838',
-        pubkeyHex:
-            '18130c0f5a36449cc5c1d5e0c17e83ba4d248625655035b08e971693fb29ae40'),
-    // 55281FDCH002QK, Pixel 10 Pro, nickname 5
-    WorkloadRosterEntry(
-        label: 'pixel-552816',
-        pubkeyHex:
-            '366dca50d82e71c72a32c234baa7c97b05252841e55f8445ef6f52525d13bbf9'),
-    // 0253914a45ebaeb0, Nexus 5X, nickname 3
-    WorkloadRosterEntry(
-        label: 'n5x-025391',
-        pubkeyHex:
-            '44a266c4c9912ec34ea7934fbbffae1745ab82df0229f8972440ae3f43862fa4'),
-  ];
-
-  /// [ringSmoke] with the desk fleet's roster already in it, so the run is one
-  /// dropdown tap on each phone and no pubkey has to be typed at a handset.
-  /// [ringSmoke] with the desk fleet's roster already in it, so the run is one
-  /// dropdown tap on each phone and no pubkey has to be typed at a handset.
+  /// It carries NO roster, and this file holds no pubkeys at all. A compiled
+  /// roster would be dead twice over here — the derived ring decides both the
+  /// topology and the send targets, so nothing reads one — and it would still
+  /// ride into the plan JSON and every trace, naming a fleet that is not
+  /// necessarily the one running. A list of handsets kept in source goes stale
+  /// the first time a phone leaves the desk or an uninstall changes its key,
+  /// and that silent staleness is the whole reason the ring derives itself
+  /// from the session table.
   ///
   /// **Bump [ringSmokeRun] before every run.** The collector refuses a reused
   /// experiment id by suffixing it, which splits one fleet's uploads across
   /// file names and breaks run discovery — and a reused id that merges instead
   /// silently pools two runs' records under one name, which for this preset
   /// would mix loads that differ by more than a factor of ten.
-  static const ringSmokeRun = 3;
+  static const ringSmokeRun = 7;
 
-  static FieldPlan ringSmokeDesk() =>
-      ringSmoke(expId: 'ring-smoke$ringSmokeRun', roster: deskRingRoster);
+  static FieldPlan ringSmokeDesk({int n = 10}) =>
+      ringSmoke(expId: 'ring-smoke$ringSmokeRun', n: n);
+
+  /// The dropdown entry for [mtuCheck].
+  static const String mtuCheckPresetName =
+      'MTU check (every phone present, desk — both legs of every pair, ~11m)';
+
+  /// **Bump before every run.** Same collector rule as [ringSmokeRun]: a
+  /// reused experiment id is either suffixed, splitting one fleet's uploads
+  /// across file names, or merged, pooling two runs under one name.
+  static const int mtuCheckRun = 2;
+
+  /// Does every leg of a converged pair know the ATT MTU its link actually
+  /// negotiated?
+  ///
+  /// A pair converges by attaching its second GATT leg to the ACL that is
+  /// already up, so both legs share one ATT bearer and one MTU, exchanged
+  /// once by whichever side reaches it first. The leg that did NOT do the
+  /// exchange gets no report of its own — its GATT server has nothing to fire
+  /// a callback about — and a leg left believing the 23-byte ATT default, or
+  /// a floor inferred from the largest packet that happened to arrive,
+  /// refuses every data-sized frame while the link reports healthy.
+  ///
+  /// The run is establishment, repeated: every step bounces the links on every
+  /// phone at the same lattice instant, so each step is an independent
+  /// convergence of every pair, and an independent chance for any leg to
+  /// settle on the wrong number.
+  ///
+  /// It is rosterless, so it sizes itself to the room: every phone addresses
+  /// every peer it holds a session with. Pairs go up with the square of the
+  /// fleet and legs at twice that, which is the whole reason to run it on more
+  /// than two handsets — a fault that shows on a few percent of legs is a coin
+  /// flip over one pair's handful and unmissable over a fleet's.
+  /// [sendBytes] sits deliberately above an ANNOUNCE, because an ANNOUNCE is
+  /// the largest thing that reaches a peripheral leg once control traffic is
+  /// the only thing written to it — a leg whose belief comes from what it
+  /// receives can never learn more than that by itself, so only a payload
+  /// bigger than one separates a correct leg from a self-limiting one.
+  ///
+  /// **How to read it**, per (device, path, role):
+  /// - Every `link` record carries that leg's `mtu`, at every stage. Both
+  ///   roles of a pair must report the same negotiated value. One role at 517
+  ///   and the other at 23 or ~185 is the failure, whatever the run's
+  ///   delivery numbers look like.
+  /// - `oversized`, `mtuPending` and `mtuTooSmall` must all be absent. They
+  ///   are the same fault seen from the send path: a frame refused by a leg
+  ///   that underestimates itself, and the pair's other leg rescuing it.
+  static FieldPlan mtuCheck({
+    String? expId,
+    int runs = 8,
+    // Long enough for every pair to converge dual-role inside the dwell after
+    // a fleet-wide simultaneous bounce: reverse-leg discovery alone is several
+    // seconds per pair, and they contend. A leg that never reaches `connected`
+    // reports nothing about its MTU, so a dwell too short to converge does not
+    // measure a smaller sample — it measures none.
+    int dwellSec = 60,
+    int sendBytes = 200,
+    int sendCount = 30,
+  }) {
+    return FieldPlan(
+      expId: expId ?? 'mtu-check$mtuCheckRun',
+      // Links bounce every step; SESSIONS do not. An MTU is negotiated while
+      // a link comes up, which is a GATT-layer event with nothing to do with
+      // Noise, so purging the session table buys this test nothing and costs
+      // it twice: no phone can send until its handshakes complete, so the
+      // early part of every dwell carries no data — and data is the whole
+      // discriminator, since an ANNOUNCE alone never proves a leg carries
+      // more than an ANNOUNCE. It also leaves the fleet cold for whatever
+      // runs next.
+      resetSessions: false,
+      resetLinks: true,
+      resetDtnBuffer: true,
+      traceEveryAdvertisement: true,
+      manualJoin: true,
+      // Desk-sized: both phones are already on the table, and the alignment
+      // window only has to cover launching two of them by hand.
+      placementSec: 20,
+      alignSec: 60,
+      linkResetDarkSec: 10,
+      // Wider than the other desk presets'. This run is ABOUT establishment,
+      // and one Nexus 5X in the fleet has a 15.1 s mode on about a fifth of
+      // its link resets; a budget that cuts a bounce short opens the step
+      // late into its own dwell, which is the part being measured.
+      resetBudgetSec: 25,
+      steps: [
+        for (var t = 1; t <= runs; t++)
+          FieldStep(
+            label: 'mtu t$t',
+            dwellSec: dwellSec,
+            sendCount: sendCount,
+            sendBytes: sendBytes,
+            autoAdvance: t > 1,
+          ),
+      ],
+    );
+  }
+
+  static const bleThroughputSenderPresetName =
+      'BLE throughput — SENDER (2 phones, ~62m)';
+  static const bleThroughputReceiverPresetName =
+      'BLE throughput — RECEIVER (2 phones, ~62m)';
+  static const bleThroughputHighSenderPresetName =
+      'BLE throughput HIGH interval — SENDER (~22m)';
+  static const bleThroughputHighReceiverPresetName =
+      'BLE throughput HIGH interval — RECEIVER (~22m)';
+
+  /// The three throughput arms, as step labels. Order is fixed; the SWEEP
+  /// shuffles which arm runs first within each pass.
+  ///
+  /// A is the measurement: 138 B is exactly one sealed packet
+  /// (`FragmentHandler.fragmentThreshold`), so a message is one write and the
+  /// rate is the pipe's. B asks whether a converged pair's second leg is a
+  /// second pipe or only a source of write-busy refusals. C is what a
+  /// multi-packet message really costs — and its ceiling is
+  /// `FragmentHandler.fragmentDelay`, a constant of ours, not the radio's.
+  static const List<(int, int)> _throughputArms = [
+    (138, 1),
+    (138, 2),
+    (1380, 1),
+  ];
+
+  /// One directed BLE throughput run: how many bytes per second one warm link
+  /// between two phones actually carries through this stack.
+  ///
+  /// Nothing in the dataset measures a saturated link — every line-sweep step
+  /// ran at the offered rate and delivered all of it — so the simulator's link
+  /// capacity is a calculation from a path-loss fit and an assumed noise
+  /// floor, unchecked in the direction that flatters flooding. This measures
+  /// the ceiling that calculation stands in for.
+  ///
+  /// [saturating] false builds the RECEIVER's copy: identical labels and
+  /// timing so the two phones' segments line up on the server, but no sends.
+  /// A step's sends otherwise target every known peer, so a receiver that ran
+  /// the sender's plan would push back down the link being measured.
+  ///
+  /// Sessions and links stay warm — this measures the data plane, not
+  /// establishment — but the DTN buffer is cleared every step: a write refused
+  /// in one step is otherwise conveyed by a sync round inside the next and
+  /// counted there.
+  ///
+  /// The arms are INTERLEAVED across [sweeps] passes in a seeded random order,
+  /// for the same reason the ring sweep interleaves: thermal drift over half
+  /// an hour would otherwise land entirely on whichever arm ran last.
+  static FieldPlan bleThroughput({
+    String expId = 'ble-tp-1',
+    bool saturating = true,
+    int sweeps = 10,
+    int dwellSec = 60,
+    // As long as the dwell. A saturating step leaves far more in flight than a
+    // paced one, and what has not been acknowledged when the dwell closes is
+    // still moving: a short drain would count it as loss and charge the link
+    // for the analyser's impatience.
+    int drainSec = 60,
+    bool? connectionPriorityHigh,
+    // Which of [_throughputArms] to run. The connection-interval launch runs
+    // arm A alone: the lever is a property of the link, so one arm measures
+    // it, and three would triple a run whose only comparison is against A.
+    List<int> arms = const [0, 1, 2],
+    int seed = 20260906,
+  }) {
+    final steps = <FieldStep>[];
+    final trialOf = <int, int>{for (final a in arms) a: 0};
+    for (var sweep = 0; sweep < sweeps; sweep++) {
+      final order = _seededShuffle(arms, seed + sweep);
+      for (final arm in order) {
+        final (bytes, lanes) = _throughputArms[arm];
+        final trial = (trialOf[arm] = trialOf[arm]! + 1);
+        steps.add(FieldStep(
+          label: 'p=${bytes}B lanes=$lanes'
+              '${connectionPriorityHigh == true ? ' prio=high' : ''} t$trial',
+          dwellSec: dwellSec,
+          sendBytes: bytes,
+          saturate: saturating,
+          sendLanes: lanes,
+          // Cleared every step; links and sessions are not touched.
+          resetDtnBuffer: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      steps: steps,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: true,
+      connectionPriorityHigh: connectionPriorityHigh,
+      manualJoin: true,
+      // The deliverable includes advertisement RSSI per step, and a
+      // rate-limited sample would report the limiter rather than the link.
+      traceEveryAdvertisement: true,
+      // A desk run: both phones are already where they will stay.
+      placementSec: 60,
+      alignSec: 60,
+      drainSec: drainSec,
+    );
+  }
+
+  static const bleOneWaySenderPresetName =
+      'BLE one-way ceiling — SENDER (2 phones, ~33m)';
+  static const bleOneWayReceiverPresetName =
+      'BLE one-way ceiling — RECEIVER (2 phones, ~33m)';
+
+  /// Payload sweep for the one-way ceiling, in 138 B fragments: 10, 30, 100,
+  /// 200, 400. It starts where the duplex run's goodput was still climbing
+  /// and goes until it stops or delivery does.
+  static const List<int> _oneWayPayloads = [1380, 4140, 13800, 27600, 55200];
+
+  /// The ONE-WAY goodput ceiling: what one link carries when nothing comes
+  /// back and nothing else is on the air.
+  ///
+  /// The duplex run found 23.6 kB/s at 13.8 kB messages with the fragment
+  /// spacing off, and goodput was still rising at the largest payload — so
+  /// that run never bracketed the ceiling. It also measured a link carrying
+  /// an acknowledgement back for every message, which is a packet on the same
+  /// radio: a duplex measurement reported as capacity.
+  ///
+  /// Here the receiver takes delivery and says nothing ([FieldPlan.suppressAcks]),
+  /// so the only measure is the RECEIVER's own arrival records. The sender's
+  /// flow record will read zero acked — by construction, not by failure, and
+  /// anyone reading `delivery_rate` from the sender will see zero. Read the
+  /// receiver.
+  ///
+  /// Spacing is off throughout: the duplex run showed it pins goodput near
+  /// 4.2 kB/s at every size, so a paced arm here would only re-measure it.
+  static FieldPlan bleOneWayCeiling({
+    String expId = 'ble-oneway-1',
+    bool saturating = true,
+    int sweeps = 4,
+    int dwellSec = 60,
+    int drainSec = 30,
+    int seed = 20260907,
+  }) {
+    final steps = <FieldStep>[];
+    final trialOf = <int, int>{for (var i = 0; i < _oneWayPayloads.length; i++) i: 0};
+    for (var sweep = 0; sweep < sweeps; sweep++) {
+      for (final i in _seededShuffle(
+          [for (var i = 0; i < _oneWayPayloads.length; i++) i], seed + sweep)) {
+        final bytes = _oneWayPayloads[i];
+        final trial = (trialOf[i] = trialOf[i]! + 1);
+        steps.add(FieldStep(
+          label: 'p=${bytes}B lanes=1 pace=0 oneway t$trial',
+          dwellSec: dwellSec,
+          sendBytes: bytes,
+          saturate: saturating,
+          sendLanes: 1,
+          fragmentDelayMs: 0,
+          resetDtnBuffer: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      steps: steps,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: true,
+      suppressAcks: true,
+      // The whole point of this run: the radio carries payload and nothing
+      // else. Without it the buffer, not the link, is what gets measured.
+      quietLink: true,
+      manualJoin: true,
+      traceEveryAdvertisement: true,
+      placementSec: 60,
+      alignSec: 120,
+      drainSec: drainSec,
+    );
+  }
+
+  static const bleCeilingSenderPresetName =
+      'BLE goodput ceiling — SENDER (2 phones, ~83m)';
+  static const bleCeilingReceiverPresetName =
+      'BLE goodput ceiling — RECEIVER (2 phones, ~83m)';
+
+  /// Payload sizes for the ceiling hunt, in fragments of 138 B: one, ten,
+  /// thirty, a hundred. Larger messages amortise the per-message send path
+  /// over more writes, which is the only lever left once the spacing is off
+  /// and lanes are known not to help.
+  static const List<int> _ceilingPayloads = [138, 1380, 4140, 13800];
+
+  /// The goodput CEILING: how many payload bytes per second one warm link
+  /// carries when nothing of ours is pacing it.
+  ///
+  /// The arms above measured 3.8 kB/s at one packet per message and 4.2 kB/s
+  /// at ten — but the ten-fragment arm spent 180 ms of every message in
+  /// [FragmentHandler.fragmentDelay], so what it measured was our own spacing.
+  /// The spacing was introduced when a write was fire-and-forget and could
+  /// outrun the radio's buffer; the send path now awaits each write's
+  /// acknowledgement and the plugin holds one GATT op per path, and an hour of
+  /// saturating traffic produced a single write-busy refusal. So the spacing
+  /// is very likely dead weight, and this run is what decides it.
+  ///
+  /// Every payload runs twice: once with the spacing off and once with it at
+  /// its production value, so the difference is measured under the same
+  /// conditions rather than against a previous run. Lanes stay at one — two
+  /// carried no more than one and produced one refusal in an hour, so the
+  /// lane sweep has nothing left to find.
+  ///
+  /// DELIVERY IS THE GUARD. A fragmented message needs every fragment, so a
+  /// payload that starts losing them is the ceiling announcing itself. Read
+  /// `delivery_rate` before reading any rate: the first payload where it
+  /// falls below 1.0 is the answer, and the rates above it are not capacity.
+  static FieldPlan bleGoodputCeiling({
+    String expId = 'ble-ceil-1',
+    bool saturating = true,
+    int sweeps = 5,
+    int dwellSec = 60,
+    int drainSec = 60,
+    int seed = 20260906,
+  }) {
+    // (payload, pacing off?) — the control rides beside its own arm.
+    final arms = <(int, bool)>[
+      for (final p in _ceilingPayloads) ...[(p, true), (p, false)],
+    ];
+    final steps = <FieldStep>[];
+    final trialOf = <int, int>{for (var i = 0; i < arms.length; i++) i: 0};
+    for (var sweep = 0; sweep < sweeps; sweep++) {
+      for (final i in _seededShuffle(
+          [for (var i = 0; i < arms.length; i++) i], seed + sweep)) {
+        final (bytes, unpaced) = arms[i];
+        final trial = (trialOf[i] = trialOf[i]! + 1);
+        steps.add(FieldStep(
+          label: 'p=${bytes}B lanes=1 '
+              '${unpaced ? 'pace=0' : 'pace=20'} t$trial',
+          dwellSec: dwellSec,
+          sendBytes: bytes,
+          saturate: saturating,
+          sendLanes: 1,
+          fragmentDelayMs: unpaced ? 0 : null,
+          resetDtnBuffer: true,
+          autoAdvance: steps.isNotEmpty,
+        ));
+      }
+    }
+    return FieldPlan(
+      expId: expId,
+      steps: steps,
+      resetSessions: false,
+      resetLinks: false,
+      resetDtnBuffer: true,
+      manualJoin: true,
+      traceEveryAdvertisement: true,
+      placementSec: 60,
+      // Twice the tap tolerance of the throughput plans. At 60 s two phones
+      // must tap inside one wall-clock minute, and a smoke run was lost to a
+      // pair of taps either side of a boundary.
+      alignSec: 120,
+      drainSec: drainSec,
+    );
+  }
 
   static Map<String, FieldPlan> get presets => {
         lineSweepPresetName: lineSweepUpTo(),
         'Diluting clique at the line load N=2..7 (~1h)': dilutingLineLoads(),
+        dilutingSaturatingPresetName: dilutingSaturating(),
+        linkChurnPresetName: linkChurn(),
         dilutingSmokePresetName: dilutingSmoke(),
         advertisementCapturePresetName:
             advertisementCapture(expId: 'adv-capture-3', dwellSec: 60),
         homeMatchPresetName: homeMatch(),
         ringSweepPresetName: ringSweep(),
         ringSmokePresetName: ringSmokeDesk(),
+        mtuCheckPresetName: mtuCheck(),
+        bleThroughputSenderPresetName: bleThroughput(),
+        bleThroughputReceiverPresetName:
+            bleThroughput(saturating: false),
+        bleThroughputHighSenderPresetName: bleThroughput(
+            expId: 'ble-tp-hi-1', arms: const [0], connectionPriorityHigh: true),
+        bleOneWaySenderPresetName: bleOneWayCeiling(),
+        bleOneWayReceiverPresetName: bleOneWayCeiling(saturating: false),
+        bleCeilingSenderPresetName: bleGoodputCeiling(),
+        bleCeilingReceiverPresetName: bleGoodputCeiling(saturating: false),
+        bleThroughputHighReceiverPresetName: bleThroughput(
+            expId: 'ble-tp-hi-1',
+            arms: const [0],
+            saturating: false,
+            connectionPriorityHigh: true),
       };
 }

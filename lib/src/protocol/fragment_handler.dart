@@ -50,11 +50,25 @@ class FragmentHandler {
   /// The radio's buffer drains slower than a send loop fills it, and an
   /// overflowed write is refused — costing the whole message, since one
   /// missing fragment never reassembles.
-  static const Duration fragmentDelay = Duration(milliseconds: 20);
+  static const Duration defaultFragmentDelay = Duration(milliseconds: 20);
+
+  /// The spacing this handler actually applies. [defaultFragmentDelay] unless
+  /// a testbed plan lowers it.
+  ///
+  /// It is settable because a throughput run has to be able to measure the
+  /// LINK rather than this constant: ten fragments at 20 ms spend 180 ms of a
+  /// message's life waiting, which put the measured ceiling at our own pacing
+  /// and not at the radio. Note also that the reason for the spacing has
+  /// weakened — [send] now awaits each write's acknowledgement and the plugin
+  /// holds one GATT op per path, so the loop cannot outrun the buffer the way
+  /// a fire-and-forget write could. Production keeps the spacing regardless
+  /// until a measurement says it is safe to drop; an experiment is not a
+  /// licence to change what ships.
+  Duration fragmentDelay = defaultFragmentDelay;
 
   /// Timeout for an incomplete reassembly. Must outlast the slowest transfer
   /// we allow: a capped file at [maxFragmentPayload] per fragment,
-  /// [fragmentDelay] apart. Sized for the ~1 MB attachment cap (~7.6k
+  /// [defaultFragmentDelay] apart. Sized for the ~1 MB attachment cap (~7.6k
   /// fragments ≈ 152 s) plus slack.
   static const Duration reassemblyTimeout = Duration(minutes: 4);
 

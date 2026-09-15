@@ -347,15 +347,21 @@ void main() {
         expect(disarmed.ringRoster, ['aa11', 'bb22']);
       });
 
-      test('survives a JSON round trip, still in ring order', () {
+      test('does not survive a JSON round trip: a restart disarms the gate',
+          () {
+        // A radius that came back from disk would be armed before warm-up, so
+        // non-neighbours could never handshake and the launch's session-count
+        // check would refuse the phone.
         final armed = settingsReducer(
           SettingsState.initial,
           SetRingGateAction(rosterHex: ['cc33', 'aa11'], radius: 3),
         );
-        final revived = SettingsState.fromJson(armed.toJson());
-        expect(revived, equals(armed));
-        expect(revived.ringRoster, ['aa11', 'cc33']);
-        expect(revived.ringRadius, 3);
+        final json = armed.toJson();
+        expect(json.containsKey('ringRadius'), isFalse);
+        expect(json.containsKey('ringRoster'), isFalse);
+        final revived = SettingsState.fromJson(json);
+        expect(revived.ringRadius, isNull);
+        expect(revived.ringRoster, isEmpty);
       });
 
       test('hydrating a settings blob with no ring keys leaves it disarmed', () {
@@ -379,6 +385,61 @@ void main() {
         expect(after.coldCallTrustLevel, ColdCallTrustLevel.closed);
         expect(after.showLinkDiagnostics, isTrue);
         expect(after.bluetoothEnabled, before.bluetoothEnabled);
+      });
+    });
+
+    group('ignored phones (testbed)', () {
+      test('nobody is ignored in the initial state', () {
+        expect(SettingsState.initial.ignoredPeerHexes, isEmpty);
+      });
+
+      test('IgnorePeerAction adds the phone, lowercased', () {
+        final s = settingsReducer(
+          SettingsState.initial,
+          IgnorePeerAction('AA11'),
+        );
+        expect(s.ignoredPeerHexes, {'aa11'});
+      });
+
+      test('ignoring the same phone twice keeps a single entry', () {
+        final s = settingsReducer(
+          settingsReducer(SettingsState.initial, IgnorePeerAction('aa11')),
+          IgnorePeerAction('AA11'),
+        );
+        expect(s.ignoredPeerHexes, {'aa11'});
+      });
+
+      test('UnignorePeerAction removes only that phone', () {
+        final both = settingsReducer(
+          settingsReducer(SettingsState.initial, IgnorePeerAction('aa11')),
+          IgnorePeerAction('bb22'),
+        );
+        final s = settingsReducer(both, UnignorePeerAction('AA11'));
+        expect(s.ignoredPeerHexes, {'bb22'});
+      });
+
+      test('does not survive a JSON round trip: a restart forgets the list',
+          () {
+        // An ignore list that came back from disk would silently shrink the
+        // next full-fleet run; like the ring gate it lives for one launch.
+        final s = settingsReducer(
+          SettingsState.initial,
+          IgnorePeerAction('aa11'),
+        );
+        expect(s.toJson().containsKey('ignoredPeerHexes'), isFalse);
+        expect(SettingsState.fromJson(s.toJson()).ignoredPeerHexes, isEmpty);
+      });
+
+      test('leaves every other setting alone', () {
+        final before = SettingsState.initial.copyWith(
+          coldCallTrustLevel: ColdCallTrustLevel.closed,
+          ringRoster: ['aa11', 'bb22'],
+          ringRadius: 1,
+        );
+        final after = settingsReducer(before, IgnorePeerAction('cc33'));
+        expect(after.coldCallTrustLevel, ColdCallTrustLevel.closed);
+        expect(after.ringRoster, ['aa11', 'bb22']);
+        expect(after.ringRadius, 1);
       });
     });
   });

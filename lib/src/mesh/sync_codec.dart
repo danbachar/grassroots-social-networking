@@ -90,10 +90,21 @@ List<Uint8List> buildSyncPayloads(List<String> packetIds) {
 
 
 /// Wire format for a GCS sync filter frame:
-/// `[n:2][fromMs:8][toMs:8][filter bytes]`.
+/// `[n:2][salt:1][fromMs:8][toMs:8][filter bytes]`.
 ///
-/// `n` is the element count the reader needs to rebuild the filter's modulus;
-/// the two timestamps are the WINDOW the filter covers, as originator-stamped
+/// `n` is the element count the reader needs to rebuild the filter's modulus.
+///
+/// `salt` is the asker's announce-cycle counter, and it is what the filter
+/// was hashed under. It travels IN THE FRAME rather than in the
+/// ANNOUNCE, and that is the whole reason it is a wire field: a salt and the
+/// filter it applies to must arrive together. They are separate writes on
+/// separate paths, so an announce-carried counter can land a round early or a
+/// round late, and a filter read under the wrong salt is not slightly wrong —
+/// the salt reshuffles every slot, so a converged peer reads as holding
+/// nothing and is conveyed its whole window back. One byte against the
+/// filter it heads is what that atomicity costs.
+///
+/// The two timestamps are the WINDOW the filter covers, as originator-stamped
 /// Unix MILLISECONDS — the same clock as a packet's `createdAtMs`, so a
 /// responder can compare the two directly. They are 8 bytes each because real
 /// epoch-ms (~1.7e12) overflow a uint32 (~4.29e9): a 4-byte field truncated
@@ -103,24 +114,40 @@ List<Uint8List> buildSyncPayloads(List<String> packetIds) {
 /// inside it, so a filter covering a subset of the sender's buffer cannot
 /// provoke a re-send of everything outside that subset. Without the bounds,
 /// capping the filter would turn it into a duplicate generator.
-const int syncFilterHeaderSize = 18;
+const int syncFilterHeaderSize = 19;
+
+/// How many announce cycles before the salt byte returns to a value it
+/// already used — about 43 minutes at a 10 s announce interval.
+///
+/// A recurrence is not a wrong answer, only a missed opportunity: a vote
+/// standing under a salt is refused by another vote under that same salt, so
+/// a packet whose coverage happens to align with this period ages out instead
+/// of retiring.
+const int syncFilterSaltPeriod = 256;
 
 Uint8List encodeSyncFilter({
   required int n,
+  required int salt,
   required int fromMs,
   required int toMs,
   required Uint8List filter,
 }) {
+  if (salt < 0 || salt >= syncFilterSaltPeriod) {
+    // A salt that does not fit the byte would be written truncated, and the
+    // two sides would then hash under different values and agree on nothing.
+    throw ArgumentError('Sync filter salt $salt is outside 0..255');
+  }
   final out = Uint8List(syncFilterHeaderSize + filter.length);
   final view = ByteData.view(out.buffer);
   view.setUint16(0, n, Endian.big);
-  view.setUint64(2, fromMs, Endian.big);
-  view.setUint64(10, toMs, Endian.big);
+  view.setUint8(2, salt);
+  view.setUint64(3, fromMs, Endian.big);
+  view.setUint64(11, toMs, Endian.big);
   out.setRange(syncFilterHeaderSize, out.length, filter);
   return out;
 }
 
-({int n, int fromMs, int toMs, Uint8List filter}) decodeSyncFilter(
+({int n, int salt, int fromMs, int toMs, Uint8List filter}) decodeSyncFilter(
     Uint8List payload) {
   if (payload.length < syncFilterHeaderSize) {
     throw const FormatException('Sync filter payload too short');
@@ -128,8 +155,9 @@ Uint8List encodeSyncFilter({
   final view = ByteData.view(payload.buffer, payload.offsetInBytes);
   return (
     n: view.getUint16(0, Endian.big),
-    fromMs: view.getUint64(2, Endian.big),
-    toMs: view.getUint64(10, Endian.big),
+    salt: view.getUint8(2),
+    fromMs: view.getUint64(3, Endian.big),
+    toMs: view.getUint64(11, Endian.big),
     filter: Uint8List.sublistView(payload, syncFilterHeaderSize),
   );
 }

@@ -10,15 +10,21 @@ import 'dart:typed_data';
 /// element, so the same buffer fits in a few hundred bytes.
 ///
 /// The cost is a false positive: the peer concludes we already hold a packet
-/// we do not, and withholds it. That is bounded by [fprOneIn] and self-heals —
-/// the next announce cycle builds a fresh filter, and a different membership
-/// draw is not correlated with the last, so a packet cannot be permanently
-/// invisible to a peer. It is the same class of miss the seen-set bloom
-/// already makes on the request side.
+/// we do not, and withholds it. That is bounded by [fprOneIn] and costs ONE
+/// ROUND, because every round hashes under its own salt — see [_hash].
+///
+/// Membership alone cannot buy that. A sweep frame covers a historical
+/// window, and a window that has passed does not gain ids, so an unsalted
+/// filter over it is rebuilt byte for byte every time the cursor wraps and
+/// withholds the SAME packet on every pass — a packet permanently invisible
+/// to that peer rather than one delayed a cycle. The salt is what makes each
+/// round an independent draw. It does not lower the rate: [fprOneIn] is
+/// structural, n ids over `n * 2^p` slots, and no entropy in the hash input
+/// moves it. It decides WHICH packet pays, freshly, each round.
 ///
 /// Encoding (BIP-158 shaped, deliberately: it is the best-tested GCS wire
 /// format there is):
-///   * each id is hashed to a value in `[0, n * 2^p)`,
+///   * each id is hashed under the round's salt to a value in `[0, n * 2^p)`,
 ///   * the values are sorted and delta-encoded,
 ///   * each delta is Golomb-Rice coded — unary quotient, then `p` raw bits.
 /// Deltas are geometrically distributed, which is exactly what Golomb-Rice is
@@ -32,34 +38,78 @@ class GcsFilter {
   /// The false-positive rate as a denominator, for documentation and tests.
   static const int fprOneIn = 1 << p;
 
-  /// A sealed sync frame must fit one BLE write, and the filter shares that
-  /// budget with the frame header. Kept well inside it: a filter that does not
-  /// fit is not a smaller filter, it is a truncated one.
-  static const int maxPayloadBytes = 120;
+  /// What one sealed sync frame leaves for the filter: the floor-MTU write of
+  /// 244 bytes, less the sealed packet's own 106 and the frame header's 19.
+  /// It is exactly the budget and not a byte under, so a change to any of the
+  /// three moves this one; `sync_on_connect_test` asserts the sum fits.
+  ///
+  /// A filter that does not fit is not a smaller filter, it is a truncated
+  /// one: these are unacknowledged writes, so the stack cannot promote them
+  /// to a GATT long write. It cuts at MTU − 3 and the peer gets an
+  /// unparseable prefix.
+  static const int maxPayloadBytes = 119;
 
   /// How many ids [maxPayloadBytes] holds, at `p + 2` bits each. A buffer
   /// larger than this advertises a SUBSET per round — the rest ride the next
   /// announce cycle rather than being silently dropped.
-  static int get maxElements => (maxPayloadBytes * 8) ~/ (p + 2);
+  static int get maxElements => maxElementsFor(maxPayloadBytes);
 
-  /// Map a packetId to its filter value in `[0, m)`. FNV-1a over the id's
-  /// bytes: both sides must agree exactly, so the hash is written out here
-  /// rather than taken from a platform library whose implementation could
-  /// differ across Dart versions or platforms.
-  static int _hash(String packetId, int m) {
-    var h = 0xcbf29ce484222325;
+  /// How many ids [payloadBytes] holds, at `p + 2` bits each.
+  ///
+  /// The budget is a property of the LEG the frame will be written to, not of
+  /// this class: legs negotiate their MTUs separately and one that settles
+  /// below the floor cannot carry a filter built for the floor. Sizing to the
+  /// leg keeps the whole round on the leg it was meant for; the alternative
+  /// is a frame that is refused and has to be rescued by the pair's other leg,
+  /// or dropped when there is no other leg to rescue it.
+  static int maxElementsFor(int payloadBytes) =>
+      payloadBytes <= 0 ? 0 : (payloadBytes * 8) ~/ (p + 2);
+
+  /// Map a packetId to its filter value in `[0, m)` under [salt]: FNV-1a from
+  /// a salted basis, then a finalizing mix. Both sides must agree exactly, so
+  /// the hash is written out here rather than taken from a platform library
+  /// whose implementation could differ across Dart versions or platforms.
+  ///
+  /// The salt enters the BASIS, ahead of the compression loop. Anything
+  /// applied to a finished hash maps equal values to equal values, so it
+  /// carries every collision through unchanged — a salt that arrives after
+  /// the loop reorders the slots and reproduces the same pairs inside them.
+  ///
+  /// The finalizer is a mix, and it is what makes the salt reach the bits the
+  /// modulus reads. The basis is XORed with the salt and then immediately
+  /// with the id's first byte, so the salt enters as one byte at one
+  /// position, and FNV diffuses upward from there — leaving the low bits,
+  /// which are exactly the ones the modulus takes, close to linear in it.
+  ///
+  /// From a salted basis alone the damage is concentrated in the salt's TOP
+  /// bit. Against a chance of 1/128 = 0.78%, a salt step of 128 recurs at
+  /// 51% — 65 times chance, half of every collision surviving the change.
+  /// Other steps sit between about 0.9 and 2 times chance. Two sightings of
+  /// one packet are a sweep-wrap apart, so the step between them is
+  /// arbitrary and lands on that bit as readily as any other, which puts the
+  /// structure squarely on the case the two-vote retirement rule prices at
+  /// 1/128 squared. With the mix every output bit depends on every input bit
+  /// and every step sits on chance.
+  static int _hash(String packetId, int m, int salt) {
+    var h = 0xcbf29ce484222325 ^ salt;
     for (final unit in packetId.codeUnits) {
       h ^= unit;
       // 64-bit FNV prime, kept inside Dart's signed 64-bit int by masking.
       h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
     }
+    h ^= h >>> 33;
+    h = (h * 0xff51afd7ed558ccd) & 0xFFFFFFFFFFFFFFFF;
+    h ^= h >>> 33;
+    h = (h * 0xc4ceb9fe1a85ec53) & 0xFFFFFFFFFFFFFFFF;
+    h ^= h >>> 33;
     // Modulo bias is irrelevant here: the filter's job is a uniform-ish
     // spread, not a uniform distribution.
     return (h % m).abs();
   }
 
-  /// Build a filter over [ids]. Returns the encoded payload; [n] (the element
-  /// count the reader needs to reconstruct the modulus) rides the frame.
+  /// Build a filter over [ids] under [salt]. Returns the encoded payload; [n]
+  /// (the element count the reader needs to reconstruct the modulus) and the
+  /// salt both ride the frame, since a reader cannot derive either.
   ///
   /// Takes at most [maxElements] from the FRONT of what it is given. The
   /// caller passes one window of its buffer, oldest first, and carries that
@@ -74,12 +124,14 @@ class GcsFilter {
   /// been waiting longest — a traveller's backlog would sit unreconciled
   /// until it aged out. Sweeping forward from the oldest covers the whole
   /// buffer over successive rounds and serves the longest waiters first.
-  static ({Uint8List data, int n}) build(List<String> ids) {
-    final take = ids.length > maxElements ? ids.sublist(0, maxElements) : ids;
+  static ({Uint8List data, int n}) build(List<String> ids,
+      {required int salt, int? maxPayloadBytes}) {
+    final cap = maxElementsFor(maxPayloadBytes ?? GcsFilter.maxPayloadBytes);
+    final take = ids.length > cap ? ids.sublist(0, cap) : ids;
     final n = take.length;
     if (n == 0) return (data: Uint8List(0), n: 0);
     final m = n << p;
-    final values = [for (final id in take) _hash(id, m)]..sort();
+    final values = [for (final id in take) _hash(id, m, salt)]..sort();
 
     final out = _BitWriter();
     var last = 0;
@@ -122,9 +174,15 @@ class GcsFilter {
   /// Whether [packetId] is (probably) in the decoded [values]. False means
   /// DEFINITELY absent — which is the direction that matters: the peer sends
   /// us exactly the packets it can prove we lack.
-  static bool mightContain(List<int> values, int n, String packetId) {
+  ///
+  /// [salt] must be the one the frame carried. A lookup under any other salt
+  /// is not a weaker answer, it is an unrelated one: the salt reshuffles the
+  /// whole slot assignment, so every id reads as absent and the holder
+  /// answers a converged peer with its entire window.
+  static bool mightContain(List<int> values, int n, String packetId,
+      {required int salt}) {
     if (n == 0 || values.isEmpty) return false;
-    final target = _hash(packetId, n << p);
+    final target = _hash(packetId, n << p, salt);
     var lo = 0, hi = values.length - 1;
     while (lo <= hi) {
       final mid = (lo + hi) >> 1;

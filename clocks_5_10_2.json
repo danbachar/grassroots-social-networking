@@ -1,0 +1,46 @@
+{
+  "measuredAtMs": 1788602251118,
+  "checkOnly": true,
+  "devices": [
+    {
+      "serial": "55281FDCH002QK",
+      "model": "Pixel 10 Pro",
+      "offsetBeforeS": -0.0454,
+      "offsetS": -0.0454,
+      "errS": 0.0266,
+      "pubkey": "366dca50d82e71c72a32c234baa7c97b05252841e55f8445ef6f52525d13bbf9"
+    },
+    {
+      "serial": "8DM0218B02000956",
+      "model": "HMA-L09",
+      "offsetBeforeS": -0.0248,
+      "offsetS": -0.0248,
+      "errS": 0.0093,
+      "pubkey": "be3a5ef56240eb49764a9be72930f5a2fbc0c2fe99dbd04a13a19944a26ec4d8"
+    },
+    {
+      "serial": "HT7AG1A00486",
+      "model": "Pixel 2",
+      "offsetBeforeS": -0.0658,
+      "offsetS": -0.0658,
+      "errS": 0.0151,
+      "pubkey": "c3cba74287fbc882e762e4746064c773a2c0aed36d1130c887e453fc29921e33"
+    },
+    {
+      "serial": "RF8M337Q3FE",
+      "model": "SM-G970F",
+      "offsetBeforeS": -0.1025,
+      "offsetS": -0.1025,
+      "errS": 0.0147,
+      "pubkey": "929a022c32a603e468f7e8d6f049c13afafcedfd8bc87530ce14862acf478208"
+    },
+    {
+      "serial": "31311JEHN12328",
+      "model": "Pixel 7a",
+      "offsetBeforeS": -0.0312,
+      "offsetS": -0.0312,
+      "errS": 0.0208,
+      "pubkey": "6b819f64b80724df3023daf45b665c8a7b8554b7084fb1c0a2479c0fb08738a3"
+    }
+  ]
+}

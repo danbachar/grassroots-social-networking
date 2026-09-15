@@ -1,0 +1,22 @@
+{
+  "measuredAtMs": 1788728111030,
+  "checkOnly": true,
+  "devices": [
+    {
+      "serial": "00d98aa1795bc454",
+      "model": "Nexus 5X",
+      "offsetBeforeS": -0.2022,
+      "offsetS": -0.2022,
+      "errS": 0.0144,
+      "pubkey": "72440e8a051dcf2981d1e2f27f58e21c564fd534af4877ee517a56f04ac228b0"
+    },
+    {
+      "serial": "00de4b24f89021e4",
+      "model": "Nexus 5X",
+      "offsetBeforeS": -0.1372,
+      "offsetS": -0.1372,
+      "errS": 0.0131,
+      "pubkey": "07e473354009ebe81b22b1c6a79606c8d653558a865c4941c98e4befbfda546c"
+    }
+  ]
+}

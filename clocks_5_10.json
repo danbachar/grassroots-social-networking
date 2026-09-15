@@ -1,0 +1,54 @@
+{
+  "measuredAtMs": 1788601983554,
+  "checkOnly": true,
+  "devices": [
+    {
+      "serial": "00d98aa1795bc454",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.5546,
+      "offsetS": 0.5546,
+      "errS": 0.0134,
+      "pubkey": "72440e8a051dcf2981d1e2f27f58e21c564fd534af4877ee517a56f04ac228b0"
+    },
+    {
+      "serial": "00de4b24f89021e4",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0284,
+      "offsetS": 0.0284,
+      "errS": 0.0142,
+      "pubkey": "07e473354009ebe81b22b1c6a79606c8d653558a865c4941c98e4befbfda546c"
+    },
+    {
+      "serial": "00f8380a3668adb1",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0269,
+      "offsetS": 0.0269,
+      "errS": 0.0146,
+      "pubkey": "18130c0f5a36449cc5c1d5e0c17e83ba4d248625655035b08e971693fb29ae40"
+    },
+    {
+      "serial": "0253914a45ebaeb0",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0257,
+      "offsetS": 0.0257,
+      "errS": 0.0116,
+      "pubkey": "44a266c4c9912ec34ea7934fbbffae1745ab82df0229f8972440ae3f43862fa4"
+    },
+    {
+      "serial": "56261FDCH00B50",
+      "model": "Pixel 10 Pro",
+      "offsetBeforeS": -0.0638,
+      "offsetS": -0.0638,
+      "errS": 0.0202,
+      "pubkey": "a2b11ef1102775e11548755ac6e8ee133bd9eae13a0f6036d0941cb1d7d218ad"
+    },
+    {
+      "serial": "31311JEHN12328",
+      "model": "Pixel 7a",
+      "offsetBeforeS": -0.0537,
+      "offsetS": -0.0537,
+      "errS": 0.0106,
+      "pubkey": "6b819f64b80724df3023daf45b665c8a7b8554b7084fb1c0a2479c0fb08738a3"
+    }
+  ]
+}

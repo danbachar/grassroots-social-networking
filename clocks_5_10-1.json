@@ -1,0 +1,46 @@
+{
+  "measuredAtMs": 1788616559037,
+  "checkOnly": true,
+  "devices": [
+    {
+      "serial": "00d98aa1795bc454",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0391,
+      "offsetS": 0.0391,
+      "errS": 0.0144,
+      "pubkey": "72440e8a051dcf2981d1e2f27f58e21c564fd534af4877ee517a56f04ac228b0"
+    },
+    {
+      "serial": "00de4b24f89021e4",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0506,
+      "offsetS": 0.0506,
+      "errS": 0.0167,
+      "pubkey": "07e473354009ebe81b22b1c6a79606c8d653558a865c4941c98e4befbfda546c"
+    },
+    {
+      "serial": "00f8380a3668adb1",
+      "model": "Nexus 5X",
+      "offsetBeforeS": 0.0288,
+      "offsetS": 0.0288,
+      "errS": 0.0159,
+      "pubkey": "18130c0f5a36449cc5c1d5e0c17e83ba4d248625655035b08e971693fb29ae40"
+    },
+    {
+      "serial": "8DM0218B02000956",
+      "model": "HMA-L09",
+      "offsetBeforeS": -0.0177,
+      "offsetS": -0.0177,
+      "errS": 0.0105,
+      "pubkey": "be3a5ef56240eb49764a9be72930f5a2fbc0c2fe99dbd04a13a19944a26ec4d8"
+    },
+    {
+      "serial": "RF8M337Q3FE",
+      "model": "SM-G970F",
+      "offsetBeforeS": -0.035,
+      "offsetS": -0.035,
+      "errS": 0.0168,
+      "pubkey": "929a022c32a603e468f7e8d6f049c13afafcedfd8bc87530ce14862acf478208"
+    }
+  ]
+}
